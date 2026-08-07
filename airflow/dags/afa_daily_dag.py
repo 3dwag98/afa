@@ -46,6 +46,12 @@ def run_daily_agent(**context):
             sys.path.insert(0, project_path)
             logger.info(f"Added {project_path} to sys.path")
         
+        # Also add current working directory path for local testing
+        cwd_path = '/workspace'
+        if cwd_path not in sys.path:
+            sys.path.insert(0, cwd_path)
+            logger.info(f"Added {cwd_path} to sys.path")
+        
         # Import the orchestrator logic
         # Adjust import path based on your actual module structure
         from src.orchestrator import run_orchestrator

@@ -4,41 +4,53 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.Python
+env/
+venv/
+.venv/
+.ENV
+.venv.bak
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Compiled and build artifacts
+*.o
+*.obj
+*.so
+*.a
+*.dll
+*.exe
+*.out
+
+# Dependencies
+node_modules/
+target/
+.gradle/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+*.swo
 
 # Environment
 .env
 .env.local
 *.env.*
 
-# Logs
-*.log
-
-# Temporary files
-*.tmp
+# Editors
+.vscode/
+.idea/
 *.swp
 *.swo
 
 # Coverage
-.coverage
 coverage/
 htmlcov/
+.coverage
 
-# Build artifacts
+# Distribution / packaging
 dist/
 build/
 *.egg-info/
-
-# Dependencies
-.venv/
-venv/
-.mypy_cache/
-.pytest_cache/
-
-# Editors
-.vscode/
-.idea/
-
-# System
-.DS_Store
-Thumbs.db
 ```
