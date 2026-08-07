@@ -16,12 +16,12 @@ import sys
 import argparse
 from pathlib import Path
 
-# Add src to path
-src_path = Path(__file__).parent / "src"
-sys.path.insert(0, str(src_path))
+# Add app directory to path so src can be imported as a package
+app_path = Path(__file__).parent
+sys.path.insert(0, str(app_path))
 
-from config import get_config
-from orchestrator import run_orchestrator
+from src.config import get_config
+from src.orchestrator import run_orchestrator
 
 
 def main():
