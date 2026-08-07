@@ -8,6 +8,176 @@ Python self-learning portfolio agent for Indian markets.
 - **No real broker trading**: There is no broker API integration for trade execution.
 - **Educational Purpose**: This tool is for educational and research purposes only. Past performance does not guarantee future results.
 
+## Scheduler Architecture
+
+This project uses Apache Airflow for scheduled local execution.
+
+**Airflow DAGs:**
+- `portfolio_daily_run` - Daily portfolio execution (weekdays)
+- `portfolio_update_outcomes` - Update trade outcomes (weekdays)
+- `portfolio_relearn` - Manual relearning task
+
+**portfolio_daily_run:**
+- Runs at 15:45 IST on weekdays.
+- Calls the full orchestrator.
+- Produces Excel output.
+
+**portfolio_update_outcomes:**
+- Runs at 16:00 IST on weekdays.
+- Updates trade outcomes if market data is available.
+
+**portfolio_relearn:**
+- Manual DAG.
+- Runs evaluate_and_learn only.
+
+## Final Airflow Quickstart
+
+```bash
+make airflow-build
+make airflow-init
+make airflow-up
+make airflow-trigger-daily
+```
+
+Then open:
+```
+output/Agent_Orchestrator_Output.xlsx
+```
+
+## Run Airflow Locally
+
+1. Fix permissions on Linux:
+   ```bash
+   ./scripts/fix_airflow_permissions.sh
+   ```
+
+2. Build:
+   ```bash
+   make airflow-build
+   ```
+
+3. Initialize:
+   ```bash
+   make airflow-init
+   ```
+
+4. Start:
+   ```bash
+   make airflow-up
+   ```
+
+5. Open UI:
+   ```
+   http://localhost:8080
+   ```
+
+6. Login:
+   ```
+   admin / admin
+   ```
+
+7. Trigger DAG manually:
+   ```bash
+   make airflow-trigger-daily
+   make airflow-trigger-outcomes
+   make airflow-trigger-relearn
+   ```
+
+8. View logs:
+   ```bash
+   make airflow-logs
+   ```
+
+## Disable Scheduler
+
+Set in config.yaml:
+
+```yaml
+scheduler_enabled: false
+```
+
+This marks DAGs as paused by default.
+
+You can also stop Airflow:
+
+```bash
+docker compose --profile airflow down
+```
+
+## Simpler Alternative: Windows Task Scheduler
+
+If Airflow is too heavy, use Windows Task Scheduler:
+
+1. Create a task.
+2. Trigger daily at 15:45 on weekdays.
+3. Action:
+   ```
+   docker compose run --rm agent
+   ```
+
+4. Optional second task at 16:00:
+   ```
+   docker compose run --rm agent python main.py --update-outcomes
+   ```
+
+## Simpler Alternative: cron
+
+On macOS/Linux, use `crontab -e`:
+
+```
+45 15 * * 1-5 cd /path/to/portfolio_agent && docker compose run --rm agent
+0 16 * * 1-5 cd /path/to/portfolio_agent && docker compose run --rm agent python main.py --update-outcomes
+```
+
+## Safety
+
+- No live trading is enabled.
+- `paper_trading_mode` must remain true.
+- Airflow UI credentials are local-only.
+- Excel output remains the primary user interface.
+
+## Make Commands
+
+Build normal agent:
+```bash
+make build
+```
+
+Run agent once:
+```bash
+make run
+```
+
+Run tests:
+```bash
+make test
+```
+
+Build Airflow:
+```bash
+make airflow-build
+```
+
+Initialize Airflow:
+```bash
+make airflow-init
+```
+
+Start Airflow:
+```bash
+make airflow-up
+```
+
+Trigger daily run manually:
+```bash
+make airflow-trigger-daily
+```
+
+Trigger learning manually:
+```bash
+make airflow-trigger-relearn
+```
+
 ## Setup
 
 ```bash

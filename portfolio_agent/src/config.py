@@ -53,6 +53,13 @@ class AppConfig:
     paper_trading_mode: bool
     min_history_days: int
     allow_synthetic_fallback: bool = True
+    # Scheduler settings (Apache Airflow)
+    scheduler_enabled: bool = False
+    schedule_time_ist: str = "15:45"
+    schedule_outcome_time_ist: str = "16:00"
+    airflow_ui_enabled: bool = True
+    airflow_webserver_port: int = 8080
+    airflow_timezone: str = "Asia/Kolkata"
 
     @classmethod
     def from_dict(cls, data: dict) -> "AppConfig":
@@ -77,6 +84,12 @@ class AppConfig:
             paper_trading_mode=data["paper_trading_mode"],
             min_history_days=data["min_history_days"],
             allow_synthetic_fallback=data.get("allow_synthetic_fallback", True),
+            scheduler_enabled=data.get("scheduler_enabled", False),
+            schedule_time_ist=data.get("schedule_time_ist", "15:45"),
+            schedule_outcome_time_ist=data.get("schedule_outcome_time_ist", "16:00"),
+            airflow_ui_enabled=data.get("airflow_ui_enabled", True),
+            airflow_webserver_port=data.get("airflow_webserver_port", 8080),
+            airflow_timezone=data.get("airflow_timezone", "Asia/Kolkata"),
         )
 
 
