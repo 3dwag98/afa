@@ -4,31 +4,35 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.Python
-env/
-venv/
-.venv/
-.ENV
-.ENV.local
 
-# Logs
-*.log
-
-# Coverage
+# Testing
+.pytest_cache/
 .coverage
 coverage/
 htmlcov/
 
-# Testing
-.pytest_cache/
-.mypy_cache/
+# Logs
+*.log
 
 # Environment
 .env
 .env.local
-*.env.*
+.env.*
+
+# Dependencies
+.venv/
+venv/
+pip-log.txt
+pipenv.lock
 
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
 ```
