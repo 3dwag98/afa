@@ -26,7 +26,6 @@ default_args = {
     'catchup': False,
 }
 
-
 def run_daily_agent(**context):
     """
     Wrapper function to execute the AFA daily orchestrator logic.
@@ -45,15 +44,9 @@ def run_daily_agent(**context):
         if project_path not in sys.path:
             sys.path.insert(0, project_path)
             logger.info(f"Added {project_path} to sys.path")
-        
-        # Also add current working directory path for local testing
-        cwd_path = '/workspace'
-        if cwd_path not in sys.path:
-            sys.path.insert(0, cwd_path)
-            logger.info(f"Added {cwd_path} to sys.path")
-        
+
         # Import the orchestrator logic
-        # Adjust import path based on your actual module structure
+        # The src module is available via volume mount at /opt/airflow/project/src
         from src.orchestrator import run_orchestrator
         
         logger.info("Starting AFA daily orchestrator...")
@@ -79,7 +72,6 @@ def run_daily_agent(**context):
         # Log the error but don't crash the worker unnecessarily
         # Re-raise to properly mark task as failed in Airflow UI
         raise
-
 
 # Define the DAG
 with DAG(
