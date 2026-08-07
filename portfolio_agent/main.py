@@ -13,6 +13,7 @@ It operates in paper trading / decision support mode only.
 """
 
 import sys
+import argparse
 from pathlib import Path
 
 # Add src to path
@@ -20,11 +21,27 @@ src_path = Path(__file__).parent / "src"
 sys.path.insert(0, str(src_path))
 
 from config import get_config
-from orchestrator import PortfolioOrchestrator
+from orchestrator import run_orchestrator
 
 
 def main():
     """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description="Portfolio Agent - Self-Learning Portfolio Optimization"
+    )
+    parser.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help="Force refresh of market data (ignore cache)"
+    )
+    parser.add_argument(
+        "--no-simulate",
+        action="store_true",
+        help="Disable simulated outcome generation for demo learning"
+    )
+    
+    args = parser.parse_args()
+    
     print("=" * 60)
     print("Portfolio Agent - Self-Learning Portfolio Optimization")
     print("Indian Markets - Decision Support System")
@@ -49,33 +66,21 @@ def main():
     print(f"  Paper Trading Mode: {config.paper_trading_mode}")
     print()
 
-    # Initialize and run orchestrator
-    print("Initializing Portfolio Orchestrator...")
-    orchestrator = PortfolioOrchestrator(config)
-
-    print("Running portfolio optimization cycle...")
+    # Run orchestrator
+    print("Running orchestrator...")
     print("-" * 60)
 
     try:
-        result = orchestrator.run()
-
-        if result.get('error'):
-            print(f"Error: {result['error']}")
-            sys.exit(1)
+        excel_path = run_orchestrator(
+            force_refresh=args.force_refresh,
+            simulate_outcome=not args.no_simulate
+        )
 
         print()
         print("OPTIMIZATION COMPLETE")
         print("-" * 60)
-        print(f"  Status: {result.get('status', 'unknown')}")
-        print(f"  Tickers Analyzed: {result.get('tickers_analyzed', 0)}")
-        print(f"  Recommendations: {result.get('recommendations_count', 0)}")
-        print(f"  Output File: {result.get('output_path', 'N/A')}")
-        print(f"  Timestamp: {result.get('timestamp', 'N/A')}")
+        print(f"  Output File: {excel_path}")
         print()
-
-        # Save agent state
-        orchestrator.save_state()
-        print("Agent state saved.")
 
     except Exception as e:
         print(f"Error during execution: {e}")
@@ -89,6 +94,9 @@ def main():
     print("No real trades are executed. Past performance does not")
     print("guarantee future results. Use at your own risk.")
     print("=" * 60)
+
+    # Print final Excel path
+    print(f"\nFinal Excel path: {excel_path}")
 
     return 0
 

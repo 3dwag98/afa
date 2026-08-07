@@ -1,11 +1,137 @@
 {
-  "decisions": [],
-  "ticker_performance": {},
-  "pattern_weights": {},
-  "learning_stats": {
-    "total_decisions": 0,
-    "wins": 0,
-    "losses": 0,
-    "win_rate": 0.0
-  }
+  "weights": {
+    "Trend": 26.0,
+    "Breakout": 22.2,
+    "Volume": 20.8,
+    "MC_Prob": 31.0
+  },
+  "trade_history": [
+    {
+      "trade_id": "df7364a2-d838-4812-802c-b72e4f37ae3d",
+      "symbol": "TEST3.NS",
+      "signal_trigger": "Breakout",
+      "entry_date": "2026-08-07T18:57:25.977177+00:00",
+      "entry_price": 153.01250475232115,
+      "exit_date": "2026-08-07T18:57:25.977187+00:00",
+      "exit_price": 167.98709508534813,
+      "outcome": "LOSS",
+      "return_pct": 9.7865140873722,
+      "outcome_source": "SIMULATED"
+    },
+    {
+      "trade_id": "df7364a2-d838-4812-802c-b72e4f37ae3d",
+      "symbol": "TEST3.NS",
+      "signal_trigger": "Breakout",
+      "entry_date": "2026-08-07T18:57:25.977177+00:00",
+      "entry_price": 153.01250475232115,
+      "exit_date": "2026-08-07T18:57:25.977187+00:00",
+      "exit_price": 167.98709508534813,
+      "outcome": "LOSS",
+      "return_pct": 9.7865140873722,
+      "outcome_source": "SIMULATED"
+    },
+    {
+      "trade_id": "3c9ded09-7729-4c0f-ac48-114cc5b443f0",
+      "symbol": "TEST3.NS",
+      "signal_trigger": "Breakout",
+      "entry_date": "2026-08-07T18:57:26.330528+00:00",
+      "entry_price": 153.01250475232115,
+      "exit_date": "2026-08-07T18:57:26.330544+00:00",
+      "exit_price": 167.98709508534813,
+      "outcome": "LOSS",
+      "return_pct": 9.7865140873722,
+      "outcome_source": "SIMULATED"
+    },
+    {
+      "trade_id": "3c9ded09-7729-4c0f-ac48-114cc5b443f0",
+      "symbol": "TEST3.NS",
+      "signal_trigger": "Breakout",
+      "entry_date": "2026-08-07T18:57:26.330528+00:00",
+      "entry_price": 153.01250475232115,
+      "exit_date": "2026-08-07T18:57:26.330544+00:00",
+      "exit_price": 167.98709508534813,
+      "outcome": "LOSS",
+      "return_pct": 9.7865140873722,
+      "outcome_source": "SIMULATED"
+    },
+    {
+      "trade_id": "df7364a2-d838-4812-802c-b72e4f37ae3d",
+      "symbol": "TEST3.NS",
+      "signal_trigger": "Breakout",
+      "entry_date": "2026-08-07T18:57:25.977177+00:00",
+      "entry_price": 153.01250475232115,
+      "exit_date": "2026-08-07T18:57:25.977187+00:00",
+      "exit_price": 167.98709508534813,
+      "outcome": "LOSS",
+      "return_pct": 9.7865140873722,
+      "outcome_source": "SIMULATED"
+    },
+    {
+      "trade_id": "a0e6197d-90be-4f65-a384-d59d544e23ed",
+      "symbol": "TEST3.NS",
+      "signal_trigger": "Breakout",
+      "entry_date": "2026-08-07T18:57:26.435331+00:00",
+      "entry_price": 153.01250475232115,
+      "exit_date": "2026-08-07T18:57:26.435342+00:00",
+      "exit_price": 167.98709508534813,
+      "outcome": "LOSS",
+      "return_pct": 9.7865140873722,
+      "outcome_source": "SIMULATED"
+    },
+    {
+      "trade_id": "a0e6197d-90be-4f65-a384-d59d544e23ed",
+      "symbol": "TEST3.NS",
+      "signal_trigger": "Breakout",
+      "entry_date": "2026-08-07T18:57:26.435331+00:00",
+      "entry_price": 153.01250475232115,
+      "exit_date": "2026-08-07T18:57:26.435342+00:00",
+      "exit_price": 167.98709508534813,
+      "outcome": "LOSS",
+      "return_pct": 9.7865140873722,
+      "outcome_source": "SIMULATED"
+    },
+    {
+      "trade_id": "3c9ded09-7729-4c0f-ac48-114cc5b443f0",
+      "symbol": "TEST3.NS",
+      "signal_trigger": "Breakout",
+      "entry_date": "2026-08-07T18:57:26.330528+00:00",
+      "entry_price": 153.01250475232115,
+      "exit_date": "2026-08-07T18:57:26.330544+00:00",
+      "exit_price": 167.98709508534813,
+      "outcome": "LOSS",
+      "return_pct": 9.7865140873722,
+      "outcome_source": "SIMULATED"
+    },
+    {
+      "trade_id": "df7364a2-d838-4812-802c-b72e4f37ae3d",
+      "symbol": "TEST3.NS",
+      "signal_trigger": "Breakout",
+      "entry_date": "2026-08-07T18:57:25.977177+00:00",
+      "entry_price": 153.01250475232115,
+      "exit_date": "2026-08-07T18:57:25.977187+00:00",
+      "exit_price": 167.98709508534813,
+      "outcome": "LOSS",
+      "return_pct": 9.7865140873722,
+      "outcome_source": "SIMULATED"
+    }
+  ],
+  "learning_log": [
+    {
+      "timestamp": "2026-08-07 18:57:25",
+      "message": "Not enough realized trades to learn."
+    },
+    {
+      "timestamp": "2026-08-07 18:57:26",
+      "message": "Not enough realized trades to learn."
+    },
+    {
+      "timestamp": "2026-08-07T18:57:26.397003",
+      "entry": "2026-08-07 Learning Update: Breakout WR:0% (Wt:23.6)"
+    },
+    {
+      "timestamp": "2026-08-07T18:57:26.518380",
+      "entry": "2026-08-07 Learning Update: Breakout WR:0% (Wt:22.2)"
+    }
+  ],
+  "updated_at": "2026-08-07T18:57:26.570807+00:00"
 }
