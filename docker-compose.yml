@@ -1,0 +1,124 @@
+# Docker Compose for AFA (Autonomous Financial Advisor)
+# Cross-platform compatible (Windows, macOS, Linux)
+
+services:
+  # Main agent service (profile: base)
+  agent:
+    profiles: ["base"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+      - ./output:/app/output
+      - ./logs:/app/logs
+    env_file:
+      - .env
+    command: python main.py
+
+  # Test service (profile: base)
+  test:
+    profiles: ["base"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+      - ./output:/app/output
+      - ./logs:/app/logs
+    env_file:
+      - .env
+    entrypoint: pytest tests/ -v
+
+  # Airflow PostgreSQL database (profile: airflow)
+  postgres:
+    profiles: ["airflow"]
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 10s
+
+  # Airflow initialization service (profile: airflow)
+  airflow-init:
+    profiles: ["airflow"]
+    image: apache/airflow:2.10.4-python3.11
+    user: "${AIRFLOW_UID:-50000}:0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      PYTHONPATH: /opt/airflow/project
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./src:/opt/airflow/project/src
+      - ./data:/opt/airflow/project/data
+      - ./output:/opt/airflow/project/output
+      - ./logs:/opt/airflow/project/logs
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com
+      "
+
+  # Airflow webserver (profile: airflow)
+  airflow-webserver:
+    profiles: ["airflow"]
+    image: apache/airflow:2.10.4-python3.11
+    user: "${AIRFLOW_UID:-50000}:0"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__WEBSERVER__WEB_SERVER_PORT: 8080
+      PYTHONPATH: /opt/airflow/project
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./src:/opt/airflow/project/src
+      - ./data:/opt/airflow/project/data
+      - ./output:/opt/airflow/project/output
+      - ./logs:/opt/airflow/project/logs
+      - ./airflow/logs:/opt/airflow/logs
+    command: airflow webserver
+
+  # Airflow scheduler (profile: airflow)
+  airflow-scheduler:
+    profiles: ["airflow"]
+    image: apache/airflow:2.10.4-python3.11
+    user: "${AIRFLOW_UID:-50000}:0"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      PYTHONPATH: /opt/airflow/project
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./src:/opt/airflow/project/src
+      - ./data:/opt/airflow/project/data
+      - ./output:/opt/airflow/project/output
+      - ./logs:/opt/airflow/project/logs
+      - ./airflow/logs:/opt/airflow/logs
+    command: airflow scheduler
+
+volumes:
+  postgres_data:
