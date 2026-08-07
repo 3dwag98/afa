@@ -1,0 +1,18 @@
+# Enforce LF line endings for all files to prevent Windows CRLF issues in Docker
+* text=auto eol=lf
+
+# Shell scripts must have LF endings
+*.sh text eol=lf
+
+# Python files must have LF endings
+*.py text eol=lf
+
+# YAML files must have LF endings
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Docker files
+Dockerfile text eol=lf
+
+# Bash scripts in any directory
+**/*.sh text eol=lf
