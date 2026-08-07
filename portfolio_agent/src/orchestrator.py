@@ -111,14 +111,22 @@ class PortfolioOrchestrator:
         # Step 3: Run Monte Carlo simulations
         simulations = {}
         for ticker, df in processed_data.items():
-            returns = df['Close'].pct_change().dropna()
+            returns = df['Close'].pct_change().dropna().tolist()
             sim_result = run_monte_carlo(
-                returns,
+                symbol=ticker,
+                daily_returns=returns,
                 horizon_days=self.config.mc_horizon_days,
                 simulations=self.config.mc_simulations,
                 seed=self.config.random_seed
             )
-            simulations[ticker] = sim_result
+            simulations[ticker] = {
+                'probability_profit': sim_result.probability_profit,
+                'expected_return_pct': sim_result.expected_return_pct,
+                'var_95': sim_result.var_95,
+                'cvar_95': sim_result.cvar_95,
+                'simulations_count': sim_result.simulations_count,
+                'horizon_days': sim_result.horizon_days
+            }
             self.logger.info(f"Monte Carlo complete for {ticker}")
 
         # Step 4: Generate recommendations
