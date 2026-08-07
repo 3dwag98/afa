@@ -69,8 +69,10 @@ services:
       - ./data:/opt/airflow/project/data
       - ./output:/opt/airflow/project/output
       - ./logs:/opt/airflow/project/logs
+      - ./requirements.txt:/opt/airflow/project/requirements.txt:ro
     command: >
       bash -c "
+        pip install --no-cache-dir -r /opt/airflow/project/requirements.txt &&
         airflow db migrate &&
         airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com
       "
@@ -97,7 +99,12 @@ services:
       - ./output:/opt/airflow/project/output
       - ./logs:/opt/airflow/project/logs
       - ./airflow/logs:/opt/airflow/logs
-    command: airflow webserver
+      - ./requirements.txt:/opt/airflow/project/requirements.txt:ro
+    command: >
+      bash -c "
+        pip install --no-cache-dir -r /opt/airflow/project/requirements.txt &&
+        airflow webserver
+      "
 
   # Airflow scheduler (profile: airflow)
   airflow-scheduler:
@@ -118,7 +125,12 @@ services:
       - ./output:/opt/airflow/project/output
       - ./logs:/opt/airflow/project/logs
       - ./airflow/logs:/opt/airflow/logs
-    command: airflow scheduler
+      - ./requirements.txt:/opt/airflow/project/requirements.txt:ro
+    command: >
+      bash -c "
+        pip install --no-cache-dir -r /opt/airflow/project/requirements.txt &&
+        airflow scheduler
+      "
 
 volumes:
   postgres_data:
