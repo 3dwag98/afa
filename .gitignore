@@ -4,38 +4,24 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.py~
-*.py.class
-*.py.backup
-*.swp
-*.swo
-
-# Database
-*.db
-*.sqlite
-*.sqlite3
-
-# Excel files
-*.xlsx
-*.xls
 
 # Dependencies
 .venv/
 venv/
 .env
 .env.local
-.env.*
+*.env.*
 
-# Logs
+# Logs and temp files
 *.log
+*.tmp
 
-# Coverage
-.coverage
-coverage/
-htmlcov/
+# Editors
+.vscode/
+.idea/
 
-# Distribution / packaging
+# Build artifacts
 dist/
 build/
-*.egg-info/
+target/
 ```

@@ -25,6 +25,7 @@ try:
     from .learning import evaluate_and_learn
     from .reporting import export_excel_report
     from .models import Recommendation, TradeOutcome, AgentBrain
+    from .outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
 except ImportError:
     from config import AppConfig, get_config
     from storage import (
@@ -41,6 +42,7 @@ except ImportError:
     from learning import evaluate_and_learn
     from reporting import export_excel_report
     from models import Recommendation, TradeOutcome, AgentBrain
+    from outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
 
 
 def _setup_logging(log_file: str) -> logging.Logger:
@@ -74,12 +76,18 @@ def _setup_logging(log_file: str) -> logging.Logger:
     return logger
 
 
-def run_orchestrator(force_refresh: bool = False, simulate_outcome: bool = True, config: AppConfig | None = None) -> str:
+def run_orchestrator(
+    force_refresh: bool = False,
+    simulate_outcome: bool = False,
+    update_outcomes: bool = False,
+    config: AppConfig | None = None
+) -> str:
     """Run the full daily loop for portfolio optimization.
 
     Args:
         force_refresh: If True, fetch fresh data instead of using cache.
-        simulate_outcome: If True, add simulated trade outcome for demo learning.
+        simulate_outcome: If True, simulate outcome for top recommendation.
+        update_outcomes: If True, fetch market data and update open outcomes.
         config: Optional AppConfig to use (for testing). If None, loads from config file.
 
     Returns:
@@ -97,10 +105,11 @@ def run_orchestrator(force_refresh: bool = False, simulate_outcome: bool = True,
         9. Score candidates.
         10. Calculate quantity and compliance.
         11. Save recommendations to SQLite.
-        12. Add simulated outcome for demo learning.
-        13. Save brain.
-        14. Export Excel report.
-        15. Log run status.
+        12. Optionally simulate outcome for top recommendation.
+        13. Optionally update outcomes from market data.
+        14. Save brain.
+        15. Export Excel report.
+        16. Log run status.
     """
     # Generate run_id
     run_id = str(uuid.uuid4())
@@ -235,48 +244,38 @@ def run_orchestrator(force_refresh: bool = False, simulate_outcome: bool = True,
     save_recommendations(config.sqlite_path, recommendations)
     logger.info(f"Saved {len(recommendations)} recommendations to SQLite")
 
-    # Step 10: For the top recommendation only, create a simulated TradeOutcome
+    # Step 10: Optionally simulate outcome for top recommendation
     if simulate_outcome and recommendations:
         top_rec = recommendations[0]
-        outcome = "WIN" if np.random.random() > 0.45 else "LOSS"
-        return_pct = np.random.uniform(-5, 10)
-
-        simulated_outcome = TradeOutcome(
-            trade_id=str(uuid.uuid4()),
-            recommendation_id=top_rec.recommendation_id or "",
-            symbol=top_rec.symbol,
-            signal_trigger=top_rec.trigger,
-            entry_date=datetime.now(timezone.utc).isoformat(),
-            entry_price=top_rec.entry_price,
-            exit_date=datetime.now(timezone.utc).isoformat(),
-            exit_price=top_rec.entry_price * (1 + return_pct / 100),
-            outcome=outcome,
-            return_pct=return_pct,
-            outcome_source="SIMULATED"
-        )
-        save_trade_outcome(config.sqlite_path, simulated_outcome)
+        simulated = simulate_outcome_fn(top_rec)
+        save_trade_outcome(config.sqlite_path, simulated)
 
         # Also add to brain's trade_history
         brain.trade_history.append({
-            "trade_id": simulated_outcome.trade_id,
-            "symbol": simulated_outcome.symbol,
-            "signal_trigger": simulated_outcome.signal_trigger,
-            "entry_date": simulated_outcome.entry_date,
-            "entry_price": simulated_outcome.entry_price,
-            "exit_date": simulated_outcome.exit_date,
-            "exit_price": simulated_outcome.exit_price,
-            "outcome": simulated_outcome.outcome,
-            "return_pct": simulated_outcome.return_pct,
-            "outcome_source": simulated_outcome.outcome_source
+            "trade_id": simulated.trade_id,
+            "symbol": simulated.symbol,
+            "signal_trigger": simulated.signal_trigger,
+            "entry_date": simulated.entry_date,
+            "entry_price": simulated.entry_price,
+            "exit_date": simulated.exit_date,
+            "exit_price": simulated.exit_price,
+            "outcome": simulated.outcome,
+            "return_pct": simulated.return_pct,
+            "outcome_source": simulated.outcome_source
         })
-        logger.info(f"Added simulated outcome for {top_rec.symbol}: {outcome}")
+        logger.info(f"Added simulated outcome for {top_rec.symbol}: {simulated.outcome}")
 
-    # Step 11: Save updated brain
+    # Step 11: Optionally update outcomes from market data
+    if update_outcomes:
+        updated = update_outcomes_from_market(config.sqlite_path, data)
+        logger.info(f"Updated {len(updated)} trade outcomes from market data")
+
+    # Step 12: Save updated brain
     brain.updated_at = datetime.now(timezone.utc).isoformat()
     save_brain(config.brain_file, brain)
     logger.info(f"Saved brain to {config.brain_file}")
 
-    # Step 12: Export Excel
+    # Step 13: Export Excel
     excel_path = export_excel_report(
         config=config,
         brain=brain,
@@ -287,7 +286,7 @@ def run_orchestrator(force_refresh: bool = False, simulate_outcome: bool = True,
     )
     logger.info(f"Exported Excel report to {excel_path}")
 
-    # Step 13: Log run result
+    # Step 14: Log run result
     log_run(
         sqlite_path=config.sqlite_path,
         run_id=run_id,
@@ -297,7 +296,7 @@ def run_orchestrator(force_refresh: bool = False, simulate_outcome: bool = True,
     )
     logger.info(f"Logged run status: SUCCESS")
 
-    # Step 14: Return Excel file path
+    # Step 15: Return Excel file path
     return excel_path
 
 
