@@ -1,92 +1,42 @@
 ```
-# Dependencies
-node_modules/
-
-# Logs and temp files
-*.log
-*.tmp
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
 # Environment
 .env
 .env.local
-.env.*
+*.env.*
 
-# Editors
-.vscode/
-.idea/
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.py~
-*.py.class
-*.py.backup
-*.py.swp
-*.py.swo
-*.py.tmp
-*.py.log
-*.py.cache
-*.py.bak
-*.py.orig
-*.py.rej
-*.py.patch
-*.py.diff
-*.py.patch~
-*.py.diff~
-*.py.swp
-*.py.swo
-*.py.tmp
-*.py.log
-*.py.cache
-*.py.bak
-*.py.orig
-*.py.rej
-*.py.patch
-*.py.diff
-*.py.patch~
-*.py.diff~
-
-# Build directories
-build/
-dist/
-*.egg-info/
-
-# Virtual environments
-venv/
-.venv/
-env/
-ENV/
-
-# IDE specific
-.vs/
-.idea/
-*.swp
-*.swo
-
-# OS generated files
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-
-# Testing
-.coverage
-htmlcov/
-.coverage.*
-.nyc_output/
-coverage/
-
-# CI/CD
-.github/
-.gitlab/
+# Airflow
+airflow/airflow.db
+portfolio_agent/airflow/airflow.db
 
 # Docker
-.dockerignore
-docker-compose.yml
+.dockerignore.airflow
 
+# Temporary files
+*.tmp
+*.swp
+*~
+.DS_Store
+Thumbs.db
 ```

@@ -13,3 +13,6 @@ htmlcov/
 .DS_Store
 *.egg-info/
 .env
+logs/airflow/
+airflow/logs/
+airflow_data/

@@ -1,9 +1,9 @@
 {
   "weights": {
-    "Trend": 26.0,
-    "Breakout": 22.2,
-    "Volume": 20.8,
-    "MC_Prob": 31.0
+    "Trend": 26.8,
+    "Breakout": 19.6,
+    "Volume": 21.5,
+    "MC_Prob": 32.1
   },
   "trade_history": [
     {
@@ -131,7 +131,15 @@
     {
       "timestamp": "2026-08-07T18:57:26.518380",
       "entry": "2026-08-07 Learning Update: Breakout WR:0% (Wt:22.2)"
+    },
+    {
+      "timestamp": "2026-08-07T19:44:29.011633",
+      "entry": "2026-08-07 Learning Update: Breakout WR:0% (Wt:20.9)"
+    },
+    {
+      "timestamp": "2026-08-07T19:44:29.133610",
+      "entry": "2026-08-07 Learning Update: Breakout WR:0% (Wt:19.6)"
     }
   ],
-  "updated_at": "2026-08-07T18:57:26.570807+00:00"
+  "updated_at": "2026-08-07T19:44:29.133658+00:00"
 }
