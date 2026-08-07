@@ -5,7 +5,11 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Any, Optional, Tuple
 
-from .config import AppConfig
+# Use absolute imports for CLI execution
+try:
+    from .config import AppConfig
+except ImportError:
+    from config import AppConfig
 
 
 def calculate_stop_target(entry_price: float, atr: Optional[float], config: AppConfig) -> Tuple[float, float]:

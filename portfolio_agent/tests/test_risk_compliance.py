@@ -22,6 +22,7 @@ def _make_config(
         target_prob_profit=0.55,
         min_reward_risk=1.5,
         learning_rate=0.01,
+        min_trades_for_learning=10,
         mc_horizon_days=20,
         mc_simulations=1000,
         random_seed=42,

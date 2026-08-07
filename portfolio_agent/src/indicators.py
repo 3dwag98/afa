@@ -5,7 +5,11 @@ import numpy as np
 from typing import Dict, Any, Optional, List
 import logging
 
-from .models import IndicatorSnapshot
+# Use absolute imports for CLI execution
+try:
+    from .models import IndicatorSnapshot
+except ImportError:
+    from models import IndicatorSnapshot
 
 logger = logging.getLogger(__name__)
 
