@@ -48,8 +48,36 @@ portfolio_agent/
 
 ## Installation
 
+### Prerequisites
+
+- Python 3.8 or higher
+- pip (Python package manager)
+
+### Setup Steps
+
+1. **Navigate to the project directory:**
+
+```bash
+cd portfolio_agent
+```
+
+2. **(Recommended) Create a virtual environment:**
+
+```bash
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+```
+
+3. **Install dependencies:**
+
 ```bash
 pip install -r requirements.txt
+```
+
+4. **Verify installation (optional):**
+
+```bash
+pytest tests/test_scoring.py
 ```
 
 ## Usage

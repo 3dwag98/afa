@@ -13,20 +13,18 @@ env/
 .env.local
 .env.*
 
-# Tests
-.pytest_cache/
+# Logs and temp files
+*.log
+*.tmp
+
+# Coverage
 .coverage
+htmlcov/
 coverage/
 
-# Logs
-*.log
+# Testing
+.pytest_cache/
+.mypy_cache/
 
-# Temporary files
-*.tmp
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
+# Original rules preserved
 ```
