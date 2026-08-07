@@ -118,3 +118,18 @@ class AgentMemory:
     reward: Optional[float] = None
     timestamp: datetime = field(default_factory=datetime.now)
     features: dict = field(default_factory=dict)
+
+
+@dataclass
+class IndicatorSnapshot:
+    """Technical indicators snapshot for a ticker."""
+    symbol: str
+    sma20: Optional[float] = None
+    sma50: Optional[float] = None
+    sma200: Optional[float] = None
+    donchian_upper_20: Optional[float] = None
+    prev_donchian_upper_20: Optional[float] = None
+    avg_volume_20: Optional[float] = None
+    volume_ratio: Optional[float] = None
+    atr14: Optional[float] = None
+    daily_log_return: Optional[float] = None
