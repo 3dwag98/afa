@@ -1,6 +1,88 @@
 """Compliance and validation module."""
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
+
+from .config import AppConfig
+
+
+def run_compliance_checks(
+    symbol: str,
+    close: float,
+    quantity: int,
+    investment_inr: float,
+    config: AppConfig
+) -> Tuple[str, List[str]]:
+    """Run compliance checks on a trade.
+
+    Args:
+        symbol: Stock symbol.
+        close: Closing price.
+        quantity: Number of shares.
+        investment_inr: Total investment amount in INR.
+        config: Application configuration.
+
+    Returns:
+        Tuple of (status, failed_reasons) where status is 'PASS' or 'FAIL'.
+    """
+    failed_reasons = []
+
+    # Check: symbol must not be empty
+    if not symbol or symbol.strip() == "":
+        failed_reasons.append("Symbol is empty")
+
+    # Check: close >= config.min_price_inr
+    if close < config.min_price_inr:
+        failed_reasons.append(f"Price {close} below minimum {config.min_price_inr}")
+
+    # Check: quantity > 0
+    if quantity <= 0:
+        failed_reasons.append("Quantity must be greater than 0")
+
+    # Check: investment_inr <= portfolio_value_inr * max_single_position_pct
+    max_position_value = config.portfolio_value_inr * config.max_single_position_pct
+    if investment_inr > max_position_value:
+        failed_reasons.append(f"Investment {investment_inr} exceeds max position {max_position_value}")
+
+    # Check: paper_trading_mode must be true for now
+    if not config.paper_trading_mode:
+        failed_reasons.append("Paper trading mode must be enabled")
+
+    # Check: no F&O symbol suffix like "-FUT" or "-OPT"
+    if symbol.endswith("-FUT") or symbol.endswith("-OPT"):
+        failed_reasons.append("F&O symbols not allowed")
+
+    status = "PASS" if len(failed_reasons) == 0 else "FAIL"
+    return (status, failed_reasons)
+
+
+def estimate_capital_gains_tax(
+    gain_inr: float,
+    holding_days: int,
+    fy_ltcg_used_inr: float = 0.0
+) -> float:
+    """Estimate capital gains tax.
+
+    Args:
+        gain_inr: Capital gain amount (negative for losses).
+        holding_days: Number of days held.
+        fy_ltcg_used_inr: LTCG exemption already used in FY.
+
+    Returns:
+        Tax amount in INR.
+    """
+    # If gain <= 0, return 0
+    if gain_inr <= 0:
+        return 0.0
+
+    if holding_days < 365:
+        # STCG: tax = gain * 20%
+        return gain_inr * 0.20
+    else:
+        # LTCG: exempt = max(0, 125000 - fy_ltcg_used_inr)
+        exempt = max(0.0, 125000 - fy_ltcg_used_inr)
+        taxable_ltcg = max(0.0, gain_inr - exempt)
+        tax = taxable_ltcg * 0.125
+        return tax
 
 
 def check_price_minimum(price: float, min_price: float) -> bool:

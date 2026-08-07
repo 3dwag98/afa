@@ -1,8 +1,88 @@
 """Risk management module."""
 
+import math
 import pandas as pd
 import numpy as np
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
+
+from .config import AppConfig
+
+
+def calculate_stop_target(entry_price: float, atr: Optional[float], config: AppConfig) -> Tuple[float, float]:
+    """Calculate stop loss and target prices based on ATR.
+
+    Args:
+        entry_price: Entry price of the position.
+        atr: Average True Range value, or None.
+        config: Application configuration.
+
+    Returns:
+        Tuple of (stop_price, target_price), both rounded.
+    """
+    # Use fallback if atr is None or <= 0
+    if atr is None or atr <= 0:
+        stop = entry_price * 0.98  # 2% fallback stop
+        target = entry_price * 1.03  # 3% fallback target
+    else:
+        stop = entry_price - 1.5 * atr
+        target = entry_price + 2.0 * atr
+
+    # Stop cannot be negative
+    stop = max(0.0, stop)
+
+    return (round(stop, 2), round(target, 2))
+
+
+def calculate_quantity(
+    entry_price: float,
+    stop_price: float,
+    config: AppConfig
+) -> int:
+    """Calculate position quantity based on risk parameters.
+
+    Args:
+        entry_price: Entry price per share.
+        stop_price: Stop loss price per share.
+        config: Application configuration.
+
+    Returns:
+        Integer quantity >= 0.
+    """
+    # Risk amount = portfolio_value_inr * risk_per_trade_pct
+    risk_amount = config.portfolio_value_inr * config.risk_per_trade_pct
+
+    # Risk per share = entry_price - stop_price
+    risk_per_share = entry_price - stop_price
+
+    # If risk per share <= 0, return 0
+    if risk_per_share <= 0:
+        return 0
+
+    # quantity = floor(risk_amount / risk_per_share)
+    quantity = math.floor(risk_amount / risk_per_share)
+
+    # Max position value = portfolio_value_inr * max_single_position_pct
+    max_position_value = config.portfolio_value_inr * config.max_single_position_pct
+
+    # Reduce quantity if quantity * entry_price > max position value
+    if quantity * entry_price > max_position_value:
+        quantity = math.floor(max_position_value / entry_price)
+
+    return max(0, quantity)
+
+
+def calculate_max_loss(quantity: int, entry_price: float, stop_price: float) -> float:
+    """Calculate maximum loss for a position.
+
+    Args:
+        quantity: Number of shares.
+        entry_price: Entry price per share.
+        stop_price: Stop loss price per share.
+
+    Returns:
+        Maximum loss amount in INR.
+    """
+    return quantity * (entry_price - stop_price)
 
 
 def calculate_position_size(portfolio_value: float, price: float,
