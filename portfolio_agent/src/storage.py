@@ -2,317 +2,347 @@
 
 import json
 import sqlite3
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
+from src.models import AgentBrain, Recommendation, TradeOutcome
 
-class SQLiteStorage:
-    """SQLite database storage for portfolio history."""
 
-    def __init__(self, db_path: str):
-        """Initialize SQLite storage.
+def _ensure_directory(path: str) -> None:
+    """Ensure the directory for a file path exists."""
+    file_path = Path(path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
 
-        Args:
-            db_path: Path to SQLite database file.
-        """
-        self.db_path = db_path
-        self._ensure_directory()
-        self._init_db()
 
-    def _ensure_directory(self) -> None:
-        """Ensure the directory for the database exists."""
-        db_dir = Path(self.db_path).parent
-        db_dir.mkdir(parents=True, exist_ok=True)
+# =============================================================================
+# JSON Brain Storage Functions
+# =============================================================================
 
-    def _init_db(self) -> None:
-        """Initialize database tables."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
+def load_brain(path: str) -> AgentBrain:
+    """Load agent brain from JSON file.
+    
+    If file does not exist, create default brain.
+    
+    Args:
+        path: Path to JSON brain file.
+        
+    Returns:
+        AgentBrain object with loaded or default data.
+    """
+    _ensure_directory(path)
+    brain_path = Path(path)
+    
+    if brain_path.exists():
+        with open(brain_path, 'r') as f:
+            data = json.load(f)
+        return AgentBrain(
+            weights=data.get("weights", {
+                "Trend": 25.0,
+                "Breakout": 25.0,
+                "Volume": 20.0,
+                "MC_Prob": 30.0
+            }),
+            trade_history=data.get("trade_history", []),
+            learning_log=data.get("learning_log", []),
+            updated_at=data.get("updated_at")
+        )
+    else:
+        # Create default brain
+        default_brain = AgentBrain(
+            weights={
+                "Trend": 25.0,
+                "Breakout": 25.0,
+                "Volume": 20.0,
+                "MC_Prob": 30.0
+            },
+            trade_history=[],
+            learning_log=[],
+            updated_at=datetime.now(timezone.utc).isoformat()
+        )
+        save_brain(path, default_brain)
+        return default_brain
 
-            # Decisions table
+
+def save_brain(path: str, brain: AgentBrain) -> None:
+    """Save agent brain to JSON file.
+    
+    Args:
+        path: Path to JSON brain file.
+        brain: AgentBrain object to save.
+    """
+    _ensure_directory(path)
+    
+    data = {
+        "weights": brain.weights,
+        "trade_history": brain.trade_history,
+        "learning_log": brain.learning_log,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+    
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2, default=str)
+
+
+# =============================================================================
+# SQLite Storage Functions
+# =============================================================================
+
+def init_db(sqlite_path: str) -> None:
+    """Initialize SQLite database with required tables.
+    
+    Creates tables if they do not exist:
+    - recommendations
+    - trade_outcomes
+    - run_logs
+    
+    Args:
+        sqlite_path: Path to SQLite database file.
+    """
+    _ensure_directory(sqlite_path)
+    
+    with sqlite3.connect(sqlite_path) as conn:
+        cursor = conn.cursor()
+        
+        # Create recommendations table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS recommendations (
+                recommendation_id TEXT PRIMARY KEY,
+                created_at TEXT,
+                symbol TEXT,
+                signal TEXT,
+                score REAL,
+                trigger TEXT,
+                entry_price REAL,
+                stop_price REAL,
+                target_price REAL,
+                reward_risk REAL,
+                quantity INTEGER,
+                investment_inr REAL,
+                max_loss_inr REAL,
+                mc_probability_profit REAL,
+                mc_var_95_pct REAL,
+                mc_cvar_95_pct REAL,
+                compliance_status TEXT,
+                rationale TEXT
+            )
+        """)
+        
+        # Create trade_outcomes table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS trade_outcomes (
+                trade_id TEXT PRIMARY KEY,
+                recommendation_id TEXT,
+                symbol TEXT,
+                signal_trigger TEXT,
+                entry_date TEXT,
+                entry_price REAL,
+                exit_date TEXT,
+                exit_price REAL,
+                outcome TEXT,
+                return_pct REAL,
+                outcome_source TEXT
+            )
+        """)
+        
+        # Create run_logs table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS run_logs (
+                run_id TEXT PRIMARY KEY,
+                run_at TEXT,
+                status TEXT,
+                message TEXT,
+                recommendations_count INTEGER
+            )
+        """)
+        
+        conn.commit()
+
+
+def save_recommendations(sqlite_path: str, recommendations: List[Recommendation]) -> None:
+    """Save recommendations to SQLite database.
+    
+    Args:
+        sqlite_path: Path to SQLite database file.
+        recommendations: List of Recommendation objects to save.
+    """
+    _ensure_directory(sqlite_path)
+    init_db(sqlite_path)
+    
+    with sqlite3.connect(sqlite_path) as conn:
+        cursor = conn.cursor()
+        
+        for rec in recommendations:
+            # Generate ID if not present
+            rec_id = rec.recommendation_id or str(uuid.uuid4())
+            created_at = rec.created_at or datetime.now(timezone.utc).isoformat()
+            
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS decisions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    decision_id TEXT UNIQUE NOT NULL,
-                    ticker TEXT NOT NULL,
-                    action TEXT NOT NULL,
-                    entry_price REAL NOT NULL,
-                    exit_price REAL,
-                    outcome TEXT,
-                    reward REAL,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    features TEXT
-                )
-            """)
-
-            # Positions table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS positions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ticker TEXT NOT NULL,
-                    quantity INTEGER NOT NULL,
-                    avg_price REAL NOT NULL,
-                    current_price REAL,
-                    entry_date DATETIME NOT NULL,
-                    last_updated DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    status TEXT DEFAULT 'OPEN'
-                )
-            """)
-
-            # Performance metrics table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS performance (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date DATE NOT NULL,
-                    portfolio_value REAL,
-                    daily_return REAL,
-                    total_return REAL,
-                    sharpe_ratio REAL,
-                    max_drawdown REAL,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            conn.commit()
-
-    def save_decision(self, decision: Dict[str, Any]) -> None:
-        """Save a trading decision to the database.
-
-        Args:
-            decision: Dictionary containing decision data.
-        """
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT OR REPLACE INTO decisions 
-                (decision_id, ticker, action, entry_price, exit_price, outcome, reward, features)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO recommendations 
+                (recommendation_id, created_at, symbol, signal, score, trigger,
+                 entry_price, stop_price, target_price, reward_risk, quantity,
+                 investment_inr, max_loss_inr, mc_probability_profit,
+                 mc_var_95_pct, mc_cvar_95_pct, compliance_status, rationale)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                decision.get('decision_id'),
-                decision.get('ticker'),
-                decision.get('action'),
-                decision.get('entry_price'),
-                decision.get('exit_price'),
-                decision.get('outcome'),
-                decision.get('reward'),
-                json.dumps(decision.get('features', {}))
+                rec_id,
+                created_at,
+                rec.symbol,
+                rec.signal,
+                rec.score,
+                rec.trigger,
+                rec.entry_price,
+                rec.stop_price,
+                rec.target_price,
+                rec.reward_risk,
+                rec.quantity,
+                rec.investment_inr,
+                rec.max_loss_inr,
+                rec.mc_probability_profit,
+                rec.mc_var_95_pct,
+                rec.mc_cvar_95_pct,
+                rec.compliance_status,
+                rec.rationale
             ))
-            conn.commit()
-
-    def get_decisions(self, ticker: Optional[str] = None, 
-                      limit: int = 100) -> List[Dict[str, Any]]:
-        """Retrieve historical decisions.
-
-        Args:
-            ticker: Optional ticker filter.
-            limit: Maximum number of records to return.
-
-        Returns:
-            List of decision dictionaries.
-        """
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-
-            if ticker:
-                cursor.execute("""
-                    SELECT * FROM decisions 
-                    WHERE ticker = ? 
-                    ORDER BY timestamp DESC 
-                    LIMIT ?
-                """, (ticker, limit))
-            else:
-                cursor.execute("""
-                    SELECT * FROM decisions 
-                    ORDER BY timestamp DESC 
-                    LIMIT ?
-                """, (limit,))
-
-            rows = cursor.fetchall()
-            decisions = []
-            for row in rows:
-                decision = dict(row)
-                if decision.get('features'):
-                    decision['features'] = json.loads(decision['features'])
-                decisions.append(decision)
-
-            return decisions
-
-    def save_position(self, position: Dict[str, Any]) -> None:
-        """Save or update a position.
-
-        Args:
-            position: Dictionary containing position data.
-        """
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT OR REPLACE INTO positions 
-                (ticker, quantity, avg_price, current_price, entry_date, status)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                position.get('ticker'),
-                position.get('quantity'),
-                position.get('avg_price'),
-                position.get('current_price'),
-                position.get('entry_date'),
-                position.get('status', 'OPEN')
-            ))
-            conn.commit()
-
-    def get_positions(self, status: str = 'OPEN') -> List[Dict[str, Any]]:
-        """Retrieve positions by status.
-
-        Args:
-            status: Position status filter ('OPEN', 'CLOSED').
-
-        Returns:
-            List of position dictionaries.
-        """
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM positions WHERE status = ?
-            """, (status,))
-            return [dict(row) for row in cursor.fetchall()]
-
-    def save_performance(self, perf: Dict[str, Any]) -> None:
-        """Save daily performance metrics.
-
-        Args:
-            perf: Dictionary containing performance data.
-        """
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO performance 
-                (date, portfolio_value, daily_return, total_return, sharpe_ratio, max_drawdown)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                perf.get('date'),
-                perf.get('portfolio_value'),
-                perf.get('daily_return'),
-                perf.get('total_return'),
-                perf.get('sharpe_ratio'),
-                perf.get('max_drawdown')
-            ))
-            conn.commit()
+        
+        conn.commit()
 
 
-class JSONBrain:
-    """JSON-based agent memory/brain storage."""
+def save_trade_outcome(sqlite_path: str, outcome: TradeOutcome) -> None:
+    """Save a trade outcome to SQLite database.
+    
+    Args:
+        sqlite_path: Path to SQLite database file.
+        outcome: TradeOutcome object to save.
+    """
+    _ensure_directory(sqlite_path)
+    init_db(sqlite_path)
+    
+    with sqlite3.connect(sqlite_path) as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            INSERT OR REPLACE INTO trade_outcomes 
+            (trade_id, recommendation_id, symbol, signal_trigger, entry_date,
+             entry_price, exit_date, exit_price, outcome, return_pct, outcome_source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            outcome.trade_id,
+            outcome.recommendation_id,
+            outcome.symbol,
+            outcome.signal_trigger,
+            outcome.entry_date,
+            outcome.entry_price,
+            outcome.exit_date,
+            outcome.exit_price,
+            outcome.outcome,
+            outcome.return_pct,
+            outcome.outcome_source
+        ))
+        
+        conn.commit()
 
-    def __init__(self, brain_path: str):
-        """Initialize JSON brain storage.
 
-        Args:
-            brain_path: Path to JSON brain file.
-        """
-        self.brain_path = brain_path
-        self._ensure_directory()
-        self.data = self._load_brain()
+def get_open_trades(sqlite_path: str) -> List[TradeOutcome]:
+    """Get all open trades from SQLite database.
+    
+    Open trades are those with outcome = 'PENDING'.
+    
+    Args:
+        sqlite_path: Path to SQLite database file.
+        
+    Returns:
+        List of TradeOutcome objects for open trades.
+    """
+    init_db(sqlite_path)
+    
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT * FROM trade_outcomes WHERE outcome = 'PENDING'
+        """)
+        
+        rows = cursor.fetchall()
+        return [TradeOutcome(
+            trade_id=row["trade_id"],
+            recommendation_id=row["recommendation_id"],
+            symbol=row["symbol"],
+            signal_trigger=row["signal_trigger"],
+            entry_date=row["entry_date"],
+            entry_price=row["entry_price"],
+            exit_date=row["exit_date"],
+            exit_price=row["exit_price"],
+            outcome=row["outcome"],
+            return_pct=row["return_pct"],
+            outcome_source=row["outcome_source"]
+        ) for row in rows]
 
-    def _ensure_directory(self) -> None:
-        """Ensure the directory for the brain file exists."""
-        brain_dir = Path(self.brain_path).parent
-        brain_dir.mkdir(parents=True, exist_ok=True)
 
-    def _load_brain(self) -> Dict[str, Any]:
-        """Load brain data from JSON file.
+def get_trade_history(sqlite_path: str) -> List[TradeOutcome]:
+    """Get all trade outcomes from SQLite database.
+    
+    Args:
+        sqlite_path: Path to SQLite database file.
+        
+    Returns:
+        List of all TradeOutcome objects.
+    """
+    init_db(sqlite_path)
+    
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT * FROM trade_outcomes ORDER BY entry_date DESC
+        """)
+        
+        rows = cursor.fetchall()
+        return [TradeOutcome(
+            trade_id=row["trade_id"],
+            recommendation_id=row["recommendation_id"],
+            symbol=row["symbol"],
+            signal_trigger=row["signal_trigger"],
+            entry_date=row["entry_date"],
+            entry_price=row["entry_price"],
+            exit_date=row["exit_date"],
+            exit_price=row["exit_price"],
+            outcome=row["outcome"],
+            return_pct=row["return_pct"],
+            outcome_source=row["outcome_source"]
+        ) for row in rows]
 
-        Returns:
-            Dictionary containing brain data.
-        """
-        if Path(self.brain_path).exists():
-            with open(self.brain_path, 'r') as f:
-                return json.load(f)
-        return {
-            'decisions': [],
-            'ticker_performance': {},
-            'pattern_weights': {},
-            'learning_stats': {
-                'total_decisions': 0,
-                'wins': 0,
-                'losses': 0,
-                'win_rate': 0.0
-            }
-        }
 
-    def _save_brain(self) -> None:
-        """Save brain data to JSON file."""
-        with open(self.brain_path, 'w') as f:
-            json.dump(self.data, f, indent=2, default=str)
-
-    def add_decision(self, decision: Dict[str, Any]) -> None:
-        """Add a decision to the brain.
-
-        Args:
-            decision: Decision dictionary to store.
-        """
-        self.data['decisions'].append({
-            **decision,
-            'stored_at': datetime.now().isoformat()
-        })
-        self._update_learning_stats(decision)
-        self._save_brain()
-
-    def _update_learning_stats(self, decision: Dict[str, Any]) -> None:
-        """Update learning statistics based on decision outcome.
-
-        Args:
-            decision: Decision dictionary with outcome.
-        """
-        stats = self.data['learning_stats']
-        stats['total_decisions'] += 1
-
-        outcome = decision.get('outcome')
-        if outcome == 'WIN':
-            stats['wins'] += 1
-        elif outcome == 'LOSS':
-            stats['losses'] += 1
-
-        if stats['total_decisions'] > 0:
-            stats['win_rate'] = stats['wins'] / stats['total_decisions']
-
-    def get_ticker_history(self, ticker: str) -> List[Dict[str, Any]]:
-        """Get decision history for a specific ticker.
-
-        Args:
-            ticker: Ticker symbol.
-
-        Returns:
-            List of historical decisions for the ticker.
-        """
-        return [d for d in self.data['decisions'] if d.get('ticker') == ticker]
-
-    def update_pattern_weight(self, pattern: str, weight: float) -> None:
-        """Update weight for a recognized pattern.
-
-        Args:
-            pattern: Pattern identifier.
-            weight: New weight value.
-        """
-        self.data['pattern_weights'][pattern] = weight
-        self._save_brain()
-
-    def get_pattern_weight(self, pattern: str, default: float = 1.0) -> float:
-        """Get weight for a pattern.
-
-        Args:
-            pattern: Pattern identifier.
-            default: Default weight if pattern not found.
-
-        Returns:
-            Pattern weight.
-        """
-        return self.data['pattern_weights'].get(pattern, default)
-
-    def get_learning_stats(self) -> Dict[str, Any]:
-        """Get current learning statistics.
-
-        Returns:
-            Dictionary with learning statistics.
-        """
-        return self.data['learning_stats'].copy()
+def log_run(sqlite_path: str, run_id: str, status: str, 
+            message: str, recommendations_count: int) -> None:
+    """Log a run to the SQLite database.
+    
+    Args:
+        sqlite_path: Path to SQLite database file.
+        run_id: Unique identifier for this run.
+        status: Status of the run (e.g., 'SUCCESS', 'FAILED').
+        message: Message describing the run outcome.
+        recommendations_count: Number of recommendations generated.
+    """
+    _ensure_directory(sqlite_path)
+    init_db(sqlite_path)
+    
+    with sqlite3.connect(sqlite_path) as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            INSERT OR REPLACE INTO run_logs 
+            (run_id, run_at, status, message, recommendations_count)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            run_id,
+            datetime.now(timezone.utc).isoformat(),
+            status,
+            message,
+            recommendations_count
+        ))
+        
+        conn.commit()

@@ -1,7 +1,7 @@
 """Data models for portfolio agent."""
 
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 
@@ -43,15 +43,54 @@ class Position:
 @dataclass
 class Recommendation:
     """Portfolio recommendation model."""
-    ticker: str
-    action: str  # 'BUY', 'SELL', 'HOLD'
+    symbol: str
+    signal: str  # 'BUY', 'SELL', 'HOLD'
+    score: float
+    trigger: str
+    entry_price: float
+    stop_price: float
+    target_price: float
+    reward_risk: float
     quantity: int
-    target_price: Optional[float] = None
-    stop_loss: Optional[float] = None
-    confidence: float = 0.0
-    expected_return: float = 0.0
-    risk_score: float = 0.0
-    rationale: str = ""
+    investment_inr: float
+    max_loss_inr: float
+    mc_probability_profit: float
+    mc_var_95_pct: float
+    mc_cvar_95_pct: float
+    compliance_status: str
+    rationale: str
+    recommendation_id: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+@dataclass
+class TradeOutcome:
+    """Trade outcome model."""
+    trade_id: str
+    recommendation_id: str
+    symbol: str
+    signal_trigger: str
+    entry_date: str
+    entry_price: float
+    exit_date: str
+    exit_price: float
+    outcome: str  # 'WIN', 'LOSS', 'PENDING'
+    return_pct: float
+    outcome_source: str
+
+
+@dataclass
+class AgentBrain:
+    """Agent brain/learning state model."""
+    weights: Dict[str, float] = field(default_factory=lambda: {
+        "Trend": 25.0,
+        "Breakout": 25.0,
+        "Volume": 20.0,
+        "MC_Prob": 30.0
+    })
+    trade_history: List[Dict[str, Any]] = field(default_factory=list)
+    learning_log: List[Dict[str, Any]] = field(default_factory=list)
+    updated_at: Optional[str] = None
 
 
 @dataclass
