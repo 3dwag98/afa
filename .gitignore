@@ -4,21 +4,15 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-
-# Dependencies
-.venv/
+.Python
+env/
 venv/
-.env
-.env.local
-*.env.*
+.venv/
+.ENV
+.ENV.local
 
-# Logs and temp files
+# Logs
 *.log
-*.tmp
-
-# Editors
-.vscode/
-.idea/
 
 # Coverage
 .coverage
@@ -28,4 +22,13 @@ htmlcov/
 # Testing
 .pytest_cache/
 .mypy_cache/
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# OS generated files
+.DS_Store
+Thumbs.db
 ```
