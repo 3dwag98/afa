@@ -12,3 +12,4 @@ logs/*.log
 htmlcov/
 .DS_Store
 *.egg-info/
+.env

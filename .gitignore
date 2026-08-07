@@ -1,35 +1,92 @@
 ```
+# Dependencies
+node_modules/
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Environment
+.env
+.env.local
+.env.*
+
+# Editors
+.vscode/
+.idea/
+
 # Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.py~
+*.py.class
+*.py.backup
+*.py.swp
+*.py.swo
+*.py.tmp
+*.py.log
+*.py.cache
+*.py.bak
+*.py.orig
+*.py.rej
+*.py.patch
+*.py.diff
+*.py.patch~
+*.py.diff~
+*.py.swp
+*.py.swo
+*.py.tmp
+*.py.log
+*.py.cache
+*.py.bak
+*.py.orig
+*.py.rej
+*.py.patch
+*.py.diff
+*.py.patch~
+*.py.diff~
 
-# Dependencies
-.venv/
+# Build directories
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
 venv/
+.venv/
 env/
-.env
-.env.local
-.env.*
+ENV/
 
-# Logs
-*.log
-
-# Coverage
-.coverage
-htmlcov/
-coverage/
-
-# IDE
-.vscode/
+# IDE specific
+.vs/
 .idea/
 *.swp
 *.swo
-*.tmp
 
-# Build artifacts
-dist/
-build/
-*.egg-info/
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Testing
+.coverage
+htmlcov/
+.coverage.*
+.nyc_output/
+coverage/
+
+# CI/CD
+.github/
+.gitlab/
+
+# Docker
+.dockerignore
+docker-compose.yml
+
 ```
