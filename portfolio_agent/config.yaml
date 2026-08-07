@@ -22,3 +22,4 @@ excel_output: output/Agent_Orchestrator_Output.xlsx
 log_file: logs/agent.log
 paper_trading_mode: true
 min_history_days: 250
+allow_synthetic_fallback: true

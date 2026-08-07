@@ -50,6 +50,7 @@ class AppConfig:
     log_file: str
     paper_trading_mode: bool
     min_history_days: int
+    allow_synthetic_fallback: bool = True
 
     @classmethod
     def from_dict(cls, data: dict) -> "AppConfig":
@@ -72,6 +73,7 @@ class AppConfig:
             log_file=data["log_file"],
             paper_trading_mode=data["paper_trading_mode"],
             min_history_days=data["min_history_days"],
+            allow_synthetic_fallback=data.get("allow_synthetic_fallback", True),
         )
 
 
