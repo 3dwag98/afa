@@ -35,9 +35,14 @@ def main():
         help="Force refresh of market data (ignore cache)"
     )
     parser.add_argument(
-        "--no-simulate",
+        "--simulate-outcome",
         action="store_true",
-        help="Disable simulated outcome generation for demo learning"
+        help="Simulate outcome for top recommendation"
+    )
+    parser.add_argument(
+        "--update-outcomes",
+        action="store_true",
+        help="Fetch market data and update open trade outcomes"
     )
     
     args = parser.parse_args()
@@ -73,7 +78,8 @@ def main():
     try:
         excel_path = run_orchestrator(
             force_refresh=args.force_refresh,
-            simulate_outcome=not args.no_simulate
+            simulate_outcome=args.simulate_outcome,
+            update_outcomes=args.update_outcomes
         )
 
         print()
