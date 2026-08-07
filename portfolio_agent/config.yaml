@@ -1,0 +1,24 @@
+portfolio_value_inr: 308733
+risk_per_trade_pct: 0.01
+max_single_position_pct: 0.03
+min_price_inr: 20
+target_prob_profit: 0.55
+min_reward_risk: 1.5
+learning_rate: 0.15
+mc_horizon_days: 20
+mc_simulations: 1000
+random_seed: 42
+tickers:
+  - NIFTYBEES.NS
+  - RELIANCE.NS
+  - TCS.NS
+  - HDFCBANK.NS
+  - ITC.NS
+  - SBIN.NS
+  - TATAMOTORS.NS
+brain_file: data/agent_brain.json
+sqlite_path: data/portfolio_agent.db
+excel_output: output/Agent_Orchestrator_Output.xlsx
+log_file: logs/agent.log
+paper_trading_mode: true
+min_history_days: 250
