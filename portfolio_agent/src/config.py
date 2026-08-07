@@ -16,6 +16,7 @@ REQUIRED_FIELDS = [
     "target_prob_profit",
     "min_reward_risk",
     "learning_rate",
+    "min_trades_for_learning",
     "mc_horizon_days",
     "mc_simulations",
     "random_seed",
@@ -40,6 +41,7 @@ class AppConfig:
     target_prob_profit: float
     min_reward_risk: float
     learning_rate: float
+    min_trades_for_learning: int
     mc_horizon_days: int
     mc_simulations: int
     random_seed: int
@@ -63,6 +65,7 @@ class AppConfig:
             target_prob_profit=data["target_prob_profit"],
             min_reward_risk=data["min_reward_risk"],
             learning_rate=data["learning_rate"],
+            min_trades_for_learning=data["min_trades_for_learning"],
             mc_horizon_days=data["mc_horizon_days"],
             mc_simulations=data["mc_simulations"],
             random_seed=data["random_seed"],
