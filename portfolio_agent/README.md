@@ -2,14 +2,64 @@
 
 ## Overview
 
-This is a **decision-support system** for portfolio optimization in Indian markets. It uses self-learning algorithms to analyze historical data and generate trading recommendations.
+Python self-learning portfolio agent for Indian markets.
 
-## Important Disclaimers
-
-- **No Real Trading**: This system does NOT place real trades. It operates in paper trading / decision support mode only.
-- **No Broker Integration**: There is no broker API integration for trade execution.
-- **Excel Output**: All recommendations and analysis are output to an Excel workbook.
+- **Decision support only**: This system does NOT place real trades. It operates in paper trading / decision support mode only.
+- **No real broker trading**: There is no broker API integration for trade execution.
 - **Educational Purpose**: This tool is for educational and research purposes only. Past performance does not guarantee future results.
+
+## Setup
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## Run
+
+```bash
+python main.py
+```
+
+## Run with synthetic data
+
+```bash
+python main.py --force-refresh
+```
+
+## Simulate outcome for learning demo
+
+```bash
+python main.py --simulate-outcome
+```
+
+## Update outcomes from market data
+
+```bash
+python main.py --update-outcomes
+```
+
+## Output
+
+```
+output/Agent_Orchestrator_Output.xlsx
+```
+
+## Learning
+
+- Agent stores weights in `data/agent_brain.json`.
+- Trade outcomes stored in `data/portfolio_agent.db`.
+- Weights update based on WIN/LOSS outcomes.
+
+## Guardrails
+
+- Paper trading only.
+- No leverage.
+- No short selling.
+- Penny stock filter.
+- Position size cap.
+- Risk per trade cap.
 
 ## Features
 

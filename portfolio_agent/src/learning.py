@@ -4,8 +4,13 @@ import json
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
-from .models import AgentBrain, TradeOutcome
-from .config import AppConfig
+# Use absolute imports for CLI execution
+try:
+    from .models import AgentBrain, TradeOutcome
+    from .config import AppConfig
+except ImportError:
+    from models import AgentBrain, TradeOutcome
+    from config import AppConfig
 
 
 def evaluate_and_learn(brain: AgentBrain, config: AppConfig) -> AgentBrain:

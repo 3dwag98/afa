@@ -3,9 +3,15 @@
 import pandas as pd
 from typing import Dict, Any, Optional
 
-from .models import IndicatorSnapshot, AgentBrain, Recommendation
-from .config import AppConfig
-from .monte_carlo import MonteCarloResult
+# Use absolute imports for CLI execution
+try:
+    from .models import IndicatorSnapshot, AgentBrain, Recommendation
+    from .config import AppConfig
+    from .monte_carlo import MonteCarloResult
+except ImportError:
+    from models import IndicatorSnapshot, AgentBrain, Recommendation
+    from config import AppConfig
+    from monte_carlo import MonteCarloResult
 
 
 def calculate_technical_score(df: pd.DataFrame) -> float:
