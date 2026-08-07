@@ -1,90 +1,100 @@
 """Monte Carlo simulation module for risk analysis."""
 
 import numpy as np
-import pandas as pd
-from typing import Dict, Any
+from dataclasses import dataclass
+from typing import Optional
 
 
-def run_monte_carlo(returns: pd.Series, horizon_days: int = 20, 
-                    simulations: int = 1000, seed: int = 42) -> Dict[str, Any]:
-    """Run Monte Carlo simulation on historical returns.
+@dataclass
+class MonteCarloResult:
+    """Monte Carlo simulation result model."""
+    probability_profit: float = 0.0
+    expected_return_pct: float = 0.0
+    var_95: float = 0.0
+    cvar_95: float = 0.0
+    simulations_count: int = 0
+    horizon_days: int = 0
+
+
+def run_monte_carlo(
+    symbol: str,
+    daily_returns: list[float],
+    horizon_days: int,
+    simulations: int,
+    seed: int | None = None
+) -> MonteCarloResult:
+    """Run Monte Carlo simulation on historical returns using log returns.
 
     Args:
-        returns: Series of daily returns.
+        symbol: Stock ticker symbol (unused in calculation, for identification).
+        daily_returns: List of daily returns.
         horizon_days: Number of days to simulate forward.
         simulations: Number of simulation runs.
         seed: Random seed for reproducibility.
 
     Returns:
-        Dictionary with simulation results.
+        MonteCarloResult with simulation statistics.
     """
-    np.random.seed(seed)
+    if seed is not None:
+        np.random.seed(seed)
 
-    if len(returns) < 30:
-        return {
-            'mean_return': 0.0,
-            'std_return': 0.0,
-            'percentile_5': 0.0,
-            'percentile_95': 0.0,
-            'probability_profit': 0.5,
-            'simulations_count': 0,
-            'horizon_days': horizon_days,
-            'error': 'Insufficient data for simulation'
-        }
+    # Convert to numpy array and clean data
+    returns_arr = np.array(daily_returns, dtype=float)
+    returns_arr = returns_arr[~np.isnan(returns_arr)]
+    returns_arr = returns_arr[~np.isinf(returns_arr)]
 
-    # Calculate parameters
-    mu = returns.mean()
-    sigma = returns.std()
+    # Require at least 30 returns
+    if len(returns_arr) < 30:
+        return MonteCarloResult(
+            probability_profit=0.0,
+            expected_return_pct=0.0,
+            var_95=0.0,
+            cvar_95=0.0,
+            simulations_count=0,
+            horizon_days=horizon_days
+        )
 
-    # Simulate future paths
-    final_values = []
-    for _ in range(simulations):
-        random_returns = np.random.normal(mu, sigma, horizon_days)
-        cumulative_return = np.prod(1 + random_returns) - 1
-        final_values.append(cumulative_return)
+    # Calculate log returns
+    # Assuming daily_returns are simple returns, convert to log returns
+    # log(1 + r) where r is simple return
+    log_returns = np.log1p(returns_arr)
 
-    final_values = np.array(final_values)
+    mu = np.mean(log_returns)
+    sigma = np.std(log_returns, ddof=0)  # Population std
 
-    # Calculate statistics
-    mean_return = np.mean(final_values)
-    std_return = np.std(final_values)
-    percentile_5 = np.percentile(final_values, 5)
-    percentile_95 = np.percentile(final_values, 95)
-    probability_profit = np.mean(final_values > 0)
+    # Handle sigma = 0 safely
+    if sigma == 0:
+        # No volatility, deterministic path
+        daily_drift = mu
+        cumulative_returns = np.full(simulations, daily_drift * horizon_days)
+    else:
+        # Simulate cumulative log returns over horizon_days
+        daily_drift = mu - 0.5 * sigma ** 2
+        random_shocks = np.random.normal(0, sigma, size=(simulations, horizon_days))
+        path_returns = daily_drift + random_shocks
+        cumulative_returns = path_returns.sum(axis=1)
 
-    return {
-        'mean_return': mean_return,
-        'std_return': std_return,
-        'percentile_5': percentile_5,
-        'percentile_95': percentile_95,
-        'probability_profit': probability_profit,
-        'simulations_count': simulations,
-        'horizon_days': horizon_days
-    }
+    # Probability profit = mean(cumulative_returns > 0)
+    probability_profit = float(np.mean(cumulative_returns > 0))
 
+    # Expected return pct = mean(exp(cumulative_returns) - 1)
+    expected_return_pct = float(np.mean(np.exp(cumulative_returns) - 1))
 
-def calculate_var(returns: pd.Series, confidence: float = 0.95) -> float:
-    """Calculate Value at Risk.
+    # VaR 95 = percentile(cumulative_returns, 5)
+    var_95 = float(np.percentile(cumulative_returns, 5))
 
-    Args:
-        returns: Series of daily returns.
-        confidence: Confidence level (e.g., 0.95 for 95%).
+    # CVaR 95 = mean of returns <= VaR 95
+    tail_mask = cumulative_returns <= var_95
+    if np.any(tail_mask):
+        cvar_95 = float(np.mean(cumulative_returns[tail_mask]))
+    else:
+        cvar_95 = var_95
 
-    Returns:
-        VaR at specified confidence level.
-    """
-    return np.percentile(returns, (1 - confidence) * 100)
-
-
-def calculate_cvar(returns: pd.Series, confidence: float = 0.95) -> float:
-    """Calculate Conditional Value at Risk (Expected Shortfall).
-
-    Args:
-        returns: Series of daily returns.
-        confidence: Confidence level.
-
-    Returns:
-        CVaR at specified confidence level.
-    """
-    var = calculate_var(returns, confidence)
-    return returns[returns <= var].mean()
+    return MonteCarloResult(
+        probability_profit=round(probability_profit, 6),
+        expected_return_pct=round(expected_return_pct, 6),
+        var_95=round(var_95, 6),
+        cvar_95=round(cvar_95, 6),
+        simulations_count=simulations,
+        horizon_days=horizon_days
+    )

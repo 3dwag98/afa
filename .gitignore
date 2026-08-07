@@ -11,20 +11,22 @@ venv/
 env/
 .env
 .env.local
-*.env.*
+.env.*
 
-# Logs and temporary files
+# Tests
+.pytest_cache/
+.coverage
+coverage/
+
+# Logs
 *.log
-*.tmp
 
-# Editors
-.vscode/
-.idea/
+# Temporary files
+*.tmp
 *.swp
 *.swo
 
-# Build artifacts
-dist/
-build/
-target/
+# OS
+.DS_Store
+Thumbs.db
 ```
