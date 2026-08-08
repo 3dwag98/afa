@@ -10,28 +10,46 @@ venv/
 .venv/
 pip-log.txt
 pip-delete-this-directory.txt
-
-# Testing
-.pytest_cache/
+.tox/
 .coverage
-coverage/
-htmlcov/
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.git/modules/
+.DS_Store
+.mypy_cache/
+.pytest_cache/
+.hypothesis/
+
+# Build artifacts
+build/
+dist/
+*.egg
+*.egg-info/
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.o
+*.a
+*.obj
 
 # Environment
 .env
 .env.local
-.env.*
-!.env.example
+*.env.*
 
-# Logs
-*.log
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
 
-# OS generated files
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
+# Dependencies
+uv.lock
 ```
