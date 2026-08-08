@@ -33,12 +33,14 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY main.py .
-COPY run_backtest.py .
-COPY config.yaml .
-COPY src/ ./src/
-COPY tests/ ./tests/
-COPY scripts/ ./scripts/
+# Use COPY --follow-symlinks to handle symlinks properly (Docker BuildKit feature)
+COPY --follow-symlinks main.py .
+COPY --follow-symlinks run_backtest.py .
+COPY --follow-symlinks config.yaml .
+COPY --follow-symlinks requirements.txt .
+COPY --follow-symlinks src/ ./src/
+COPY --follow-symlinks tests/ ./tests/
+COPY --follow-symlinks scripts/ ./scripts/
 
 # Create runtime directories
 RUN mkdir -p /app/data /app/data/market_data /app/output /app/logs
