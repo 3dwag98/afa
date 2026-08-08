@@ -39,6 +39,152 @@ def _ticker_filename(ticker: str) -> str:
     return f"{safe}.parquet"
 
 
+def load_ticker_data(
+    ticker: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+) -> Optional[pd.DataFrame]:
+    """
+    Load ticker data from local parquet cache (module-level convenience function).
+    
+    Args:
+        ticker: Ticker symbol.
+        start_date: Optional start date (YYYY-MM-DD).
+        end_date: Optional end date (YYYY-MM-DD).
+        
+    Returns:
+        DataFrame with OHLCV data, or None if file doesn't exist or is empty.
+    """
+    # Build path
+    path = DATA_DIR / _ticker_filename(ticker)
+    
+    if not path.exists():
+        return None
+    
+    try:
+        df = pd.read_parquet(path)
+        
+        if df.empty:
+            return None
+        
+        # Restore datetime index
+        if 'Date' in df.columns:
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.set_index('Date')
+        elif 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.set_index('date')
+        elif 'index' in df.columns:
+            df['index'] = pd.to_datetime(df['index'])
+            df = df.set_index('index')
+        
+        # Ensure index is datetime and sorted ascending
+        if not isinstance(df.index, pd.DatetimeIndex):
+            try:
+                df.index = pd.to_datetime(df.index)
+            except Exception:
+                return None
+        
+        df = df.sort_index()
+        
+        # Filter by date range if provided
+        if start_date is not None:
+            df = df[df.index >= pd.to_datetime(start_date)]
+        
+        if end_date is not None:
+            df = df[df.index <= pd.to_datetime(end_date)]
+        
+        # After filtering, check if empty
+        if df.empty:
+            return None
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error loading {ticker}: {e}")
+        return None
+
+
+def batch_download_and_cache(
+    tickers: List[str],
+    start_date: str,
+    end_date: str,
+    chunk_size: int = 50,
+    skip_existing: bool = True
+) -> bool:
+    """
+    Download and cache data for multiple tickers (module-level convenience function).
+    
+    Args:
+        tickers: List of ticker symbols.
+        start_date: Start date (YYYY-MM-DD).
+        end_date: End date (YYYY-MM-DD).
+        chunk_size: Number of tickers per batch.
+        skip_existing: Skip tickers that already have valid cached data.
+        
+    Returns:
+        True on success, False on failure.
+    """
+    ds = DataStore()
+    ds.chunk_size = chunk_size
+    
+    stats = ds.batch_download_and_cache(
+        tickers, start_date, end_date,
+        chunk_size=chunk_size,
+        skip_existing=skip_existing
+    )
+    
+    # Return True if all tickers were successfully downloaded or skipped
+    return stats['failed'] == 0
+
+
+def get_ticker_data(
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    force_refresh: bool = False
+) -> Optional[pd.DataFrame]:
+    """
+    Get ticker data with automatic caching and forward-fill.
+    
+    Convenience function that:
+    1. Tries to load from cache (unless force_refresh=True)
+    2. Downloads and caches if not available
+    3. Forward-fills missing business days
+    
+    Args:
+        ticker: Ticker symbol.
+        start_date: Start date (YYYY-MM-DD).
+        end_date: End date (YYYY-MM-DD).
+        force_refresh: If True, forces re-download even if cached.
+        
+    Returns:
+        DataFrame with OHLCV data and forward-filled dates, or None on failure.
+    """
+    # Normalize ticker
+    if not ticker.endswith('.NS'):
+        ticker = f"{ticker}.NS"
+    ticker = ticker.upper()
+    
+    # 1. Try cache first unless force_refresh
+    if not force_refresh:
+        df = load_ticker_data(ticker, start_date, end_date)
+        if df is not None and len(df) > 0:
+            return _fill_missing_days(df, start_date, end_date)
+    
+    # 2. Download and cache
+    ok = batch_download_and_cache([ticker], start_date, end_date, skip_existing=False)
+    if not ok:
+        return None
+    
+    # 3. Load back
+    df = load_ticker_data(ticker, start_date, end_date)
+    if df is None:
+        return None
+    
+    return _fill_missing_days(df, start_date, end_date)
+
+
 def _extract_ticker_df(raw: pd.DataFrame, ticker: str, is_single: bool) -> Optional[pd.DataFrame]:
     """
     Extract DataFrame for a single ticker from yfinance output.
