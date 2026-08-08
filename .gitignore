@@ -1,24 +1,4 @@
-# Dependencies
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Environment
-.env
-.env.local
-*.env.*
-
-# Logs and temporary files
-*.log
-*.tmp
-*.swp
-
-# Editors
-.vscode/
-.idea/
-
-# Build artifacts
-dist/
-build/
-*.egg-info/
+```makefile
+# No build artifacts, dependencies, or temporary files detected in changes
+# Only source/config files present (.sh, Makefile, .md) should not be ignored
+```

@@ -2,7 +2,7 @@
 set -e
 
 # Run the backtest engine via Docker Compose
-# Arguments are passed through to docker compose
-# Example: ./scripts/run_backtest.sh --years 2 --universe-size 20
+# Arguments are passed through to the CLI entrypoint
+# Example: ./scripts/run_backtest.sh --help
 
-docker compose run --rm backtest "$@"
+docker compose run --rm backtest python -m portfolio_agent.cli backtest "$@"

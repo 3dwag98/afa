@@ -8,6 +8,50 @@ Self-learning portfolio optimization agent for Indian markets.
 - **No real broker trading**: There is no broker API integration for trade execution.
 - **Educational Purpose**: This tool is for educational and research purposes only. Past performance does not guarantee future results.
 
+## Modern Docker & GPU Training
+
+This project uses a modern architecture with `uv` for package management and Docker Compose for containerized execution. The Docker images are GPU-enabled for accelerated ML training.
+
+### Building the GPU-Enabled Image
+
+```bash
+# Build the main Docker image (includes GPU support)
+make build
+```
+
+The Dockerfile includes CUDA and PyTorch GPU dependencies. When running on a Linux host with an NVIDIA GPU, the container will automatically use GPU acceleration if available.
+
+### GPU Training
+
+To trigger a GPU-accelerated training run:
+
+```bash
+make train-gpu
+```
+
+This runs the LSTM model training with automatic device selection (`--device auto`). If a GPU is available and the NVIDIA Container Toolkit is installed, it will use CUDA; otherwise, it falls back to CPU (or MPS on macOS).
+
+**Note on GPU Passthrough:**
+- **Linux**: Requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) to be installed on the host for GPU passthrough to work.
+- **Windows/macOS**: GPU passthrough via Docker is limited. The training will automatically fallback to CPU or MPS (Metal Performance Shaders on macOS).
+
+### Airflow UI
+
+To start the Airflow services and access the web UI:
+
+```bash
+# Start Airflow (webserver + scheduler)
+make airflow-up
+
+# Access the UI at http://localhost:8080
+# Login credentials: admin / admin
+
+# Stop Airflow services
+make airflow-down
+```
+
+Airflow provides scheduled execution of the portfolio agent on weekdays at 15:45 IST using TaskFlow API for DAG definition.
+
 ## Quick Start
 
 ### Option 1: Run with Docker (Recommended)
