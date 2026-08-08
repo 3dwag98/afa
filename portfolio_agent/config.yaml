@@ -9,14 +9,7 @@ min_trades_for_learning: 5
 mc_horizon_days: 20
 mc_simulations: 1000
 random_seed: 42
-tickers:
-  - NIFTYBEES.NS
-  - RELIANCE.NS
-  - TCS.NS
-  - HDFCBANK.NS
-  - ITC.NS
-  - SBIN.NS
-  - INFY.NS
+tickers: []
 brain_file: data/agent_brain.json
 sqlite_path: data/portfolio_agent.db
 excel_output: output/Agent_Orchestrator_Output.xlsx
