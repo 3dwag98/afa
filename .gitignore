@@ -8,16 +8,17 @@ __pycache__/
 # Dependencies
 .venv/
 venv/
-env/
-pip-log.txt
-pip-selfcheck.json
+.env
+.env.local
+*.env.*
 
-# Testing
+# Logs
+*.log
+
+# Coverage
 .coverage
 coverage/
 htmlcov/
-.pytest_cache/
-.hypothesis/
 
 # IDE
 .vscode/
@@ -25,20 +26,20 @@ htmlcov/
 *.swp
 *.swo
 
-# Logs
-*.log
-
-# Environment
-.env
-.env.local
-*.env.*
+# Build artifacts
+dist/
+build/
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Build artifacts
-dist/
-build/
-*.egg-info/
+# Testing
+.pytest_cache/
+.mypy_cache/
 ```
