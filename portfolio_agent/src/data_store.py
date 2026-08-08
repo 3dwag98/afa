@@ -125,7 +125,7 @@ def batch_download_and_cache(
     Returns:
         True on success, False on failure.
     """
-    ds = DataStore()
+    ds = DataStore(cache_dir=DATA_DIR)
     ds.chunk_size = chunk_size
     
     stats = ds.batch_download_and_cache(
@@ -518,8 +518,8 @@ class DataStore:
         Returns:
             DataFrame with OHLCV data, or None if file doesn't exist or is empty.
         """
-        # Build path using the same helper
-        path = DATA_DIR / _ticker_filename(ticker)
+        # Build path using self.cache_dir to match save_ticker_data
+        path = self.cache_dir / _ticker_filename(ticker)
         
         if not path.exists():
             return None
