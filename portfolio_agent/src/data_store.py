@@ -440,7 +440,7 @@ class DataStore:
         Returns:
             Path to the parquet file.
         """
-        return DATA_DIR / _ticker_filename(ticker)
+        return self.cache_dir / _ticker_filename(ticker)
     
     def _parse_ticker_from_path(self, path: Path) -> str:
         """
@@ -468,7 +468,7 @@ class DataStore:
             Path to saved parquet file.
         """
         # Ensure directory exists
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         
         # Flatten MultiIndex columns if present
         if isinstance(df.columns, pd.MultiIndex):
@@ -486,6 +486,7 @@ class DataStore:
         # Reset index to include date as column
         df_to_save = df.reset_index()
         
+
         path = self._get_ticker_path(ticker)
         
         # Use pyarrow engine if available, otherwise fastparquet
@@ -846,7 +847,7 @@ class DataStore:
             DataFrame with OHLCV data, or None if file doesn't exist.
         """
         # Build path using the same helper
-        path = DATA_DIR / _ticker_filename(ticker)
+        path = self.cache_dir / _ticker_filename(ticker)
         
         if not path.exists():
             return None
