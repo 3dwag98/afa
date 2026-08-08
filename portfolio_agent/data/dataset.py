@@ -146,29 +146,36 @@ def create_dataloaders(
     # Create dataloaders with GPU optimizations
     # pin_memory=True enables faster transfer to CUDA GPUs
     # num_workers controls parallel data loading
+    # persistent_workers=True avoids worker restart overhead between epochs
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=False,  # NO SHUFFLING - preserve temporal order
-        num_workers=config.num_workers,
+        num_workers=min(config.num_workers, 2),  # Limit workers on Windows to avoid overhead
         pin_memory=use_cuda,
         drop_last=True,  # Drop incomplete batches for stable training
+        persistent_workers=True if config.num_workers > 0 else False,
+        prefetch_factor=2 if config.num_workers > 0 else None,
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
-        num_workers=config.num_workers,
+        num_workers=min(config.num_workers, 2),
         pin_memory=use_cuda,
+        persistent_workers=True if config.num_workers > 0 else False,
+        prefetch_factor=2 if config.num_workers > 0 else None,
     )
 
     test_loader = DataLoader(
         test_dataset,
         batch_size=config.batch_size,
         shuffle=False,
-        num_workers=config.num_workers,
+        num_workers=min(config.num_workers, 2),
         pin_memory=use_cuda,
+        persistent_workers=True if config.num_workers > 0 else False,
+        prefetch_factor=2 if config.num_workers > 0 else None,
     )
 
     print(
