@@ -12,9 +12,14 @@ coverage/
 htmlcov/
 
 # Environment
+.venv/
+venv/
 .env
 .env.local
 *.env.*
+
+# Logs
+*.log
 
 # Editors
 .vscode/
@@ -22,9 +27,22 @@ htmlcov/
 *.swp
 *.swo
 
-# Logs
-*.log
+# Build artifacts
+dist/
+build/
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
 
-# Temp files
-*.tmp
+# Dependencies
+node_modules/
+.mypy_cache/
+.gradle/
+target/
+
+# System
+.DS_Store
+Thumbs.db
 ```
