@@ -1,0 +1,819 @@
+"""
+Data Store for high-performance market data storage and retrieval.
+
+Uses pandas and parquet for efficient local caching of OHLCV data.
+"""
+
+import os
+import time
+import logging
+from pathlib import Path
+from typing import List, Optional, Dict, Any, Tuple
+from datetime import datetime, timedelta
+
+import pandas as pd
+
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    YFINANCE_AVAILABLE = False
+
+# Single source of truth for cache directory
+DATA_DIR = Path("data") / "market_data"
+
+logger = logging.getLogger(__name__)
+
+
+def _ticker_filename(ticker: str) -> str:
+    """
+    Generate a safe filename for a ticker.
+    
+    Args:
+        ticker: Ticker symbol (e.g., RELIANCE.NS).
+        
+    Returns:
+        Safe filename string.
+    """
+    safe = ticker.replace("/", "_").replace("\\", "_").replace(":", "_")
+    return f"{safe}.parquet"
+
+
+def _extract_ticker_df(raw: pd.DataFrame, ticker: str, is_single: bool) -> Optional[pd.DataFrame]:
+    """
+    Extract DataFrame for a single ticker from yfinance output.
+    
+    Handles both single-ticker (flat columns) and multi-ticker (MultiIndex columns)
+    outputs from yfinance.download().
+    
+    Args:
+        raw: Raw DataFrame from yfinance.download().
+        ticker: Ticker symbol to extract.
+        is_single: True if downloading a single ticker (flat columns expected).
+        
+    Returns:
+        Clean DataFrame with flat column names, or None if extraction fails.
+    """
+    if raw is None or raw.empty:
+        return None
+    
+    if is_single:
+        df = raw.copy()
+    else:
+        # Multi-ticker download: columns are MultiIndex (ticker, metric)
+        if not isinstance(raw.columns, pd.MultiIndex):
+            # Unexpected format, try to handle gracefully
+            df = raw.copy()
+        elif ticker not in raw.columns.get_level_values(0):
+            return None
+        else:
+            df = raw[ticker].copy()
+    
+    # Flatten if still MultiIndex
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    
+    # Lowercase all column names
+    df.columns = [str(c).lower() for c in df.columns]
+    
+    # Drop fully-empty rows
+    df = df.dropna(how="all")
+    
+    return df
+
+
+def generate_data_quality_report(
+    df: Optional[pd.DataFrame], 
+    ticker: str,
+    stale_threshold_days: int = 5
+) -> Dict[str, Any]:
+    """
+    Generate a comprehensive data quality report for a ticker's DataFrame.
+    
+    Args:
+        df: DataFrame with OHLCV data and DatetimeIndex. Can be None or empty.
+        ticker: Ticker symbol for the report.
+        stale_threshold_days: Number of days after which data is considered stale.
+        
+    Returns:
+        Dictionary with quality metrics using exactly these keys:
+        - ticker: str
+        - rows: int
+        - start_date: str or None (ISO date string)
+        - end_date: str or None
+        - missing_values: dict (column -> count of NaN)
+        - total_missing: int
+        - duplicate_dates: int
+        - zero_volume_days: int
+        - date_gaps: int (business-day gaps > 1 day between consecutive rows)
+        - days_out_of_range: int (rows outside expected range, default 0)
+        - is_stale: bool (True if end_date older than stale_threshold_days)
+        - passed: bool (overall quality gate)
+    """
+    # Handle empty/None input
+    if df is None or df.empty:
+        return {
+            "ticker": ticker,
+            "rows": 0,
+            "start_date": None,
+            "end_date": None,
+            "missing_values": {},
+            "total_missing": 0,
+            "duplicate_dates": 0,
+            "zero_volume_days": 0,
+            "date_gaps": 0,
+            "days_out_of_range": 0,
+            "is_stale": True,
+            "passed": False
+        }
+    
+    # Ensure we have a copy to work with
+    df = df.copy()
+    
+    # Ensure index is datetime
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    
+    df = df.sort_index()
+    
+    # Calculate basic stats
+    rows = len(df)
+    start_date = df.index.min()
+    end_date = df.index.max()
+    
+    # Convert dates to ISO strings
+    start_date_str = start_date.strftime('%Y-%m-%d') if pd.notna(start_date) else None
+    end_date_str = end_date.strftime('%Y-%m-%d') if pd.notna(end_date) else None
+    
+    # Count missing values per column
+    missing_values = {}
+    for col in df.columns:
+        missing_count = int(df[col].isna().sum())
+        if missing_count > 0:
+            missing_values[col] = missing_count
+    
+    total_missing = sum(missing_values.values())
+    
+    # Count duplicate dates
+    duplicate_dates = int(df.index.duplicated().sum())
+    
+    # Count zero volume days (handle missing 'volume' column gracefully)
+    if 'volume' in df.columns:
+        zero_volume_days = int((df['volume'] == 0).sum())
+    else:
+        zero_volume_days = 0
+    
+    # Calculate date gaps: count diffs greater than 3 calendar days
+    # This tolerates weekends but catches longer gaps
+    if len(df) > 1:
+        index_series = pd.Series(df.index)
+        diffs = index_series.diff().dt.days
+        date_gaps = int((diffs > 3).sum())
+    else:
+        date_gaps = 0
+    
+    # Days out of range (default 0 as no expected range provided)
+    days_out_of_range = 0
+    
+    # Check if data is stale
+    last_date = pd.Timestamp(end_date).normalize()
+    today = pd.Timestamp.now().normalize()
+    is_stale = (today - last_date) > pd.Timedelta(days=stale_threshold_days)
+    
+    # Calculate passed status
+    # passed = (rows > 0) and (total_missing / max(rows,1) < 0.10) and (not is_stale)
+    missing_ratio = total_missing / max(rows, 1)
+    passed = (rows > 0) and (missing_ratio < 0.10) and (not is_stale)
+    
+    return {
+        "ticker": ticker,
+        "rows": rows,
+        "start_date": start_date_str,
+        "end_date": end_date_str,
+        "missing_values": missing_values,
+        "total_missing": total_missing,
+        "duplicate_dates": duplicate_dates,
+        "zero_volume_days": zero_volume_days,
+        "date_gaps": date_gaps,
+        "days_out_of_range": days_out_of_range,
+        "is_stale": is_stale,
+        "passed": passed
+    }
+
+
+def _fill_missing_days(
+    df: pd.DataFrame, 
+    start_date: str, 
+    end_date: str, 
+    ffill_limit: int = 3
+) -> pd.DataFrame:
+    """
+    Fill missing business days in the DataFrame using forward-fill.
+    
+    Creates a complete business-day date range and forward-fills price columns
+    while leaving volume as 0 for filled days. This handles market holidays
+    and weekends properly.
+    
+    Args:
+        df: DataFrame with OHLCV data and DatetimeIndex.
+        start_date: Start date for the complete range (YYYY-MM-DD).
+        end_date: End date for the complete range (YYYY-MM-DD).
+        ffill_limit: Maximum number of consecutive days to forward-fill.
+        
+    Returns:
+        DataFrame with complete business-day index and forward-filled prices.
+    """
+    df = df.copy()
+    
+    # Ensure index is datetime
+    df.index = pd.to_datetime(df.index)
+    
+    # Remove duplicate indices, keep last
+    df = df[~df.index.duplicated(keep='last')]
+    
+    # Sort by index
+    df = df.sort_index()
+    
+    # Create full business-day range (Mon-Fri)
+    # Market holidays will appear as NaN rows to fill
+    full_range = pd.bdate_range(start=start_date, end=end_date)
+    
+    # Reindex to full business-day range
+    df = df.reindex(full_range)
+    
+    # Forward-fill PRICE columns only, with limit to avoid filling long suspensions
+    price_cols = [c for c in df.columns if c.lower() != 'volume']
+    df[price_cols] = df[price_cols].ffill(limit=ffill_limit)
+    
+    # Volume: never forward-fill. Fill remaining NaN with 0.
+    if 'volume' in df.columns:
+        df['volume'] = df['volume'].fillna(0)
+    
+    # Set index name
+    df.index.name = 'date'
+    
+    return df
+
+
+class DataStore:
+    """
+    High-performance data store for market data.
+    
+    Features:
+    - Batch download with chunking to avoid API rate limits
+    - Parquet-based local storage for fast I/O
+    - Retry logic with exponential backoff
+    - Forward-fill for handling market holidays
+    """
+    
+    def __init__(self, cache_dir: Optional[Path] = None):
+        """
+        Initialize the DataStore.
+        
+        Args:
+            cache_dir: Directory for storing parquet files. 
+                      Defaults to data/market_data/ directory.
+        """
+        if cache_dir is None:
+            cache_dir = Path(__file__).parent.parent / "data" / "market_data"
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Configuration
+        self.chunk_size = 50  # Tickers per batch
+        self.max_retries = 3
+        self.base_delay = 1.0  # Base delay in seconds for backoff
+    
+    def _get_ticker_path(self, ticker: str) -> Path:
+        """
+        Get the parquet file path for a ticker.
+        
+        Args:
+            ticker: Ticker symbol (e.g., RELIANCE.NS).
+            
+        Returns:
+            Path to the parquet file.
+        """
+        return DATA_DIR / _ticker_filename(ticker)
+    
+    def _parse_ticker_from_path(self, path: Path) -> str:
+        """
+        Parse ticker symbol from parquet filename.
+        
+        Args:
+            path: Path to parquet file.
+            
+        Returns:
+            Ticker symbol (e.g., RELIANCE.NS).
+        """
+        filename = path.stem
+        # Reverse the safe transformation
+        return filename.replace('_NS', '.NS').replace('_', '.')
+    
+    def save_ticker_data(self, ticker: str, df: pd.DataFrame) -> Path:
+        """
+        Save ticker DataFrame to parquet file.
+        
+        Args:
+            ticker: Ticker symbol.
+            df: DataFrame with OHLCV data.
+            
+        Returns:
+            Path to saved parquet file.
+        """
+        # Ensure directory exists
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        
+        # Flatten MultiIndex columns if present
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        
+        # Convert index to datetime
+        df.index = pd.to_datetime(df.index)
+        
+        # Lowercase all column names
+        df.columns = [c.lower() for c in df.columns]
+        
+        # Drop fully-empty rows
+        df = df.dropna(how="all")
+        
+        # Reset index to include date as column
+        df_to_save = df.reset_index()
+        
+        path = self._get_ticker_path(ticker)
+        
+        # Use pyarrow engine if available, otherwise fastparquet
+        try:
+            df_to_save.to_parquet(path, engine='pyarrow', index=False)
+        except ImportError:
+            try:
+                df_to_save.to_parquet(path, engine='fastparquet', index=False)
+            except ImportError:
+                # Fallback to default engine
+                df_to_save.to_parquet(path, index=False)
+        
+        return path
+    
+    def load_ticker_data(
+        self,
+        ticker: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None
+    ) -> Optional[pd.DataFrame]:
+        """
+        Load ticker data from local parquet cache.
+        
+        Args:
+            ticker: Ticker symbol.
+            start_date: Optional start date (YYYY-MM-DD).
+            end_date: Optional end date (YYYY-MM-DD).
+            
+        Returns:
+            DataFrame with OHLCV data, or None if file doesn't exist or is empty.
+        """
+        # Build path using the same helper
+        path = DATA_DIR / _ticker_filename(ticker)
+        
+        if not path.exists():
+            return None
+        
+        try:
+            df = pd.read_parquet(path)
+            
+            if df.empty:
+                return None
+            
+            # Restore datetime index
+            if 'Date' in df.columns:
+                df['Date'] = pd.to_datetime(df['Date'])
+                df = df.set_index('Date')
+            elif 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date'])
+                df = df.set_index('date')
+            elif 'index' in df.columns:
+                df['index'] = pd.to_datetime(df['index'])
+                df = df.set_index('index')
+            
+            # Ensure index is datetime and sorted ascending
+            if not isinstance(df.index, pd.DatetimeIndex):
+                try:
+                    df.index = pd.to_datetime(df.index)
+                except Exception:
+                    return None
+            
+            df = df.sort_index()
+            
+            # Filter by date range if provided
+            if start_date is not None:
+                df = df[df.index >= pd.to_datetime(start_date)]
+            
+            if end_date is not None:
+                df = df[df.index <= pd.to_datetime(end_date)]
+            
+            # After filtering, check if empty
+            if df.empty:
+                return None
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error loading {ticker}: {e}")
+            return None
+    
+    def _fetch_chunk(
+        self,
+        tickers: List[str],
+        start_date: str,
+        end_date: str,
+        max_retries: int = 3
+    ) -> Dict[str, Optional[pd.DataFrame]]:
+        """
+        Download data for a chunk of tickers with retry logic.
+        
+        Uses yfinance.download with group_by='ticker' to fetch multiple
+        tickers efficiently, then extracts individual DataFrames.
+        
+        Args:
+            tickers: List of ticker symbols.
+            start_date: Start date (YYYY-MM-DD).
+            end_date: End date (YYYY-MM-DD).
+            max_retries: Maximum retry attempts with exponential backoff.
+            
+        Returns:
+            Dictionary mapping ticker to DataFrame (or None if failed).
+        """
+        results: Dict[str, Optional[pd.DataFrame]] = {}
+        
+        if not YFINANCE_AVAILABLE:
+            for ticker in tickers:
+                results[ticker] = None
+            return results
+        
+        is_single = len(tickers) == 1
+        delay = self.base_delay
+        
+        for attempt in range(max_retries):
+            try:
+                # Download with group_by='ticker' for consistent MultiIndex output
+                raw = yf.download(
+                    tickers,
+                    start=start_date,
+                    end=end_date,
+                    group_by='ticker',
+                    auto_adjust=True,
+                    progress=False,
+                    threads=False
+                )
+                
+                # Extract each ticker's DataFrame
+                for ticker in tickers:
+                    df = _extract_ticker_df(raw, ticker, is_single)
+                    
+                    if df is not None and not df.empty:
+                        # Check required columns
+                        if 'close' not in df.columns:
+                            logger.warning(f"Ticker {ticker} missing 'close' column, skipping.")
+                            results[ticker] = None
+                            continue
+                        
+                        # Add volume as 0 if missing
+                        if 'volume' not in df.columns:
+                            df['volume'] = 0
+                        
+                        results[ticker] = df
+                    else:
+                        results[ticker] = None
+                
+                # Successfully downloaded, return results
+                return results
+                
+            except Exception as e:
+                logger.warning(f"Chunk download attempt {attempt + 1} failed: {e}")
+                
+                if attempt < max_retries - 1:
+                    time.sleep(delay)
+                    delay *= 2  # Exponential backoff
+                else:
+                    # All retries exhausted, return None for all tickers
+                    logger.error(f"Failed to download chunk after {max_retries} attempts: {e}")
+                    for ticker in tickers:
+                        results[ticker] = None
+                    return results
+        
+        return results
+    
+    def _is_cache_valid(
+        self,
+        ticker: str,
+        start_date: str,
+        end_date: str
+    ) -> bool:
+        """
+        Check if cached data covers the requested date range.
+        
+        Args:
+            ticker: Ticker symbol.
+            start_date: Requested start date.
+            end_date: Requested end date.
+            
+        Returns:
+            True if cache is valid, False otherwise.
+        """
+        df = self._load_raw_ticker_data(ticker)
+        
+        if df is None or len(df) == 0:
+            return False
+        
+        # Ensure index is datetime
+        if not isinstance(df.index, pd.DatetimeIndex):
+            return False
+        
+        # Check date range coverage
+        cache_start = pd.Timestamp(df.index.min())
+        cache_end = pd.Timestamp(df.index.max())
+        
+        req_start = pd.Timestamp(start_date)
+        req_end = pd.Timestamp(end_date)
+        
+        return cache_start <= req_start and cache_end >= req_end
+    
+    def batch_download_and_cache(
+        self,
+        tickers: List[str],
+        start_date: str,
+        end_date: str,
+        chunk_size: Optional[int] = None,
+        skip_existing: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Download and cache data for multiple tickers in batches.
+        
+        Downloads data in chunks to avoid API rate limits.
+        Saves each ticker's OHLCV data as a separate parquet file.
+        
+        Args:
+            tickers: List of ticker symbols.
+            start_date: Start date (YYYY-MM-DD).
+            end_date: End date (YYYY-MM-DD).
+            chunk_size: Number of tickers per batch. Defaults to self.chunk_size.
+            skip_existing: Skip tickers that already have valid cached data.
+            
+        Returns:
+            Dictionary with download statistics:
+            - total: Total number of tickers
+            - downloaded: Number successfully downloaded
+            - skipped: Number skipped (already cached)
+            - failed: Number that failed to download
+            - errors: List of failed ticker symbols
+        """
+        if chunk_size is None:
+            chunk_size = self.chunk_size
+        
+        stats = {
+            'total': len(tickers),
+            'downloaded': 0,
+            'skipped': 0,
+            'failed': 0,
+            'errors': []
+        }
+        
+        # Process in chunks
+        for i in range(0, len(tickers), chunk_size):
+            chunk = tickers[i:i + chunk_size]
+            print(f"Processing chunk {i // chunk_size + 1}/{(len(tickers) + chunk_size - 1) // chunk_size}")
+            
+            # Normalize tickers in chunk
+            normalized_chunk = []
+            for ticker in chunk:
+                if not ticker.endswith('.NS'):
+                    ticker = f"{ticker}.NS"
+                ticker = ticker.upper()
+                normalized_chunk.append(ticker)
+            
+            # Check which tickers need downloading
+            to_download = []
+            for ticker in normalized_chunk:
+                if skip_existing and self._is_cache_valid(ticker, start_date, end_date):
+                    stats['skipped'] += 1
+                else:
+                    to_download.append(ticker)
+            
+            # Download the chunk with retry logic
+            if to_download:
+                results = self._fetch_chunk(to_download, start_date, end_date)
+                
+                for ticker, df in results.items():
+                    if df is not None and not df.empty:
+                        self.save_ticker_data(ticker, df)
+                        stats['downloaded'] += 1
+                    else:
+                        stats['failed'] += 1
+                        stats['errors'].append(ticker)
+            
+            # Small delay between chunks
+            if i + chunk_size < len(tickers):
+                time.sleep(1.0)
+        
+        print(f"Download complete: {stats['downloaded']} downloaded, "
+              f"{stats['skipped']} skipped, {stats['failed']} failed")
+        
+        return stats
+    
+    def load_ticker_data(
+        self,
+        ticker: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        forward_fill_days: int = 3
+    ) -> Optional[pd.DataFrame]:
+        """
+        Load ticker data from local parquet cache.
+        
+        Handles missing days using forward-fill to account for market holidays.
+        Uses business-day frequency and only forward-fills price columns (not volume).
+        
+        Args:
+            ticker: Ticker symbol.
+            start_date: Start date (YYYY-MM-DD). If None, loads all data.
+            end_date: End date (YYYY-MM-DD). If None, loads all data.
+            forward_fill_days: Maximum days to forward-fill for missing data.
+            
+        Returns:
+            Clean pandas DataFrame with OHLCV data, or None if data unavailable.
+        """
+        # Ensure proper format
+        if not ticker.endswith('.NS'):
+            ticker = f"{ticker}.NS"
+        ticker = ticker.upper()
+        
+        # Load from cache (without date filtering first)
+        df = self._load_raw_ticker_data(ticker)
+        
+        if df is None or len(df) == 0:
+            return None
+        
+        # Filter by date range if provided
+        if start_date is not None or end_date is not None:
+            if start_date is not None:
+                df = df[df.index >= pd.to_datetime(start_date)]
+            if end_date is not None:
+                df = df[df.index <= pd.to_datetime(end_date)]
+            
+            if len(df) == 0:
+                return None
+            
+            # Use the _fill_missing_days helper for proper business-day handling
+            df = _fill_missing_days(df, start_date, end_date, ffill_limit=forward_fill_days)
+            
+            # Drop any leading rows where 'close' is still NaN (before first real data point)
+            if 'close' in df.columns:
+                df = df[df['close'].notna()]
+            
+            # If after reindex + ffill the 'close' column is entirely NaN, return None
+            if df.empty or ('close' in df.columns and df['close'].isna().all()):
+                return None
+            
+            # Restore original column types
+            numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+            for col in numeric_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            # Add ticker column if not present
+            if 'ticker' not in df.columns:
+                df['ticker'] = ticker
+            
+            return df
+        
+        return df
+    
+    def _load_raw_ticker_data(self, ticker: str) -> Optional[pd.DataFrame]:
+        """
+        Load raw ticker data from local parquet cache without any processing.
+        
+        This is used internally by load_ticker_data.
+        
+        Args:
+            ticker: Ticker symbol.
+            
+        Returns:
+            DataFrame with OHLCV data, or None if file doesn't exist.
+        """
+        # Build path using the same helper
+        path = DATA_DIR / _ticker_filename(ticker)
+        
+        if not path.exists():
+            return None
+        
+        try:
+            df = pd.read_parquet(path)
+            
+            if df.empty:
+                return None
+            
+            # Restore datetime index
+            if 'Date' in df.columns:
+                df['Date'] = pd.to_datetime(df['Date'])
+                df = df.set_index('Date')
+            elif 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date'])
+                df = df.set_index('date')
+            elif 'index' in df.columns:
+                df['index'] = pd.to_datetime(df['index'])
+                df = df.set_index('index')
+            
+            # Ensure index is datetime and sorted ascending
+            if not isinstance(df.index, pd.DatetimeIndex):
+                try:
+                    df.index = pd.to_datetime(df.index)
+                except Exception:
+                    return None
+            
+            df = df.sort_index()
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error loading {ticker}: {e}")
+            return None
+    
+    def load_ticker_data_only(self, ticker: str) -> Optional[pd.DataFrame]:
+        """
+        Load ticker data from local parquet cache without date filtering.
+        
+        This is a simple wrapper for backward compatibility.
+        
+        Args:
+            ticker: Ticker symbol.
+            
+        Returns:
+            DataFrame with OHLCV data, or None if file doesn't exist.
+        """
+        return self.load_ticker_data(ticker, start_date=None, end_date=None)
+    
+    def get_cached_tickers(self) -> List[str]:
+        """
+        Get list of all tickers with cached data.
+        
+        Returns:
+            List of ticker symbols.
+        """
+        tickers = []
+        for path in self.cache_dir.glob("*.parquet"):
+            tickers.append(self._parse_ticker_from_path(path))
+        return tickers
+    
+    def clear_cache(self, ticker: Optional[str] = None) -> None:
+        """
+        Clear cached data.
+        
+        Args:
+            ticker: Specific ticker to clear. If None, clears all cache.
+        """
+        if ticker is None:
+            # Clear all
+            for path in self.cache_dir.glob("*.parquet"):
+                path.unlink()
+        else:
+            # Clear specific ticker
+            if not ticker.endswith('.NS'):
+                ticker = f"{ticker}.NS"
+            ticker = ticker.upper()
+            path = self.cache_dir / _ticker_filename(ticker)
+            if path.exists():
+                path.unlink()
+    
+    def get_data_quality_report(
+        self,
+        tickers: Optional[List[str]] = None
+    ) -> pd.DataFrame:
+        """
+        Generate a data quality report for cached tickers.
+        
+        Args:
+            tickers: List of tickers to check. If None, checks all cached.
+            
+        Returns:
+            DataFrame with quality metrics per ticker.
+        """
+        if tickers is None:
+            tickers = self.get_cached_tickers()
+        
+        reports = []
+        for ticker in tickers:
+            df = self.load_ticker_data_only(ticker)
+            
+            if df is None:
+                continue
+            
+            report = {
+                'ticker': ticker,
+                'start_date': df.index.min(),
+                'end_date': df.index.max(),
+                'total_days': len(df),
+                'missing_days': None,  # Would need comparison to trading calendar
+                'has_volume': bool('volume' in df.columns and df['volume'].notna().any())
+            }
+            reports.append(report)
+        
+        return pd.DataFrame(reports)
