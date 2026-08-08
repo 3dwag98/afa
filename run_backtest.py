@@ -16,7 +16,7 @@ import pandas as pd
 # Add workspace to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.universe import UniverseManager
+from src.universe import resolve_backtest_universe
 from src.data_store import DataStore, batch_download_and_cache
 from src.backtest_engine import BacktestEngine
 from src.risk_analytics import RiskAnalyzer
@@ -59,8 +59,22 @@ def parse_args():
     parser.add_argument(
         "--universe-size",
         type=int,
-        default=100,
-        help="Number of tickers to include (prevents running 2000 tickers on first test)"
+        default=None,
+        help="Number of tickers to include (None means ALL cached tickers)"
+    )
+    
+    parser.add_argument(
+        "--use-all-available",
+        action="store_true",
+        default=True,
+        help="Use all available cached tickers (calls resolve_backtest_universe)"
+    )
+    
+    parser.add_argument(
+        "--force-download",
+        action="store_true",
+        default=False,
+        help="Force full universe download from master list"
     )
     
     parser.add_argument(
@@ -77,6 +91,7 @@ def run_backtest(
     years: int,
     initial_capital: float,
     universe_size: int,
+    force_download: bool,
     output_file: str
 ) -> bool:
     """
@@ -85,7 +100,8 @@ def run_backtest(
     Args:
         years: Number of years for simulation.
         initial_capital: Starting capital in INR.
-        universe_size: Number of tickers to include.
+        universe_size: Number of tickers to include (None = ALL).
+        force_download: Force full universe download.
         output_file: Path for Excel report.
         
     Returns:
@@ -103,21 +119,20 @@ def run_backtest(
         
         print(f"Backtest Period: {start_date_str} to {end_date_str}")
         print(f"Initial Capital: ₹{initial_capital:,.2f}")
-        print(f"Universe Size: {universe_size} tickers")
+        print(f"Universe Size: {universe_size if universe_size else 'ALL'} tickers")
         print("-" * 50)
         
-        # Step 1: Fetch Universe
+        # Step 1: Fetch Universe using resolve_backtest_universe
         print("Fetching Universe...")
-        universe_mgr = UniverseManager()
-        master_tickers = universe_mgr.get_master_ticker_list()
+        tickers = resolve_backtest_universe(
+            force_full_download=force_download,
+            max_tickers=universe_size
+        )
         
-        # Limit universe size for testing
-        if universe_size > 0 and len(master_tickers) > universe_size:
-            tickers = master_tickers[:universe_size]
-            print(f"  Limited to {universe_size} tickers from {len(master_tickers)} available")
-        else:
-            tickers = master_tickers
-            print(f"  Using all {len(tickers)} tickers")
+        if not tickers:
+            raise SystemExit("No tickers with available data. Run with --force-download first.")
+        
+        print(f"  Resolved {len(tickers)} tickers with available data")
         
         if _shutdown_requested:
             return False
@@ -370,6 +385,7 @@ def main():
         years=args.years,
         initial_capital=args.initial_capital,
         universe_size=args.universe_size,
+        force_download=args.force_download,
         output_file=args.output_file
     )
     

@@ -464,15 +464,26 @@ pytest tests/test_scoring.py -v
 Run historical simulations with the `run_backtest.py` script:
 
 ```bash
-# Quick test with 50 tickers, 1 year
-python run_backtest.py --universe-size 50 --years 1
+# Quick test with 5 tickers, 1 year
+python run_backtest.py --universe-size 5 --years 1
 
-# Full 5-year backtest with 500 tickers
-python run_backtest.py --universe-size 500 --years 5
+# Full 5-year backtest with ALL cached tickers (auto-discovered)
+python run_backtest.py --years 5
+
+# Force download of full universe before backtest
+python run_backtest.py --force-download --years 5
 
 # Custom initial capital
 python run_backtest.py --initial-capital 5000000 --years 5
 ```
+
+### Universe Auto-Discovery
+
+The backtest engine now **automatically discovers all cached tickers** from the `data/market_data/` directory. This means:
+
+- By default, `--universe-size` is `None`, which uses **ALL** available tickers
+- Use `--universe-size N` to limit to N tickers for quick tests
+- Use `--force-download` to fetch fresh data for the entire master ticker list before running
 
 ### Advanced Risk Metrics
 

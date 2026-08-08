@@ -110,7 +110,16 @@ class BacktestEngine:
     
     def _load_all_data(self) -> None:
         """Load all ticker data into memory using data_store.load_ticker_data."""
-        for ticker in self.universe_tickers:
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Log progress for large universes
+        total_tickers = len(self.universe_tickers)
+        if total_tickers > 100:
+            logger.info(f"Loading data for {total_tickers} tickers (this may take a while)...")
+        
+        loaded_count = 0
+        for i, ticker in enumerate(self.universe_tickers):
             df = load_ticker_data(ticker, 
                                   start_date=self.start_date.strftime('%Y-%m-%d'),
                                   end_date=self.end_date.strftime('%Y-%m-%d'))
@@ -125,10 +134,17 @@ class BacktestEngine:
                 
                 df = df.sort_index()
                 self.ticker_data[ticker] = df
+                loaded_count += 1
             else:
                 # Mark as untradeable if no data
                 self.untradeable_tickers.add(ticker)
                 logger.warning(f"No data available for {ticker}, marking as untradeable")
+            
+            # Log progress every 50 tickers for large universes
+            if total_tickers > 100 and (i + 1) % 50 == 0:
+                logger.info(f"Loaded {i + 1}/{total_tickers} tickers...")
+        
+        logger.info(f"Successfully loaded {loaded_count}/{total_tickers} tickers")
     
     def _build_master_date_index(self) -> pd.DatetimeIndex:
         """
@@ -417,7 +433,18 @@ class BacktestEngine:
         signals = {}
         prev_date = current_date - pd.Timedelta(days=1)
         
-        for ticker in self.universe_tickers:
+        # Use tqdm for progress tracking if available and universe is large
+        try:
+            from tqdm import tqdm
+            use_tqdm = len(self.universe_tickers) > 100
+        except ImportError:
+            use_tqdm = False
+        
+        ticker_iter = self.universe_tickers
+        if use_tqdm:
+            ticker_iter = tqdm(ticker_iter, desc=f"Scanning tickers ({current_date.date()})", unit="ticker", leave=False)
+        
+        for ticker in ticker_iter:
             if ticker in self.untradeable_tickers:
                 continue
             
