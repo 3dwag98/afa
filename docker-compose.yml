@@ -14,7 +14,8 @@ services:
       - ./logs:/app/logs
     env_file:
       - .env
-    command: ["python", "main.py"]
+    entrypoint: ["python", "main.py"]
+    command: []
 
   # Test service (profile: base)
   test:
