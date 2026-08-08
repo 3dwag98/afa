@@ -19,11 +19,13 @@ try:
     from .models import AgentBrain
     from .learning import evaluate_and_learn
     from .config import AppConfig
+    from .execution_sim import ExecutionSimulator
 except ImportError:
     from data_store import load_ticker_data
     from models import AgentBrain
     from learning import evaluate_and_learn
     from config import AppConfig
+    from execution_sim import ExecutionSimulator
 
 
 class BacktestEngine:
@@ -102,6 +104,9 @@ class BacktestEngine:
         
         # Trading day counter for learning triggers
         self.trading_day_count = 0
+        
+        # Execution simulator for realistic friction modeling
+        self.execution_sim = ExecutionSimulator()
     
     def _load_all_data(self) -> None:
         """Load all ticker data into memory using data_store.load_ticker_data."""
@@ -261,6 +266,46 @@ class BacktestEngine:
                 return last_row[col]
         
         return None
+    
+    def _get_entry_price_for_tax(self, ticker: str) -> float:
+        """
+        Get the entry price for a holding (for tax calculation).
+        
+        Args:
+            ticker: Ticker symbol.
+            
+        Returns:
+            Entry price or 0 if not found.
+        """
+        # Look up the entry price from trade log
+        for trade in reversed(self.trade_log):
+            if trade.get('ticker') == ticker and trade.get('action') == 'BUY':
+                return trade.get('entry_price', trade.get('price', 0))
+        
+        # Fallback: use stop_loss level as proxy (set at 95% of entry)
+        if ticker in self.stop_loss_levels:
+            return self.stop_loss_levels[ticker] / 0.95
+        
+        return 0.0
+    
+    def _get_holding_days(self, ticker: str, current_date: pd.Timestamp) -> int:
+        """
+        Get the number of days a position has been held.
+        
+        Args:
+            ticker: Ticker symbol.
+            current_date: Current date.
+            
+        Returns:
+            Number of days held.
+        """
+        # Look up the entry date from trade log
+        for trade in reversed(self.trade_log):
+            if trade.get('ticker') == ticker and trade.get('action') == 'BUY':
+                entry_date = pd.to_datetime(trade.get('date', current_date))
+                return (current_date - entry_date).days
+        
+        return 0
     
     def _check_stop_loss_take_profit(self, current_date: pd.Timestamp) -> List[Dict[str, Any]]:
         """
@@ -436,6 +481,7 @@ class BacktestEngine:
         Execute simulated trades for T+1 Open.
         
         This avoids look-ahead bias by executing at the next day's open price.
+        Uses ExecutionSimulator to model realistic friction (costs, slippage, taxes).
         
         Args:
             execution_date: The date to execute trades (T+1).
@@ -469,28 +515,76 @@ class BacktestEngine:
                 orders_to_remove.append(i)
                 continue
             
-            trade_value = quantity * open_price
+            # Get market data for slippage calculation
+            df = self.ticker_data.get(ticker)
+            avg_daily_volume = 0
+            atr = open_price * 0.02  # Default ATR estimate (2% of price)
+            
+            if df is not None and execution_date in df.index:
+                # Calculate average daily volume (last 20 days)
+                prev_dates = df[df.index < execution_date].tail(20)
+                if 'volume' in prev_dates.columns and len(prev_dates) > 0:
+                    avg_daily_volume = int(prev_dates['volume'].mean())
+                
+                # Calculate ATR (14-day)
+                if len(prev_dates) >= 14:
+                    highs = prev_dates['high'] if 'high' in prev_dates.columns else prev_dates.iloc[:, 1]
+                    lows = prev_dates['low'] if 'low' in prev_dates.columns else prev_dates.iloc[:, 2]
+                    closes = prev_dates['close'] if 'close' in prev_dates.columns else prev_dates.iloc[:, 3]
+                    
+                    tr_list = []
+                    for j in range(1, len(prev_dates)):
+                        high_low = highs.iloc[j] - lows.iloc[j]
+                        high_close_prev = abs(highs.iloc[j] - closes.iloc[j-1])
+                        low_close_prev = abs(lows.iloc[j] - closes.iloc[j-1])
+                        tr = max(high_low, high_close_prev, low_close_prev)
+                        tr_list.append(tr)
+                    
+                    if tr_list:
+                        atr = sum(tr_list[-14:]) / min(14, len(tr_list[-14:]))
+            
+            # Check if trade should be executed based on cost vs reward
+            should_execute, exec_info = self.execution_sim.should_execute_trade(
+                side=action,
+                price=open_price,
+                quantity=quantity,
+                avg_daily_volume=max(avg_daily_volume, 1),  # Avoid division by zero
+                atr=atr,
+                expected_reward_atr=1.0  # Expecting 1 ATR reward
+            )
+            
+            if not should_execute:
+                logger.info(f"Skipping {action} order for {ticker}: friction exceeds expected reward")
+                orders_to_remove.append(i)
+                continue
+            
+            # Get adjusted execution price with slippage
+            adjusted_price = exec_info['adjusted_price']
+            trade_value = quantity * adjusted_price
+            txn_cost = exec_info['transaction_cost']
             
             if action == 'BUY':
-                if self.cash >= trade_value:
-                    self.cash -= trade_value
+                total_cost = trade_value + txn_cost
+                if self.cash >= total_cost:
+                    self.cash -= total_cost
                     self.holdings[ticker] = self.holdings.get(ticker, 0) + quantity
                     
                     # Set stop-loss and take-profit levels
                     # Stop-loss at 5% below entry
-                    self.stop_loss_levels[ticker] = open_price * 0.95
+                    self.stop_loss_levels[ticker] = adjusted_price * 0.95
                     # Take-profit at 10% above entry
-                    self.take_profit_levels[ticker] = open_price * 1.10
+                    self.take_profit_levels[ticker] = adjusted_price * 1.10
                     
                     trade_record = {
                         'date': execution_date.strftime('%Y-%m-%d'),
                         'ticker': ticker,
                         'action': 'BUY',
                         'quantity': quantity,
-                        'price': open_price,
+                        'price': adjusted_price,
                         'value': trade_value,
+                        'txn_cost': txn_cost,
                         'trigger': order.get('trigger', 'SIGNAL'),
-                        'entry_price': open_price
+                        'entry_price': adjusted_price
                     }
                     self.trade_log.append(trade_record)
                     executed_trades.append(trade_record)
@@ -498,8 +592,20 @@ class BacktestEngine:
                     
             elif action == 'SELL':
                 if ticker in self.holdings and self.holdings[ticker] >= quantity:
+                    # Get holding info for capital gains tax calculation
+                    entry_price = self._get_entry_price_for_tax(ticker)
+                    holding_days = self._get_holding_days(ticker, execution_date)
+                    
+                    # Calculate capital gains tax
+                    cap_gains_tax = self.execution_sim.calculate_capital_gains_tax(
+                        entry_price=entry_price,
+                        exit_price=adjusted_price,
+                        quantity=quantity,
+                        holding_days=holding_days
+                    )
+                    
                     self.holdings[ticker] -= quantity
-                    self.cash += trade_value
+                    self.cash += trade_value - cap_gains_tax  # Deduct tax from cash
                     
                     # Clear stop/target levels
                     if ticker in self.stop_loss_levels:
@@ -512,10 +618,15 @@ class BacktestEngine:
                         'ticker': ticker,
                         'action': 'SELL',
                         'quantity': quantity,
-                        'price': open_price,
+                        'price': adjusted_price,
                         'value': trade_value,
+                        'txn_cost': txn_cost,
+                        'cap_gains_tax': cap_gains_tax,
                         'trigger': order.get('trigger', 'SIGNAL'),
-                        'exit_price': open_price
+                        'exit_price': adjusted_price,
+                        'entry_price': entry_price,
+                        'holding_days': holding_days,
+                        'pnl': (adjusted_price - entry_price) * quantity - cap_gains_tax - txn_cost
                     }
                     self.trade_log.append(trade_record)
                     executed_trades.append(trade_record)
