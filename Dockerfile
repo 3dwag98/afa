@@ -45,9 +45,9 @@ RUN mkdir -p /app/data /app/models /app/output /app/logs \
 # Copy application code
 COPY portfolio_agent/ ./portfolio_agent/
 COPY config/ ./config/
-COPY main.py .
+COPY --link portfolio_agent/main.py ./main.py
 COPY run_backtest.py .
-COPY cli.py . 2>/dev/null || true
+COPY --link portfolio_agent/cli.py ./cli.py
 
 # Switch to non-root user
 USER appuser
