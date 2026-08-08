@@ -9,13 +9,12 @@ services:
       context: .
       dockerfile: Dockerfile
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
       - ./output:/app/output
       - ./logs:/app/logs
     env_file:
       - .env
-    command: python main.py
+    command: ["python", "main.py"]
 
   # Test service (profile: base)
   test:
@@ -24,13 +23,12 @@ services:
       context: .
       dockerfile: Dockerfile
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
       - ./output:/app/output
       - ./logs:/app/logs
     env_file:
       - .env
-    entrypoint: pytest tests/ -v
+    command: ["pytest", "tests/", "-v"]
 
   # Airflow PostgreSQL database (profile: airflow)
   postgres:
