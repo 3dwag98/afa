@@ -51,3 +51,13 @@ features:
       - atr_14
       - bollinger_pct_b
       - donchian_upper_20
+
+# Strategy settings
+strategy:
+  enabled: true
+  module: "portfolio_agent.strategies"
+  type: "rule_based"
+  config_path: "config/strategies/trend_breakout.yaml"
+  params:
+    type: "rule_based"
+    yaml_path: "config/strategies/trend_breakout.yaml"
