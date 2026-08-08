@@ -23,16 +23,26 @@ try:
     from src.storage import init_db, save_brain, load_brain, get_trade_history, get_open_trades
     from src.learning import evaluate_and_learn
     from src.outcomes import update_outcomes_from_market
+    from src.backtest_engine import BacktestEngine
+    from src.data_store import DataStore, batch_download_and_cache
+    from src.universe import resolve_backtest_universe
+    from src.risk_analytics import RiskAnalyzer
+    from src.backtest_reporting import export_backtest_excel
 except ImportError:
     from config import get_config
     from orchestrator import run_orchestrator
     from storage import init_db, save_brain, load_brain, get_trade_history, get_open_trades
     from learning import evaluate_and_learn
     from outcomes import update_outcomes_from_market
+    from backtest_engine import BacktestEngine
+    from data_store import DataStore, batch_download_and_cache
+    from universe import resolve_backtest_universe
+    from risk_analytics import RiskAnalyzer
+    from backtest_reporting import export_backtest_excel
 
 
-def run_daily_job(**context) -> Dict[str, Any]:
-    """Run the daily portfolio optimization job.
+def run_daily_agent_job(**context) -> Dict[str, Any]:
+    """Run the daily agent job in paper trading mode.
 
     Args:
         **context: Airflow context dictionary (unused but accepted for compatibility).
@@ -43,7 +53,7 @@ def run_daily_job(**context) -> Dict[str, Any]:
     Raises:
         RuntimeError: If paper_trading_mode is false.
     """
-    logger.info("Starting daily job")
+    logger.info("Starting daily agent job")
 
     # Load config
     config = get_config()
@@ -53,14 +63,258 @@ def run_daily_job(**context) -> Dict[str, Any]:
         raise RuntimeError("Live trading is disabled. Set paper_trading_mode=true.")
 
     # Run orchestrator
-    excel_path = run_orchestrator(force_refresh=False)
+    excel_path = run_orchestrator(force_refresh=False, config=config)
 
-    logger.info(f"Daily job completed successfully. Excel report: {excel_path}")
+    logger.info(f"Daily agent job completed successfully. Excel report: {excel_path}")
 
     return {
         "status": "success",
-        "job": "DAILY_RUN",
+        "job": "DAILY_AGENT",
         "excel_path": excel_path
+    }
+
+
+def run_backtest_job(**context) -> Dict[str, Any]:
+    """Run a small backtest job with safe default parameters.
+
+    Args:
+        **context: Airflow context dictionary (unused but accepted for compatibility).
+
+    Returns:
+        Dictionary with status, job name, and backtest Excel path.
+
+    Defaults:
+        years: 1
+        universe_size: 20
+        force_download: False
+    """
+    from datetime import timedelta
+    from pathlib import Path
+    
+    logger.info("Starting backtest job with safe defaults")
+
+    # Load config
+    config = get_config()
+
+    # Safe default parameters
+    years = 1
+    universe_size = 20
+    force_download = False
+    initial_capital = config.initial_capital_inr if hasattr(config, 'initial_capital_inr') else 1000000
+    output_file = "output/backtest_small_report.xlsx"
+
+    # Calculate date range
+    from datetime import datetime
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=years * 365)
+    
+    start_date_str = start_date.strftime("%Y-%m-%d")
+    end_date_str = end_date.strftime("%Y-%m-%d")
+
+    logger.info(f"Backtest period: {start_date_str} to {end_date_str}")
+    logger.info(f"Universe size: {universe_size}, Initial capital: {initial_capital}")
+
+    # Fetch universe
+    tickers = resolve_backtest_universe(
+        force_full_download=force_download,
+        max_tickers=universe_size
+    )
+
+    if not tickers:
+        raise RuntimeError("No tickers with available data. Run download first.")
+
+    logger.info(f"Resolved {len(tickers)} tickers")
+
+    # Download/cache data
+    data_store = DataStore()
+    batch_download_and_cache(
+        tickers=tickers,
+        start_date=start_date_str,
+        end_date=end_date_str,
+        chunk_size=50,
+        skip_existing=True
+    )
+
+    # Initialize and run backtest engine
+    engine = BacktestEngine(
+        start_date=start_date_str,
+        end_date=end_date_str,
+        initial_capital=initial_capital,
+        universe_tickers=tickers
+    )
+
+    # Run simulation
+    engine.run_backtest()
+
+    # Calculate analytics
+    analyzer = RiskAnalyzer(
+        daily_equity_curve=engine.daily_equity_curve,
+        trade_log=engine.trade_log
+    )
+    analytics_report = analyzer.generate_analytics_report()
+
+    # Prepare analytics for export
+    analytics_for_export = {
+        'cagr': analytics_report.get('cagr', 0),
+        'sharpe': analytics_report.get('sharpe_ratio', 0),
+        'sortino': analytics_report.get('sortino_ratio', 0),
+        'max_drawdown': analytics_report.get('max_drawdown_pct', 0),
+        'profit_factor': analytics_report.get('profit_factor', 0),
+        'probability_of_ruin': analytics_report.get('mc_probability_of_ruin_pct', 0),
+        'total_return': analytics_report.get('total_return_pct', 0),
+        'volatility': analytics_report.get('annualized_volatility_pct', 0),
+        'win_rate': analytics_report.get('win_rate_pct', 0),
+        'total_trades': analytics_report.get('total_trades', 0),
+        'final_portfolio_value': analytics_report.get('final_capital', 0),
+        'initial_capital': initial_capital,
+        'monte_carlo_results': {
+            'percentile_5': analytics_report.get('mc_percentile_5', 0),
+            'percentile_50': analytics_report.get('mc_median_terminal_wealth', 0),
+            'percentile_95': analytics_report.get('mc_percentile_95', 0)
+        }
+    }
+
+    # Export Excel report
+    export_backtest_excel(
+        analytics=analytics_for_export,
+        equity_curve=engine.daily_equity_curve,
+        trade_log=engine.trade_log,
+        brain_evolution=engine.brain_evolution,
+        daily_activity_log=engine.daily_activity_log,
+        filepath=output_file
+    )
+
+    logger.info(f"Backtest job completed. Report: {output_file}")
+
+    return {
+        "status": "success",
+        "job": "BACKTEST_SMALL",
+        "excel_path": output_file,
+        "cagr": analytics_report.get('cagr_pct', 0),
+        "sharpe": analytics_report.get('sharpe_ratio', 0),
+        "total_trades": analytics_report.get('total_trades', 0)
+    }
+
+
+def run_full_backtest_job(**context) -> Dict[str, Any]:
+    """Run a full 5-year backtest with all available tickers.
+
+    Args:
+        **context: Airflow context dictionary (unused but accepted for compatibility).
+
+    Returns:
+        Dictionary with status, job name, and backtest Excel path.
+
+    Parameters:
+        years: 5
+        universe_size: None (all available tickers)
+        force_download: False
+    """
+    from datetime import timedelta
+    from pathlib import Path
+    
+    logger.info("Starting full backtest job (5 years, all tickers)")
+
+    # Load config
+    config = get_config()
+
+    # Full backtest parameters
+    years = 5
+    universe_size = None  # All available tickers
+    force_download = False
+    initial_capital = config.initial_capital_inr if hasattr(config, 'initial_capital_inr') else 1000000
+    output_file = "output/backtest_full_report.xlsx"
+
+    # Calculate date range
+    from datetime import datetime
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=years * 365)
+    
+    start_date_str = start_date.strftime("%Y-%m-%d")
+    end_date_str = end_date.strftime("%Y-%m-%d")
+
+    logger.info(f"Backtest period: {start_date_str} to {end_date_str}")
+    logger.info(f"Universe size: ALL, Initial capital: {initial_capital}")
+
+    # Fetch universe (all available)
+    tickers = resolve_backtest_universe(
+        force_full_download=force_download,
+        max_tickers=universe_size
+    )
+
+    if not tickers:
+        raise RuntimeError("No tickers with available data. Run download first.")
+
+    logger.info(f"Resolved {len(tickers)} tickers")
+
+    # Download/cache data
+    data_store = DataStore()
+    batch_download_and_cache(
+        tickers=tickers,
+        start_date=start_date_str,
+        end_date=end_date_str,
+        chunk_size=50,
+        skip_existing=True
+    )
+
+    # Initialize and run backtest engine
+    engine = BacktestEngine(
+        start_date=start_date_str,
+        end_date=end_date_str,
+        initial_capital=initial_capital,
+        universe_tickers=tickers
+    )
+
+    # Run simulation
+    engine.run_backtest()
+
+    # Calculate analytics
+    analyzer = RiskAnalyzer(
+        daily_equity_curve=engine.daily_equity_curve,
+        trade_log=engine.trade_log
+    )
+    analytics_report = analyzer.generate_analytics_report()
+
+    # Prepare analytics for export
+    analytics_for_export = {
+        'cagr': analytics_report.get('cagr', 0),
+        'sharpe': analytics_report.get('sharpe_ratio', 0),
+        'sortino': analytics_report.get('sortino_ratio', 0),
+        'max_drawdown': analytics_report.get('max_drawdown_pct', 0),
+        'profit_factor': analytics_report.get('profit_factor', 0),
+        'probability_of_ruin': analytics_report.get('mc_probability_of_ruin_pct', 0),
+        'total_return': analytics_report.get('total_return_pct', 0),
+        'volatility': analytics_report.get('annualized_volatility_pct', 0),
+        'win_rate': analytics_report.get('win_rate_pct', 0),
+        'total_trades': analytics_report.get('total_trades', 0),
+        'final_portfolio_value': analytics_report.get('final_capital', 0),
+        'initial_capital': initial_capital,
+        'monte_carlo_results': {
+            'percentile_5': analytics_report.get('mc_percentile_5', 0),
+            'percentile_50': analytics_report.get('mc_median_terminal_wealth', 0),
+            'percentile_95': analytics_report.get('mc_percentile_95', 0)
+        }
+    }
+
+    # Export Excel report
+    export_backtest_excel(
+        analytics=analytics_for_export,
+        equity_curve=engine.daily_equity_curve,
+        trade_log=engine.trade_log,
+        brain_evolution=engine.brain_evolution,
+        daily_activity_log=engine.daily_activity_log,
+        filepath=output_file
+    )
+
+    logger.info(f"Full backtest job completed. Report: {output_file}")
+
+    return {
+        "status": "success",
+        "job": "BACKTEST_FULL",
+        "excel_path": output_file,
+        "cagr": analytics_report.get('cagr_pct', 0),
+        "sharpe": analytics_report.get('sharpe_ratio', 0),
+        "total_trades": analytics_report.get('total_trades', 0)
     }
 
 
