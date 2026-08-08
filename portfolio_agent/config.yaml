@@ -32,3 +32,32 @@ schedule_outcome_time_ist: "16:00"
 airflow_ui_enabled: true
 airflow_webserver_port: 8080
 airflow_timezone: "Asia/Kolkata"
+
+# Feature Store settings
+features:
+  normalize: false
+  normalize_window: 252
+  feature_sets:
+    core:
+      - sma_20
+      - sma_50
+      - sma_200
+    momentum:
+      - rsi_14
+      - macd
+      - return_1d
+      - return_5d
+    volatility:
+      - atr_14
+      - bollinger_pct_b
+      - donchian_upper_20
+
+# Strategy settings
+strategy:
+  enabled: true
+  module: "portfolio_agent.strategies"
+  type: "rule_based"
+  config_path: "config/strategies/trend_breakout.yaml"
+  params:
+    type: "rule_based"
+    yaml_path: "config/strategies/trend_breakout.yaml"

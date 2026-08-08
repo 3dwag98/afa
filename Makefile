@@ -1,4 +1,4 @@
-.PHONY: setup build agent backtest backtest-small backtest-full download-data test logs clean-output clean-logs airflow-build airflow-init airflow-up airflow-down airflow-logs help
+.PHONY: setup build build-airflow train-gpu backtest agent test airflow-up airflow-down logs clean-output clean-logs help
 
 help:
 	@echo "AFA Portfolio Agent - Available Commands"
@@ -6,14 +6,15 @@ help:
 	@echo ""
 	@echo "Setup & Build:"
 	@echo "  make setup         - Run platform setup script"
-	@echo "  make build         - Build Docker images"
+	@echo "  make build         - Build Docker images (GPU-enabled)"
+	@echo "  make build-airflow - Build Airflow services"
+	@echo ""
+	@echo "Training & Backtesting:"
+	@echo "  make train-gpu     - Run GPU training (requires NVIDIA Container Toolkit)"
+	@echo "  make backtest      - Run default backtest"
 	@echo ""
 	@echo "Running:"
 	@echo "  make agent         - Run the live agent"
-	@echo "  make backtest      - Run default backtest"
-	@echo "  make backtest-small- Run quick backtest (1 year, 20 tickers)"
-	@echo "  make backtest-full - Run full backtest (5 years)"
-	@echo "  make download-data - Download market data (50 tickers, 2 years)"
 	@echo "  make test          - Run pytest"
 	@echo "  make logs          - Follow Docker logs"
 	@echo ""
@@ -21,12 +22,9 @@ help:
 	@echo "  make clean-output  - Remove output Excel files"
 	@echo "  make clean-logs    - Remove log files"
 	@echo ""
-	@echo "Airflow (requires --profile airflow):"
-	@echo "  make airflow-build - Build Airflow services"
-	@echo "  make airflow-init  - Initialize Airflow database"
-	@echo "  make airflow-up    - Start Airflow services"
+	@echo "Airflow:"
+	@echo "  make airflow-up    - Start Airflow services (UI at localhost:8080)"
 	@echo "  make airflow-down  - Stop Airflow services"
-	@echo "  make airflow-logs  - Follow Airflow scheduler logs"
 	@echo ""
 
 setup:
@@ -35,20 +33,17 @@ setup:
 build:
 	docker compose build
 
-agent:
-	docker compose run --rm agent
+build-airflow:
+	docker compose --profile airflow build
+
+train-gpu:
+	docker compose run --rm train python -m portfolio_agent.cli train --model lstm --device auto
 
 backtest:
-	docker compose run --rm backtest
+	docker compose run --rm backtest python -m portfolio_agent.cli backtest --use-trained-model
 
-backtest-small:
-	docker compose run --rm backtest python run_backtest.py --years 1 --universe-size 20
-
-backtest-full:
-	docker compose run --rm backtest python run_backtest.py --years 5
-
-download-data:
-	docker compose run --rm backtest python run_backtest.py --force-download --universe-size 50 --years 2
+agent:
+	docker compose run --rm agent python -m portfolio_agent.cli run-agent
 
 test:
 	docker compose run --rm test
@@ -62,17 +57,8 @@ clean-output:
 clean-logs:
 	rm -f logs/*.log || true
 
-airflow-build:
-	docker compose --profile airflow build
-
-airflow-init:
-	docker compose --profile airflow run --rm airflow-init
-
 airflow-up:
 	docker compose --profile airflow up -d
 
 airflow-down:
 	docker compose --profile airflow down
-
-airflow-logs:
-	docker compose --profile airflow logs -f airflow-scheduler
