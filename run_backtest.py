@@ -279,6 +279,7 @@ def run_backtest(
             equity_curve=engine.daily_equity_curve,
             trade_log=engine.trade_log,
             brain_evolution=engine.brain_evolution,
+            daily_activity_log=engine.daily_activity_log,
             filepath=output_file
         )
         
@@ -360,6 +361,7 @@ def _save_partial_results(engine, initial_capital, output_file, title_suffix):
             equity_curve=engine.daily_equity_curve,
             trade_log=engine.trade_log,
             brain_evolution=engine.brain_evolution,
+            daily_activity_log=engine.daily_activity_log,
             filepath=str(partial_output)
         )
         

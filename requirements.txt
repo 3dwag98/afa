@@ -5,3 +5,4 @@ xlsxwriter
 pytest
 PyYAML
 tqdm
+openpyxl
