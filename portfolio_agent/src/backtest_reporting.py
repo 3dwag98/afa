@@ -15,6 +15,67 @@ import xlsxwriter
 logger = logging.getLogger(__name__)
 
 
+# Expected columns for Trade_Log sheet (16 columns in exact order)
+EXPECTED_COLUMNS = [
+    'trade_id',
+    'ticker',
+    'entry_date',
+    'entry_price',
+    'exit_date',
+    'exit_price',
+    'quantity',
+    'side',
+    'signal_trigger',
+    'gross_pnl',
+    'transaction_costs',
+    'taxes',
+    'net_pnl',
+    'return_pct',
+    'holding_days',
+    'exit_reason'
+]
+
+
+def _normalize_trade_log(trade_log) -> pd.DataFrame:
+    """
+    Normalize trade log into a flat DataFrame with consistent columns.
+    
+    Args:
+        trade_log: List of trade dicts, or dict of trades.
+        
+    Returns:
+        DataFrame with exactly 16 columns as defined in EXPECTED_COLUMNS.
+    """
+    # Handle None / empty
+    if not trade_log:
+        return pd.DataFrame(columns=EXPECTED_COLUMNS)
+    
+    # If it's a dict, try to convert to list of its values
+    if isinstance(trade_log, dict):
+        trade_log = list(trade_log.values())
+    
+    # Ensure list of dicts
+    rows = []
+    for t in trade_log:
+        if isinstance(t, dict):
+            # Flatten nested dicts - skip any nested dict/list values
+            row = {}
+            for k in EXPECTED_COLUMNS:
+                val = t.get(k)
+                # Skip nested structures
+                if isinstance(val, (dict, list)):
+                    val = None
+                row[k] = val
+            rows.append(row)
+        else:
+            # Skip malformed entries but log them
+            logger.warning(f"Skipping malformed trade entry: {t}")
+            continue
+    
+    df = pd.DataFrame(rows, columns=EXPECTED_COLUMNS)
+    return df
+
+
 def export_backtest_excel(
     analytics: Dict[str, Any],
     equity_curve: pd.Series,
@@ -210,71 +271,112 @@ def export_backtest_excel(
         # =========================================================================
         # Sheet 3: Trade_Log
         # =========================================================================
-        trade_df = _prepare_trade_log_df(trade_log)
+        trade_df = _normalize_trade_log(trade_log)
+        
+        # Verify we have exactly 16 columns
+        assert trade_df.shape[1] == 16, f"Trade_Log should have 16 columns, got {trade_df.shape[1]}"
+        logger.info(f"Trade_Log shape: {trade_df.shape}")
+        
         if len(trade_df) > 0:
             trade_df.to_excel(writer, sheet_name='Trade_Log', index=False, header=True)
 
             worksheet_trades = writer.sheets['Trade_Log']
-            worksheet_trades.set_column('A:A', 12)  # Entry Date
-            worksheet_trades.set_column('B:B', 12)  # Exit Date
-            worksheet_trades.set_column('C:C', 10)  # Ticker
-            worksheet_trades.set_column('D:D', 8)   # Side
-            worksheet_trades.set_column('E:E', 12)  # Entry Price
-            worksheet_trades.set_column('F:F', 12)  # Exit Price
-            worksheet_trades.set_column('G:G', 8)   # Qty
-            worksheet_trades.set_column('H:H', 14)  # Gross PnL
-            worksheet_trades.set_column('I:I', 14)  # STT/Taxes
-            worksheet_trades.set_column('J:J', 12)  # Slippage
-            worksheet_trades.set_column('K:K', 14)  # Net PnL
-            worksheet_trades.set_column('L:L', 10)  # Holding Days
-            worksheet_trades.set_column('M:M', 15)  # Signal Trigger
+            
+            # Set column widths for all 16 columns
+            col_widths = [
+                ('A:A', 14),   # trade_id
+                ('B:B', 12),   # ticker
+                ('C:C', 12),   # entry_date
+                ('D:D', 12),   # entry_price
+                ('E:E', 12),   # exit_date
+                ('F:F', 12),   # exit_price
+                ('G:G', 10),   # quantity
+                ('H:H', 8),    # side
+                ('I:I', 15),   # signal_trigger
+                ('J:J', 14),   # gross_pnl
+                ('K:K', 14),   # transaction_costs
+                ('L:L', 12),   # taxes
+                ('M:M', 14),   # net_pnl
+                ('N:N', 12),   # return_pct
+                ('O:O', 12),   # holding_days
+                ('P:P', 15),   # exit_reason
+            ]
+            for col_range, width in col_widths:
+                worksheet_trades.set_column(col_range, width)
 
-            # Get column indices for price and PnL columns (after renaming)
-            entry_price_col = trade_df.columns.get_loc('Entry Price')
-            exit_price_col = trade_df.columns.get_loc('Exit Price')
-            gross_pnl_col = trade_df.columns.get_loc('Gross PnL')
-            net_pnl_col = trade_df.columns.get_loc('Net PnL')
+            # Get column indices for formatting
+            entry_price_col = trade_df.columns.get_loc('entry_price')
+            exit_price_col = trade_df.columns.get_loc('exit_price')
+            gross_pnl_col = trade_df.columns.get_loc('gross_pnl')
+            transaction_costs_col = trade_df.columns.get_loc('transaction_costs')
+            taxes_col = trade_df.columns.get_loc('taxes')
+            net_pnl_col = trade_df.columns.get_loc('net_pnl')
+            return_pct_col = trade_df.columns.get_loc('return_pct')
 
-            # Apply currency formatting to price and PnL columns
+            # Apply formatting to each row
             for row_idx in range(1, len(trade_df) + 1):
-                # Entry Price (column E)
+                # Entry Price (column D)
                 val_entry = trade_df.iloc[row_idx - 1, entry_price_col]
                 if pd.notna(val_entry):
-                    worksheet_trades.write_number(row_idx, 4, val_entry, currency_format)
+                    worksheet_trades.write_number(row_idx, 3, val_entry, currency_format)
 
-                # Exit Price (column F)
+                # Exit Price (column E)
                 val_exit = trade_df.iloc[row_idx - 1, exit_price_col]
                 if pd.notna(val_exit):
-                    worksheet_trades.write_number(row_idx, 5, val_exit, currency_format)
+                    worksheet_trades.write_number(row_idx, 4, val_exit, currency_format)
 
-                # Gross PnL (column H)
+                # Gross PnL (column J)
                 val_gross = trade_df.iloc[row_idx - 1, gross_pnl_col]
                 if pd.notna(val_gross):
                     fmt = currency_positive if val_gross >= 0 else currency_negative
-                    worksheet_trades.write_number(row_idx, 7, val_gross, fmt)
+                    worksheet_trades.write_number(row_idx, 9, val_gross, fmt)
 
-                # Net PnL (column K)
+                # Transaction Costs (column K)
+                val_txn = trade_df.iloc[row_idx - 1, transaction_costs_col]
+                if pd.notna(val_txn):
+                    worksheet_trades.write_number(row_idx, 10, val_txn, currency_format)
+
+                # Taxes (column L)
+                val_taxes = trade_df.iloc[row_idx - 1, taxes_col]
+                if pd.notna(val_taxes):
+                    worksheet_trades.write_number(row_idx, 11, val_taxes, currency_format)
+
+                # Net PnL (column M)
                 val_net = trade_df.iloc[row_idx - 1, net_pnl_col]
                 if pd.notna(val_net):
                     fmt = currency_positive if val_net >= 0 else currency_negative
-                    worksheet_trades.write_number(row_idx, 10, val_net, fmt)
+                    worksheet_trades.write_number(row_idx, 12, val_net, fmt)
 
-            # Apply conditional formatting for Net PnL column (K)
+                # Return Pct (column N) - stored as decimal (e.g., 0.05 for 5%)
+                val_return = trade_df.iloc[row_idx - 1, return_pct_col]
+                if pd.notna(val_return):
+                    # Ensure value is stored as decimal
+                    return_val = val_return / 100 if abs(val_return) > 1 else val_return
+                    fmt = percent_positive if return_val >= 0 else percent_negative
+                    worksheet_trades.write_number(row_idx, 13, return_val, fmt)
+
+            # Apply conditional formatting for Net PnL column (M)
             worksheet_trades.conditional_format(
-                1, 10, len(trade_df), 10,
+                1, 12, len(trade_df), 12,
                 {'type': 'cell', 'criteria': '>=', 'value': 0, 'format': currency_positive}
             )
             worksheet_trades.conditional_format(
-                1, 10, len(trade_df), 10,
+                1, 12, len(trade_df), 12,
                 {'type': 'cell', 'criteria': '<', 'value': 0, 'format': currency_negative}
             )
+            
+            # Freeze the header row
+            worksheet_trades.freeze_panes(1, 0)
         else:
             # Create empty sheet with headers if no trades
-            empty_df = pd.DataFrame(columns=[
-                'Entry Date', 'Exit Date', 'Ticker', 'Side', 'Entry Price', 'Exit Price',
-                'Qty', 'Gross PnL', 'STT/Taxes', 'Slippage', 'Net PnL', 'Holding Days', 'Signal Trigger'
-            ])
+            empty_df = pd.DataFrame(columns=EXPECTED_COLUMNS)
             empty_df.to_excel(writer, sheet_name='Trade_Log', index=False)
+            
+            worksheet_trades = writer.sheets['Trade_Log']
+            # Still set column widths and freeze header for empty sheet
+            for col_range, width in col_widths:
+                worksheet_trades.set_column(col_range, width)
+            worksheet_trades.freeze_panes(1, 0)
 
         # =========================================================================
         # Sheet 4: Monthly_Heatmap

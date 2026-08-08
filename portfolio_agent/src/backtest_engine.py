@@ -304,6 +304,23 @@ class BacktestEngine:
         
         return 0.0
     
+    def _get_entry_date_for_ticker(self, ticker: str) -> Optional[str]:
+        """
+        Get the entry date for a holding (for trade log).
+        
+        Args:
+            ticker: Ticker symbol.
+            
+        Returns:
+            Entry date in ISO format or None if not found.
+        """
+        # Look up the entry date from trade log
+        for trade in reversed(self.trade_log):
+            if trade.get('ticker') == ticker and 'entry_date' in trade:
+                return trade.get('entry_date')
+        
+        return None
+    
     def _get_holding_days(self, ticker: str, current_date: pd.Timestamp) -> int:
         """
         Get the number of days a position has been held.
@@ -390,18 +407,32 @@ class BacktestEngine:
                 sale_value = quantity * trigger_price
                 self.cash += sale_value
                 
-                # Record trade
+                # Calculate return percentage
+                entry_val = (entry_price or 0) * quantity
+                gross_pnl = (trigger_price - (entry_price or 0)) * quantity
+                return_pct = (gross_pnl / entry_val * 100) if entry_val > 0 else 0.0
+                
+                # Determine exit reason
+                exit_reason = 'stop_loss' if trigger_type == 'STOP_LOSS' else 'target'
+                
+                # Record trade with all 16 required fields
                 trade_record = {
-                    'date': current_date.strftime('%Y-%m-%d'),
+                    'trade_id': f"T{len(self.trade_log) + 1:06d}",
                     'ticker': ticker,
-                    'action': 'SELL',
-                    'quantity': quantity,
-                    'price': trigger_price,
-                    'value': sale_value,
-                    'trigger': trigger_type,
+                    'entry_date': self._get_entry_date_for_ticker(ticker),
                     'entry_price': entry_price,
+                    'exit_date': current_date.strftime('%Y-%m-%d'),
                     'exit_price': trigger_price,
-                    'pnl': (trigger_price - (entry_price or 0)) * quantity
+                    'quantity': quantity,
+                    'side': 'LONG',
+                    'signal_trigger': 'STOP_LOSS' if trigger_type == 'STOP_LOSS' else 'TAKE_PROFIT',
+                    'gross_pnl': gross_pnl,
+                    'transaction_costs': 0.0,
+                    'taxes': 0.0,
+                    'net_pnl': gross_pnl,
+                    'return_pct': return_pct,
+                    'holding_days': self._get_holding_days(ticker, current_date),
+                    'exit_reason': exit_reason
                 }
                 self.trade_log.append(trade_record)
                 executed_trades.append(trade_record)
@@ -602,16 +633,24 @@ class BacktestEngine:
                     # Take-profit at 10% above entry
                     self.take_profit_levels[ticker] = adjusted_price * 1.10
                     
+                    # Record BUY trade with all 16 required fields
                     trade_record = {
-                        'date': execution_date.strftime('%Y-%m-%d'),
+                        'trade_id': f"T{len(self.trade_log) + 1:06d}",
                         'ticker': ticker,
-                        'action': 'BUY',
+                        'entry_date': execution_date.strftime('%Y-%m-%d'),
+                        'entry_price': adjusted_price,
+                        'exit_date': None,
+                        'exit_price': None,
                         'quantity': quantity,
-                        'price': adjusted_price,
-                        'value': trade_value,
-                        'txn_cost': txn_cost,
-                        'trigger': order.get('trigger', 'SIGNAL'),
-                        'entry_price': adjusted_price
+                        'side': 'LONG',
+                        'signal_trigger': order.get('trigger', 'SIGNAL'),
+                        'gross_pnl': 0.0,
+                        'transaction_costs': txn_cost,
+                        'taxes': 0.0,
+                        'net_pnl': -txn_cost,
+                        'return_pct': 0.0,
+                        'holding_days': 0,
+                        'exit_reason': None
                     }
                     self.trade_log.append(trade_record)
                     executed_trades.append(trade_record)
@@ -640,20 +679,39 @@ class BacktestEngine:
                     if ticker in self.take_profit_levels:
                         del self.take_profit_levels[ticker]
                     
+                    # Calculate return percentage
+                    entry_val = (entry_price or 0) * quantity
+                    gross_pnl = (adjusted_price - (entry_price or 0)) * quantity
+                    net_pnl = gross_pnl - cap_gains_tax - txn_cost
+                    return_pct = (gross_pnl / entry_val * 100) if entry_val > 0 else 0.0
+                    
+                    # Determine exit reason
+                    trigger_type = order.get('trigger', 'SIGNAL')
+                    if trigger_type == 'STOP_LOSS':
+                        exit_reason = 'stop_loss'
+                    elif trigger_type == 'TAKE_PROFIT':
+                        exit_reason = 'target'
+                    else:
+                        exit_reason = 'end_of_backtest'
+                    
+                    # Record SELL trade with all 16 required fields
                     trade_record = {
-                        'date': execution_date.strftime('%Y-%m-%d'),
+                        'trade_id': f"T{len(self.trade_log) + 1:06d}",
                         'ticker': ticker,
-                        'action': 'SELL',
-                        'quantity': quantity,
-                        'price': adjusted_price,
-                        'value': trade_value,
-                        'txn_cost': txn_cost,
-                        'cap_gains_tax': cap_gains_tax,
-                        'trigger': order.get('trigger', 'SIGNAL'),
-                        'exit_price': adjusted_price,
+                        'entry_date': self._get_entry_date_for_ticker(ticker),
                         'entry_price': entry_price,
+                        'exit_date': execution_date.strftime('%Y-%m-%d'),
+                        'exit_price': adjusted_price,
+                        'quantity': quantity,
+                        'side': 'LONG',
+                        'signal_trigger': trigger_type,
+                        'gross_pnl': gross_pnl,
+                        'transaction_costs': txn_cost,
+                        'taxes': cap_gains_tax,
+                        'net_pnl': net_pnl,
+                        'return_pct': return_pct,
                         'holding_days': holding_days,
-                        'pnl': (adjusted_price - entry_price) * quantity - cap_gains_tax - txn_cost
+                        'exit_reason': exit_reason
                     }
                     self.trade_log.append(trade_record)
                     executed_trades.append(trade_record)
@@ -765,20 +823,35 @@ class BacktestEngine:
                     # Force liquidation
                     quantity = self.holdings[ticker]
                     last_price = self._get_last_valid_price(ticker, current_date)
+                    entry_price = self._get_entry_price_for_tax(ticker)
                     
                     if last_price is not None and quantity > 0:
                         sale_value = quantity * last_price
                         self.cash += sale_value
                         
+                        # Calculate return percentage
+                        entry_val = (entry_price or 0) * quantity
+                        gross_pnl = (last_price - (entry_price or 0)) * quantity
+                        return_pct = (gross_pnl / entry_val * 100) if entry_val > 0 else 0.0
+                        
+                        # Record SELL trade with all 16 required fields
                         trade_record = {
-                            'date': current_date.strftime('%Y-%m-%d'),
+                            'trade_id': f"T{len(self.trade_log) + 1:06d}",
                             'ticker': ticker,
-                            'action': 'SELL',
+                            'entry_date': self._get_entry_date_for_ticker(ticker),
+                            'entry_price': entry_price,
+                            'exit_date': current_date.strftime('%Y-%m-%d'),
+                            'exit_price': last_price,
                             'quantity': quantity,
-                            'price': last_price,
-                            'value': sale_value,
-                            'trigger': 'DELISTED',
-                            'exit_price': last_price
+                            'side': 'LONG',
+                            'signal_trigger': 'DELISTED',
+                            'gross_pnl': gross_pnl,
+                            'transaction_costs': 0.0,
+                            'taxes': 0.0,
+                            'net_pnl': gross_pnl,
+                            'return_pct': return_pct,
+                            'holding_days': self._get_holding_days(ticker, current_date),
+                            'exit_reason': 'delisted'
                         }
                         self.trade_log.append(trade_record)
                         
