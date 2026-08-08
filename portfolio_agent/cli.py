@@ -66,7 +66,7 @@ def cmd_download_data(args) -> int:
 
 def cmd_train(args) -> int:
     """Train model command."""
-    import pandas as pd
+    import torch
     from portfolio_agent.agents.trainer import run_training
     from portfolio_agent.utils.device import get_device
     
@@ -78,7 +78,7 @@ def cmd_train(args) -> int:
     
     # Validate device
     device = get_device(config.training.device)
-    if device.type == "cuda" and not pd.cuda.is_available():
+    if device.type == "cuda" and not torch.cuda.is_available():
         print("Warning: CUDA requested but not available, falling back to CPU")
         config.training.device = "cpu"
     
