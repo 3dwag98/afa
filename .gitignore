@@ -1,56 +1,48 @@
-*.bat
-*.tmp
+```
+# Docker
+.dockerignore
+
+# Logs and temp files
 *.log
-*.swp
-*.swo
-.DS_Store
-Thumbs.db
+*.tmp
+
+# Environment
 .env
 .env.local
 *.env.*
+
+# Dependencies
 node_modules/
-venv/
 .venv/
+venv/
 __pycache__/
 .mypy_cache/
 .pytest_cache/
+coverage/
+htmlcov/
+.dist-info/
+
+# Build artifacts
 dist/
 build/
 target/
-.gradle/
-.vscode/
-.idea/
-coverage/
-htmlcov/
-.coverage
 *.pyc
 *.class
 *.o
+*.obj
 *.exe
 *.dll
 *.so
 *.a
-*.obj
 *.out
-*.zip
-*.gz
-*.tar
-*.tgz
-*.bz2
-*.xz
-*.7z
-*.rar
-*.zst
-*.lz4
-*.lzh
-*.cab
-*.arj
-*.rpm
-*.deb
-*.Z
-*.lz
-*.lzo
-*.tar.gz
-*.tar.bz2
-*.tar.xz
-*.tar.zst
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# System
+.DS_Store
+Thumbs.db
+```
