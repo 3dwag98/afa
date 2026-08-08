@@ -1,43 +1,11 @@
 ```
-# Python
-__pycache__/
+# Compiled Python files
 *.pyc
-*.pyo
-*.pyd
-*.py~
-
-# Dependencies
-venv/
-.venv/
-.env
-.env.local
-.env.*
-
-# Build artifacts
-dist/
-build/
-*.egg-info/
+__pycache__/
 
 # Logs
 *.log
 
-# OS generated files
-.DS_Store
-Thumbs.db
-
-# Coverage reports
-.coverage
-htmlcov/
-coverage/
-
-# Temporary files
-*.tmp
-*.swp
-*.swo
-
-# Model files (if they are large binary files)
-*.pt
-*.pth
-*.ckpt
-*.model
+# Excel reports and outputs
+output/
 ```
