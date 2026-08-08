@@ -1,10 +1,11 @@
 #!/bin/bash
 # AFA Agent Runner Script for macOS/Linux
-# Usage: ./run-agent.sh [OPTIONS]
-# Options:
-#   --force-refresh      Force refresh all data
-#   --simulate-outcome   Simulate trade outcomes
-#   --update-outcomes    Update actual trade outcomes
+# Usage: ./run-agent.sh
+# 
+# Options can be set in config.yaml:
+#   force_refresh: true/false
+#   simulate_outcome: true/false
+#   update_outcomes: true/false
 
 set -e
 
@@ -14,11 +15,8 @@ if ! docker info > /dev/null 2>&1; then
     exit 1
 fi
 
-# Parse command line arguments
-ARGS="$@"
-
 echo "Starting AFA Agent..."
-docker compose --profile base run --rm agent $ARGS
+docker compose --profile base run --rm agent
 
 if [ $? -eq 0 ]; then
     echo ""

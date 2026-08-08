@@ -1,18 +1,13 @@
 @echo off
 REM AFA Agent Runner Script for Windows
-REM Usage: run-agent.bat [OPTIONS]
-REM Options:
-REM   --force-refresh      Force refresh all data
-REM   --simulate-outcome   Simulate trade outcomes
-REM   --update-outcomes    Update actual trade outcomes
+REM Usage: run-agent.bat
+REM 
+REM Options can be set in config.yaml:
+REM   force_refresh: true/false
+REM   simulate_outcome: true/false
+REM   update_outcomes: true/false
 
 setlocal enabledelayedexpansion
-
-REM Parse command line arguments
-set ARGS=
-for %%a in (%*) do (
-    set ARGS=!ARGS! %%a
-)
 
 REM Check if Docker is running
 docker info >nul 2>&1
@@ -23,7 +18,7 @@ if errorlevel 1 (
 
 REM Build and run the agent
 echo Starting AFA Agent...
-docker compose --profile base run --rm agent %ARGS%
+docker compose --profile base run --rm agent
 
 if errorlevel 0 (
     echo.
