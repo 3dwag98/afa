@@ -1,44 +1,4 @@
 ```
-# Docker-related
-.dockerenv
-Dockerfile.backup
-*.dockerignore
-
-# Build artifacts (if any Docker-related builds occur)
-build/
-dist/
-target/
-
 # Dependencies
-node_modules/
-venv/
-.env
-.env.local
-.env.*
-
-# Logs and temporary files
-*.log
-*.tmp
-*.swp
-
-# Editors
-.vscode/
-.idea/
-
-# Python (if Python components exist in Docker context)
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-*.so
-
-# Coverage reports
-coverage/
-htmlcov/
-.coverage
-
-# OS generated files
-.DS_Store
-Thumbs.db
+uv.lock
 ```
