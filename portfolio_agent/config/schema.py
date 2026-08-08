@@ -79,9 +79,9 @@ class TrainingConfig(BaseModel):
     train_fraction: float = Field(
         default=0.8, description="Fraction of data to use for training"
     )
-    batch_size: int = Field(default=32, description="Training batch size")
+    batch_size: int = Field(default=128, description="Training batch size (larger for GPU efficiency)")
     epochs: int = Field(default=100, description="Number of training epochs")
-    learning_rate: float = Field(default=0.001, description="Learning rate")
+    learning_rate: float = Field(default=0.003, description="Learning rate")
     device: Literal["auto", "cuda", "mps", "cpu"] = Field(
         default="auto", description="Device for model training"
     )
@@ -89,7 +89,7 @@ class TrainingConfig(BaseModel):
         default=True, description="Whether to use mixed precision training"
     )
     num_workers: int = Field(
-        default=4, description="Number of data loading workers"
+        default=2, description="Number of data loading workers (lower on Windows)"
     )
 
 

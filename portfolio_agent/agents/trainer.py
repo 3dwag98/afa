@@ -141,7 +141,7 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
     
     if use_mixed_precision:
         print("Mixed Precision: Enabled")
-        scaler = torch.cuda.amp.GradScaler()
+        scaler = torch.amp.GradScaler('cuda')
     else:
         print("Mixed Precision: Disabled")
         scaler = None
@@ -228,6 +228,11 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
     # =========================================================================
     # 7. Epoch Loop
     # =========================================================================
+    # Enable cudnn benchmarking for faster training on fixed-size inputs
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        print("cuDNN benchmarking: Enabled (optimized for fixed input sizes)")
+    
     for epoch in range(config.training.epochs):
         if early_stop:
             print(f"\nEarly stopping at epoch {epoch + 1}")
@@ -239,14 +244,16 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
         num_train_batches = 0
         
         # Use autocast for mixed precision
-        for batch_x, batch_y in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.training.epochs} [Train]", leave=False):
+        # Set progress bar to update less frequently for speed
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.training.epochs} [Train]", leave=False, mininterval=0.5)
+        for batch_x, batch_y in pbar:
             batch_x = batch_x.to(device, non_blocking=True)
             batch_y = batch_y.to(device, non_blocking=True)
             
             optimizer.zero_grad()
             
             if use_mixed_precision:
-                with torch.cuda.amp.autocast():
+                with torch.autocast('cuda' if device.type == 'cuda' else 'cpu'):
                     outputs = model(batch_x)
                     loss = loss_fn(outputs.squeeze(), batch_y)
                 
@@ -276,7 +283,7 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
                 batch_y = batch_y.to(device, non_blocking=True)
                 
                 if use_mixed_precision:
-                    with torch.cuda.amp.autocast():
+                    with torch.autocast('cuda' if device.type == 'cuda' else 'cpu'):
                         outputs = model(batch_x)
                         loss = loss_fn(outputs.squeeze(), batch_y)
                 else:

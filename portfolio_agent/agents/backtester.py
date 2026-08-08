@@ -383,8 +383,9 @@ class BacktesterAgent:
             # We need to inject model predictions into the process
             engine._generate_signals = self._generate_signals_with_model.__get__(engine, BacktestEngine)
             engine.model_loader = self.model_loader  # Inject model loader
-            # Inject the helper method as well
+            # Inject the helper methods as well
             engine._prepare_features_for_model_inline = self._prepare_features_for_model_inline.__get__(engine, BacktestEngine)
+            engine._get_model_probability = self._get_model_probability.__get__(engine, BacktestEngine)
         
         # Run simulation
         logger.info(f"Running backtest from {start_date} to {end_date}")
