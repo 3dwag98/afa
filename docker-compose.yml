@@ -1,12 +1,26 @@
 # Docker Compose for AFA (Autonomous Financial Advisor)
 # Cross-platform compatible (Windows, macOS, Linux)
+# Modern format with GPU support, uv package manager, and service profiles
+
+# YAML anchor for GPU configuration to avoid repetition
+x-gpu-config: &gpu-config
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
 
 services:
-  # Live agent service
+  # Live agent service (profile: default)
   agent:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: afa-app:latest
     container_name: afa-agent
+    profiles: ["default"]
     env_file:
       - path: .env
         required: false
@@ -15,16 +29,20 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
+      - ./models:/app/models
       - ./output:/app/output
       - ./logs:/app/logs
-    command: ["python", "main.py"]
+    command: ["python", "-m", "portfolio_agent.cli", "run-agent"]
     restart: "no"
 
-  # Backtest service
+  # Backtest service (profile: default)
   backtest:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: afa-app:latest
     container_name: afa-backtest
+    profiles: ["default"]
     env_file:
       - path: .env
         required: false
@@ -33,16 +51,43 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
+      - ./models:/app/models
       - ./output:/app/output
       - ./logs:/app/logs
-    command: ["python", "run_backtest.py"]
+    command: ["python", "-m", "portfolio_agent.cli", "backtest"]
     restart: "no"
 
-  # Test service
+  # Train service (profile: default, GPU-enabled)
+  train:
+    <<: *gpu-config
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: afa-app:latest
+    container_name: afa-train
+    profiles: ["default"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TZ: Asia/Kolkata
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./output:/app/output
+      - ./logs:/app/logs
+    command: ["python", "-m", "portfolio_agent.cli", "train"]
+    restart: "no"
+
+  # Test service (profile: default)
   test:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: afa-app:latest
     container_name: afa-test
+    profiles: ["default"]
     env_file:
       - path: .env
         required: false
@@ -52,9 +97,9 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
+      - ./models:/app/models
       - ./output:/app/output
       - ./logs:/app/logs
-      - ./tests:/app/tests
     entrypoint: ["pytest"]
     command: ["tests", "-v"]
     restart: "no"
@@ -62,7 +107,7 @@ services:
   # Airflow PostgreSQL database (profile: airflow)
   postgres:
     profiles: ["airflow"]
-    image: postgres:13
+    image: postgres:16-alpine
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
@@ -78,7 +123,10 @@ services:
   # Airflow initialization service (profile: airflow)
   airflow-init:
     profiles: ["airflow"]
-    image: apache/airflow:2.10.4-python3.11
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    image: afa-airflow:latest
     user: "${AIRFLOW_UID:-50000}:0"
     depends_on:
       postgres:
@@ -91,16 +139,14 @@ services:
       PYTHONPATH: /opt/airflow/project
     volumes:
       - ./airflow/dags:/opt/airflow/dags
-      - ./src:/opt/airflow/project/src
-      - ./run_backtest.py:/opt/airflow/project/run_backtest.py:ro
-      - ./main.py:/opt/airflow/project/main.py:ro
+      - .:/opt/airflow/project
       - ./config.yaml:/opt/airflow/project/config.yaml:ro
       - ./data:/opt/airflow/project/data
+      - ./models:/opt/airflow/project/models
       - ./output:/opt/airflow/project/output
       - ./logs:/opt/airflow/project/logs
     command: >
       bash -c "
-        pip install --no-cache-dir -r /opt/airflow/project/requirements.txt &&
         airflow db migrate &&
         airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com
       "
@@ -108,7 +154,10 @@ services:
   # Airflow webserver (profile: airflow)
   airflow-webserver:
     profiles: ["airflow"]
-    image: apache/airflow:2.10.4-python3.11
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    image: afa-airflow:latest
     user: "${AIRFLOW_UID:-50000}:0"
     depends_on:
       airflow-init:
@@ -124,24 +173,23 @@ services:
       - "8080:8080"
     volumes:
       - ./airflow/dags:/opt/airflow/dags
-      - ./src:/opt/airflow/project/src
-      - ./run_backtest.py:/opt/airflow/project/run_backtest.py:ro
-      - ./main.py:/opt/airflow/project/main.py:ro
+      - .:/opt/airflow/project
       - ./config.yaml:/opt/airflow/project/config.yaml:ro
       - ./data:/opt/airflow/project/data
+      - ./models:/opt/airflow/project/models
       - ./output:/opt/airflow/project/output
       - ./logs:/opt/airflow/project/logs
       - ./airflow/logs:/opt/airflow/logs
-    command: >
-      bash -c "
-        pip install --no-cache-dir -r /opt/airflow/project/requirements.txt &&
-        airflow webserver
-      "
+    command: airflow webserver
 
-  # Airflow scheduler (profile: airflow)
+  # Airflow scheduler (profile: airflow, GPU-enabled)
   airflow-scheduler:
+    <<: *gpu-config
     profiles: ["airflow"]
-    image: apache/airflow:2.10.4-python3.11
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    image: afa-airflow:latest
     user: "${AIRFLOW_UID:-50000}:0"
     depends_on:
       airflow-init:
@@ -154,19 +202,14 @@ services:
       PYTHONPATH: /opt/airflow/project
     volumes:
       - ./airflow/dags:/opt/airflow/dags
-      - ./src:/opt/airflow/project/src
-      - ./run_backtest.py:/opt/airflow/project/run_backtest.py:ro
-      - ./main.py:/opt/airflow/project/main.py:ro
+      - .:/opt/airflow/project
       - ./config.yaml:/opt/airflow/project/config.yaml:ro
       - ./data:/opt/airflow/project/data
+      - ./models:/opt/airflow/project/models
       - ./output:/opt/airflow/project/output
       - ./logs:/opt/airflow/project/logs
       - ./airflow/logs:/opt/airflow/logs
-    command: >
-      bash -c "
-        pip install --no-cache-dir -r /opt/airflow/project/requirements.txt &&
-        airflow scheduler
-      "
+    command: airflow scheduler
 
 volumes:
   postgres_data:
