@@ -5,44 +5,25 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Testing
-.pytest_cache/
-.coverage
-coverage/
-htmlcov/
+# Data and output files
+data/market_data/*.parquet
+output/
 
 # Environment
-.venv/
-venv/
 .env
 .env.local
 *.env.*
 
+# Dependencies
+venv/
+.venv/
+.env/
+node_modules/
+
 # Logs
 *.log
 
-# Editors
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Build artifacts
-dist/
-build/
-*.so
-*.dylib
-*.dll
-*.exe
-*.out
-
-# Dependencies
-node_modules/
-.mypy_cache/
-.gradle/
-target/
-
-# System
+# OS generated files
 .DS_Store
 Thumbs.db
 ```
