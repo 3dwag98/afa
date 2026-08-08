@@ -36,6 +36,9 @@ class FeaturesConfig(BaseModel):
     normalize: bool = Field(
         default=True, description="Whether to normalize features"
     )
+    normalize_window: int = Field(
+        default=252, description="Window size for feature normalization"
+    )
     feature_sets: Dict[str, List[str]] = Field(
         default_factory=lambda: {
             "price": ["open", "high", "low", "close", "volume"],

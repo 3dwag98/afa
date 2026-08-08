@@ -256,7 +256,60 @@ class BacktesterAgent:
         except Exception as e:
             logger.warning(f"Error preparing features for {ticker}: {e}")
             return None
-    
+
+    def _prepare_features_for_model_inline(
+        self,
+        df: pd.DataFrame,
+        ticker: str,
+        model_loader
+    ) -> Optional[torch.Tensor]:
+        """Prepare features for model prediction (inline version for BacktestEngine).
+
+        Args:
+            df: DataFrame with OHLCV data up to current date.
+            ticker: Ticker symbol.
+            model_loader: ModelLoader instance with feature_names and metadata.
+
+        Returns:
+            Tensor of shape (1, sequence_length, n_features) or None.
+        """
+        if model_loader is None or model_loader.metadata is None:
+            return None
+
+        feature_names = model_loader.feature_names
+        sequence_length = model_loader.metadata.get('sequence_length', 60)
+
+        if len(feature_names) == 0:
+            return None
+
+        try:
+            # Build features using the pipeline
+            from portfolio_agent.agents.trainer import build_features
+            feature_df = build_features(
+                df,
+                feature_names,
+                normalize=False  # Model expects pre-normalized or raw features
+            )
+
+            # Drop NaN values
+            feature_df = feature_df.dropna()
+
+            if len(feature_df) < sequence_length:
+                logger.debug(f"Not enough data for {ticker}: {len(feature_df)} < {sequence_length}")
+                return None
+
+            # Take the last sequence_length samples
+            recent_features = feature_df.iloc[-sequence_length:].values
+
+            # Convert to tensor and add batch dimension
+            features_tensor = torch.FloatTensor(recent_features).unsqueeze(0)
+
+            return features_tensor
+
+        except Exception as e:
+            logger.warning(f"Error preparing features for {ticker}: {e}")
+            return None
+
     def _get_model_probability(
         self, 
         features: torch.Tensor
@@ -330,6 +383,8 @@ class BacktesterAgent:
             # We need to inject model predictions into the process
             engine._generate_signals = self._generate_signals_with_model.__get__(engine, BacktestEngine)
             engine.model_loader = self.model_loader  # Inject model loader
+            # Inject the helper method as well
+            engine._prepare_features_for_model_inline = self._prepare_features_for_model_inline.__get__(engine, BacktestEngine)
         
         # Run simulation
         logger.info(f"Running backtest from {start_date} to {end_date}")
@@ -416,7 +471,7 @@ class BacktesterAgent:
             # Prepare features for model
             model_loader = getattr(self, 'model_loader', None)
             if model_loader is not None and model_loader._model_loaded:
-                features_tensor = self._prepare_features_for_model(hist_data, ticker)
+                features_tensor = self._prepare_features_for_model_inline(hist_data, ticker, model_loader)
                 
                 if features_tensor is not None:
                     model_prob = self._get_model_probability(features_tensor)
