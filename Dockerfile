@@ -1,20 +1,19 @@
 # Dockerfile for AFA (Autonomous Financial Advisor)
 # Portfolio Agent and Historical Backtest Engine
-# Cross-platform compatible (Windows, macOS, Linux)
+# Modern, optimized with uv package manager and GPU support
 
 FROM python:3.11-slim
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    TZ=Asia/Kolkata \
-    APP_HOME=/app \
-    PYTHONPATH=/app
+    UV_SYSTEM_PYTHON=1 \
+    PATH="/root/.local/bin:$PATH"
 
 # Labels
 LABEL project="afa" \
       component="agent-backtest" \
-      purpose="portfolio agent and historical backtest engine"
+      purpose="portfolio agent and historical backtest engine with GPU support"
 
 # Install minimal OS dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -23,35 +22,35 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
+# Install uv package manager
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+
 # Set working directory
 WORKDIR /app
 
-# Copy requirements first for better layer caching
-COPY requirements.txt .
+# Copy dependency files first for better layer caching
+COPY pyproject.toml .
+COPY uv.lock* ./
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application code - copy from portfolio_agent directory since main.py is a symlink
-COPY portfolio_agent/main.py .
-COPY run_backtest.py .
-COPY config.yaml .
-COPY requirements.txt .
-COPY portfolio_agent/src/ ./src/
-COPY tests/ ./tests/
-COPY scripts/ ./scripts/
-
-# Create runtime directories
-RUN mkdir -p /app/data /app/data/market_data /app/output /app/logs
+# Install Python dependencies with GPU support (frozen lockfile)
+RUN uv sync --frozen --no-dev --extra gpu || uv sync --no-dev --extra gpu
 
 # Create non-root user
-RUN useradd --create-home --shell /bin/bash appuser
+RUN useradd --create-home --shell /bin/bash --uid 1000 appuser
 
-# Give ownership of data, output, and logs directories to appuser
-RUN chown -R appuser:appuser /app/data /app/output /app/logs
+# Create runtime directories and set ownership
+RUN mkdir -p /app/data /app/models /app/output /app/logs \
+    && chown -R appuser:appuser /app/data /app/models /app/output /app/logs
+
+# Copy application code
+COPY portfolio_agent/ ./portfolio_agent/
+COPY config/ ./config/
+COPY main.py .
+COPY run_backtest.py .
+COPY cli.py . 2>/dev/null || true
 
 # Switch to non-root user
 USER appuser
 
 # Default command runs the live agent
-CMD ["python", "main.py"]
+CMD ["python", "-m", "portfolio_agent.cli", "run-agent"]
