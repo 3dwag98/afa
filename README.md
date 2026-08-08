@@ -528,6 +528,378 @@ Using Monte Carlo bootstrap resampling (10,000 simulations), this metric estimat
 - **5-15%**: Moderate risk, acceptable for most strategies
 - **> 20%**: High risk, consider reducing position sizes
 
+## Airflow Commands
+
+### Build Airflow
+
+```bash
+docker compose --profile airflow build
+```
+
+### Initialize Airflow
+
+```bash
+docker compose --profile airflow run --rm airflow-init
+```
+
+### Start Airflow
+
+```bash
+docker compose --profile airflow up -d
+```
+
+Access the Airflow UI at http://localhost:8080 (login: admin / admin)
+
+### Trigger Small Backtest Manually
+
+```bash
+docker compose --profile airflow exec airflow-scheduler airflow dags trigger afa_backtest_small
+```
+
+### Trigger Full Backtest Manually
+
+```bash
+docker compose --profile airflow exec airflow-scheduler airflow dags trigger afa_backtest_full
+```
+
+### Stop Airflow
+
+```bash
+docker compose --profile airflow down
+```
+
+### View Airflow Logs
+
+```bash
+docker compose --profile airflow logs -f airflow-scheduler
+```
+
+## Windows PowerShell Commands
+
+### Setup
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/setup_windows.ps1
+```
+
+### Run Agent
+
+```powershell
+.\scripts\run_agent.ps1
+```
+
+### Run Backtest
+
+```powershell
+# Default backtest
+.\scripts\run_backtest.ps1
+
+# Small backtest (1 year, 20 tickers)
+.\scripts\run_backtest.ps1 --years 1 --universe-size 20
+
+# Full 5-year backtest
+.\scripts\run_backtest.ps1 --years 5
+
+# Force download data first
+.\scripts\run_backtest.ps1 --force-download --universe-size 50 --years 2
+```
+
+### Run Tests
+
+```powershell
+.\scripts\run_tests.ps1
+```
+
+### Build Images
+
+```powershell
+docker compose build
+```
+
+### Start Airflow
+
+```powershell
+docker compose --profile airflow up -d
+```
+
+### Stop Airflow
+
+```powershell
+docker compose --profile airflow down
+```
+
+### View Airflow Logs
+
+```powershell
+docker compose --profile airflow logs -f airflow-scheduler
+```
+
+**Note:** Windows users do not need bash or make. The PowerShell scripts provide full functionality. If you prefer using `make`, you can install it via Chocolatey (`choco install make`) or use the included batch files.
+
+---
+
+## Docker Smoke Test
+
+Validate your Docker setup with a comprehensive smoke test that builds the image, runs tests, and executes a small backtest.
+
+### Linux/macOS
+
+```bash
+./scripts/smoke_test.sh
+```
+
+### Windows PowerShell
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/smoke_test.ps1
+```
+
+Or directly from PowerShell:
+
+```powershell
+.\scripts\smoke_test.ps1
+```
+
+### What the Smoke Test Does
+
+1. **Builds** the Docker image (`docker compose build`)
+2. **Runs tests** (`docker compose run --rm test`)
+3. **Checks agent** help/dry run (`docker compose run --rm agent python main.py --help`)
+4. **Checks backtest** help/dry run (`docker compose run --rm backtest python run_backtest.py --help`)
+5. **Runs a small backtest** (1 year, 10 tickers) to verify end-to-end functionality
+
+### Expected Output
+
+After successful completion, check the `./output` directory for generated Excel files from the small backtest.
+
+### Manual Smoke Test Steps
+
+If you prefer to run steps individually:
+
+```bash
+# Build
+docker compose build
+
+# Run tests
+docker compose run --rm test
+
+# Quick agent check
+docker compose run --rm agent python main.py --help || true
+
+# Quick backtest check  
+docker compose run --rm backtest python run_backtest.py --help || true
+
+# Small backtest
+docker compose run --rm backtest python run_backtest.py --years 1 --universe-size 10
+```
+
+---
+
+## Running With Docker
+
+This section provides comprehensive instructions for running the AFA agent and backtests using Docker on any platform.
+
+### 1. Initial Setup
+
+**Linux/macOS:**
+```bash
+python scripts/setup_platform.py
+chmod +x scripts/*.sh
+```
+
+**Windows:**
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/setup_windows.ps1
+```
+
+**Optional build (if you want to pre-build the image):**
+```bash
+docker compose build
+```
+
+### 2. Run the Live Paper-Trading Agent
+
+**Linux/macOS:**
+```bash
+./scripts/run_agent.sh
+```
+
+**Windows:**
+```powershell
+.\scripts\run_agent.ps1
+```
+
+**Or directly with docker compose:**
+```bash
+docker compose run --rm agent
+```
+
+**Output:** The agent generates an Excel report at:
+```
+output/Agent_Orchestrator_Output.xlsx
+```
+
+### 3. Run Backtests
+
+**Small quick backtest (1 year, 20 tickers):**
+```bash
+docker compose run --rm backtest python run_backtest.py --years 1 --universe-size 20
+```
+
+**5-year backtest using all available cached tickers:**
+```bash
+docker compose run --rm backtest python run_backtest.py --years 5
+```
+
+**Force download more historical data first:**
+```bash
+docker compose run --rm backtest python run_backtest.py --force-download --universe-size 50 --years 2
+```
+
+**Using helper scripts:**
+
+Linux/macOS:
+```bash
+./scripts/run_backtest.sh --years 1 --universe-size 20
+./scripts/run_backtest.sh --years 5
+```
+
+Windows:
+```powershell
+.\scripts\run_backtest.ps1 --years 1 --universe-size 20
+.\scripts\run_backtest.ps1 --years 5
+```
+
+**Output:** Backtest reports are generated at:
+```
+output/Backtest_Report.xlsx
+```
+
+### 4. Run Tests
+
+```bash
+docker compose run --rm test
+```
+
+Or using helper scripts:
+
+Linux/macOS:
+```bash
+./scripts/run_tests.sh
+```
+
+Windows:
+```powershell
+.\scripts\run_tests.ps1
+```
+
+### 5. Optional Airflow Scheduler
+
+For automated scheduling of daily agent runs and backtests.
+
+**Build:**
+```bash
+docker compose --profile airflow build
+```
+
+**Initialize:**
+```bash
+docker compose --profile airflow run --rm airflow-init
+```
+
+**Start:**
+```bash
+docker compose --profile airflow up -d
+```
+
+**Open UI:**
+Navigate to http://localhost:8080
+
+**Default local login:**
+- Username: `admin`
+- Password: `admin`
+
+**Trigger daily agent:**
+```bash
+docker compose --profile airflow exec airflow-scheduler airflow dags trigger afa_daily_agent
+```
+
+**Trigger small backtest:**
+```bash
+docker compose --profile airflow exec airflow-scheduler airflow dags trigger afa_backtest_small
+```
+
+**Trigger full backtest:**
+```bash
+docker compose --profile airflow exec airflow-scheduler airflow dags trigger afa_backtest_full
+```
+
+**Stop Airflow:**
+```bash
+docker compose --profile airflow down
+```
+
+**View Airflow logs:**
+```bash
+docker compose --profile airflow logs -f airflow-scheduler
+```
+
+### 6. Persistent Data
+
+The following host folders persist results and state between Docker runs:
+
+| Directory | Purpose |
+|-----------|---------|
+| `data/` | Agent brain (`agent_brain.json`), SQLite database (`portfolio_agent.db`), settings state |
+| `data/market_data/` | Cached historical ticker parquet files (downloaded once, reused) |
+| `output/` | Excel reports (`Agent_Orchestrator_Output.xlsx`, `Backtest_Report.xlsx`) |
+| `logs/` | Runtime logs (`agent.log`, backtest logs, etc.) |
+
+These directories are mounted as Docker volumes, so your data persists even if you remove containers.
+
+### 7. Troubleshooting
+
+**Docker daemon not running:**
+- Start Docker Desktop (Windows/macOS) or the Docker service (Linux)
+- Verify with: `docker info`
+
+**Permission denied on Linux:**
+```bash
+sudo chown -R 1000:1000 data output logs
+```
+If using Airflow:
+```bash
+sudo chown -R 50000:0 data output logs airflow
+```
+
+**Backtest is slow:**
+- Use `--universe-size 20` first for quick tests
+- Full universe backtest downloads and processes many tickers
+- Consider using `--force-download` only when needed
+
+**Excel output missing:**
+- Check logs for errors:
+  ```bash
+  docker compose logs agent
+  docker compose logs backtest
+  ```
+- Verify the `output/` directory exists and is writable
+
+**Windows line-ending errors:**
+- Ensure `.gitattributes` exists in the repository
+- Shell scripts should use LF line endings, not CRLF
+- Use PowerShell scripts (`.ps1`) instead of bash scripts on Windows
+
+**Module import errors:**
+- Ensure `config.yaml` exists at project root
+- Verify Docker volumes are mounted correctly in `docker-compose.yml`
+
+**Airflow not starting:**
+- Run initialization first: `docker compose --profile airflow run --rm airflow-init`
+- Check logs: `docker compose --profile airflow logs airflow-init`
+
+---
+
 ## Alternative Scheduling Options
 
 ### Windows Task Scheduler

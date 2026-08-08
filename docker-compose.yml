@@ -2,34 +2,62 @@
 # Cross-platform compatible (Windows, macOS, Linux)
 
 services:
-  # Backtest service (profile: base)
-  backtest:
-    profiles: ["base"]
-    build:
-      context: .
-      dockerfile: Dockerfile
+  # Live agent service
+  agent:
+    build: .
+    image: afa-app:latest
+    container_name: afa-agent
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TZ: Asia/Kolkata
     volumes:
+      - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
       - ./output:/app/output
       - ./logs:/app/logs
-    env_file:
-      - .env
-    entrypoint: ["python", "run_backtest.py"]
-    command: []
+    command: ["python", "main.py"]
+    restart: "no"
 
-  # Test service (profile: base)
-  test:
-    profiles: ["base"]
-    build:
-      context: .
-      dockerfile: Dockerfile
+  # Backtest service
+  backtest:
+    build: .
+    image: afa-app:latest
+    container_name: afa-backtest
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TZ: Asia/Kolkata
     volumes:
+      - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
       - ./output:/app/output
       - ./logs:/app/logs
+    command: ["python", "run_backtest.py"]
+    restart: "no"
+
+  # Test service
+  test:
+    build: .
+    image: afa-app:latest
+    container_name: afa-test
     env_file:
-      - .env
-    command: ["pytest", "tests/", "-v"]
+      - path: .env
+        required: false
+    environment:
+      TZ: Asia/Kolkata
+      PYTHONDONTWRITEBYTECODE: 1
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+      - ./output:/app/output
+      - ./logs:/app/logs
+      - ./tests:/app/tests
+    entrypoint: ["pytest"]
+    command: ["tests", "-v"]
+    restart: "no"
 
   # Airflow PostgreSQL database (profile: airflow)
   postgres:
@@ -42,10 +70,10 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "airflow"]
-      interval: 10s
-      retries: 5
-      start_period: 10s
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   # Airflow initialization service (profile: airflow)
   airflow-init:
@@ -57,19 +85,19 @@ services:
         condition: service_healthy
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-      AIRFLOW__CORE__FERNET_KEY: ''
-      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
-      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DEFAULT_TIMEZONE: Asia/Kolkata
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       PYTHONPATH: /opt/airflow/project
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./src:/opt/airflow/project/src
-      - ./portfolio_agent/config.yaml:/opt/airflow/project/config.yaml:ro
+      - ./run_backtest.py:/opt/airflow/project/run_backtest.py:ro
+      - ./main.py:/opt/airflow/project/main.py:ro
+      - ./config.yaml:/opt/airflow/project/config.yaml:ro
       - ./data:/opt/airflow/project/data
       - ./output:/opt/airflow/project/output
       - ./logs:/opt/airflow/project/logs
-      - ./requirements.txt:/opt/airflow/project/requirements.txt:ro
     command: >
       bash -c "
         pip install --no-cache-dir -r /opt/airflow/project/requirements.txt &&
@@ -87,7 +115,9 @@ services:
         condition: service_completed_successfully
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DEFAULT_TIMEZONE: Asia/Kolkata
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__WEBSERVER__WEB_SERVER_PORT: 8080
       PYTHONPATH: /opt/airflow/project
     ports:
@@ -95,12 +125,13 @@ services:
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./src:/opt/airflow/project/src
-      - ./portfolio_agent/config.yaml:/opt/airflow/project/config.yaml:ro
+      - ./run_backtest.py:/opt/airflow/project/run_backtest.py:ro
+      - ./main.py:/opt/airflow/project/main.py:ro
+      - ./config.yaml:/opt/airflow/project/config.yaml:ro
       - ./data:/opt/airflow/project/data
       - ./output:/opt/airflow/project/output
       - ./logs:/opt/airflow/project/logs
       - ./airflow/logs:/opt/airflow/logs
-      - ./requirements.txt:/opt/airflow/project/requirements.txt:ro
     command: >
       bash -c "
         pip install --no-cache-dir -r /opt/airflow/project/requirements.txt &&
@@ -117,17 +148,20 @@ services:
         condition: service_completed_successfully
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DEFAULT_TIMEZONE: Asia/Kolkata
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       PYTHONPATH: /opt/airflow/project
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./src:/opt/airflow/project/src
-      - ./portfolio_agent/config.yaml:/opt/airflow/project/config.yaml:ro
+      - ./run_backtest.py:/opt/airflow/project/run_backtest.py:ro
+      - ./main.py:/opt/airflow/project/main.py:ro
+      - ./config.yaml:/opt/airflow/project/config.yaml:ro
       - ./data:/opt/airflow/project/data
       - ./output:/opt/airflow/project/output
       - ./logs:/opt/airflow/project/logs
       - ./airflow/logs:/opt/airflow/logs
-      - ./requirements.txt:/opt/airflow/project/requirements.txt:ro
     command: >
       bash -c "
         pip install --no-cache-dir -r /opt/airflow/project/requirements.txt &&

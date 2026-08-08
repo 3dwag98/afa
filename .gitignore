@@ -5,19 +5,55 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+env/
 venv/
 .venv/
+.venv.bak/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+*.tmp
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Environment
 .env
 .env.local
-.env.*
+*.env.*
 
-# Logs
-logs/
+# Dependencies
+node_modules/
+
+# Testing
+.pytest_cache/
+.mypy_cache/
+htmlcov/
+coverage/
+
+# IDE
+.vscode/
+.idea/
 
 # Build artifacts
-*.pyc
-portfolio_agent/src/__pycache__/
-
-# Environment specific
-.env
+dist/
+build/
+target/
+.gradle/
+*.class
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.a
+*.out
 ```
