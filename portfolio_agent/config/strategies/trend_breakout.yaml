@@ -1,0 +1,53 @@
+# Trend + Breakout + Volume + Monte Carlo Strategy
+# 
+# This strategy implements the hardcoded scoring logic from the original agent
+# as a configurable rule-based strategy.
+
+name: "Trend Breakout Volume MC"
+description: "Combines trend following, breakout detection, volume confirmation, and Monte Carlo probability"
+version: "1.0"
+
+# Entry conditions - all must be true for a BUY signal
+entry:
+  description: "All conditions must be met for entry"
+  conditions:
+    - field: "close"
+      operator: ">"
+      reference_field: "sma_200"
+      description: "Price above 200-day SMA"
+    
+    - field: "close"
+      operator: ">"
+      reference_field: "sma_50"
+      description: "Price above 50-day SMA"
+    
+    - field: "close"
+      operator: ">"
+      reference_field: "prev_donchian_upper_20"
+      description: "Price broke out above previous Donchian upper band"
+    
+    - field: "volume_ratio"
+      operator: ">"
+      value: 1.5
+      description: "Volume ratio above 1.5x average"
+
+# Exit rules (stop loss and take profit)
+exit:
+  description: "Risk management rules based on ATR"
+  stop_loss:
+    type: "atr_multiple"
+    multiplier: 1.5
+    description: "Stop loss at 1.5x ATR below entry"
+  take_profit:
+    type: "atr_multiple"
+    multiplier: 2.0
+    description: "Take profit at 2.0x ATR above entry"
+
+# Scoring weights (should sum to 100)
+scoring:
+  description: "Weights for each scoring component"
+  weights:
+    trend: 25.0           # Weight for trend score
+    breakout: 25.0        # Weight for breakout score  
+    volume: 20.0          # Weight for volume score
+    model_probability: 30.0  # Weight for Monte Carlo probability score
