@@ -1,58 +1,66 @@
 # Portfolio Agent Configuration
-# These values can be overridden by environment variables with PA_ prefix
+# These values can be overridden by environment variables with AFA_ prefix
+# Example: AFA_TRAINING__DEVICE="cuda" overrides training.device
 
-# Core portfolio settings
-portfolio_value_inr: 308733
-risk_per_trade_pct: 0.01
-max_single_position_pct: 0.03
-min_price_inr: 20
-target_prob_profit: 0.55
-min_reward_risk: 1.5
-learning_rate: 0.15
-min_trades_for_learning: 5
+# Data configuration
+data:
+  data_dir: data
+  market_data_dir: data/market_data
+  default_history_years: 5
+  universe_size: 10
 
-# Monte Carlo settings
-mc_horizon_days: 20
-mc_simulations: 1000
-random_seed: 42
+# Features configuration
+features:
+  lookbacks:
+    short: 5
+    medium: 20
+    long: 60
+  normalize: true
+  feature_sets:
+    price:
+      - open
+      - high
+      - low
+      - close
+      - volume
+    technical:
+      - rsi
+      - macd
+      - bollinger
+    fundamental:
+      - pe_ratio
+      - market_cap
+      - dividend_yield
 
-# Directory paths (relative to project root, or absolute in Docker)
-data_dir: data
-market_data_dir: data/market_data
-output_dir: output
-log_dir: logs
+# Strategy configuration
+strategy:
+  enabled: true
+  module: portfolio_agent.strategies
+  config_path: strategies/default.yaml
+  params: {}
 
-# File paths
-sqlite_path: data/portfolio_agent.db
-brain_file: data/agent_brain.json
-excel_output: output/Agent_Orchestrator_Output.xlsx
-backtest_excel_output: output/Backtest_Report.xlsx
-log_file: logs/agent.log
+# Training configuration
+training:
+  model: lstm
+  target: return_5d
+  sequence_length: 60
+  train_fraction: 0.8
+  batch_size: 32
+  epochs: 100
+  learning_rate: 0.001
+  device: auto
+  use_mixed_precision: true
+  num_workers: 4
 
-# Trading mode
-paper_trading_mode: true
-min_history_days: 250
-allow_synthetic_fallback: true
+# Backtest configuration
+backtest:
+  initial_capital: 1000000.0
+  start_years_ago: 5
+  use_trained_model: false
+  model_path: ""
 
-# Scheduler settings (Apache Airflow)
-scheduler_enabled: false
-schedule_time_ist: "15:45"
-schedule_outcome_time_ist: "16:00"
-airflow_ui_enabled: true
-airflow_webserver_port: 8080
-airflow_timezone: "Asia/Kolkata"
-
-# Default tickers (can be overridden by universe selection)
-tickers:
-  - NIFTYBEES.NS
-  - RELIANCE.NS
-  - TCS.NS
-  - HDFCBANK.NS
-  - ITC.NS
-  - SBIN.NS
-  - INFY.NS
-
-# Backtest defaults (can be overridden by BACKTEST_ env vars)
-backtest_default_years: 5
-backtest_default_universe_size:
-backtest_force_download: false
+# Risk configuration
+risk:
+  portfolio_value_inr: 308733.0
+  risk_per_trade_pct: 0.01
+  max_single_position_pct: 0.03
