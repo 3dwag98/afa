@@ -5,7 +5,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from .registry import register_model
 
+
+@register_model('lstm')
 class LSTMForecaster(nn.Module):
     """
     LSTM-based forecaster for time series prediction.
