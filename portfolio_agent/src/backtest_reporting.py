@@ -35,6 +35,21 @@ EXPECTED_COLUMNS = [
     'exit_reason'
 ]
 
+# Expected columns for Daily_Trade_Log sheet (11 columns in exact order)
+EXPECTED_DAILY_COLUMNS = [
+    'date',
+    'ticker',
+    'action',
+    'price',
+    'quantity',
+    'position_value',
+    'cash_balance',
+    'total_portfolio_value',
+    'score',
+    'signal',
+    'notes'
+]
+
 
 def _normalize_trade_log(trade_log) -> pd.DataFrame:
     """
@@ -76,11 +91,52 @@ def _normalize_trade_log(trade_log) -> pd.DataFrame:
     return df
 
 
+def _normalize_daily_log(daily_log) -> pd.DataFrame:
+    """
+    Normalize daily activity log into a flat DataFrame with consistent columns.
+    
+    Args:
+        daily_log: List of daily activity dicts.
+        
+    Returns:
+        DataFrame with exactly 11 columns as defined in EXPECTED_DAILY_COLUMNS.
+    """
+    # Handle None / empty
+    if not daily_log:
+        return pd.DataFrame(columns=EXPECTED_DAILY_COLUMNS)
+    
+    # If it's a dict, try to convert to list of its values
+    if isinstance(daily_log, dict):
+        daily_log = list(daily_log.values())
+    
+    # Ensure list of dicts
+    rows = []
+    for d in daily_log:
+        if isinstance(d, dict):
+            # Flatten nested dicts - skip any nested dict/list values
+            row = {}
+            for k in EXPECTED_DAILY_COLUMNS:
+                val = d.get(k)
+                # Skip nested structures
+                if isinstance(val, (dict, list)):
+                    val = None
+                row[k] = val
+            rows.append(row)
+        else:
+            # Skip malformed entries but log them
+            logger.warning(f"Skipping malformed daily activity entry: {d}")
+            continue
+    
+    df = pd.DataFrame(rows, columns=EXPECTED_DAILY_COLUMNS)
+    return df
+
+
 def export_backtest_excel(
     analytics: Dict[str, Any],
     equity_curve: pd.Series,
     trade_log: List[Dict[str, Any]],
     brain_evolution: List[Dict[str, Any]],
+    daily_activity_log: List[Dict[str, Any]],
     filepath: str
 ) -> str:
     """
@@ -102,6 +158,9 @@ def export_backtest_excel(
             - qty, gross_pnl, stt_taxes, slippage, net_pnl, holding_days, signal_trigger
         brain_evolution: List of dicts showing agent weights over time:
             - trading_day, weights (Trend, Breakout, Volume, MC_Prob)
+        daily_activity_log: List of daily activity dicts with 11 keys:
+            - date, ticker, action, price, quantity, position_value, cash_balance,
+              total_portfolio_value, score, signal, notes
         filepath: Output file path for the Excel workbook.
 
     Returns:
@@ -379,7 +438,110 @@ def export_backtest_excel(
             worksheet_trades.freeze_panes(1, 0)
 
         # =========================================================================
-        # Sheet 4: Monthly_Heatmap
+        # Sheet 4: Daily_Trade_Log
+        # =========================================================================
+        daily_df = _normalize_daily_log(daily_activity_log if 'daily_activity_log' in locals() else [])
+        
+        # Verify we have exactly 11 columns
+        assert daily_df.shape[1] == 11, f"Daily_Trade_Log should have 11 columns, got {daily_df.shape[1]}"
+        logger.info(f"Daily_Trade_Log shape: {daily_df.shape}")
+        
+        if len(daily_df) > 0:
+            daily_df.to_excel(writer, sheet_name='Daily_Trade_Log', index=False, header=True)
+
+            worksheet_daily = writer.sheets['Daily_Trade_Log']
+            
+            # Set column widths for all 11 columns
+            col_widths_daily = [
+                ('A:A', 12),   # date
+                ('B:B', 15),   # ticker
+                ('C:C', 14),   # action
+                ('D:D', 12),   # price
+                ('E:E', 10),   # quantity
+                ('F:F', 14),   # position_value
+                ('G:G', 14),   # cash_balance
+                ('H:H', 16),   # total_portfolio_value
+                ('I:I', 10),   # score
+                ('J:J', 10),   # signal
+                ('K:K', 30),   # notes
+            ]
+            for col_range, width in col_widths_daily:
+                worksheet_daily.set_column(col_range, width)
+
+            # Get column indices for formatting
+            price_col = daily_df.columns.get_loc('price')
+            position_value_col = daily_df.columns.get_loc('position_value')
+            cash_balance_col = daily_df.columns.get_loc('cash_balance')
+            total_portfolio_value_col = daily_df.columns.get_loc('total_portfolio_value')
+            action_col = daily_df.columns.get_loc('action')
+
+            # Apply number formatting to numeric columns
+            for row_idx in range(1, len(daily_df) + 1):
+                # Price (column D)
+                val_price = daily_df.iloc[row_idx - 1, price_col]
+                if pd.notna(val_price):
+                    worksheet_daily.write_number(row_idx, 3, val_price, number_format)
+
+                # Position Value (column F)
+                val_pos = daily_df.iloc[row_idx - 1, position_value_col]
+                if pd.notna(val_pos):
+                    worksheet_daily.write_number(row_idx, 5, val_pos, number_format)
+
+                # Cash Balance (column G)
+                val_cash = daily_df.iloc[row_idx - 1, cash_balance_col]
+                if pd.notna(val_cash):
+                    worksheet_daily.write_number(row_idx, 6, val_cash, number_format)
+
+                # Total Portfolio Value (column H)
+                val_total = daily_df.iloc[row_idx - 1, total_portfolio_value_col]
+                if pd.notna(val_total):
+                    worksheet_daily.write_number(row_idx, 7, val_total, number_format)
+
+            # Conditional formatting on action column
+            # "BUY" green font
+            worksheet_daily.conditional_format(
+                1, action_col + 1, len(daily_df), action_col + 1,
+                {'type': 'text', 'criteria': 'containing', 'value': 'BUY', 
+                 'format': workbook.add_format({'font_color': 'green', 'bold': True})}
+            )
+            # "SELL" red font
+            worksheet_daily.conditional_format(
+                1, action_col + 1, len(daily_df), action_col + 1,
+                {'type': 'text', 'criteria': 'containing', 'value': 'SELL', 
+                 'format': workbook.add_format({'font_color': 'red', 'bold': True})}
+            )
+            # "STOP_LOSS_HIT" red fill
+            worksheet_daily.conditional_format(
+                1, action_col + 1, len(daily_df), action_col + 1,
+                {'type': 'text', 'criteria': 'containing', 'value': 'STOP_LOSS', 
+                 'format': workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})}
+            )
+            # "TARGET_HIT" green fill
+            worksheet_daily.conditional_format(
+                1, action_col + 1, len(daily_df), action_col + 1,
+                {'type': 'text', 'criteria': 'containing', 'value': 'TARGET', 
+                 'format': workbook.add_format({'bg_color': '#C6EFCE', 'font_color': '#006100'})}
+            )
+            
+            # Freeze the header row
+            worksheet_daily.freeze_panes(1, 0)
+            
+            # Add autofilter on header row
+            worksheet_daily.autofilter(0, 0, len(daily_df), len(daily_df.columns) - 1)
+        else:
+            # Create empty sheet with headers if no activity
+            empty_df = pd.DataFrame(columns=EXPECTED_DAILY_COLUMNS)
+            empty_df.to_excel(writer, sheet_name='Daily_Trade_Log', index=False)
+            
+            worksheet_daily = writer.sheets['Daily_Trade_Log']
+            # Still set column widths and freeze header for empty sheet
+            for col_range, width in col_widths_daily:
+                worksheet_daily.set_column(col_range, width)
+            worksheet_daily.freeze_panes(1, 0)
+            worksheet_daily.autofilter(0, 0, 0, len(empty_df.columns) - 1)
+
+        # =========================================================================
+        # Sheet 5: Monthly_Heatmap
         # =========================================================================
         monthly_df = _create_monthly_heatmap_df(equity_curve)
         monthly_df.to_excel(writer, sheet_name='Monthly_Heatmap', index=True, header=True)

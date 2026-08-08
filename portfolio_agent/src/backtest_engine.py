@@ -94,6 +94,7 @@ class BacktestEngine:
         self.daily_equity_curve: pd.Series = pd.Series(dtype=float)
         self.trade_log: List[Dict[str, Any]] = []
         self.brain_evolution: List[Dict[str, Any]] = []
+        self.daily_activity_log: List[Dict[str, Any]] = []
         
         # Stop-loss and take-profit tracking (ticker -> {stop_price, target_price, entry_price})
         self.stop_loss_levels: Dict[str, float] = {}
@@ -866,27 +867,109 @@ class BacktestEngine:
             - daily_equity_curve: pd.Series
             - trade_log: list of dicts
             - brain_evolution: list of weight snapshots
+            - daily_activity_log: list of dicts with day-by-day activity
         """
         equity_curve = {}
         
         for i, current_date in enumerate(self.master_date_index):
             self.trading_day_count = i + 1
+            date_str = current_date.strftime('%Y-%m-%d')
             
             # Step A: Mark-to-Market portfolio using T's closing prices
             self._mark_to_market(current_date)
             equity_curve[current_date] = self.portfolio_value
             
+            # Log end-of-day mark-to-market (always one per day for PORTFOLIO)
+            self.daily_activity_log.append({
+                'date': date_str,
+                'ticker': 'PORTFOLIO',
+                'action': 'MARK_TO_MARKET',
+                'price': None,
+                'quantity': None,
+                'position_value': None,
+                'cash_balance': round(self.cash, 2),
+                'total_portfolio_value': round(self.portfolio_value, 2),
+                'score': None,
+                'signal': None,
+                'notes': 'EOD valuation'
+            })
+            
             # Step B: Check for stop-losses and take-profits based on T's intraday High/Low
-            self._check_stop_loss_take_profit(current_date)
+            executed_sl_tp = self._check_stop_loss_take_profit(current_date)
+            
+            # Log stop-loss/take-profit events
+            for trade in executed_sl_tp:
+                ticker = trade['ticker']
+                action = 'STOP_LOSS_HIT' if trade.get('exit_reason') == 'stop_loss' else 'TARGET_HIT'
+                close_price = self._get_price_at_date(ticker, current_date, 'close')
+                position_val = self.holdings.get(ticker, 0) * close_price if close_price and self.holdings.get(ticker, 0) > 0 else None
+                
+                self.daily_activity_log.append({
+                    'date': date_str,
+                    'ticker': ticker,
+                    'action': action,
+                    'price': trade['exit_price'],
+                    'quantity': trade['quantity'],
+                    'position_value': position_val,
+                    'cash_balance': round(self.cash, 2),
+                    'total_portfolio_value': round(self.portfolio_value, 2),
+                    'score': None,
+                    'signal': None,
+                    'notes': f"{action.replace('_', ' ')} triggered"
+                })
             
             # Step C: Run Agent's signal generation using data up to T-1
             signals = self._generate_signals(current_date)
+            
+            # Log signal evaluations
+            for ticker, signal_info in signals.items():
+                score = signal_info.get('score')
+                signal_type = signal_info.get('signal', 'HOLD')
+                
+                self.daily_activity_log.append({
+                    'date': date_str,
+                    'ticker': ticker,
+                    'action': 'HOLD',  # Signal evaluation, not an actual trade yet
+                    'price': signal_info.get('current_price'),
+                    'quantity': None,
+                    'position_value': self.holdings.get(ticker, 0) * signal_info.get('current_price') if self.holdings.get(ticker, 0) > 0 and signal_info.get('current_price') else None,
+                    'cash_balance': round(self.cash, 2),
+                    'total_portfolio_value': round(self.portfolio_value, 2),
+                    'score': score,
+                    'signal': signal_type,
+                    'notes': f"Signal evaluated: {signal_type}"
+                })
             
             # Step D: Create pending orders for T+1 execution
             self._create_pending_orders(signals, current_date)
             
             # Execute any pending orders for today (from previous day's signals)
-            self._execute_pending_orders(current_date)
+            executed_orders = self._execute_pending_orders(current_date)
+            
+            # Log BUY/SELL executions
+            for trade in executed_orders:
+                ticker = trade['ticker']
+                action = 'BUY' if trade['side'] == 'LONG' and trade.get('exit_date') is None else 'SELL'
+                close_price = self._get_price_at_date(ticker, current_date, 'close')
+                position_val = self.holdings.get(ticker, 0) * close_price if close_price and self.holdings.get(ticker, 0) > 0 else None
+                
+                notes = f"Order executed at {trade.get('entry_price') or trade.get('exit_price')}"
+                if trade.get('transaction_costs', 0) > 0:
+                    notes += f", cost: {trade['transaction_costs']:.2f}"
+                
+                self.daily_activity_log.append({
+                    'date': date_str,
+                    'ticker': ticker,
+                    'action': action,
+                    'price': trade.get('entry_price') or trade.get('exit_price'),
+                    'quantity': trade['quantity'],
+                    'position_value': position_val,
+                    'cash_balance': round(self.cash, 2),
+                    'total_portfolio_value': round(self.portfolio_value, 2),
+                    'score': None,
+                    'signal': trade.get('signal_trigger'),
+                    'notes': notes
+                })
             
             # Handle delisted tickers
             self._handle_delisted_tickers(current_date)
@@ -909,7 +992,8 @@ class BacktestEngine:
         return {
             'daily_equity_curve': self.daily_equity_curve,
             'trade_log': self.trade_log,
-            'brain_evolution': self.brain_evolution
+            'brain_evolution': self.brain_evolution,
+            'daily_activity_log': self.daily_activity_log
         }
     
     def get_performance_metrics(self) -> Dict[str, Any]:
