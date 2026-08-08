@@ -16,7 +16,7 @@ tickers:
   - HDFCBANK.NS
   - ITC.NS
   - SBIN.NS
-  - TATAMOTORS.NS
+  - INFY.NS
 brain_file: data/agent_brain.json
 sqlite_path: data/portfolio_agent.db
 excel_output: output/Agent_Orchestrator_Output.xlsx

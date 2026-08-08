@@ -23,8 +23,9 @@ WORKDIR /app
 # Copy requirements first for better layer caching
 COPY requirements.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies including pyarrow for parquet support
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir pyarrow
 
 # Copy application code
 COPY portfolio_agent/src/ ./src/
