@@ -201,17 +201,38 @@ def validate_ohlcv(df: pd.DataFrame, min_rows: int = 50) -> bool:
     return True
 
 
-def load_or_fetch_data(config, force_refresh: bool = False) -> dict[str, pd.DataFrame]:
+def load_or_fetch_data(config, force_refresh: bool = False, use_auto_discovery: bool = True) -> dict[str, pd.DataFrame]:
     """Load cached data or fetch fresh data from yfinance.
     
     Args:
         config: AppConfig instance with configuration.
         force_refresh: If True, ignore cache and fetch fresh data.
+        use_auto_discovery: If True, auto-discover all cached tickers unless
+                           config explicitly lists tickers (which takes precedence).
     
     Returns:
         Dictionary mapping ticker to DataFrame.
     """
     _setup_logging(config.log_file)
+    
+    # Determine tickers to use:
+    # 1. If config.tickers is explicitly set and non-empty, use those (override)
+    # 2. Otherwise, auto-discover all cached tickers
+    tickers_to_use = config.tickers
+    
+    if use_auto_discovery and (not tickers_to_use or len(tickers_to_use) == 0):
+        try:
+            from .universe import resolve_backtest_universe
+        except ImportError:
+            from universe import resolve_backtest_universe
+        
+        discovered_tickers = resolve_backtest_universe(max_tickers=None)
+        if discovered_tickers:
+            tickers_to_use = discovered_tickers
+            logger.info(f"Auto-discovered {len(tickers_to_use)} tickers from cache")
+        else:
+            # Fallback to config.tickers even if empty (will likely fail gracefully)
+            logger.warning("No cached tickers found, using config.tickers")
     
     # Determine cache directory
     base_dir = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -241,8 +262,8 @@ def load_or_fetch_data(config, force_refresh: bool = False) -> dict[str, pd.Data
             logger.warning(f"Error loading cache: {e}")
     
     # Fetch fresh data
-    logger.info(f"Fetching fresh data for tickers: {config.tickers}")
-    data = fetch_ohlcv(config.tickers)
+    logger.info(f"Fetching fresh data for {len(tickers_to_use)} tickers")
+    data = fetch_ohlcv(tickers_to_use)
     
     if not data:
         logger.warning("No data fetched from yfinance")
@@ -251,7 +272,7 @@ def load_or_fetch_data(config, force_refresh: bool = False) -> dict[str, pd.Data
         allow_synthetic = getattr(config, "allow_synthetic_fallback", False)
         if allow_synthetic:
             logger.info("Generating synthetic data as fallback")
-            for ticker in config.tickers:
+            for ticker in tickers_to_use:
                 data[ticker] = generate_synthetic_ohlcv(
                     ticker, days=config.min_history_days, seed=config.random_seed
                 )
