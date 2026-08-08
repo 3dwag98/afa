@@ -2,8 +2,8 @@
 # Cross-platform compatible (Windows, macOS, Linux)
 
 services:
-  # Main agent service (profile: base)
-  agent:
+  # Backtest service (profile: base)
+  backtest:
     profiles: ["base"]
     build:
       context: .
@@ -14,7 +14,7 @@ services:
       - ./logs:/app/logs
     env_file:
       - .env
-    entrypoint: ["python", "main.py"]
+    entrypoint: ["python", "run_backtest.py"]
     command: []
 
   # Test service (profile: base)

@@ -28,14 +28,14 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir pyarrow
 
 # Copy application code
-COPY portfolio_agent/src/ ./src/
-COPY portfolio_agent/main.py .
-COPY portfolio_agent/config.yaml .
-COPY portfolio_agent/tests/ ./tests/
+COPY src/ ./src/
+COPY run_backtest.py .
+COPY config.yaml .
+COPY tests/ ./tests/
 
 # Create necessary directories inside the container
 # These will be overlaid by host volumes in docker-compose, but ensures structure exists
 RUN mkdir -p /app/data /app/output /app/logs
 
 # Default entrypoint
-ENTRYPOINT ["python", "main.py"]
+ENTRYPOINT ["python", "run_backtest.py"]
