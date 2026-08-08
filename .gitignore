@@ -1,11 +1,29 @@
 ```
-# Compiled Python files
-*.pyc
+# Python
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
 
-# Logs
+# Dependencies
+venv/
+.venv/
+.env
+.env.local
+*.env.*
+
+# Logs and temp files
 *.log
+*.tmp
 
-# Excel reports and outputs
-output/
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build artifacts
+dist/
+build/
+target/
 ```
