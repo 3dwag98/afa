@@ -7,3 +7,4 @@ pytest
 PyYAML
 tqdm
 openpyxl
+pyarrow

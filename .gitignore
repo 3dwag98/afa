@@ -1,40 +1,22 @@
 ```
-# Docker
-.dockerignore
-
-# Logs and temp files
-*.log
-*.tmp
-
-# Environment
-.env
-.env.local
-*.env.*
-
 # Dependencies
-node_modules/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 .venv/
 venv/
-__pycache__/
-.mypy_cache/
-.pytest_cache/
-coverage/
-htmlcov/
-.dist-info/
+.env
+.env.local
+.env.*
 
 # Build artifacts
 dist/
 build/
-target/
-*.pyc
-*.class
-*.o
-*.obj
-*.exe
-*.dll
-*.so
-*.a
-*.out
+*.egg-info/
+
+# Logs
+*.log
 
 # Editors
 .vscode/
@@ -42,7 +24,16 @@ target/
 *.swp
 *.swo
 
-# System
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# Testing
+.pytest_cache/
+.mypy_cache/
+
+# OS
 .DS_Store
 Thumbs.db
 ```
