@@ -1,4 +1,23 @@
 ```
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+.env
+.env.local
+.env.*
+
+# Logs
+logs/
+
+# Build artifacts
+*.pyc
+portfolio_agent/src/__pycache__/
+
+# Environment specific
+.env
 ```

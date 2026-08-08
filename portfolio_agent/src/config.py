@@ -1,4 +1,9 @@
-"""Configuration module for portfolio agent."""
+"""Configuration module for portfolio agent.
+
+This module loads configuration from config.yaml and allows environment variables
+to override config values. Environment variables use the PA_ prefix for application
+config and BACKTEST_ prefix for backtest defaults.
+"""
 
 import os
 from dataclasses import dataclass, field
@@ -30,6 +35,92 @@ REQUIRED_FIELDS = [
 ]
 
 
+def _get_env_bool(env_name: str, default: bool) -> bool:
+    """Get boolean value from environment variable."""
+    val = os.environ.get(env_name)
+    if val is None:
+        return default
+    return val.lower() in ("true", "1", "yes", "on")
+
+
+def _apply_env_overrides(config: dict) -> dict:
+    """Apply environment variable overrides to config.
+    
+    Environment variables with PA_ prefix override corresponding config values.
+    For example, PA_PORTFOLIO_VALUE_INR overrides portfolio_value_inr.
+    """
+    # Mapping of env var suffix to config key
+    env_mapping = {
+        "PORTFOLIO_VALUE_INR": "portfolio_value_inr",
+        "RISK_PER_TRADE_PCT": "risk_per_trade_pct",
+        "MAX_SINGLE_POSITION_PCT": "max_single_position_pct",
+        "MIN_PRICE_INR": "min_price_inr",
+        "TARGET_PROB_PROFIT": "target_prob_profit",
+        "MIN_REWARD_RISK": "min_reward_risk",
+        "LEARNING_RATE": "learning_rate",
+        "PAPER_TRADING_MODE": "paper_trading_mode",
+        "DATA_DIR": "data_dir",
+        "MARKET_DATA_DIR": "market_data_dir",
+        "OUTPUT_DIR": "output_dir",
+        "LOG_DIR": "log_dir",
+        "SQLITE_PATH": "sqlite_path",
+        "BRAIN_FILE": "brain_file",
+        "EXCEL_OUTPUT": "excel_output",
+        "BACKTEST_EXCEL_OUTPUT": "backtest_excel_output",
+    }
+    
+    for env_suffix, config_key in env_mapping.items():
+        env_name = f"PA_{env_suffix}"
+        if env_name in os.environ:
+            val = os.environ[env_name]
+            # Convert to appropriate type
+            if config_key in config:
+                existing_val = config[config_key]
+                if isinstance(existing_val, bool):
+                    config[config_key] = _get_env_bool(env_name, existing_val)
+                elif isinstance(existing_val, float):
+                    try:
+                        config[config_key] = float(val)
+                    except ValueError:
+                        pass
+                elif isinstance(existing_val, int):
+                    try:
+                        config[config_key] = int(val)
+                    except ValueError:
+                        pass
+                else:
+                    config[config_key] = val
+            else:
+                config[config_key] = val
+    
+    # Apply backtest defaults from environment
+    backtest_mapping = {
+        "BACKTEST_DEFAULT_YEARS": "backtest_default_years",
+        "BACKTEST_DEFAULT_UNIVERSE_SIZE": "backtest_default_universe_size",
+        "BACKTEST_FORCE_DOWNLOAD": "backtest_force_download",
+    }
+    
+    for env_name, config_key in backtest_mapping.items():
+        if env_name in os.environ:
+            val = os.environ[env_name]
+            if config_key in config:
+                existing_val = config[config_key]
+                if isinstance(existing_val, bool):
+                    config[config_key] = _get_env_bool(env_name, existing_val)
+                elif isinstance(existing_val, int) or existing_val is None:
+                    if val.strip():
+                        try:
+                            config[config_key] = int(val)
+                        except ValueError:
+                            pass
+                else:
+                    config[config_key] = val
+            else:
+                config[config_key] = val
+    
+    return config
+
+
 @dataclass
 class AppConfig:
     """Application configuration dataclass."""
@@ -53,6 +144,12 @@ class AppConfig:
     paper_trading_mode: bool
     min_history_days: int
     allow_synthetic_fallback: bool = True
+    # Directory paths
+    data_dir: str = "data"
+    market_data_dir: str = "data/market_data"
+    output_dir: str = "output"
+    log_dir: str = "logs"
+    backtest_excel_output: str = "output/Backtest_Report.xlsx"
     # Scheduler settings (Apache Airflow)
     scheduler_enabled: bool = False
     schedule_time_ist: str = "15:45"
@@ -60,6 +157,10 @@ class AppConfig:
     airflow_ui_enabled: bool = True
     airflow_webserver_port: int = 8080
     airflow_timezone: str = "Asia/Kolkata"
+    # Backtest defaults
+    backtest_default_years: int = 5
+    backtest_default_universe_size: Optional[int] = None
+    backtest_force_download: bool = False
 
     @classmethod
     def from_dict(cls, data: dict) -> "AppConfig":
@@ -84,12 +185,20 @@ class AppConfig:
             paper_trading_mode=data["paper_trading_mode"],
             min_history_days=data["min_history_days"],
             allow_synthetic_fallback=data.get("allow_synthetic_fallback", True),
+            data_dir=data.get("data_dir", "data"),
+            market_data_dir=data.get("market_data_dir", "data/market_data"),
+            output_dir=data.get("output_dir", "output"),
+            log_dir=data.get("log_dir", "logs"),
+            backtest_excel_output=data.get("backtest_excel_output", "output/Backtest_Report.xlsx"),
             scheduler_enabled=data.get("scheduler_enabled", False),
             schedule_time_ist=data.get("schedule_time_ist", "15:45"),
             schedule_outcome_time_ist=data.get("schedule_outcome_time_ist", "16:00"),
             airflow_ui_enabled=data.get("airflow_ui_enabled", True),
             airflow_webserver_port=data.get("airflow_webserver_port", 8080),
             airflow_timezone=data.get("airflow_timezone", "Asia/Kolkata"),
+            backtest_default_years=data.get("backtest_default_years", 5),
+            backtest_default_universe_size=data.get("backtest_default_universe_size"),
+            backtest_force_download=data.get("backtest_force_download", False),
         )
 
 
@@ -108,6 +217,9 @@ def _load_config(config_path: Optional[str] = None) -> dict:
 
     if config is None:
         raise ValueError("Configuration file is empty or invalid")
+
+    # Apply environment variable overrides
+    config = _apply_env_overrides(config)
 
     return config
 

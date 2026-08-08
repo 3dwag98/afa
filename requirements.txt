@@ -2,6 +2,7 @@ pandas
 numpy
 yfinance
 xlsxwriter
+openpyxl
 pytest
 PyYAML
 tqdm
