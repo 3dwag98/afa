@@ -10,17 +10,72 @@ Python self-learning portfolio agent for Indian markets.
 
 ## Quick Start
 
-### Run with Docker
+### Option 1: Run with Docker (from project root)
 
 ```bash
 # Run the agent once
-docker compose run --rm portfolio-agent
+docker compose --profile base run --rm agent
+
+# Run with options
+docker compose --profile base run --rm agent python main.py --force-refresh
 
 # Run tests
-docker compose run --rm test
+docker compose --profile base run --rm test
 ```
 
-### Run Locally with Python
+### Option 2: Use Helper Scripts (Easiest!)
+
+**Windows:**
+```cmd
+# Run the agent
+run-agent.bat
+
+# Run with options
+run-agent.bat --force-refresh
+run-agent.bat --simulate-outcome
+run-agent.bat --update-outcomes
+
+# Manage Airflow
+airflow-manage.bat start
+airflow-manage.bat stop
+airflow-manage.bat status
+```
+
+**macOS/Linux:**
+```bash
+# Make scripts executable (first time only)
+chmod +x ../run-agent.sh ../airflow-manage.sh
+
+# Run the agent
+../run-agent.sh
+
+# Run with options
+../run-agent.sh --force-refresh
+
+# Manage Airflow
+../airflow-manage.sh start
+../airflow-manage.sh stop
+```
+
+### Option 3: Use Make Commands
+
+```bash
+# Show all available commands
+make help
+
+# Run the agent
+make run
+
+# Run tests
+make test
+
+# Manage Airflow
+make airflow-up
+make airflow-down
+make airflow-trigger-daily
+```
+
+### Option 4: Run Locally with Python
 
 ```bash
 # Create virtual environment

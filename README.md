@@ -16,11 +16,47 @@ Self-learning portfolio optimization agent for Indian markets.
 # Run the agent once
 docker compose --profile base run --rm agent
 
+# Run with options
+docker compose --profile base run --rm agent python main.py --force-refresh
+
 # Run tests
 docker compose --profile base run --rm test
 ```
 
-### Option 2: Run Locally with Python
+### Option 2: Use Helper Scripts (Easiest!)
+
+**Windows:**
+```cmd
+# Run the agent
+run-agent.bat
+
+# Run with options
+run-agent.bat --force-refresh
+
+# Manage Airflow
+airflow-manage.bat start
+airflow-manage.bat stop
+airflow-manage.bat status
+```
+
+**macOS/Linux:**
+```bash
+# Make scripts executable (first time only)
+chmod +x run-agent.sh airflow-manage.sh
+
+# Run the agent
+./run-agent.sh
+
+# Run with options
+./run-agent.sh --force-refresh
+
+# Manage Airflow
+./airflow-manage.sh start
+./airflow-manage.sh stop
+./airflow-manage.sh status
+```
+
+### Option 3: Run Locally with Python
 
 ```bash
 # Create virtual environment
@@ -136,33 +172,75 @@ The system includes three DAGs:
 
 ### Airflow Quickstart
 
-```bash
-# 1. Fix permissions on Linux (if needed)
-./scripts/fix_airflow_permissions.sh
+#### Using Helper Scripts (Easiest!)
 
-# 2. Build Airflow images
+**Windows:**
+```cmd
+# Start Airflow services
+airflow-manage.bat start
+
+# Check status
+airflow-manage.bat status
+
+# View logs
+airflow-manage.bat logs
+
+# Stop services
+airflow-manage.bat stop
+
+# Reset database (if needed)
+airflow-manage.bat init
+```
+
+**macOS/Linux:**
+```bash
+# Start Airflow services
+./airflow-manage.sh start
+
+# Check status
+./airflow-manage.sh status
+
+# View logs
+./airflow-manage.sh logs
+
+# Stop services
+./airflow-manage.sh stop
+
+# Reset database (if needed)
+./airflow-manage.sh init
+```
+
+#### Manual Docker Commands
+
+```bash
+# 1. Build Airflow images
 docker compose --profile airflow build
 
-# 3. Initialize Airflow database and create admin user
+# 2. Initialize Airflow database and create admin user
 docker compose --profile airflow run --rm airflow-init
 
-# 4. Start Airflow services (webserver + scheduler)
+# 3. Start Airflow services (webserver + scheduler)
 docker compose --profile airflow up -d
 
-# 5. Open Airflow UI
+# 4. Open Airflow UI
 # Navigate to: http://localhost:8080
 # Login: admin / admin
 
-# 6. Enable the DAG (it's paused by default)
+# 5. Enable the DAG (it's paused by default)
 # In the Airflow UI, toggle the DAG to "On"
 
-# 7. View logs
+# 6. View logs
 docker compose --profile airflow logs -f airflow-scheduler
 ```
 
 ### Stop Airflow
 
 ```bash
+# Using helper script (recommended)
+./airflow-manage.sh stop    # macOS/Linux
+airflow-manage.bat stop     # Windows
+
+# Or manually
 docker compose --profile airflow down
 ```
 
@@ -208,6 +286,9 @@ If working from the `portfolio_agent` subdirectory:
 ```bash
 cd portfolio_agent
 
+# Show all available commands
+make help
+
 # Build Airflow
 make airflow-build
 
@@ -231,6 +312,49 @@ make airflow-logs
 
 # Stop Airflow
 make airflow-down
+```
+
+### Using Helper Scripts (Root Directory - Recommended!)
+
+From the project root directory, use the helper scripts for easier management:
+
+**Windows:**
+```cmd
+# Run agent
+run-agent.bat
+
+# Run with options
+run-agent.bat --force-refresh
+run-agent.bat --simulate-outcome
+run-agent.bat --update-outcomes
+
+# Manage Airflow
+airflow-manage.bat start
+airflow-manage.bat stop
+airflow-manage.bat status
+airflow-manage.bat logs
+airflow-manage.bat init
+```
+
+**macOS/Linux:**
+```bash
+# Make scripts executable (first time only)
+chmod +x run-agent.sh airflow-manage.sh
+
+# Run agent
+./run-agent.sh
+
+# Run with options
+./run-agent.sh --force-refresh
+./run-agent.sh --simulate-outcome
+./run-agent.sh --update-outcomes
+
+# Manage Airflow
+./airflow-manage.sh start
+./airflow-manage.sh stop
+./airflow-manage.sh status
+./airflow-manage.sh logs
+./airflow-manage.sh init
 ```
 
 ## Configuration
@@ -376,6 +500,26 @@ If you encounter `ModuleNotFoundError: No module named 'src'`:
 2. For Airflow, verify PYTHONPATH is set correctly in docker-compose.yml
 3. The DAG file adds `/workspace` to sys.path as a fallback
 
+### Config File Not Found
+
+If you get `FileNotFoundError: Configuration file not found`:
+
+1. Ensure `config.yaml` exists at the project root: `ls -la config.yaml`
+2. If missing, copy it from portfolio_agent: `cp portfolio_agent/config.yaml .`
+3. Verify Docker volumes are mounted correctly in docker-compose.yml
+
+### Docker Volume Mount Issues (Windows)
+
+If you see errors like "Cannot create a file when that file already exists":
+
+**Option 1:** Remove existing src symlink and recreate as junction:
+```powershell
+Remove-Item .\src -Force -Recurse
+cmd /c mklink /J src portfolio_agent\src
+```
+
+**Option 2:** Use the helper scripts which handle this automatically
+
 ### Airflow Permission Issues (Linux)
 
 ```bash
@@ -394,6 +538,26 @@ docker compose --profile airflow build --no-cache
 If scripts fail with "bad interpreter" errors:
 ```bash
 sed -i 's/\r$//' scripts/airflow-init.sh
+```
+
+### Helper Scripts Not Working
+
+**Windows:** Run from Command Prompt or PowerShell, not Git Bash
+**macOS/Linux:** Make sure scripts are executable: `chmod +x *.sh`
+
+### Checking Service Status
+
+```bash
+# Check if Docker is running
+docker info
+
+# Check container status
+docker compose --profile base ps
+docker compose --profile airflow ps
+
+# View logs
+docker compose --profile base logs -f agent
+docker compose --profile airflow logs -f airflow-scheduler
 ```
 
 ## License

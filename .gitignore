@@ -1,4 +1,38 @@
 ```
-# Environment variables
+# Environment files
 .env
+.env.local
+*.env.*
+
+# Logs
+*.log
+
+# Dependencies
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.egg-info/
+
+# Build artifacts
+dist/
+build/
+target/
+
+# Editor/IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python specific
+*.pyc
+*.pyo
+*.pyd
+.Python
 ```
