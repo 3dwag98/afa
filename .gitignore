@@ -1,47 +1,44 @@
 ```
-# Compiled Python files
-*.pyc
-__pycache__/
+# Docker-related
+.dockerenv
+Dockerfile.backup
+*.dockerignore
 
-# Virtual environments
+# Build artifacts (if any Docker-related builds occur)
+build/
+dist/
+target/
+
+# Dependencies
+node_modules/
 venv/
-.venv/
 .env
 .env.local
-*.env.*
+.env.*
 
-# Logs
+# Logs and temporary files
 *.log
-
-# Temporary files
 *.tmp
 *.swp
-
-# Coverage reports
-.coverage
-coverage/
-htmlcov/
 
 # Editors
 .vscode/
 .idea/
 
+# Python (if Python components exist in Docker context)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Coverage reports
+coverage/
+htmlcov/
+.coverage
+
 # OS generated files
 .DS_Store
 Thumbs.db
-
-# Build artifacts
-build/
-dist/
-target/
-*.class
-*.o
-*.obj
-*.out
-
-# Dependencies cache
-.mypy_cache/
-.pytest_cache/
-node_modules/
-.gradle/
 ```
