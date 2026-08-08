@@ -166,3 +166,36 @@ class TestGetTickerData:
         
         assert isinstance(result, bool)
         assert result is True
+
+    def test_load_returns_dataframe_not_none(self, tmp_path, monkeypatch):
+        """Regression test: save then load roundtrip returns a DataFrame, not None.
+        
+        This directly guards against the original bug where load_ticker_data
+        returned None due to path mismatch between save and load.
+        """
+        # Redirect DATA_DIR to tmp_path
+        test_dir = tmp_path / "market_data"
+        test_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr("data_store.DATA_DIR", test_dir)
+
+        # Create a known-good DataFrame
+        dates = pd.bdate_range("2023-01-02", "2023-01-10")
+        df_original = pd.DataFrame({
+            "open": [100.0] * len(dates),
+            "high": [105.0] * len(dates),
+            "low": [99.0] * len(dates),
+            "close": [103.0] * len(dates),
+            "volume": [1000] * len(dates),
+        }, index=dates)
+
+        # Save via save_ticker_data (using DataStore class)
+        from data_store import DataStore
+        ds = DataStore(cache_dir=test_dir)
+        ds.save_ticker_data("REGRESSION.TEST", df_original)
+
+        # Immediately load via load_ticker_data (module-level function)
+        result = load_ticker_data("REGRESSION.TEST", "2023-01-02", "2023-01-10")
+
+        # Assert result is not None and is a DataFrame
+        assert result is not None, "load_ticker_data returned None - path mismatch bug!"
+        assert isinstance(result, pd.DataFrame), f"Expected DataFrame, got {type(result)}"
