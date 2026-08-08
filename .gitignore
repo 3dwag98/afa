@@ -5,43 +5,34 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
-env/
-venv/
+*.so
+*.egg-info/
+.eggs/
+
+# Dependencies
 .venv/
-pip-log.txt
-pip-delete-this-directory.txt
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.log
-.git/modules/
-.DS_Store
-.mypy_cache/
-.pytest_cache/
-.hypothesis/
+venv/
+.env
+.env.local
+.env.*
 
 # Build artifacts
 build/
 dist/
 *.egg
-*.egg-info/
-*.so
-*.dylib
-*.dll
-*.exe
-*.out
-*.o
-*.a
-*.obj
 
-# Environment
-.env
-.env.local
-*.env.*
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# Logs
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
 
 # Editors
 .vscode/
@@ -49,7 +40,4 @@ dist/
 *.swp
 *.swo
 *.tmp
-
-# Dependencies
-uv.lock
 ```
