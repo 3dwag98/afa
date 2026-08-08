@@ -6,6 +6,7 @@ Handles ticker list retrieval and filtering for the Nifty 500 universe.
 
 import os
 import csv
+import logging
 from typing import List, Optional
 from pathlib import Path
 
@@ -20,6 +21,109 @@ try:
     REQUESTS_AVAILABLE = True
 except ImportError:
     REQUESTS_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
+
+
+def discover_available_tickers(data_dir: str = "data/market_data") -> list[str]:
+    """
+    Discover all tickers for which historical data is available locally.
+    
+    Scans the data directory for parquet files and extracts ticker symbols
+    from filenames.
+    
+    Args:
+        data_dir: Directory containing parquet files. Defaults to "data/market_data".
+        
+    Returns:
+        Sorted list of unique ticker symbols. Empty list if no parquet files exist.
+    """
+    data_path = Path(data_dir)
+    
+    # Create directory if it does not exist
+    data_path.mkdir(parents=True, exist_ok=True)
+    
+    # Scan for all .parquet files
+    parquet_files = list(data_path.glob("*.parquet"))
+    
+    if not parquet_files:
+        return []
+    
+    tickers = set()
+    for file_path in parquet_files:
+        # Strip the .parquet extension to get the ticker
+        ticker = file_path.stem
+        # Reverse filename sanitization: replace _NS back to .NS, and _ to .
+        # Note: _ticker_filename replaces "/" with "_", but typical tickers like
+        # "RELIANCE.NS" have no slash, so we just need to handle the basic case
+        # The stem is usually the ticker itself (e.g., "RELIANCE.NS" from "RELIANCE.NS.parquet")
+        tickers.add(ticker)
+    
+    return sorted(tickers)
+
+
+def resolve_backtest_universe(
+    force_full_download: bool = False,
+    max_tickers: int | None = None
+) -> list[str]:
+    """
+    Resolve the universe of tickers for backtesting.
+    
+    This function:
+    1. Discovers locally available tickers
+    2. If none found or force_full_download=True, downloads data for all master tickers
+    3. Optionally truncates to max_tickers for quick tests
+    
+    Args:
+        force_full_download: If True, forces download of full master list.
+        max_tickers: Maximum number of tickers to return (for quick tests). 
+                     None means use ALL available.
+                     
+    Returns:
+        List of ticker symbols with available data. Never returns None.
+    """
+    # Import here to avoid circular imports
+    import pandas as pd
+    from src.data_store import batch_download_and_cache
+    
+    # Step 1: Discover available tickers
+    tickers = discover_available_tickers()
+    
+    # Step 2: If empty OR force_full_download, download from master list
+    if not tickers or force_full_download:
+        try:
+            # Get master ticker list
+            manager = UniverseManager()
+            master_list = manager.get_master_ticker_list()
+            
+            if master_list:
+                # Calculate date range (5 years of history)
+                end_date = pd.Timestamp.now().strftime("%Y-%m-%d")
+                start_date = (pd.Timestamp.now() - pd.DateOffset(years=5)).strftime("%Y-%m-%d")
+                
+                # Download data for all tickers
+                batch_download_and_cache(
+                    tickers=master_list,
+                    start_date=start_date,
+                    end_date=end_date,
+                    skip_existing=False
+                )
+                
+                # Re-discover tickers that actually got valid data
+                tickers = discover_available_tickers()
+        except Exception as e:
+            logger.warning(f"Download failed: {e}. Falling back to locally discovered tickers.")
+            # Fall back to whatever was discovered locally (may be empty)
+            pass
+    
+    # Step 3: Truncate if max_tickers is provided
+    if max_tickers is not None and max_tickers > 0:
+        tickers = tickers[:max_tickers]
+    
+    # Log the count
+    logger.info(f"Resolved universe: {len(tickers)} tickers with available data")
+    
+    return tickers
 
 
 class UniverseManager:
