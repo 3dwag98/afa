@@ -4,3 +4,4 @@ yfinance
 xlsxwriter
 pytest
 PyYAML
+tqdm

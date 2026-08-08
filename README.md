@@ -455,9 +455,67 @@ pytest tests/test_scoring.py -v
 - **No leverage**: Positions are fully funded
 - **No short selling**: Only long positions allowed
 - **Penny stock filter**: Low-quality stocks excluded
-- **Position size cap**: Maximum 10% per position
+- **Position size cap**: Maximum 3% per position
 - **Risk per trade cap**: Maximum 2% risk per trade
 - **Airflow UI credentials**: Local-only (admin/admin)
+
+## Backtesting
+
+Run historical simulations with the `run_backtest.py` script:
+
+```bash
+# Quick test with 50 tickers, 1 year
+python run_backtest.py --universe-size 50 --years 1
+
+# Full 5-year backtest with 500 tickers
+python run_backtest.py --universe-size 500 --years 5
+
+# Custom initial capital
+python run_backtest.py --initial-capital 5000000 --years 5
+```
+
+### Advanced Risk Metrics
+
+The backtest report includes institutional-grade risk analytics:
+
+| Metric | Description |
+|--------|-------------|
+| **CAGR** | Compound Annual Growth Rate - annualized return over the period |
+| **Sharpe Ratio** | Risk-adjusted return using total volatility (excess return / volatility) |
+| **Sortino Ratio** | Risk-adjusted return using downside deviation (penalizes only negative volatility) |
+| **Calmar Ratio** | Return relative to maximum drawdown (CAGR / Max Drawdown) |
+| **Max Drawdown** | Largest peak-to-trough decline in portfolio value |
+| **Profit Factor** | Gross profits divided by gross losses |
+| **Win Rate** | Percentage of profitable trades |
+| **Probability of Ruin** | Monte Carlo simulation result showing chance of portfolio dropping below threshold (default 50%) |
+
+#### Understanding Sortino Ratio
+
+Unlike Sharpe ratio which penalizes all volatility equally, Sortino ratio only considers **downside deviation** - the volatility of negative returns. This is more appropriate for investors who care about losses, not gains.
+
+```
+Sortino = (CAGR - Risk Free Rate) / Downside Deviation
+```
+
+A Sortino > 2.0 is considered excellent.
+
+#### Understanding Calmar Ratio
+
+Calmar ratio measures return per unit of worst-case loss (maximum drawdown). It answers: "How much return did I get for surviving the worst period?"
+
+```
+Calmar = CAGR / Maximum Drawdown
+```
+
+A Calmar > 3.0 indicates strong risk-adjusted performance.
+
+#### Understanding Probability of Ruin
+
+Using Monte Carlo bootstrap resampling (10,000 simulations), this metric estimates the probability that your portfolio will drop below a critical threshold (typically 50% of initial capital) based on historical trade distributions.
+
+- **< 5%**: Very low risk of catastrophic loss
+- **5-15%**: Moderate risk, acceptable for most strategies
+- **> 20%**: High risk, consider reducing position sizes
 
 ## Alternative Scheduling Options
 
