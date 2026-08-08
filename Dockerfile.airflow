@@ -1,0 +1,50 @@
+# Custom Airflow Image for AFA Project
+# Extends official Airflow with project dependencies and code
+
+FROM apache/airflow:2.9.2-python3.11
+
+# Labels
+LABEL project="afa"
+LABEL component="airflow"
+LABEL purpose="quantitative models, features, and GPU capabilities for DAG tasks"
+
+# Environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV TZ=Asia/Kolkata
+ENV AIRFLOW_HOME=/opt/airflow
+ENV UV_SYSTEM_PYTHON=1
+
+# Set working directory
+WORKDIR /opt/airflow
+
+# Switch to root user to install system deps and uv
+USER root
+
+# Install uv from official binary
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+
+# Copy project dependency files
+COPY pyproject.toml /opt/airflow/pyproject.toml
+COPY uv.lock /opt/airflow/uv.lock
+
+# Install project dependencies with GPU support (no dev deps)
+RUN uv sync --frozen --no-dev --extra gpu --project /opt/airflow
+
+# Copy project code
+COPY portfolio_agent/ /opt/airflow/project/portfolio_agent/
+COPY config/ /opt/airflow/project/config/
+COPY scripts/ /opt/airflow/project/scripts/
+
+# Add project to Python path
+ENV PYTHONPATH="${PYTHONPATH}:/opt/airflow/project"
+
+# Ensure airflow user owns the project directories
+RUN chown -R airflow:airflow /opt/airflow/project
+
+# Revert to airflow user
+USER airflow
+
+# The image can now run:
+# - Airflow commands: airflow webserver, airflow scheduler
+# - Project CLI commands: python -m portfolio_agent.cli ...
