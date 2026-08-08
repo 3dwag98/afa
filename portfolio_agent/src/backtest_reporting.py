@@ -336,30 +336,31 @@ def export_backtest_excel(
         assert trade_df.shape[1] == 16, f"Trade_Log should have 16 columns, got {trade_df.shape[1]}"
         logger.info(f"Trade_Log shape: {trade_df.shape}")
         
+        # Set column widths for all 16 columns (defined outside the if block for reuse)
+        col_widths = [
+            ('A:A', 14),   # trade_id
+            ('B:B', 12),   # ticker
+            ('C:C', 12),   # entry_date
+            ('D:D', 12),   # entry_price
+            ('E:E', 12),   # exit_date
+            ('F:F', 12),   # exit_price
+            ('G:G', 10),   # quantity
+            ('H:H', 8),    # side
+            ('I:I', 15),   # signal_trigger
+            ('J:J', 14),   # gross_pnl
+            ('K:K', 14),   # transaction_costs
+            ('L:L', 12),   # taxes
+            ('M:M', 14),   # net_pnl
+            ('N:N', 12),   # return_pct
+            ('O:O', 12),   # holding_days
+            ('P:P', 15),   # exit_reason
+        ]
+        
         if len(trade_df) > 0:
             trade_df.to_excel(writer, sheet_name='Trade_Log', index=False, header=True)
 
             worksheet_trades = writer.sheets['Trade_Log']
             
-            # Set column widths for all 16 columns
-            col_widths = [
-                ('A:A', 14),   # trade_id
-                ('B:B', 12),   # ticker
-                ('C:C', 12),   # entry_date
-                ('D:D', 12),   # entry_price
-                ('E:E', 12),   # exit_date
-                ('F:F', 12),   # exit_price
-                ('G:G', 10),   # quantity
-                ('H:H', 8),    # side
-                ('I:I', 15),   # signal_trigger
-                ('J:J', 14),   # gross_pnl
-                ('K:K', 14),   # transaction_costs
-                ('L:L', 12),   # taxes
-                ('M:M', 14),   # net_pnl
-                ('N:N', 12),   # return_pct
-                ('O:O', 12),   # holding_days
-                ('P:P', 15),   # exit_reason
-            ]
             for col_range, width in col_widths:
                 worksheet_trades.set_column(col_range, width)
 
@@ -446,25 +447,26 @@ def export_backtest_excel(
         assert daily_df.shape[1] == 11, f"Daily_Trade_Log should have 11 columns, got {daily_df.shape[1]}"
         logger.info(f"Daily_Trade_Log shape: {daily_df.shape}")
         
+        # Set column widths for all 11 columns (defined outside the if block for reuse)
+        col_widths_daily = [
+            ('A:A', 12),   # date
+            ('B:B', 15),   # ticker
+            ('C:C', 14),   # action
+            ('D:D', 12),   # price
+            ('E:E', 10),   # quantity
+            ('F:F', 14),   # position_value
+            ('G:G', 14),   # cash_balance
+            ('H:H', 16),   # total_portfolio_value
+            ('I:I', 10),   # score
+            ('J:J', 10),   # signal
+            ('K:K', 30),   # notes
+        ]
+        
         if len(daily_df) > 0:
             daily_df.to_excel(writer, sheet_name='Daily_Trade_Log', index=False, header=True)
 
             worksheet_daily = writer.sheets['Daily_Trade_Log']
             
-            # Set column widths for all 11 columns
-            col_widths_daily = [
-                ('A:A', 12),   # date
-                ('B:B', 15),   # ticker
-                ('C:C', 14),   # action
-                ('D:D', 12),   # price
-                ('E:E', 10),   # quantity
-                ('F:F', 14),   # position_value
-                ('G:G', 14),   # cash_balance
-                ('H:H', 16),   # total_portfolio_value
-                ('I:I', 10),   # score
-                ('J:J', 10),   # signal
-                ('K:K', 30),   # notes
-            ]
             for col_range, width in col_widths_daily:
                 worksheet_daily.set_column(col_range, width)
 
