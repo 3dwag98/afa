@@ -1,6 +1,0 @@
-pandas
-numpy
-yfinance
-xlsxwriter
-pytest
-PyYAML

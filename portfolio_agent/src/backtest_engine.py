@@ -6,6 +6,8 @@ and allowing the Agent's Brain to learn over time.
 """
 
 import copy
+import logging
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
@@ -13,19 +15,85 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
+from portfolio_agent.config.schema import StrategyConfig
+from portfolio_agent.features.pipeline import build_features
+from portfolio_agent.strategies.base import BaseStrategy
+from portfolio_agent.strategies.registry import load_strategy
+from portfolio_agent.strategies.types import RiskParams, StrategyContext, StrategySignal
+from portfolio_agent.strategies.weighting import evaluate_and_learn
+
 # Import from src module
 try:
     from .data_store import load_ticker_data
     from .models import AgentBrain
-    from .learning import evaluate_and_learn
-    from .config import AppConfig
     from .execution_sim import ExecutionSimulator
+    from .monte_carlo import run_monte_carlo
 except ImportError:
     from data_store import load_ticker_data
     from models import AgentBrain
-    from learning import evaluate_and_learn
-    from config import AppConfig
     from execution_sim import ExecutionSimulator
+    from monte_carlo import run_monte_carlo
+
+
+def _score_one_ticker(
+    strategy: BaseStrategy,
+    ticker: str,
+    hist_data: pd.DataFrame,
+    required_features: List[str],
+    risk_params: RiskParams,
+    weights: Dict[str, float],
+    mc_params: Tuple[int, int, int],
+) -> Optional[StrategySignal]:
+    """Score a single ticker: run Monte Carlo + build features + call strategy.score().
+
+    Module-level (not a method) so it is picklable for ProcessPoolExecutor dispatch.
+    """
+    try:
+        horizon_days, simulations, seed = mc_params
+        daily_returns = hist_data['close'].pct_change().dropna().tolist()
+        mc_result = run_monte_carlo(
+            symbol=ticker,
+            daily_returns=daily_returns,
+            horizon_days=horizon_days,
+            simulations=simulations,
+            seed=seed,
+        )
+        features = build_features(hist_data, required_features)
+        context = StrategyContext(risk=risk_params, weights=weights, mc_result=mc_result)
+        return strategy.score(ticker, features, context)
+    except Exception:
+        logger.debug(f"Signal generation failed for {ticker}", exc_info=True)
+        return None
+
+
+def _score_tickers_parallel(
+    strategy: BaseStrategy,
+    eligible: Dict[str, pd.DataFrame],
+    required_features: List[str],
+    risk_params: RiskParams,
+    weights: Dict[str, float],
+    mc_params: Tuple[int, int, int],
+    max_workers: Optional[int],
+) -> Dict[str, StrategySignal]:
+    """Dispatch _score_one_ticker() across a CPU process pool.
+
+    Used for cheap per-ticker rule-based scoring, where CPU parallelism across
+    tickers is the right speedup (GPU would not help here).
+    """
+    signals: Dict[str, StrategySignal] = {}
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_score_one_ticker, strategy, ticker, hist_data, required_features, risk_params, weights, mc_params): ticker
+            for ticker, hist_data in eligible.items()
+        }
+        for future in as_completed(futures):
+            ticker = futures[future]
+            result = future.result()
+            if result is not None:
+                signals[ticker] = result
+    return signals
+
+logger = logging.getLogger(__name__)
 
 
 class BacktestEngine:
@@ -42,23 +110,58 @@ class BacktestEngine:
         end_date: str,
         initial_capital: float,
         universe_tickers: List[str],
-        initial_brain: Optional[Dict[str, Any]] = None
+        initial_brain: Optional[Dict[str, Any]] = None,
+        strategy: Optional["BaseStrategy"] = None,
+        risk_params: Optional["RiskParams"] = None,
+        parallel: bool = False,
+        max_workers: Optional[int] = None,
+        mc_horizon_days: int = 20,
+        mc_simulations: int = 1000,
+        mc_seed: int = 42,
     ):
         """
         Initialize the BacktestEngine.
-        
+
         Args:
             start_date: Start date (YYYY-MM-DD).
             end_date: End date (YYYY-MM-DD).
             initial_capital: Initial cash in INR.
             universe_tickers: List of ticker symbols to trade.
             initial_brain: Optional initial brain state. If None, uses default weights.
+            strategy: Strategy used for signal generation. Defaults to the
+                registered "rule_based" strategy if not provided.
+            risk_params: Risk/eligibility parameters passed to the strategy.
+                Defaults to a conservative built-in set if not provided.
+            parallel: If True and the strategy does not support GPU batching,
+                dispatch per-ticker signal generation across a CPU process pool.
+                If the strategy does support GPU batching (e.g. an ML strategy),
+                all eligible tickers are scored in a single batched call instead.
+            max_workers: Max worker processes when parallel=True (default: CPU count).
         """
         self.start_date = pd.to_datetime(start_date)
         self.end_date = pd.to_datetime(end_date)
         self.initial_capital = initial_capital
         self.universe_tickers = [t.upper() if not t.endswith('.NS') else t for t in universe_tickers]
-        
+
+        if strategy is None:
+            strategy_config = StrategyConfig()
+            strategy = load_strategy(strategy_config)
+        self.strategy = strategy
+        self.risk_params = risk_params or RiskParams(
+            target_prob_profit=0.55,
+            min_reward_risk=1.5,
+            min_price_inr=20.0,
+            portfolio_value_inr=initial_capital,
+            risk_per_trade_pct=0.01,
+            max_single_position_pct=0.03,
+        )
+        self.parallel = parallel
+        self.max_workers = max_workers
+        self.mc_horizon_days = mc_horizon_days
+        self.mc_simulations = mc_simulations
+        self.mc_seed = mc_seed
+
+
         # Track untradeable tickers (delisted or NaN issues) - initialize BEFORE loading data
         self.untradeable_tickers: set = set()
         
@@ -450,89 +553,61 @@ class BacktestEngine:
         
         return executed_trades
     
-    def _generate_signals(self, current_date: pd.Timestamp) -> Dict[str, Dict[str, Any]]:
+    def _generate_signals(self, current_date: pd.Timestamp) -> Dict[str, StrategySignal]:
         """
-        Run the Agent's signal generation using data up to T-1.
-        
+        Run the configured strategy's signal generation using data up to T-1.
+
         CRITICAL: Only uses data up to current_date - 1 day to avoid look-ahead bias.
-        
+
+        Uses the SAME strategy code path as the live orchestrator (via
+        strategies/registry.py), so backtest and live decisions can never
+        drift apart. Rule-based strategies are scored per-ticker (optionally
+        parallelized across CPU workers); strategies that support GPU batching
+        (e.g. an ML strategy) are scored in a single stacked forward pass.
+
         Args:
             current_date: Current date timestamp.
-            
+
         Returns:
-            Dictionary of ticker -> signal info.
+            Dictionary of ticker -> StrategySignal.
         """
-        signals = {}
-        prev_date = current_date - pd.Timedelta(days=1)
-        
-        # Use tqdm for progress tracking if available and universe is large
-        try:
-            from tqdm import tqdm
-            use_tqdm = len(self.universe_tickers) > 100
-        except ImportError:
-            use_tqdm = False
-        
-        ticker_iter = self.universe_tickers
-        if use_tqdm:
-            ticker_iter = tqdm(ticker_iter, desc=f"Scanning tickers ({current_date.date()})", unit="ticker", leave=False)
-        
-        for ticker in ticker_iter:
+        eligible: Dict[str, pd.DataFrame] = {}
+        for ticker in self.universe_tickers:
             if ticker in self.untradeable_tickers:
                 continue
-            
-            # Get historical data up to T-1
             hist_data = self._get_historical_data_up_to(ticker, current_date)
-            
             if hist_data is None or len(hist_data) < 20:
-                # Not enough data for signals
                 continue
-            
-            # Simple signal generation logic (mimicking fetch_and_score)
-            # In a real implementation, this would call the agent's scoring logic
-            
-            close_prices = hist_data['close'] if 'close' in hist_data.columns else hist_data.get('Close', hist_data.iloc[:, 0])
-            
-            # Calculate simple momentum signal
-            if len(close_prices) >= 20:
-                sma_20 = close_prices.rolling(window=20).mean().iloc[-1]
-                current_price = close_prices.iloc[-1]
-                
-                # Trend signal
-                trend_signal = 1 if current_price > sma_20 else -1
-                
-                # Volume signal (if available)
-                volume_signal = 0
-                if 'volume' in hist_data.columns:
-                    avg_vol = hist_data['volume'].rolling(window=20).mean().iloc[-1]
-                    current_vol = hist_data['volume'].iloc[-1]
-                    if current_vol > avg_vol * 1.5:
-                        volume_signal = 1
-                    elif current_vol < avg_vol * 0.5:
-                        volume_signal = -1
-                
-                # Combine signals using brain weights
-                weights = self.agent_brain.weights
-                combined_score = (
-                    weights.get('Trend', 25.0) * trend_signal +
-                    weights.get('Volume', 20.0) * volume_signal
-                ) / 100.0
-                
-                # Generate signal
-                if combined_score > 0.3:
-                    signal_type = 'BUY'
-                elif combined_score < -0.3:
-                    signal_type = 'SELL'
-                else:
-                    signal_type = 'HOLD'
-                
-                signals[ticker] = {
-                    'signal': signal_type,
-                    'score': combined_score,
-                    'current_price': current_price,
-                    'sma_20': sma_20,
-                    'trigger': 'Trend' if abs(trend_signal) > 0 else 'Volume'
-                }
-        
+            eligible[ticker] = hist_data
+
+        if not eligible:
+            return {}
+
+        weights = dict(self.agent_brain.weights)
+
+        if self.strategy.supports_gpu_batch:
+            features_by_symbol = {
+                ticker: build_features(hist_data, self.strategy.required_features())
+                for ticker, hist_data in eligible.items()
+            }
+            context = StrategyContext(risk=self.risk_params, weights=weights)
+            return self.strategy.score_batch(features_by_symbol, context)
+
+        required_features = self.strategy.required_features()
+        mc_params = (self.mc_horizon_days, self.mc_simulations, self.mc_seed)
+
+        if self.parallel and len(eligible) > 1:
+            return _score_tickers_parallel(
+                self.strategy, eligible, required_features, self.risk_params, weights, mc_params, self.max_workers
+            )
+
+        signals: Dict[str, StrategySignal] = {}
+        for ticker, hist_data in eligible.items():
+            result = _score_one_ticker(
+                self.strategy, ticker, hist_data, required_features, self.risk_params, weights, mc_params
+            )
+            if result is not None:
+                signals[ticker] = result
         return signals
     
     def _execute_pending_orders(self, execution_date: pd.Timestamp) -> List[Dict[str, Any]]:
@@ -728,38 +803,38 @@ class BacktestEngine:
         
         return executed_trades
     
-    def _create_pending_orders(self, signals: Dict[str, Dict[str, Any]], current_date: pd.Timestamp) -> None:
+    def _create_pending_orders(self, signals: Dict[str, StrategySignal], current_date: pd.Timestamp) -> None:
         """
         Create pending orders for T+1 execution based on signals.
-        
+
         Args:
-            signals: Dictionary of ticker -> signal info.
+            signals: Dictionary of ticker -> StrategySignal.
             current_date: Current date (orders will execute at T+1 open).
         """
         execution_date = current_date + pd.Timedelta(days=1)
-        
+
         # Skip weekends
         while execution_date.weekday() >= 5:
             execution_date += pd.Timedelta(days=1)
-        
-        for ticker, signal_info in signals.items():
-            signal = signal_info.get('signal', 'HOLD')
-            
+
+        for ticker, sig in signals.items():
+            signal = sig.signal
+
             if signal == 'BUY' and ticker not in self.holdings:
                 # Calculate position size (10% of portfolio per position)
                 position_value = self.portfolio_value * 0.10
-                price = signal_info.get('current_price', 100)
+                price = sig.entry_price or 100
                 quantity = int(position_value / price)
-                
+
                 if quantity > 0:
                     self.pending_orders.append({
                         'ticker': ticker,
                         'action': 'BUY',
                         'quantity': quantity,
                         'execution_date': execution_date,
-                        'trigger': signal_info.get('trigger', 'SIGNAL')
+                        'trigger': sig.trigger or 'SIGNAL'
                     })
-            
+
             elif signal == 'SELL' and ticker in self.holdings:
                 quantity = self.holdings[ticker]
                 if quantity > 0:
@@ -768,21 +843,16 @@ class BacktestEngine:
                         'action': 'SELL',
                         'quantity': quantity,
                         'execution_date': execution_date,
-                        'trigger': signal_info.get('trigger', 'SIGNAL')
+                        'trigger': sig.trigger or 'SIGNAL'
                     })
     
-    def _evaluate_and_learn(self) -> None:
+    def _evaluate_and_learn(self, learning_rate: float = 0.15, min_trades_for_learning: int = 3) -> None:
         """
-        Trigger agent learning every 20 trading days.
-        
-        Creates a mock config for the learning function.
+        Trigger agent learning every N trading days.
+
+        Uses the same pure weight-adaptation function (strategies/weighting.py)
+        as the live orchestrator, so backtest and live learning stay identical.
         """
-        # Create a mock config for learning
-        mock_config = type('MockConfig', (), {
-            'learning_rate': 0.15,
-            'min_trades_for_learning': 3
-        })()
-        
         # Snapshot brain state before learning
         brain_snapshot = {
             'trading_day': self.trading_day_count,
@@ -790,11 +860,21 @@ class BacktestEngine:
             'trade_count': len(self.agent_brain.trade_history)
         }
         self.brain_evolution.append(brain_snapshot)
-        
-        # Run learning
+
         try:
-            self.agent_brain = evaluate_and_learn(self.agent_brain, mock_config)
-        except Exception as e:
+            new_weights, message = evaluate_and_learn(
+                weights=self.agent_brain.weights,
+                trade_history=self.agent_brain.trade_history,
+                learning_rate=learning_rate,
+                min_trades_for_learning=min_trades_for_learning,
+            )
+            self.agent_brain.weights = new_weights
+            if message is not None:
+                self.agent_brain.learning_log.append({
+                    'trading_day': self.trading_day_count,
+                    'entry': message,
+                })
+        except Exception:
             # Log error but continue
             pass
     
@@ -922,22 +1002,19 @@ class BacktestEngine:
             signals = self._generate_signals(current_date)
             
             # Log signal evaluations
-            for ticker, signal_info in signals.items():
-                score = signal_info.get('score')
-                signal_type = signal_info.get('signal', 'HOLD')
-                
+            for ticker, sig in signals.items():
                 self.daily_activity_log.append({
                     'date': date_str,
                     'ticker': ticker,
                     'action': 'HOLD',  # Signal evaluation, not an actual trade yet
-                    'price': signal_info.get('current_price'),
+                    'price': sig.entry_price,
                     'quantity': None,
-                    'position_value': self.holdings.get(ticker, 0) * signal_info.get('current_price') if self.holdings.get(ticker, 0) > 0 and signal_info.get('current_price') else None,
+                    'position_value': self.holdings.get(ticker, 0) * sig.entry_price if self.holdings.get(ticker, 0) > 0 and sig.entry_price else None,
                     'cash_balance': round(self.cash, 2),
                     'total_portfolio_value': round(self.portfolio_value, 2),
-                    'score': score,
-                    'signal': signal_type,
-                    'notes': f"Signal evaluated: {signal_type}"
+                    'score': sig.score,
+                    'signal': sig.signal,
+                    'notes': f"Signal evaluated: {sig.signal}"
                 })
             
             # Step D: Create pending orders for T+1 execution
@@ -1046,8 +1123,3 @@ class BacktestEngine:
             'final_cash': self.cash,
             'final_holdings': self.holdings
         }
-
-
-# Module-level logger
-import logging
-logger = logging.getLogger(__name__)

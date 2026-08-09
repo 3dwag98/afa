@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -19,6 +19,16 @@ class DataConfig(BaseModel):
     )
     universe_size: int = Field(
         default=10, description="Number of securities in the trading universe"
+    )
+    tickers: List[str] = Field(
+        default_factory=list,
+        description="Explicit ticker override list for the live agent; empty means auto-discover from cache",
+    )
+    min_history_days: int = Field(
+        default=250, description="Minimum number of historical days required to consider a ticker tradeable"
+    )
+    allow_synthetic_fallback: bool = Field(
+        default=True, description="Whether to fall back to synthetic OHLCV data when real data is unavailable"
     )
 
 
@@ -53,12 +63,16 @@ class StrategyConfig(BaseModel):
     """Configuration for trading strategies."""
 
     enabled: bool = Field(default=True, description="Whether strategies are enabled")
+    type: str = Field(
+        default="rule_based",
+        description="Registered strategy type (see strategies/registry.py), e.g. 'rule_based' or 'lstm'",
+    )
     module: str = Field(
         default="portfolio_agent.strategies",
         description="Python module path for strategy implementations",
     )
     config_path: str = Field(
-        default="strategies/default.yaml",
+        default="config/strategies/trend_breakout.yaml",
         description="Path to strategy configuration file",
     )
     params: Dict[str, Any] = Field(
@@ -91,6 +105,11 @@ class TrainingConfig(BaseModel):
     num_workers: int = Field(
         default=2, description="Number of data loading workers (lower on Windows)"
     )
+    use_synthetic_data: bool = Field(
+        default=False,
+        description="If True, train on generated synthetic OHLCV data instead of real cached tickers "
+        "(offline/CI testing only; real training should leave this False)",
+    )
 
 
 class BacktestConfig(BaseModel):
@@ -108,6 +127,12 @@ class BacktestConfig(BaseModel):
     model_path: str = Field(
         default="", description="Path to the trained model file"
     )
+    parallel: bool = Field(
+        default=False, description="Whether to parallelize per-ticker signal generation across CPU workers"
+    )
+    max_workers: Optional[int] = Field(
+        default=None, description="Max worker processes when parallel=True (default: CPU count)"
+    )
 
 
 class RiskConfig(BaseModel):
@@ -124,6 +149,54 @@ class RiskConfig(BaseModel):
     )
 
 
+class LearningConfig(BaseModel):
+    """Configuration for the self-learning weight adaptation."""
+
+    learning_rate: float = Field(
+        default=0.15, description="Rate at which strategy component weights adapt to realized win rate"
+    )
+    min_trades_for_learning: int = Field(
+        default=5, description="Minimum number of realized trades required before weights are adjusted"
+    )
+
+
+class SimulationConfig(BaseModel):
+    """Configuration for per-symbol Monte Carlo forward simulation (feeds strategy scoring)."""
+
+    mc_horizon_days: int = Field(default=20, description="Forward simulation horizon in trading days")
+    mc_simulations: int = Field(default=1000, description="Number of Monte Carlo simulation paths")
+    random_seed: int = Field(default=42, description="Random seed for reproducible simulations")
+
+
+class ComplianceConfig(BaseModel):
+    """Configuration for trade compliance/eligibility checks."""
+
+    min_price_inr: float = Field(default=20.0, description="Minimum share price to be eligible")
+    target_prob_profit: float = Field(
+        default=0.55, description="Minimum Monte Carlo probability-of-profit required for a BUY signal"
+    )
+    min_reward_risk: float = Field(default=1.5, description="Minimum reward:risk ratio required for a BUY signal")
+    paper_trading_mode: bool = Field(
+        default=True, description="Must remain True; this system never places real trades"
+    )
+
+
+class PathsConfig(BaseModel):
+    """Configuration for file/directory locations."""
+
+    brain_file: str = Field(default="data/agent_brain.json", description="Path to the agent's learned weights JSON")
+    sqlite_path: str = Field(default="data/portfolio_agent.db", description="Path to the SQLite state database")
+    excel_output: str = Field(
+        default="output/Agent_Orchestrator_Output.xlsx", description="Path to the live-agent Excel report"
+    )
+    backtest_excel_output: str = Field(
+        default="output/Backtest_Report.xlsx", description="Path to the backtest Excel report"
+    )
+    log_file: str = Field(default="logs/agent.log", description="Path to the log file")
+    log_dir: str = Field(default="logs", description="Directory for log files")
+    output_dir: str = Field(default="output", description="Directory for generated reports")
+
+
 class AppConfig(BaseModel):
     """Root application configuration composing all sub-configurations."""
 
@@ -133,3 +206,7 @@ class AppConfig(BaseModel):
     training: TrainingConfig = Field(default_factory=TrainingConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
+    learning: LearningConfig = Field(default_factory=LearningConfig)
+    simulation: SimulationConfig = Field(default_factory=SimulationConfig)
+    compliance: ComplianceConfig = Field(default_factory=ComplianceConfig)
+    paths: PathsConfig = Field(default_factory=PathsConfig)

@@ -23,10 +23,10 @@ entry:
     
     - field: "close"
       operator: ">"
-      reference_field: "prev_donchian_upper_20"
+      reference_field: "donchian_upper_20"
       description: "Price broke out above previous Donchian upper band"
-    
-    - field: "volume_ratio"
+
+    - field: "volume_ratio_20"
       operator: ">"
       value: 1.5
       description: "Volume ratio above 1.5x average"

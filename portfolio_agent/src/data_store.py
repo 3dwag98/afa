@@ -138,6 +138,141 @@ def batch_download_and_cache(
     return stats['failed'] == 0
 
 
+def get_cached_tickers(cache_dir: Optional[Path] = None) -> List[str]:
+    """
+    Discover all tickers with cached parquet data (module-level convenience
+    function; the single canonical implementation used by both DataStore and
+    universe.py's discover_available_tickers()).
+
+    Args:
+        cache_dir: Directory to scan. Defaults to DATA_DIR (data/market_data,
+            resolved relative to the current working directory).
+
+    Returns:
+        Sorted list of unique ticker symbols. Empty list if none cached.
+    """
+    directory = Path(cache_dir) if cache_dir is not None else DATA_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    tickers = {path.stem for path in directory.glob("*.parquet")}
+    return sorted(tickers)
+
+
+def generate_synthetic_ohlcv(
+    ticker: str, days: int = 500, seed: int = 42
+) -> pd.DataFrame:
+    """
+    Generate synthetic OHLCV data using a random walk. Used only as a fallback
+    when neither cached nor freshly-downloaded real data is available (e.g.
+    offline development, or config.data.allow_synthetic_fallback in tests).
+
+    Args:
+        ticker: Stock ticker symbol (unused in calculation, kept for API symmetry).
+        days: Number of days of data to generate.
+        seed: Random seed for reproducibility.
+
+    Returns:
+        DataFrame with synthetic OHLCV data.
+    """
+    import numpy as np
+
+    np.random.seed(seed)
+
+    end_date = datetime(2024, 1, 1)
+    start_date = end_date - timedelta(days=days)
+    dates = pd.date_range(start=start_date, end=end_date, freq="B")
+
+    returns = np.random.normal(0.0005, 0.02, len(dates))
+    close_prices = 100 * np.cumprod(1 + returns)
+
+    daily_vol = np.abs(np.random.normal(0.01, 0.005, len(dates)))
+    high_prices = close_prices * (1 + daily_vol)
+    low_prices = close_prices * (1 - daily_vol)
+    open_prices = low_prices + np.random.uniform(0, 1, len(dates)) * (high_prices - low_prices)
+    high_prices = np.maximum(high_prices, low_prices)
+    volume = np.random.randint(100000, 10000000, len(dates)).astype(float)
+
+    df = pd.DataFrame(
+        {
+            "open": open_prices,
+            "high": high_prices,
+            "low": low_prices,
+            "close": close_prices,
+            "volume": volume,
+        },
+        index=dates,
+    )
+    df.index.name = "date"
+    return df
+
+
+def load_or_fetch_data(
+    config,
+    force_refresh: bool = False,
+    use_auto_discovery: bool = True,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Load cached ticker data (via the per-ticker parquet cache), downloading
+    anything missing, and falling back to synthetic data only if configured.
+
+    Supersedes the old src/data_ingestion.py::load_or_fetch_data(), which
+    maintained a second, independent combined-file cache
+    (data/raw/ohlcv_data.parquet) that never interoperated with this module's
+    per-ticker parquet cache — that split-brain cache is gone.
+
+    Args:
+        config: AppConfig instance.
+        force_refresh: If True, ignore the cache and re-download everything.
+        use_auto_discovery: If True, auto-discover all cached tickers when
+            config.data.tickers is empty (which takes precedence when set).
+
+    Returns:
+        Dictionary mapping ticker to DataFrame.
+    """
+    tickers_to_use = list(config.data.tickers)
+
+    if use_auto_discovery and not tickers_to_use:
+        discovered = get_cached_tickers()
+        if discovered:
+            tickers_to_use = discovered
+            logger.info(f"Auto-discovered {len(tickers_to_use)} tickers from cache")
+        else:
+            logger.warning("No cached tickers found and config.data.tickers is empty")
+
+    result: Dict[str, pd.DataFrame] = {}
+    missing: List[str] = []
+
+    for ticker in tickers_to_use:
+        df = None if force_refresh else load_ticker_data(ticker)
+        if df is not None and len(df) > 0:
+            result[ticker] = df
+        else:
+            missing.append(ticker)
+
+    if missing:
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=config.data.default_history_years * 365)
+        logger.info(f"Fetching fresh data for {len(missing)} tickers")
+        batch_download_and_cache(
+            missing,
+            start_date=start_date.strftime('%Y-%m-%d'),
+            end_date=end_date.strftime('%Y-%m-%d'),
+            skip_existing=False,
+        )
+        for ticker in missing:
+            df = load_ticker_data(ticker)
+            if df is not None and len(df) > 0:
+                result[ticker] = df
+
+    if not result and config.data.allow_synthetic_fallback:
+        logger.info("No real data available; generating synthetic fallback data")
+        for ticker in tickers_to_use:
+            result[ticker] = generate_synthetic_ohlcv(
+                ticker, days=config.data.min_history_days, seed=config.simulation.random_seed
+            )
+
+    return result
+
+
 def get_ticker_data(
     ticker: str,
     start_date: str,
@@ -901,14 +1036,11 @@ class DataStore:
     def get_cached_tickers(self) -> List[str]:
         """
         Get list of all tickers with cached data.
-        
+
         Returns:
             List of ticker symbols.
         """
-        tickers = []
-        for path in self.cache_dir.glob("*.parquet"):
-            tickers.append(self._parse_ticker_from_path(path))
-        return tickers
+        return get_cached_tickers(self.cache_dir)
     
     def clear_cache(self, ticker: Optional[str] = None) -> None:
         """

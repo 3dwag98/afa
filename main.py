@@ -1,1 +1,1 @@
-/workspace/portfolio_agent/main.py
+portfolio_agent/main.py

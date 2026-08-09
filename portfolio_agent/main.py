@@ -20,7 +20,7 @@ from pathlib import Path
 app_path = Path(__file__).parent
 sys.path.insert(0, str(app_path))
 
-from src.config import get_config
+from portfolio_agent.config.loader import load_config as get_config
 from src.orchestrator import run_orchestrator
 
 
@@ -64,11 +64,11 @@ def main():
         print(f"Error: Invalid configuration: {e}")
         sys.exit(1)
 
-    print(f"  Portfolio Value: ₹{config.portfolio_value_inr:,.2f}")
-    print(f"  Risk per Trade: {config.risk_per_trade_pct * 100:.1f}%")
-    print(f"  Max Position: {config.max_single_position_pct * 100:.1f}%")
-    print(f"  Tickers: {len(config.tickers)}")
-    print(f"  Paper Trading Mode: {config.paper_trading_mode}")
+    print(f"  Portfolio Value: ₹{config.risk.portfolio_value_inr:,.2f}")
+    print(f"  Risk per Trade: {config.risk.risk_per_trade_pct * 100:.1f}%")
+    print(f"  Max Position: {config.risk.max_single_position_pct * 100:.1f}%")
+    print(f"  Tickers: {len(config.data.tickers)}")
+    print(f"  Paper Trading Mode: {config.compliance.paper_trading_mode}")
     print()
 
     # Run orchestrator

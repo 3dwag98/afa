@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from src.orchestrator import run_orchestrator
-from src.config import AppConfig
+from portfolio_agent.config.schema import AppConfig
 
 
 @pytest.fixture
@@ -44,27 +44,23 @@ def test_config(temp_dirs):
     excel_output = os.path.join(temp_dirs["output_dir"], "Agent_Orchestrator_Output.xlsx")
     log_file = os.path.join(temp_dirs["logs_dir"], "test.log")
     
-    return AppConfig(
-        portfolio_value_inr=1000000.0,
-        risk_per_trade_pct=0.01,
-        max_single_position_pct=0.10,
-        min_price_inr=100.0,
-        target_prob_profit=0.55,
-        min_reward_risk=1.5,
-        learning_rate=0.01,
-        min_trades_for_learning=5,
-        mc_horizon_days=20,
-        mc_simulations=100,
-        random_seed=42,
-        tickers=["RELIANCE", "TCS", "INFY"],
-        brain_file=brain_file,
-        sqlite_path=sqlite_path,
-        excel_output=excel_output,
-        log_file=log_file,
-        paper_trading_mode=True,
-        min_history_days=200,
-        allow_synthetic_fallback=True,
-    )
+    return AppConfig.model_validate({
+        "risk": {"portfolio_value_inr": 1000000.0, "risk_per_trade_pct": 0.01, "max_single_position_pct": 0.10},
+        "compliance": {"min_price_inr": 100.0, "target_prob_profit": 0.55, "min_reward_risk": 1.5, "paper_trading_mode": True},
+        "learning": {"learning_rate": 0.01, "min_trades_for_learning": 5},
+        "simulation": {"mc_horizon_days": 20, "mc_simulations": 100, "random_seed": 42},
+        "data": {
+            "tickers": ["RELIANCE", "TCS", "INFY"],
+            "min_history_days": 200,
+            "allow_synthetic_fallback": True,
+        },
+        "paths": {
+            "brain_file": brain_file,
+            "sqlite_path": sqlite_path,
+            "excel_output": excel_output,
+            "log_file": log_file,
+        },
+    })
 
 
 class TestIntegrationOrchestrator:
@@ -82,14 +78,14 @@ class TestIntegrationOrchestrator:
         assert result is not None
         
         # Assert output Excel exists
-        assert os.path.exists(test_config.excel_output), \
-            f"Excel output file should exist at {test_config.excel_output}"
+        assert os.path.exists(test_config.paths.excel_output), \
+            f"Excel output file should exist at {test_config.paths.excel_output}"
         
         # Assert SQLite database exists and contains recommendations
-        assert os.path.exists(test_config.sqlite_path), \
-            f"SQLite database should exist at {test_config.sqlite_path}"
+        assert os.path.exists(test_config.paths.sqlite_path), \
+            f"SQLite database should exist at {test_config.paths.sqlite_path}"
         
-        conn = sqlite3.connect(test_config.sqlite_path)
+        conn = sqlite3.connect(test_config.paths.sqlite_path)
         cursor = conn.cursor()
         
         # Check recommendations table has entries
@@ -100,11 +96,11 @@ class TestIntegrationOrchestrator:
         conn.close()
         
         # Assert brain JSON exists
-        assert os.path.exists(test_config.brain_file), \
-            f"Brain JSON file should exist at {test_config.brain_file}"
+        assert os.path.exists(test_config.paths.brain_file), \
+            f"Brain JSON file should exist at {test_config.paths.brain_file}"
         
         # Assert weights sum to 100
-        with open(test_config.brain_file, "r") as f:
+        with open(test_config.paths.brain_file, "r") as f:
             brain = json.load(f)
         
         assert "weights" in brain, "Brain should contain weights"
@@ -126,10 +122,10 @@ class TestIntegrationOrchestrator:
         assert result is not None
         
         # Assert output Excel exists
-        assert os.path.exists(test_config.excel_output)
+        assert os.path.exists(test_config.paths.excel_output)
         
         # Assert SQLite contains trade outcomes from simulation
-        conn = sqlite3.connect(test_config.sqlite_path)
+        conn = sqlite3.connect(test_config.paths.sqlite_path)
         cursor = conn.cursor()
         
         # Check trade_outcomes table has entries
@@ -145,9 +141,9 @@ class TestIntegrationOrchestrator:
         conn.close()
         
         # Assert brain JSON exists and weights sum to 100
-        assert os.path.exists(test_config.brain_file)
+        assert os.path.exists(test_config.paths.brain_file)
         
-        with open(test_config.brain_file, "r") as f:
+        with open(test_config.paths.brain_file, "r") as f:
             brain = json.load(f)
         
         weights = brain["weights"]
@@ -165,7 +161,7 @@ class TestIntegrationOrchestrator:
         )
         
         # Load initial weights
-        with open(test_config.brain_file, "r") as f:
+        with open(test_config.paths.brain_file, "r") as f:
             initial_brain = json.load(f)
         initial_weights = dict(initial_brain["weights"])
         
@@ -177,7 +173,7 @@ class TestIntegrationOrchestrator:
         )
         
         # Load updated weights
-        with open(test_config.brain_file, "r") as f:
+        with open(test_config.paths.brain_file, "r") as f:
             updated_brain = json.load(f)
         updated_weights = dict(updated_brain["weights"])
         

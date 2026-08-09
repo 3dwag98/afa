@@ -1,135 +1,87 @@
 """Tests for configuration module."""
 
 import os
-import tempfile
+
 import pytest
-from pathlib import Path
 
-# Add src to path for imports
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
-from config import get_config, clear_config_cache, _validate_config, AppConfig
+from portfolio_agent.config.loader import load_config
+from portfolio_agent.config.schema import AppConfig
 
 
 class TestConfigLoading:
     """Test suite for configuration loading."""
 
-    def setup_method(self):
-        """Clear cache before each test."""
-        clear_config_cache()
-
-    def teardown_method(self):
-        """Clear cache after each test."""
-        clear_config_cache()
-
     def test_config_loads_successfully(self):
-        """Test that config loads from default location."""
-        config = get_config()
-        assert config is not None
-        assert isinstance(config.portfolio_value_inr, (int, float))
-        assert config.portfolio_value_inr > 0
+        """Test that config loads from the default location."""
+        config = load_config()
+        assert isinstance(config, AppConfig)
+        assert config.risk.portfolio_value_inr > 0
 
-    def test_default_tickers_exist(self):
-        """Test that default tickers are present and valid."""
-        config = get_config()
-        assert config.tickers is not None
-        assert len(config.tickers) > 0
-        
-        # Check expected tickers are present
-        expected_tickers = ["NIFTYBEES.NS", "RELIANCE.NS", "TCS.NS", 
-                          "HDFCBANK.NS", "ITC.NS", "SBIN.NS", "TATAMOTORS.NS"]
-        
-        for ticker in expected_tickers:
-            assert ticker in config.tickers, f"Expected ticker {ticker} not found"
+    def test_config_has_all_sections(self):
+        """Test that all configuration sections are present."""
+        config = load_config()
 
-    def test_config_has_required_fields(self):
-        """Test that all required fields are loaded."""
-        config = get_config()
-        
-        assert hasattr(config, 'portfolio_value_inr')
-        assert hasattr(config, 'risk_per_trade_pct')
-        assert hasattr(config, 'max_single_position_pct')
-        assert hasattr(config, 'min_price_inr')
-        assert hasattr(config, 'target_prob_profit')
-        assert hasattr(config, 'min_reward_risk')
-        assert hasattr(config, 'learning_rate')
-        assert hasattr(config, 'mc_horizon_days')
-        assert hasattr(config, 'mc_simulations')
-        assert hasattr(config, 'random_seed')
-        assert hasattr(config, 'tickers')
-        assert hasattr(config, 'brain_file')
-        assert hasattr(config, 'sqlite_path')
-        assert hasattr(config, 'excel_output')
-        assert hasattr(config, 'log_file')
-        assert hasattr(config, 'paper_trading_mode')
-        assert hasattr(config, 'min_history_days')
+        assert hasattr(config, "data")
+        assert hasattr(config, "features")
+        assert hasattr(config, "strategy")
+        assert hasattr(config, "training")
+        assert hasattr(config, "backtest")
+        assert hasattr(config, "risk")
+        assert hasattr(config, "learning")
+        assert hasattr(config, "simulation")
+        assert hasattr(config, "compliance")
+        assert hasattr(config, "paths")
 
     def test_paper_trading_mode_is_true(self):
         """Test that paper trading mode is enabled by default."""
-        config = get_config()
-        assert config.paper_trading_mode is True
+        config = load_config()
+        assert config.compliance.paper_trading_mode is True
+
+    def test_strategy_config_path_exists(self):
+        """The default strategy YAML referenced by config.yaml must actually exist."""
+        config = load_config()
+        candidate = config.strategy.config_path
+        package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        workspace_root = os.path.dirname(package_root)
+        assert os.path.exists(os.path.join(workspace_root, candidate)) or os.path.exists(
+            os.path.join(package_root, candidate)
+        )
 
 
-class TestConfigValidation:
-    """Test suite for configuration validation."""
+class TestAppConfigDefaults:
+    """Test AppConfig default construction and validation."""
 
-    def test_invalid_config_raises_error(self):
-        """Test that missing required fields raise ValueError."""
-        invalid_config = {
-            "portfolio_value_inr": 100000,
-            # Missing other required fields
-        }
-        
-        with pytest.raises(ValueError) as exc_info:
-            _validate_config(invalid_config)
-        
-        assert "Missing required configuration fields" in str(exc_info.value)
+    def test_default_construction(self):
+        """AppConfig should construct with sensible defaults with no input."""
+        config = AppConfig()
+        assert config.risk.portfolio_value_inr > 0
+        assert config.compliance.paper_trading_mode is True
+        assert config.learning.learning_rate > 0
+        assert config.simulation.mc_simulations > 0
 
-    def test_empty_config_raises_error(self):
-        """Test that empty config raises ValueError."""
-        with pytest.raises(ValueError):
-            _validate_config({})
-
-
-class TestAppConfigFromDict:
-    """Test AppConfig creation from dictionary."""
-
-    def test_from_dict_creates_valid_config(self):
-        """Test creating AppConfig from valid dictionary."""
+    def test_validate_from_nested_dict(self):
+        """AppConfig should validate a nested dict matching the schema."""
         valid_dict = {
-            "portfolio_value_inr": 308733,
-            "risk_per_trade_pct": 0.01,
-            "max_single_position_pct": 0.03,
-            "min_price_inr": 20,
-            "target_prob_profit": 0.55,
-            "min_reward_risk": 1.5,
-            "learning_rate": 0.15,
-            "min_trades_for_learning": 5,
-            "mc_horizon_days": 20,
-            "mc_simulations": 1000,
-            "random_seed": 42,
-            "tickers": ["RELIANCE.NS"],
-            "brain_file": "data/brain.json",
-            "sqlite_path": "data/test.db",
-            "excel_output": "output/test.xlsx",
-            "log_file": "logs/test.log",
-            "paper_trading_mode": True,
-            "min_history_days": 250,
+            "risk": {"portfolio_value_inr": 500000, "risk_per_trade_pct": 0.02},
+            "data": {"tickers": ["RELIANCE.NS"]},
+            "compliance": {"paper_trading_mode": True},
         }
-        
-        config = AppConfig.from_dict(valid_dict)
-        assert config.portfolio_value_inr == 308733
-        assert config.tickers == ["RELIANCE.NS"]
-        assert config.paper_trading_mode is True
+
+        config = AppConfig.model_validate(valid_dict)
+        assert config.risk.portfolio_value_inr == 500000
+        assert config.data.tickers == ["RELIANCE.NS"]
+        assert config.compliance.paper_trading_mode is True
 
 
-class TestConfigFileNotFound:
-    """Test behavior when config file is missing."""
+class TestConfigEnvOverrides:
+    """Test environment variable overrides via the AFA_ prefix."""
 
-    def test_missing_config_file_raises_error(self):
-        """Test that missing config file raises FileNotFoundError."""
-        clear_config_cache()
-        
-        with pytest.raises(FileNotFoundError):
-            get_config(config_path="/nonexistent/path/config.yaml")
+    def test_env_override_applied(self, monkeypatch):
+        monkeypatch.setenv("AFA_RISK__PORTFOLIO_VALUE_INR", "999999")
+        config = load_config()
+        assert config.risk.portfolio_value_inr == 999999.0
+
+    def test_missing_config_file_uses_defaults(self):
+        """A nonexistent config path should fall back to schema defaults, not raise."""
+        config = load_config(path="/nonexistent/path/config.yaml")
+        assert isinstance(config, AppConfig)

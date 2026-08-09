@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from src.config import AppConfig
+from portfolio_agent.config.schema import AppConfig
 from src.models import Recommendation, IndicatorSnapshot, AgentBrain
 from src.monte_carlo import MonteCarloResult
 from src.reporting import export_excel_report
@@ -14,27 +14,23 @@ from src.reporting import export_excel_report
 
 def _create_test_config(tmp_path: str) -> AppConfig:
     """Create a test configuration."""
-    return AppConfig(
-        portfolio_value_inr=308733.0,
-        risk_per_trade_pct=0.01,
-        max_single_position_pct=0.03,
-        min_price_inr=20.0,
-        target_prob_profit=0.55,
-        min_reward_risk=1.5,
-        learning_rate=0.15,
-        min_trades_for_learning=5,
-        mc_horizon_days=20,
-        mc_simulations=1000,
-        random_seed=42,
-        tickers=["NIFTYBEES.NS", "RELIANCE.NS"],
-        brain_file="data/agent_brain.json",
-        sqlite_path="data/portfolio_agent.db",
-        excel_output=tmp_path,
-        log_file="logs/agent.log",
-        paper_trading_mode=True,
-        min_history_days=250,
-        allow_synthetic_fallback=True,
-    )
+    return AppConfig.model_validate({
+        "risk": {"portfolio_value_inr": 308733.0, "risk_per_trade_pct": 0.01, "max_single_position_pct": 0.03},
+        "compliance": {
+            "min_price_inr": 20.0, "target_prob_profit": 0.55, "min_reward_risk": 1.5, "paper_trading_mode": True,
+        },
+        "learning": {"learning_rate": 0.15, "min_trades_for_learning": 5},
+        "simulation": {"mc_horizon_days": 20, "mc_simulations": 1000, "random_seed": 42},
+        "data": {
+            "tickers": ["NIFTYBEES.NS", "RELIANCE.NS"], "min_history_days": 250, "allow_synthetic_fallback": True,
+        },
+        "paths": {
+            "brain_file": "data/agent_brain.json",
+            "sqlite_path": "data/portfolio_agent.db",
+            "excel_output": tmp_path,
+            "log_file": "logs/agent.log",
+        },
+    })
 
 
 def _create_dummy_brain() -> AgentBrain:

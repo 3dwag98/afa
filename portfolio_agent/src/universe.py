@@ -28,38 +28,21 @@ logger = logging.getLogger(__name__)
 def discover_available_tickers(data_dir: str = "data/market_data") -> list[str]:
     """
     Discover all tickers for which historical data is available locally.
-    
-    Scans the data directory for parquet files and extracts ticker symbols
-    from filenames.
-    
+
+    Thin wrapper over data_store.get_cached_tickers() (the single canonical
+    parquet-cache scanning implementation).
+
     Args:
         data_dir: Directory containing parquet files. Defaults to "data/market_data".
-        
+
     Returns:
         Sorted list of unique ticker symbols. Empty list if no parquet files exist.
     """
-    data_path = Path(data_dir)
-    
-    # Create directory if it does not exist
-    data_path.mkdir(parents=True, exist_ok=True)
-    
-    # Scan for all .parquet files
-    parquet_files = list(data_path.glob("*.parquet"))
-    
-    if not parquet_files:
-        return []
-    
-    tickers = set()
-    for file_path in parquet_files:
-        # Strip the .parquet extension to get the ticker
-        ticker = file_path.stem
-        # Reverse filename sanitization: replace _NS back to .NS, and _ to .
-        # Note: _ticker_filename replaces "/" with "_", but typical tickers like
-        # "RELIANCE.NS" have no slash, so we just need to handle the basic case
-        # The stem is usually the ticker itself (e.g., "RELIANCE.NS" from "RELIANCE.NS.parquet")
-        tickers.add(ticker)
-    
-    return sorted(tickers)
+    try:
+        from .data_store import get_cached_tickers
+    except ImportError:
+        from data_store import get_cached_tickers
+    return get_cached_tickers(Path(data_dir))
 
 
 def resolve_backtest_universe(
@@ -138,18 +121,19 @@ class UniverseManager:
     # Public CSV URL for Nifty 500 constituents (GitHub Gist or similar)
     NIFTY_500_CSV_URL = "https://raw.githubusercontent.com/amitkumarjha/nse-data/main/nifty500_tickers.csv"
     
-    # Fallback local path
-    LOCAL_TICKER_PATH = Path(__file__).parent.parent / "data" / "nse500_tickers.csv"
-    
+    # Fallback local path (cwd-relative, matching data_store.DATA_DIR's convention)
+    LOCAL_TICKER_PATH = Path("data") / "nse500_tickers.csv"
+
     def __init__(self, cache_dir: Optional[Path] = None):
         """
         Initialize the UniverseManager.
-        
+
         Args:
-            cache_dir: Directory for caching ticker lists. Defaults to data/ directory.
+            cache_dir: Directory for caching ticker lists. Defaults to data/ directory
+                (resolved relative to the current working directory).
         """
         if cache_dir is None:
-            cache_dir = Path(__file__).parent.parent / "data"
+            cache_dir = Path("data")
         self.cache_dir = cache_dir
         self._ticker_cache: Optional[List[str]] = None
     
