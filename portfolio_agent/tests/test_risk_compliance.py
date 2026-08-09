@@ -2,7 +2,15 @@
 
 import pytest
 from portfolio_agent.config.schema import AppConfig
-from src.risk import calculate_quantity, calculate_stop_target, calculate_max_loss
+from src.risk import (
+    calculate_quantity,
+    calculate_stop_target,
+    calculate_max_loss,
+    calculate_kelly_fraction,
+    calculate_kelly_quantity,
+    calculate_position_quantity,
+    estimate_kelly_inputs,
+)
 from src.compliance import run_compliance_checks, estimate_capital_gains_tax
 
 
@@ -436,6 +444,146 @@ class TestEstimateCapitalGainsTax:
         tax = estimate_capital_gains_tax(gain_inr, holding_days, fy_ltcg_used_inr)
 
         assert tax == 0.0
+
+
+class TestEstimateKellyInputs:
+    """Tests for estimate_kelly_inputs()."""
+
+    def _trades(self, n_wins: int, n_losses: int, win_pct: float = 5.0, loss_pct: float = -2.0):
+        trades = [{"outcome": "WIN", "return_pct": win_pct} for _ in range(n_wins)]
+        trades += [{"outcome": "LOSS", "return_pct": loss_pct} for _ in range(n_losses)]
+        return trades
+
+    def test_none_below_min_trades(self):
+        trades = self._trades(3, 2)
+        assert estimate_kelly_inputs(trades, min_trades=20) is None
+
+    def test_none_with_no_losses(self):
+        trades = self._trades(20, 0)
+        assert estimate_kelly_inputs(trades, min_trades=10) is None
+
+    def test_none_with_no_wins(self):
+        trades = self._trades(0, 20)
+        assert estimate_kelly_inputs(trades, min_trades=10) is None
+
+    def test_computes_win_rate_and_reward_risk(self):
+        # 12 wins @ +6%, 8 losses @ -3% => p=0.6, b=6/3=2.0
+        trades = self._trades(12, 8, win_pct=6.0, loss_pct=-3.0)
+        result = estimate_kelly_inputs(trades, min_trades=10)
+        assert result is not None
+        win_probability, reward_risk_ratio = result
+        assert win_probability == pytest.approx(0.6)
+        assert reward_risk_ratio == pytest.approx(2.0)
+
+    def test_ignores_pending_trades(self):
+        trades = self._trades(10, 10) + [{"outcome": "PENDING", "return_pct": 0.0}] * 100
+        result = estimate_kelly_inputs(trades, min_trades=20)
+        assert result is not None
+
+
+class TestCalculateKellyFraction:
+    """Tests for calculate_kelly_fraction()."""
+
+    def test_positive_edge(self):
+        # p=0.6, b=2.0 => f* = 0.6 - 0.4/2 = 0.4
+        assert calculate_kelly_fraction(0.6, 2.0) == pytest.approx(0.4)
+
+    def test_negative_edge_clamped_to_zero(self):
+        # p=0.3, b=1.0 => f* = 0.3 - 0.7/1 = -0.4 -> clamped to 0
+        assert calculate_kelly_fraction(0.3, 1.0) == 0.0
+
+    def test_zero_reward_risk_returns_zero(self):
+        assert calculate_kelly_fraction(0.9, 0.0) == 0.0
+
+    def test_clamped_to_one(self):
+        assert calculate_kelly_fraction(0.99, 100.0) <= 1.0
+
+
+class TestCalculateKellyQuantity:
+    """Tests for calculate_kelly_quantity()."""
+
+    def test_basic_sizing(self):
+        qty = calculate_kelly_quantity(
+            entry_price=100.0,
+            portfolio_value_inr=1_000_000.0,
+            max_single_position_pct=0.5,
+            win_probability=0.6,
+            reward_risk_ratio=2.0,
+            kelly_fraction=0.5,
+        )
+        # f* = 0.4, half-Kelly = 0.2 -> position value ~= 200,000 -> qty ~= 2000
+        # (floor of a floating-point division, so off-by-one from binary rounding is fine)
+        assert qty in (1999, 2000)
+
+    def test_capped_by_max_single_position_pct(self):
+        qty = calculate_kelly_quantity(
+            entry_price=100.0,
+            portfolio_value_inr=1_000_000.0,
+            max_single_position_pct=0.05,
+            win_probability=0.6,
+            reward_risk_ratio=2.0,
+            kelly_fraction=0.5,
+        )
+        # Uncapped would be 2000 shares (200,000 INR); cap is 5% = 50,000 INR -> 500 shares
+        assert qty == 500
+
+    def test_zero_quantity_on_negative_edge(self):
+        qty = calculate_kelly_quantity(
+            entry_price=100.0,
+            portfolio_value_inr=1_000_000.0,
+            max_single_position_pct=0.5,
+            win_probability=0.3,
+            reward_risk_ratio=1.0,
+            kelly_fraction=0.5,
+        )
+        assert qty == 0
+
+    def test_zero_entry_price_returns_zero(self):
+        qty = calculate_kelly_quantity(
+            entry_price=0.0,
+            portfolio_value_inr=1_000_000.0,
+            max_single_position_pct=0.5,
+            win_probability=0.6,
+            reward_risk_ratio=2.0,
+        )
+        assert qty == 0
+
+
+class TestCalculatePositionQuantity:
+    """Tests for calculate_position_quantity() — the single sizing entry point."""
+
+    def test_falls_back_to_fixed_fractional_when_kelly_disabled(self):
+        config = _make_config()
+        trade_history = [{"outcome": "WIN", "return_pct": 6.0}] * 12 + [{"outcome": "LOSS", "return_pct": -3.0}] * 8
+        expected = calculate_quantity(entry_price=150.0, stop_price=145.0, config=config)
+        actual = calculate_position_quantity(
+            entry_price=150.0, stop_price=145.0, config=config, trade_history=trade_history
+        )
+        assert actual == expected
+
+    def test_falls_back_when_not_enough_trade_history(self):
+        config = _make_config()
+        config.risk.use_kelly_sizing = True
+        config.risk.kelly_min_trades = 20
+        trade_history = [{"outcome": "WIN", "return_pct": 6.0}] * 3
+        expected = calculate_quantity(entry_price=150.0, stop_price=145.0, config=config)
+        actual = calculate_position_quantity(
+            entry_price=150.0, stop_price=145.0, config=config, trade_history=trade_history
+        )
+        assert actual == expected
+
+    def test_uses_kelly_when_enabled_and_enough_history(self):
+        config = _make_config(portfolio_value_inr=1_000_000.0, max_single_position_pct=0.5)
+        config.risk.use_kelly_sizing = True
+        config.risk.kelly_min_trades = 10
+        config.risk.kelly_fraction = 0.5
+        trade_history = [{"outcome": "WIN", "return_pct": 6.0}] * 12 + [{"outcome": "LOSS", "return_pct": -3.0}] * 8
+
+        actual = calculate_position_quantity(
+            entry_price=100.0, stop_price=95.0, config=config, trade_history=trade_history
+        )
+        # p=0.6, b=2.0 -> f*=0.4, half-Kelly=0.2 -> ~200,000 INR / 100 = ~2000 shares
+        assert actual in (1999, 2000)
 
 
 if __name__ == "__main__":

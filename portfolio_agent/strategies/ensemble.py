@@ -65,6 +65,11 @@ class EnsembleStrategy(BaseStrategy):
     member embedded in a UMA is therefore called once per ticker rather than
     batched across tickers — for maximum ML-inference throughput, use that
     strategy directly (--strategy lstm) instead of wrapping it in a UMA.
+
+    Cross-sectional strategies (momentum, low_volatility) cannot be UMA
+    members at all: their signals depend on ranking the *entire* eligible
+    universe at once (BaseStrategy.requires_full_batch), which per-ticker
+    score() cannot provide. Use them directly instead.
     """
 
     def __init__(self, config: StrategyConfig):
@@ -87,7 +92,15 @@ class EnsembleStrategy(BaseStrategy):
                 config_path=member_spec.get("config_path", config.config_path),
                 params=member_spec.get("params", {}),
             )
-            self._members.append(load_strategy(member_config))
+            member = load_strategy(member_config)
+            if member.requires_full_batch:
+                raise ValueError(
+                    f"UMA member '{member.name}' (type={member_spec['type']!r}) requires the full "
+                    f"eligible universe to score correctly (e.g. cross-sectional momentum/low-volatility "
+                    f"ranking) and cannot be combined via per-ticker score() the way UMAs blend members "
+                    f"today. Use it directly (--strategy {member_spec['type']}) instead of inside a UMA."
+                )
+            self._members.append(member)
             self._weights.append(float(member_spec.get("weight", 1.0)))
 
     def _load_spec(self) -> Dict[str, Any]:

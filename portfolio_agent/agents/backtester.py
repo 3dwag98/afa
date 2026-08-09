@@ -104,6 +104,10 @@ class BacktesterAgent:
             mc_horizon_days=self.config.simulation.mc_horizon_days,
             mc_simulations=self.config.simulation.mc_simulations,
             mc_seed=self.config.simulation.random_seed,
+            use_garch_volatility=self.config.simulation.use_garch_volatility,
+            use_kelly_sizing=self.config.risk.use_kelly_sizing,
+            kelly_fraction=self.config.risk.kelly_fraction,
+            kelly_min_trades=self.config.risk.kelly_min_trades,
         )
 
         logger.info(f"Running backtest from {start_date} to {end_date} with strategy '{strategy.name}'")

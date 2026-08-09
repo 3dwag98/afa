@@ -27,12 +27,14 @@ try:
     from .data_store import load_ticker_data
     from .models import AgentBrain
     from .execution_sim import ExecutionSimulator
-    from .monte_carlo import run_monte_carlo
+    from .monte_carlo import run_monte_carlo, run_monte_carlo_garch
+    from .risk import calculate_kelly_quantity, estimate_kelly_inputs
 except ImportError:
     from data_store import load_ticker_data
     from models import AgentBrain
     from execution_sim import ExecutionSimulator
-    from monte_carlo import run_monte_carlo
+    from monte_carlo import run_monte_carlo, run_monte_carlo_garch
+    from risk import calculate_kelly_quantity, estimate_kelly_inputs
 
 
 def _score_one_ticker(
@@ -42,16 +44,17 @@ def _score_one_ticker(
     required_features: List[str],
     risk_params: RiskParams,
     weights: Dict[str, float],
-    mc_params: Tuple[int, int, int],
+    mc_params: Tuple[int, int, int, bool],
 ) -> Optional[StrategySignal]:
     """Score a single ticker: run Monte Carlo + build features + call strategy.score().
 
     Module-level (not a method) so it is picklable for ProcessPoolExecutor dispatch.
     """
     try:
-        horizon_days, simulations, seed = mc_params
+        horizon_days, simulations, seed, use_garch = mc_params
         daily_returns = hist_data['close'].pct_change().dropna().tolist()
-        mc_result = run_monte_carlo(
+        mc_fn = run_monte_carlo_garch if use_garch else run_monte_carlo
+        mc_result = mc_fn(
             symbol=ticker,
             daily_returns=daily_returns,
             horizon_days=horizon_days,
@@ -72,7 +75,7 @@ def _score_tickers_parallel(
     required_features: List[str],
     risk_params: RiskParams,
     weights: Dict[str, float],
-    mc_params: Tuple[int, int, int],
+    mc_params: Tuple[int, int, int, bool],
     max_workers: Optional[int],
 ) -> Dict[str, StrategySignal]:
     """Dispatch _score_one_ticker() across a CPU process pool.
@@ -118,6 +121,10 @@ class BacktestEngine:
         mc_horizon_days: int = 20,
         mc_simulations: int = 1000,
         mc_seed: int = 42,
+        use_garch_volatility: bool = False,
+        use_kelly_sizing: bool = False,
+        kelly_fraction: float = 0.5,
+        kelly_min_trades: int = 20,
     ):
         """
         Initialize the BacktestEngine.
@@ -137,6 +144,14 @@ class BacktestEngine:
                 If the strategy does support GPU batching (e.g. an ML strategy),
                 all eligible tickers are scored in a single batched call instead.
             max_workers: Max worker processes when parallel=True (default: CPU count).
+            use_garch_volatility: If True, forecast each ticker's forward
+                volatility with GJR-GARCH(1,1) instead of a flat historical
+                standard deviation (see src/volatility_models.py).
+            use_kelly_sizing: If True, size positions with fractional-Kelly
+                once enough realized trades exist in this run's trade_log,
+                falling back to fixed-fractional sizing otherwise.
+            kelly_fraction: Fractional-Kelly multiplier kappa (default 0.5 = half-Kelly).
+            kelly_min_trades: Minimum realized trades required before Kelly sizing is trusted.
         """
         self.start_date = pd.to_datetime(start_date)
         self.end_date = pd.to_datetime(end_date)
@@ -160,6 +175,10 @@ class BacktestEngine:
         self.mc_horizon_days = mc_horizon_days
         self.mc_simulations = mc_simulations
         self.mc_seed = mc_seed
+        self.use_garch_volatility = use_garch_volatility
+        self.use_kelly_sizing = use_kelly_sizing
+        self.kelly_fraction = kelly_fraction
+        self.kelly_min_trades = kelly_min_trades
 
 
         # Track untradeable tickers (delisted or NaN issues) - initialize BEFORE loading data
@@ -585,7 +604,7 @@ class BacktestEngine:
 
         weights = dict(self.agent_brain.weights)
 
-        if self.strategy.supports_gpu_batch:
+        if self.strategy.supports_gpu_batch or self.strategy.requires_full_batch:
             features_by_symbol = {
                 ticker: build_features(hist_data, self.strategy.required_features())
                 for ticker, hist_data in eligible.items()
@@ -594,7 +613,7 @@ class BacktestEngine:
             return self.strategy.score_batch(features_by_symbol, context)
 
         required_features = self.strategy.required_features()
-        mc_params = (self.mc_horizon_days, self.mc_simulations, self.mc_seed)
+        mc_params = (self.mc_horizon_days, self.mc_simulations, self.mc_seed, self.use_garch_volatility)
 
         if self.parallel and len(eligible) > 1:
             return _score_tickers_parallel(
@@ -803,6 +822,30 @@ class BacktestEngine:
         
         return executed_trades
     
+    def _kelly_quantity(self, entry_price: float) -> int:
+        """Fractional-Kelly position size from this run's realized trade_log so far.
+
+        Returns 0 (triggering the caller's fixed-fractional fallback) when
+        there aren't yet enough realized trades to estimate Kelly inputs
+        reliably (see risk.py::estimate_kelly_inputs).
+        """
+        realized = [
+            {"outcome": "WIN" if t.get("net_pnl", 0.0) > 0 else "LOSS", "return_pct": t.get("return_pct", 0.0)}
+            for t in self.trade_log
+        ]
+        kelly_inputs = estimate_kelly_inputs(realized, min_trades=self.kelly_min_trades)
+        if kelly_inputs is None:
+            return 0
+        win_probability, reward_risk_ratio = kelly_inputs
+        return calculate_kelly_quantity(
+            entry_price=entry_price,
+            portfolio_value_inr=self.portfolio_value,
+            max_single_position_pct=self.risk_params.max_single_position_pct,
+            win_probability=win_probability,
+            reward_risk_ratio=reward_risk_ratio,
+            kelly_fraction=self.kelly_fraction,
+        )
+
     def _create_pending_orders(self, signals: Dict[str, StrategySignal], current_date: pd.Timestamp) -> None:
         """
         Create pending orders for T+1 execution based on signals.
@@ -821,10 +864,13 @@ class BacktestEngine:
             signal = sig.signal
 
             if signal == 'BUY' and ticker not in self.holdings:
-                # Calculate position size (10% of portfolio per position)
-                position_value = self.portfolio_value * 0.10
                 price = sig.entry_price or 100
-                quantity = int(position_value / price)
+                quantity = self._kelly_quantity(price) if self.use_kelly_sizing else 0
+
+                if quantity <= 0:
+                    # Default / Kelly-unavailable fallback: 10% of portfolio per position.
+                    position_value = self.portfolio_value * 0.10
+                    quantity = int(position_value / price)
 
                 if quantity > 0:
                     self.pending_orders.append({

@@ -9,6 +9,7 @@ from typing import Dict, Type
 
 from .base import BaseStrategy
 from .rule_based import RuleBasedStrategy
+from .cross_sectional import MomentumStrategy, LowVolatilityStrategy
 from portfolio_agent.config.schema import StrategyConfig
 
 STRATEGY_REGISTRY: Dict[str, Type[BaseStrategy]] = {}
@@ -25,6 +26,8 @@ def register_strategy(name: str, strategy_class: Type[BaseStrategy]) -> None:
 
 
 register_strategy("rule_based", RuleBasedStrategy)
+register_strategy("momentum", MomentumStrategy)
+register_strategy("low_volatility", LowVolatilityStrategy)
 
 try:
     from .ml_strategy import MLStrategy

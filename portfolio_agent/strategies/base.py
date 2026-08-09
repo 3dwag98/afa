@@ -54,6 +54,19 @@ class BaseStrategy(ABC):
         """
         return False
 
+    @property
+    def requires_full_batch(self) -> bool:
+        """Whether this strategy's signals depend on the full eligible universe
+        at once (e.g. cross-sectional ranking), not just each ticker's own history.
+
+        Callers must invoke score_batch() with every eligible ticker in one
+        call for such strategies — scoring one ticker at a time (even in a
+        loop) is semantically wrong, since ranking degenerates to a universe
+        of one. Distinct from supports_gpu_batch, which is about batching for
+        performance rather than correctness.
+        """
+        return False
+
     def entry_rules(self) -> Dict[str, Any]:
         """Optional: return the entry rules for this strategy (for reporting/introspection)."""
         return {}
