@@ -10,34 +10,22 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-# Configure logging
-logger = logging.getLogger(__name__)
+# Use absolute imports for CLI execution
+try:
+    from .logging_utils import get_logger, ContextualLogger
+except ImportError:
+    from logging_utils import get_logger, ContextualLogger
 
 
-def _setup_logging(log_file: str = "logs/agent.log") -> None:
-    """Setup logging to file and console."""
-    log_path = Path(log_file)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    if not logger.handlers:
-        logger.setLevel(logging.INFO)
-        
-        # File handler
-        file_handler = logging.FileHandler(log_path)
-        file_handler.setLevel(logging.INFO)
-        
-        # Console handler
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
-        
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
-        file_handler.setFormatter(formatter)
-        console_handler.setFormatter(formatter)
-        
-        logger.addHandler(file_handler)
-        logger.addHandler(console_handler)
+def _get_logger(run_id: Optional[str] = None, log_file: str = "logs/afa_pipeline.log") -> ContextualLogger:
+    """Get a contextual logger for data ingestion module."""
+    return get_logger(
+        module_name='data_ingestion',
+        log_file=log_file,
+        run_id=run_id,
+        worker_id='main',
+        level=logging.INFO
+    )
 
 
 def generate_synthetic_ohlcv(
@@ -93,24 +81,28 @@ def generate_synthetic_ohlcv(
     return df
 
 
-def fetch_ohlcv(tickers: list[str], period: str = "2y") -> dict[str, pd.DataFrame]:
+def fetch_ohlcv(tickers: list[str], period: str = "2y", run_id: Optional[str] = None, log_file: str = "logs/afa_pipeline.log") -> dict[str, pd.DataFrame]:
     """Fetch daily OHLCV data for Indian tickers using yfinance.
     
     Args:
         tickers: List of ticker symbols (e.g., ['RELIANCE.NS', 'TCS.NS']).
         period: Period of data to fetch (default "2y").
+        run_id: Unique run identifier for logging context.
+        log_file: Path to the log file.
     
     Returns:
         Dictionary mapping ticker to DataFrame with columns:
         open, high, low, close, volume.
     """
-    _setup_logging()
+    logger = _get_logger(run_id=run_id, log_file=log_file)
+    logger.info(f"Fetching OHLCV data for {len(tickers)} tickers")
     
     try:
         # Download all tickers at once with group_by="ticker"
         data = yf.download(tickers, period=period, group_by="ticker", auto_adjust=True)
+        logger.info("Data download complete from yfinance")
     except Exception as e:
-        logger.error(f"Error downloading data: {e}")
+        logger.exception(f"Error downloading data: {e}")
         return {}
     
     result = {}
@@ -136,6 +128,7 @@ def fetch_ohlcv(tickers: list[str], period: str = "2y") -> dict[str, pd.DataFram
             return {}
         
         result[tickers[0]] = df
+        logger.debug(f"Fetched {len(df)} rows for {tickers[0]}")
     else:
         # Multiple tickers - data is multi-indexed by ticker
         for ticker in tickers:
@@ -163,10 +156,12 @@ def fetch_ohlcv(tickers: list[str], period: str = "2y") -> dict[str, pd.DataFram
                     continue
                 
                 result[ticker] = df
+                logger.debug(f"Fetched {len(df)} rows for {ticker}")
             except Exception as e:
                 logger.warning(f"Error processing ticker {ticker}: {e}")
                 continue
     
+    logger.info(f"Successfully fetched data for {len(result)}/{len(tickers)} tickers")
     return result
 
 
@@ -201,7 +196,7 @@ def validate_ohlcv(df: pd.DataFrame, min_rows: int = 50) -> bool:
     return True
 
 
-def load_or_fetch_data(config, force_refresh: bool = False, use_auto_discovery: bool = True) -> dict[str, pd.DataFrame]:
+def load_or_fetch_data(config, force_refresh: bool = False, use_auto_discovery: bool = True, run_id: Optional[str] = None) -> dict[str, pd.DataFrame]:
     """Load cached data or fetch fresh data from yfinance.
     
     Args:
@@ -209,11 +204,12 @@ def load_or_fetch_data(config, force_refresh: bool = False, use_auto_discovery: 
         force_refresh: If True, ignore cache and fetch fresh data.
         use_auto_discovery: If True, auto-discover all cached tickers unless
                            config explicitly lists tickers (which takes precedence).
+        run_id: Unique run identifier for logging context.
     
     Returns:
         Dictionary mapping ticker to DataFrame.
     """
-    _setup_logging(config.log_file)
+    logger = _get_logger(run_id=run_id, log_file=config.log_file)
     
     # Determine tickers to use:
     # 1. If config.tickers is explicitly set and non-empty, use those (override)
@@ -263,7 +259,7 @@ def load_or_fetch_data(config, force_refresh: bool = False, use_auto_discovery: 
     
     # Fetch fresh data
     logger.info(f"Fetching fresh data for {len(tickers_to_use)} tickers")
-    data = fetch_ohlcv(tickers_to_use)
+    data = fetch_ohlcv(tickers_to_use, run_id=run_id, log_file=config.log_file)
     
     if not data:
         logger.warning("No data fetched from yfinance")

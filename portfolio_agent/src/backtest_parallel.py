@@ -108,7 +108,8 @@ def _process_single_ticker_signal(args):
             config=mock_config,
             entry_price=current_price,
             stop_price=stop_price,
-            target_price=target_price
+            target_price=target_price,
+            run_id=None  # No run_id in parallel backtest workers
         )
         
         # Generate signal

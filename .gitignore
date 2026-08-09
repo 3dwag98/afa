@@ -26,8 +26,12 @@ env/
 .vscode/
 .idea/
 
-# Coverage
+# Coverage reports
 .coverage
-htmlcov/
 coverage/
+htmlcov/
+
+# Testing
+.pytest_cache/
+.mypy_cache/
 ```
