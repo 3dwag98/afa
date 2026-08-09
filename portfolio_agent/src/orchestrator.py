@@ -2,6 +2,7 @@
 
 import logging
 import uuid
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -65,6 +66,98 @@ def _setup_logging(log_file: str, run_id: str) -> ContextualLogger:
         worker_id='main',
         level=logging.INFO
     )
+
+
+def _prepare_one_ticker(
+    ticker: str,
+    df: pd.DataFrame,
+    required_features: List[str],
+    mc_horizon_days: int,
+    mc_simulations: int,
+    mc_seed: int,
+    use_garch: bool,
+):
+    """Indicators + Monte Carlo + features for one ticker.
+
+    Module-level (not a closure) so it can be dispatched to a
+    ProcessPoolExecutor. Returns None if the ticker cannot be prepared.
+    """
+    try:
+        indicator = calculate_indicators(ticker, df)
+        daily_returns = df['close'].pct_change().dropna().tolist()
+        mc_fn = run_monte_carlo_garch if use_garch else run_monte_carlo
+        mc_result = mc_fn(
+            symbol=ticker,
+            daily_returns=daily_returns,
+            horizon_days=mc_horizon_days,
+            simulations=mc_simulations,
+            seed=mc_seed,
+        )
+        features = build_features(df, required_features)
+        return ticker, indicator, mc_result, features
+    except Exception:
+        return None
+
+
+def _prepare_all_tickers(
+    data: Dict[str, pd.DataFrame],
+    required_features: List[str],
+    config: AppConfig,
+    logger,
+) -> List[tuple]:
+    """Prepare every ticker, in parallel when configured.
+
+    Output is ordered by `data`'s iteration order in both the serial and the
+    parallel path, so downstream scoring, ranking and the exported report do
+    not depend on which worker finished first.
+    """
+    args = (
+        required_features,
+        config.simulation.mc_horizon_days,
+        config.simulation.mc_simulations,
+        config.simulation.random_seed,
+        config.simulation.use_garch_volatility,
+    )
+
+    if not (config.data.parallel_ticker_prep and len(data) > 1):
+        results = []
+        for ticker, df in data.items():
+            prepared = _prepare_one_ticker(ticker, df, *args)
+            if prepared is None:
+                logger.warning(f"Skipping {ticker}: preparation failed")
+            else:
+                results.append(prepared)
+        return results
+
+    by_ticker = {}
+    try:
+        with ProcessPoolExecutor(max_workers=config.data.ticker_prep_workers) as executor:
+            futures = {
+                executor.submit(_prepare_one_ticker, ticker, df, *args): ticker
+                for ticker, df in data.items()
+            }
+            for future in as_completed(futures):
+                ticker = futures[future]
+                try:
+                    prepared = future.result()
+                except Exception as e:
+                    logger.warning(f"Skipping {ticker}: preparation failed in worker ({e})")
+                    continue
+                if prepared is None:
+                    logger.warning(f"Skipping {ticker}: preparation failed")
+                else:
+                    by_ticker[ticker] = prepared
+    except Exception as e:
+        # Never lose the run because workers could not start.
+        logger.warning(f"Parallel ticker preparation unavailable ({e}); falling back to serial")
+        results = []
+        for ticker, df in data.items():
+            prepared = _prepare_one_ticker(ticker, df, *args)
+            if prepared is not None:
+                results.append(prepared)
+        return results
+
+    return [by_ticker[t] for t in data if t in by_ticker]
 
 
 def run_orchestrator(
@@ -157,31 +250,20 @@ def run_orchestrator(
         mc_results: List[MonteCarloResult] = []
         indicator_snapshots = []
 
-        # Step 8: Calculate indicators + Monte Carlo + features for every ticker up front.
+        # Step 8: Calculate indicators + Monte Carlo + features for every ticker
+        # up front. This is the run's CPU-bound hot spot (Monte Carlo dominates),
+        # so it is dispatched across a process pool when
+        # config.data.parallel_ticker_prep is set — results are collected back
+        # in universe order, so recommendations are identical either way.
+        prepared = _prepare_all_tickers(data, strategy.required_features(), config, logger)
+
         mc_by_ticker: Dict[str, MonteCarloResult] = {}
         features_by_ticker: Dict[str, pd.DataFrame] = {}
-        mc_fn = run_monte_carlo_garch if config.simulation.use_garch_volatility else run_monte_carlo
-
-        for ticker, df in data.items():
-            try:
-                indicator = calculate_indicators(ticker, df)
-                indicator_snapshots.append(indicator)
-
-                daily_returns = df['close'].pct_change().dropna().tolist()
-                mc_result = mc_fn(
-                    symbol=ticker,
-                    daily_returns=daily_returns,
-                    horizon_days=config.simulation.mc_horizon_days,
-                    simulations=config.simulation.mc_simulations,
-                    seed=config.simulation.random_seed
-                )
-                mc_by_ticker[ticker] = mc_result
-                mc_results.append(mc_result)
-
-                features_by_ticker[ticker] = build_features(df, strategy.required_features())
-            except Exception as e:
-                logger.exception(f"Error preparing ticker {ticker}: {e}")
-                continue
+        for ticker, indicator, mc_result, features in prepared:
+            indicator_snapshots.append(indicator)
+            mc_by_ticker[ticker] = mc_result
+            mc_results.append(mc_result)
+            features_by_ticker[ticker] = features
 
         # Step 9: Score via the strategy — the same code path the backtest engine
         # uses, so live and backtest decisions can never drift apart. Strategies

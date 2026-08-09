@@ -307,9 +307,14 @@ class TestBacktestReporting:
         assert any('CAGR' in str(m) for m in metrics_column), "CAGR not found"
     
     def test_trade_log_columns(self, dummy_data, output_dir):
-        """Test Trade Log sheet has all required columns."""
+        """The exported Trade_Log sheet uses the canonical 16-column schema.
+
+        This used to assert a second, display-name schema ('Entry Date',
+        'Qty', 'STT/Taxes', ...) produced by a helper that nothing exported,
+        so it could never pass against the real report.
+        """
         filepath = str(output_dir / 'backtest_report.xlsx')
-        
+
         export_backtest_excel(
             analytics=dummy_data['analytics'],
             equity_curve=dummy_data['equity_curve'],
@@ -318,18 +323,12 @@ class TestBacktestReporting:
             daily_activity_log=dummy_data['daily_activity_log'],
             filepath=filepath
         )
-        
+
         trade_df = pd.read_excel(filepath, sheet_name='Trade_Log')
-        
-        expected_columns = [
-            'Entry Date', 'Exit Date', 'Ticker', 'Side', 'Entry Price', 
-            'Exit Price', 'Qty', 'Gross PnL', 'STT/Taxes', 'Slippage', 
-            'Net PnL', 'Holding Days', 'Signal Trigger'
-        ]
-        
-        for col in expected_columns:
-            assert col in trade_df.columns, f"Column '{col}' not found in Trade_Log"
-    
+
+        assert list(trade_df.columns) == EXPECTED_COLUMNS
+
+
     def test_monthly_heatmap_structure(self, dummy_data, output_dir):
         """Test Monthly Heatmap has years as rows and months as columns."""
         filepath = str(output_dir / 'backtest_report.xlsx')

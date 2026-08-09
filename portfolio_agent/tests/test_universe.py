@@ -497,9 +497,30 @@ class TestIntegration:
         import shutil
         shutil.rmtree(self.temp_dir, ignore_errors=True)
     
+    @patch('yfinance.download')
     @patch('yfinance.Ticker')
-    def test_full_workflow(self, mock_ticker):
-        """Test full workflow: get tickers -> filter -> download -> load."""
+    def test_full_workflow(self, mock_ticker, mock_download):
+        """Test full workflow: get tickers -> filter -> download -> load.
+
+        DataStore downloads through yfinance.download(), not yfinance.Ticker,
+        so that has to be mocked too — without it this test reached the real
+        Yahoo API and failed on any machine without internet access.
+        """
+        dates = pd.date_range(start='2024-01-01', periods=2, freq='D')
+        metrics = ['Open', 'High', 'Low', 'Close', 'Volume']
+        values = {'Open': 100.0, 'High': 105.0, 'Low': 99.0, 'Close': 102.0, 'Volume': 1000}
+
+        def fake_download(tickers, start=None, end=None, **kwargs):
+            symbols = tickers if isinstance(tickers, list) else [tickers]
+            if len(symbols) == 1:
+                return pd.DataFrame({m: [values[m]] * len(dates) for m in metrics}, index=dates)
+            data = {(s, m): [values[m]] * len(dates) for s in symbols for m in metrics}
+            df = pd.DataFrame(data, index=dates)
+            df.columns = pd.MultiIndex.from_tuples(df.columns)
+            return df
+
+        mock_download.side_effect = fake_download
+
         mock_stock = MagicMock()
         # For universe manager methods
         mock_history_long = pd.DataFrame(

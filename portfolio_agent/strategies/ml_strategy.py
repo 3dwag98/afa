@@ -25,6 +25,7 @@ from .base import BaseStrategy
 from .types import StrategyContext, StrategySignal
 from portfolio_agent.config.schema import StrategyConfig
 from portfolio_agent.models.registry import get_model
+from portfolio_agent.utils.device import resolve_device
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,9 @@ class ModelLoader:
 
     def __init__(self, models_dir: str = "models", device: str = "cpu"):
         self.models_dir = Path(models_dir)
-        self.device = torch.device(device)
+        # resolve_device() downgrades an unavailable accelerator to CPU instead
+        # of handing back a torch.device that blows up on the first .to() call.
+        self.device = resolve_device(device)
         self.model: Optional[nn.Module] = None
         self.metadata: Optional[Dict[str, Any]] = None
         self._model_loaded = False

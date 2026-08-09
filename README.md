@@ -6,14 +6,24 @@ A lightweight, CLI-first platform for training and backtesting trading strategie
 - **No broker integration**: there is no execution path to any real broker.
 - **Educational purpose**: for research and education. Past performance does not guarantee future results.
 
+## Documentation
+
+| Document | What's in it |
+|---|---|
+| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | How the platform works, with diagrams — the strategy/model layer in detail, the backtest day loop, the concurrency map, device selection, and report data lineage |
+| **[docs/STRATEGIES.md](docs/STRATEGIES.md)** | Plug-and-play guide to **creating, updating and deleting** strategies, with worked examples for each kind, plus adding features and model architectures |
+| **[docs/QUANT_RESEARCH.md](docs/QUANT_RESEARCH.md)** | The academic basis for every strategy and risk model |
+
 ## Table of Contents
 
 - [Quick Start](#quick-start)
 - [CLI Reference](#cli-reference)
+- [GPU / CUDA setup](#gpu--cuda-setup)
 - [Strategies (plug-and-play)](#strategies-plug-and-play)
 - [UMAs — combining strategies](#umas--combining-strategies)
 - [Quant research basis](#quant-research-basis)
 - [Training](#training)
+- [Parallelism](#parallelism)
 - [Configuration](#configuration)
 - [Scheduling (cron / Task Scheduler)](#scheduling-cron--task-scheduler)
 - [Testing](#testing)
@@ -49,8 +59,10 @@ uv run portfolio-agent backtest --strategy lstm --years 1
 All commands are subcommands of `portfolio-agent` (equivalently `uv run python -m portfolio_agent.cli`).
 
 ```
-portfolio-agent download-data [--force] [--universe-size N]
+portfolio-agent download-data [--force] [--universe-size N] [--workers N]
     Download and cache OHLCV data for the resolved ticker universe.
+    Chunks are fetched concurrently (default 4); use --workers 1 if the
+    data provider rate-limits you.
 
 portfolio-agent train [--device auto|cuda|mps|cpu]
     Train the configured model (default: LSTM) on real cached market data.
@@ -73,9 +85,39 @@ portfolio-agent run-agent [--force-refresh] [--simulate-outcome] [--update-outco
 portfolio-agent list-strategies [--name NAME] [--strategy-config PATH]
     List registered strategies. With --name, show that strategy's entry/exit
     rules and required features (pass --strategy-config to inspect a UMA file).
+
+portfolio-agent gpu-check
+    Report which compute devices this install can actually use, and — when
+    CUDA is unavailable — why, plus the exact command to fix it.
 ```
 
 `--strategy` and `--strategy-config` are also accepted by `backtest` (see below) to select any registered strategy — `rule_based`, `lstm`, `ensemble` (a UMA), or a custom one you register yourself.
+
+## GPU / CUDA setup
+
+`uv sync --extra gpu` installs `torch` from PyPI. **On Windows that wheel is CPU-only**, so `--device cuda` will correctly fall back to CPU no matter how good your GPU is. Check what you actually have:
+
+```bash
+portfolio-agent gpu-check
+```
+
+If it reports a CPU-only build, install a CUDA build from the PyTorch index (pick the URL matching your driver at [pytorch.org/get-started/locally](https://pytorch.org/get-started/locally/)):
+
+```bash
+uv pip install --force-reinstall --index-url https://download.pytorch.org/whl/cu126 torch
+portfolio-agent gpu-check     # should now report CUDA available: True
+```
+
+Device selection resolves once, up front, and never returns an accelerator PyTorch cannot use. Requesting an unavailable device prints one warning explaining the cause and the fix, then runs on CPU — the resolved device is written back into the config so dataloaders, mixed precision and the saved checkpoint metadata all agree with what was printed.
+
+| `--device` | Behaviour |
+|---|---|
+| `auto` (default) | CUDA if usable, else MPS, else CPU |
+| `cuda` | CUDA if usable, else CPU with a diagnostic |
+| `mps` | Apple Metal if usable, else CPU with a diagnostic |
+| `cpu` | CPU |
+
+CUDA is used for two things: **training** (with automatic mixed precision and cuDNN benchmarking) and **ML-strategy inference**, where all eligible tickers on a date are scored in a single batched forward pass. Rule-based strategies are CPU work; parallelize those with `--parallel` instead.
 
 ## Strategies (plug-and-play)
 
@@ -98,6 +140,8 @@ Built-in strategies:
 3. Use it: `portfolio-agent backtest --strategy my_strategy`.
 
 No other code needs to change — `run-agent`, `backtest`, and any UMA that references your strategy by name all pick it up automatically through the registry.
+
+> **Full guide: [docs/STRATEGIES.md](docs/STRATEGIES.md)** — complete worked examples for all four kinds of strategy, how to update one safely, how to remove one cleanly, plus adding indicators and model architectures. For how the layer works internally, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## UMAs — combining strategies
 
@@ -171,6 +215,30 @@ Plus, already in place from the underlying `DataLoader`/device setup: `pin_memor
 
 Set `training.use_synthetic_data: true` to fall back to generated random-walk data instead (offline/CI testing only — real training should leave this `false`).
 
+## Parallelism
+
+Every hot path uses the executor that matches the work, and **all of them are speed-only**: parallel and serial runs produce identical results.
+
+| Path | Executor | Enable / tune |
+|---|---|---|
+| Market data download | Thread pool (network-bound) | `download-data --workers N`, `data.download_workers` (default 4) |
+| Training panel build | Process pool (CPU-bound) | `training.parallel_data_loading` (default on), `training.data_load_workers` |
+| Backtest signal scoring | Process pool (CPU-bound) | `backtest --parallel --workers N` |
+| Live per-ticker prep | Process pool (CPU-bound) | `data.parallel_ticker_prep` (default on), `data.ticker_prep_workers` |
+| Model training | GPU | `training.device`, `use_mixed_precision`, `use_torch_compile` |
+| ML-strategy inference | GPU | `backtest --device cuda` (one batched forward pass per date) |
+| Batch feeding | DataLoader workers | `training.num_workers` |
+
+```bash
+# 2-year rule-based backtest over 120 tickers: ~2.3x faster on 4 cores,
+# byte-identical Excel report
+portfolio-agent backtest --strategy rule_based --years 2 --parallel --workers 4
+```
+
+Determinism is guaranteed by construction, not by luck: parallel results are reassembled in universe order (never completion order), orders are queued SELL-first then BUYs by descending score so that finite cash is allocated reproducibly, and both Monte Carlo simulations are seeded from `simulation.random_seed`. `tests/test_parallel_determinism.py` enforces this by running the same backtest both ways and comparing the exported workbook sheet by sheet. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#determinism-guarantees).
+
+`--parallel` is not free: for small universes, process startup can cost more than it saves. It pays off from a few dozen tickers upward.
+
 ## Configuration
 
 Edit `config.yaml` at the repo root. Every field can also be overridden via environment variables using the `AFA_` prefix with double-underscore nesting (see `.env.example`):
@@ -182,6 +250,10 @@ AFA_RISK__PORTFOLIO_VALUE_INR=500000 uv run portfolio-agent run-agent
 Key sections: `data` (universe/tickers), `strategy`, `training`, `backtest`, `risk`, `learning`, `simulation` (Monte Carlo), `compliance`, `paths`.
 
 ```yaml
+data:
+  download_workers: 4          # concurrent chunk downloads; set to 1 if rate-limited
+  parallel_ticker_prep: true   # prepare tickers across a CPU pool during run-agent
+  ticker_prep_workers: null    # null = CPU count
 compliance:
   paper_trading_mode: true   # must remain true
 risk:
@@ -230,7 +302,10 @@ afa/
 │   ├── src/                    # orchestrator, backtest engine, data store, risk.py (incl. Kelly sizing),
 │   │                           # volatility_models.py (GJR-GARCH), monte_carlo.py, compliance, ...
 │   └── tests/
-├── docs/QUANT_RESEARCH.md      # research basis for every strategy/risk model (see Quant research basis)
+├── docs/
+│   ├── ARCHITECTURE.md         # how it all works, with diagrams
+│   ├── STRATEGIES.md           # create / update / delete a strategy
+│   └── QUANT_RESEARCH.md       # research basis for every strategy/risk model
 ├── data/                       # gitignored: market_data/*.parquet cache, agent_brain.json, sqlite db
 ├── output/                     # gitignored: Excel reports
 ├── models/                     # gitignored: trained model checkpoints

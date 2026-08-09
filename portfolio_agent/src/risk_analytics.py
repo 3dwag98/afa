@@ -13,6 +13,45 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Any, List, Optional, Tuple
 
+# Keys that may carry a trade's realized profit, most specific first.
+# BacktestEngine writes 'net_pnl' (P&L after costs and taxes); older/simpler
+# trade logs — and the test fixtures — use a plain 'pnl'. Reading only 'pnl',
+# as this module used to, silently scored every real backtest as zero profit
+# and zero loss, which made win rate, profit factor, expectancy and the whole
+# Monte Carlo risk-of-ruin block meaningless in the exported report.
+_PNL_KEYS = ('net_pnl', 'pnl', 'gross_pnl')
+
+
+def _trade_pnl(trade: Dict[str, Any]) -> float:
+    """Realized profit for one trade, in currency units."""
+    for key in _PNL_KEYS:
+        value = trade.get(key)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
+    value = trade.get('return', 0)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _closed_trades(trade_log: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep only round trips that actually closed.
+
+    A BUY leg is recorded with `exit_date: None` and a negative net P&L (its
+    transaction cost); counting those as trades inflates the trade count and
+    reports every open position as a loss. Records with no `exit_date` key at
+    all are kept — those come from simpler trade logs where every entry is
+    already a completed trade.
+    """
+    if not trade_log:
+        return []
+    return [t for t in trade_log if 'exit_date' not in t or t.get('exit_date') is not None]
+
 
 class RiskAnalyzer:
     """
@@ -31,19 +70,27 @@ class RiskAnalyzer:
         self,
         daily_equity_curve: pd.Series,
         trade_log: List[Dict[str, Any]],
-        risk_free_rate: float = 0.065
+        risk_free_rate: float = 0.065,
+        random_seed: Optional[int] = 42,
     ):
         """
         Initialize the RiskAnalyzer.
-        
+
         Args:
             daily_equity_curve: Time series of daily portfolio values.
-            trade_log: List of trade records with 'pnl' or 'return' fields.
+            trade_log: List of trade records with 'net_pnl' (or 'pnl') fields.
             risk_free_rate: Annual risk-free rate (default 6.5% for India).
+            random_seed: Seed for the bootstrap Monte Carlo. Defaults to a
+                fixed seed so re-running the same backtest reproduces the same
+                risk-of-ruin and terminal-wealth percentiles — unseeded, those
+                report cells changed on every single run. Pass None for a
+                genuinely random draw.
         """
         self.daily_equity_curve = daily_equity_curve.copy()
         self.trade_log = trade_log
         self.risk_free_rate = risk_free_rate
+        self.random_seed = random_seed
+        self.closed_trades = _closed_trades(trade_log)
         
         # Ensure index is datetime for proper resampling
         if not isinstance(self.daily_equity_curve.index, pd.DatetimeIndex):
@@ -201,14 +248,14 @@ class RiskAnalyzer:
         Returns:
             Profit factor (dimensionless). Returns inf if no losses.
         """
-        if not self.trade_log:
+        if not self.closed_trades:
             return 1.0
-        
+
         gross_profits = 0.0
         gross_losses = 0.0
-        
-        for trade in self.trade_log:
-            pnl = trade.get('pnl', trade.get('return', 0))
+
+        for trade in self.closed_trades:
+            pnl = _trade_pnl(trade)
             if pnl > 0:
                 gross_profits += pnl
             elif pnl < 0:
@@ -229,15 +276,15 @@ class RiskAnalyzer:
         Returns:
             Win rate as a decimal (e.g., 0.60 for 60%).
         """
-        if not self.trade_log:
+        if not self.closed_trades:
             return 0.0
-        
-        winning_trades = sum(1 for t in self.trade_log if t.get('pnl', t.get('return', 0)) > 0)
-        total_trades = len(self.trade_log)
-        
+
+        winning_trades = sum(1 for t in self.closed_trades if _trade_pnl(t) > 0)
+        total_trades = len(self.closed_trades)
+
         if total_trades == 0:
             return 0.0
-        
+
         win_rate = winning_trades / total_trades
         return win_rate
     
@@ -250,11 +297,11 @@ class RiskAnalyzer:
         Returns:
             Average profit per trade in currency units.
         """
-        if not self.trade_log:
+        if not self.closed_trades:
             return 0.0
-        
-        total_pnl = sum(t.get('pnl', t.get('return', 0)) for t in self.trade_log)
-        expectancy = total_pnl / len(self.trade_log)
+
+        total_pnl = sum(_trade_pnl(t) for t in self.closed_trades)
+        expectancy = total_pnl / len(self.closed_trades)
         return expectancy
     
     def calculate_drawdown_duration(self) -> int:
@@ -347,7 +394,8 @@ class RiskAnalyzer:
         Args:
             n_simulations: Number of Monte Carlo simulations (default 10,000).
             ruin_threshold: Portfolio drop threshold for "ruin" (default 50%).
-            seed: Random seed for reproducibility.
+            seed: Random seed for reproducibility. Defaults to the analyzer's
+                random_seed.
         
         Returns:
             Dictionary with:
@@ -357,7 +405,7 @@ class RiskAnalyzer:
                 - median_terminal_wealth: Median terminal wealth.
                 - mean_terminal_wealth: Mean terminal wealth.
         """
-        if not self.trade_log or len(self.trade_log) < 2:
+        if len(self.closed_trades) < 2:
             return {
                 'probability_of_ruin': 0.0,
                 'percentile_5': self.daily_equity_curve.iloc[-1] if len(self.daily_equity_curve) > 0 else 0,
@@ -369,11 +417,11 @@ class RiskAnalyzer:
         
         # Extract trade returns (as decimals, e.g., 0.05 for +5%)
         trade_returns = []
-        for trade in self.trade_log:
-            pnl = trade.get('pnl', 0)
-            entry_price = trade.get('entry_price', 1)
-            quantity = trade.get('quantity', 1)
-            
+        for trade in self.closed_trades:
+            pnl = _trade_pnl(trade)
+            entry_price = trade.get('entry_price') or 0
+            quantity = trade.get('quantity') or 0
+
             # Calculate return as percentage
             if entry_price > 0 and quantity > 0:
                 trade_return = pnl / (entry_price * quantity)
@@ -399,10 +447,11 @@ class RiskAnalyzer:
                 'simulations_run': 0
             }
         
-        # Set random seed
-        if seed is not None:
-            np.random.seed(seed)
-        
+        # Draw from a local generator rather than seeding NumPy's global RNG,
+        # so reproducibility here does not perturb (or depend on) any other
+        # random draw in the process.
+        rng = np.random.default_rng(self.random_seed if seed is None else seed)
+
         initial_capital = self.daily_equity_curve.iloc[0] if len(self.daily_equity_curve) > 0 else 100000
         ruin_level = initial_capital * ruin_threshold
         
@@ -414,7 +463,7 @@ class RiskAnalyzer:
         
         for _ in range(n_simulations):
             # Bootstrap resampling: randomly shuffle trade order
-            shuffled_returns = np.random.choice(trade_array, size=n_trades, replace=True)
+            shuffled_returns = rng.choice(trade_array, size=n_trades, replace=True)
             
             # Simulate cumulative returns
             cumulative_returns = np.cumprod(1 + shuffled_returns)
@@ -490,7 +539,8 @@ class RiskAnalyzer:
             'mc_simulations_run': mc_results['simulations_run'],
             
             # Summary Statistics
-            'total_trades': len(self.trade_log),
+            'total_trades': len(self.closed_trades),
+            'total_trade_records': len(self.trade_log),
             'initial_capital': self.daily_equity_curve.iloc[0] if len(self.daily_equity_curve) > 0 else 0,
             'final_capital': self.daily_equity_curve.iloc[-1] if len(self.daily_equity_curve) > 0 else 0,
             'total_return': (self.daily_equity_curve.iloc[-1] / self.daily_equity_curve.iloc[0] - 1) if len(self.daily_equity_curve) > 1 else 0,

@@ -37,6 +37,9 @@ except ImportError:
     from risk import calculate_kelly_quantity, estimate_kelly_inputs
 
 
+logger = logging.getLogger(__name__)
+
+
 def _score_one_ticker(
     strategy: BaseStrategy,
     ticker: str,
@@ -69,34 +72,40 @@ def _score_one_ticker(
         return None
 
 
-def _score_tickers_parallel(
+# Per-worker constants, installed once by _init_scoring_worker() instead of
+# being re-pickled with every task. A 5-year backtest scores each ticker on
+# ~1,250 days; shipping the strategy object, risk params and feature list with
+# each of those tasks was the dominant cost of the parallel path.
+_WORKER_STRATEGY: Optional[BaseStrategy] = None
+_WORKER_FEATURES: List[str] = []
+_WORKER_RISK: Optional[RiskParams] = None
+_WORKER_MC_PARAMS: Tuple[int, int, int, bool] = (0, 0, 0, False)
+
+
+def _init_scoring_worker(
     strategy: BaseStrategy,
-    eligible: Dict[str, pd.DataFrame],
     required_features: List[str],
     risk_params: RiskParams,
-    weights: Dict[str, float],
     mc_params: Tuple[int, int, int, bool],
-    max_workers: Optional[int],
-) -> Dict[str, StrategySignal]:
-    """Dispatch _score_one_ticker() across a CPU process pool.
+) -> None:
+    """ProcessPoolExecutor initializer: pin the run-constant scoring inputs."""
+    global _WORKER_STRATEGY, _WORKER_FEATURES, _WORKER_RISK, _WORKER_MC_PARAMS
+    _WORKER_STRATEGY = strategy
+    _WORKER_FEATURES = required_features
+    _WORKER_RISK = risk_params
+    _WORKER_MC_PARAMS = mc_params
 
-    Used for cheap per-ticker rule-based scoring, where CPU parallelism across
-    tickers is the right speedup (GPU would not help here).
-    """
-    signals: Dict[str, StrategySignal] = {}
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(_score_one_ticker, strategy, ticker, hist_data, required_features, risk_params, weights, mc_params): ticker
-            for ticker, hist_data in eligible.items()
-        }
-        for future in as_completed(futures):
-            ticker = futures[future]
-            result = future.result()
-            if result is not None:
-                signals[ticker] = result
-    return signals
 
-logger = logging.getLogger(__name__)
+def _score_one_ticker_in_worker(
+    ticker: str, hist_data: pd.DataFrame, weights: Dict[str, float]
+) -> Optional[StrategySignal]:
+    """Worker-side entry point: only the per-day varying arguments travel."""
+    if _WORKER_STRATEGY is None or _WORKER_RISK is None:
+        raise RuntimeError("Scoring worker was not initialized")
+    return _score_one_ticker(
+        _WORKER_STRATEGY, ticker, hist_data, _WORKER_FEATURES,
+        _WORKER_RISK, weights, _WORKER_MC_PARAMS,
+    )
 
 
 class BacktestEngine:
@@ -172,6 +181,9 @@ class BacktestEngine:
         )
         self.parallel = parallel
         self.max_workers = max_workers
+        # Created lazily on the first parallel scoring round and reused for the
+        # whole run (see _get_scoring_executor).
+        self._scoring_executor: Optional[ProcessPoolExecutor] = None
         self.mc_horizon_days = mc_horizon_days
         self.mc_simulations = mc_simulations
         self.mc_seed = mc_seed
@@ -194,6 +206,13 @@ class BacktestEngine:
         # State Management
         self.cash = initial_capital
         self.holdings: Dict[str, int] = {}  # ticker -> quantity
+        # ticker -> {'entry_price', 'entry_date', 'quantity'} for every open
+        # position. The cost basis has to be tracked explicitly: reconstructing
+        # it by scanning the trade log (as this engine used to) silently failed,
+        # because trade records have no 'action' key to match on — which left
+        # every realized P&L measured from the wrong price and every
+        # holding_days reported as 0.
+        self.open_positions: Dict[str, Dict[str, Any]] = {}
         self.portfolio_value = initial_capital
         
         # Initialize agent brain (isolated copy for backtesting)
@@ -406,63 +425,80 @@ class BacktestEngine:
         
         return None
     
+    def _open_position(
+        self, ticker: str, quantity: int, price: float, entry_date: pd.Timestamp
+    ) -> None:
+        """Record (or add to) an open position, keeping a weighted cost basis."""
+        existing = self.open_positions.get(ticker)
+        if existing and existing['quantity'] > 0:
+            total_quantity = existing['quantity'] + quantity
+            existing['entry_price'] = (
+                existing['entry_price'] * existing['quantity'] + price * quantity
+            ) / total_quantity
+            existing['quantity'] = total_quantity
+            # Entry date stays at the *first* entry, so holding period (and
+            # therefore STCG vs LTCG) is measured from when risk was first taken.
+        else:
+            self.open_positions[ticker] = {
+                'entry_price': price,
+                'entry_date': entry_date,
+                'quantity': quantity,
+            }
+
+    def _close_position(self, ticker: str, quantity: int) -> None:
+        """Reduce (or clear) an open position after a sale."""
+        position = self.open_positions.get(ticker)
+        if position is None:
+            return
+        position['quantity'] -= quantity
+        if position['quantity'] <= 0:
+            del self.open_positions[ticker]
+
     def _get_entry_price_for_tax(self, ticker: str) -> float:
         """
-        Get the entry price for a holding (for tax calculation).
-        
+        Get the cost basis for an open holding (for P&L and tax calculation).
+
         Args:
             ticker: Ticker symbol.
-            
+
         Returns:
-            Entry price or 0 if not found.
+            Entry price per share, or 0.0 if there is no open position.
         """
-        # Look up the entry price from trade log
-        for trade in reversed(self.trade_log):
-            if trade.get('ticker') == ticker and trade.get('action') == 'BUY':
-                return trade.get('entry_price', trade.get('price', 0))
-        
-        # Fallback: use stop_loss level as proxy (set at 95% of entry)
-        if ticker in self.stop_loss_levels:
-            return self.stop_loss_levels[ticker] / 0.95
-        
-        return 0.0
-    
+        position = self.open_positions.get(ticker)
+        return float(position['entry_price']) if position else 0.0
+
     def _get_entry_date_for_ticker(self, ticker: str) -> Optional[str]:
         """
-        Get the entry date for a holding (for trade log).
-        
+        Get the entry date for an open holding (for the trade log).
+
         Args:
             ticker: Ticker symbol.
-            
+
         Returns:
-            Entry date in ISO format or None if not found.
+            Entry date as YYYY-MM-DD, or None if there is no open position.
         """
-        # Look up the entry date from trade log
-        for trade in reversed(self.trade_log):
-            if trade.get('ticker') == ticker and 'entry_date' in trade:
-                return trade.get('entry_date')
-        
-        return None
-    
+        position = self.open_positions.get(ticker)
+        if not position:
+            return None
+        return pd.Timestamp(position['entry_date']).strftime('%Y-%m-%d')
+
     def _get_holding_days(self, ticker: str, current_date: pd.Timestamp) -> int:
         """
-        Get the number of days a position has been held.
-        
+        Get the number of calendar days an open position has been held.
+
         Args:
             ticker: Ticker symbol.
             current_date: Current date.
-            
+
         Returns:
-            Number of days held.
+            Number of days held (0 if there is no open position).
         """
-        # Look up the entry date from trade log
-        for trade in reversed(self.trade_log):
-            if trade.get('ticker') == ticker and trade.get('action') == 'BUY':
-                entry_date = pd.to_datetime(trade.get('date', current_date))
-                return (current_date - entry_date).days
-        
-        return 0
-    
+        position = self.open_positions.get(ticker)
+        if not position:
+            return 0
+        return max(0, (current_date - pd.Timestamp(position['entry_date'])).days)
+
+
     def _check_stop_loss_take_profit(self, current_date: pd.Timestamp) -> List[Dict[str, Any]]:
         """
         Check for stop-losses and take-profits based on current date's intraday High/Low.
@@ -507,8 +543,12 @@ class BacktestEngine:
             
             stop_price = self.stop_loss_levels.get(ticker)
             target_price = self.take_profit_levels.get(ticker)
-            entry_price = self._get_last_valid_price(ticker, current_date)
-            
+            # The position's actual cost basis — NOT the previous close, which
+            # is what this used to use and which made every stop/target exit
+            # report a one-day P&L instead of the trade's real P&L.
+            entry_price = self._get_entry_price_for_tax(ticker)
+            holding_days = self._get_holding_days(ticker, current_date)
+
             triggered = False
             trigger_price = None
             trigger_type = None
@@ -526,18 +566,31 @@ class BacktestEngine:
                 trigger_type = 'TAKE_PROFIT'
             
             if triggered:
-                # Execute sale at trigger price
+                # Exits pay the same friction as any other sale — brokerage,
+                # STT, exchange charges, GST and capital gains tax. Booking
+                # them at zero cost (as this path used to) inflated reported
+                # net P&L on every stop and target hit.
                 sale_value = quantity * trigger_price
-                self.cash += sale_value
-                
+                txn_cost = self.execution_sim.calculate_transaction_costs(
+                    side='SELL', price=trigger_price, quantity=quantity
+                )
+                cap_gains_tax = self.execution_sim.calculate_capital_gains_tax(
+                    entry_price=entry_price,
+                    exit_price=trigger_price,
+                    quantity=quantity,
+                    holding_days=holding_days,
+                )
+                self.cash += sale_value - txn_cost - cap_gains_tax
+
                 # Calculate return percentage
                 entry_val = (entry_price or 0) * quantity
                 gross_pnl = (trigger_price - (entry_price or 0)) * quantity
+                net_pnl = gross_pnl - txn_cost - cap_gains_tax
                 return_pct = (gross_pnl / entry_val * 100) if entry_val > 0 else 0.0
-                
+
                 # Determine exit reason
                 exit_reason = 'stop_loss' if trigger_type == 'STOP_LOSS' else 'target'
-                
+
                 # Record trade with all 16 required fields
                 trade_record = {
                     'trade_id': f"T{len(self.trade_log) + 1:06d}",
@@ -550,26 +603,35 @@ class BacktestEngine:
                     'side': 'LONG',
                     'signal_trigger': 'STOP_LOSS' if trigger_type == 'STOP_LOSS' else 'TAKE_PROFIT',
                     'gross_pnl': gross_pnl,
-                    'transaction_costs': 0.0,
-                    'taxes': 0.0,
-                    'net_pnl': gross_pnl,
+                    'transaction_costs': txn_cost,
+                    'taxes': cap_gains_tax,
+                    'net_pnl': net_pnl,
                     'return_pct': return_pct,
-                    'holding_days': self._get_holding_days(ticker, current_date),
+                    'holding_days': holding_days,
                     'exit_reason': exit_reason
                 }
                 self.trade_log.append(trade_record)
                 executed_trades.append(trade_record)
-                
+
                 # Remove holding
                 del self.holdings[ticker]
+                self._close_position(ticker, quantity)
                 tickers_to_remove.append(ticker)
-                
+
+                # Any still-pending order for this ticker is stale now that the
+                # position is closed — drop it so a queued SELL cannot execute
+                # against a position that no longer exists.
+                self.pending_orders = [
+                    o for o in self.pending_orders
+                    if not (o['ticker'] == ticker and o['action'] == 'SELL')
+                ]
+
                 # Clear stop/target levels
                 if ticker in self.stop_loss_levels:
                     del self.stop_loss_levels[ticker]
                 if ticker in self.take_profit_levels:
                     del self.take_profit_levels[ticker]
-        
+
         return executed_trades
     
     def _generate_signals(self, current_date: pd.Timestamp) -> Dict[str, StrategySignal]:
@@ -612,19 +674,96 @@ class BacktestEngine:
             context = StrategyContext(risk=self.risk_params, weights=weights)
             return self.strategy.score_batch(features_by_symbol, context)
 
-        required_features = self.strategy.required_features()
-        mc_params = (self.mc_horizon_days, self.mc_simulations, self.mc_seed, self.use_garch_volatility)
-
         if self.parallel and len(eligible) > 1:
-            return _score_tickers_parallel(
-                self.strategy, eligible, required_features, self.risk_params, weights, mc_params, self.max_workers
-            )
+            parallel_signals = self._score_tickers_parallel(eligible, weights)
+            if parallel_signals is not None:
+                return parallel_signals
+
+        required_features = self.strategy.required_features()
+        mc_params = self._mc_params()
 
         signals: Dict[str, StrategySignal] = {}
         for ticker, hist_data in eligible.items():
             result = _score_one_ticker(
                 self.strategy, ticker, hist_data, required_features, self.risk_params, weights, mc_params
             )
+            if result is not None:
+                signals[ticker] = result
+        return signals
+
+    def _mc_params(self) -> Tuple[int, int, int, bool]:
+        """Monte Carlo settings bundled for dispatch to scoring workers."""
+        return (self.mc_horizon_days, self.mc_simulations, self.mc_seed, self.use_garch_volatility)
+
+    def _get_scoring_executor(self) -> ProcessPoolExecutor:
+        """Return this run's scoring process pool, creating it on first use.
+
+        The pool is created once per backtest, not once per trading day: a
+        5-year run has ~1,250 scoring rounds, and spawning (and tearing down)
+        a full set of worker processes for each of them cost far more than the
+        scoring itself — especially on Windows, where every worker re-imports
+        the package from scratch.
+        """
+        if self._scoring_executor is None:
+            self._scoring_executor = ProcessPoolExecutor(
+                max_workers=self.max_workers,
+                initializer=_init_scoring_worker,
+                initargs=(
+                    self.strategy,
+                    self.strategy.required_features(),
+                    self.risk_params,
+                    self._mc_params(),
+                ),
+            )
+        return self._scoring_executor
+
+    def shutdown_workers(self) -> None:
+        """Tear down the scoring process pool, if one was started."""
+        if self._scoring_executor is not None:
+            self._scoring_executor.shutdown(wait=True)
+            self._scoring_executor = None
+
+    def _score_tickers_parallel(
+        self, eligible: Dict[str, pd.DataFrame], weights: Dict[str, float]
+    ) -> Optional[Dict[str, StrategySignal]]:
+        """Score every eligible ticker across the run's CPU process pool.
+
+        Results are reassembled in `eligible` order (i.e. universe order),
+        never in worker-completion order. That matters beyond tidiness:
+        downstream order creation walks this dict, and with finite cash the
+        order in which BUY candidates are considered decides which ones
+        actually get filled — so a completion-ordered dict would make the same
+        backtest produce different trades, different equity curves and
+        different Excel reports on every run.
+
+        Returns None if the pool could not be used at all, so the caller can
+        fall back to serial scoring rather than losing the run.
+        """
+        try:
+            executor = self._get_scoring_executor()
+            futures = {
+                ticker: executor.submit(_score_one_ticker_in_worker, ticker, hist_data, weights)
+                for ticker, hist_data in eligible.items()
+            }
+        except Exception:
+            logger.warning(
+                "Could not start parallel scoring workers; falling back to serial scoring",
+                exc_info=True,
+            )
+            self.parallel = False
+            self.shutdown_workers()
+            return None
+
+        signals: Dict[str, StrategySignal] = {}
+        for ticker in eligible:  # deterministic: universe order, not completion order
+            try:
+                result = futures[ticker].result()
+            except Exception:
+                # A single failed ticker is skipped exactly as in the serial
+                # path (where _score_one_ticker returns None), instead of
+                # aborting the whole backtest.
+                logger.warning(f"Parallel signal generation failed for {ticker}", exc_info=True)
+                continue
             if result is not None:
                 signals[ticker] = result
         return signals
@@ -644,19 +783,30 @@ class BacktestEngine:
         """
         executed_trades = []
         orders_to_remove = []
-        
+
         for i, order in enumerate(self.pending_orders):
-            if order['execution_date'] != execution_date:
+            if order['execution_date'] > execution_date:
                 continue
-            
+
+            # Anything due today or earlier is handled on this pass and leaves
+            # the book, filled or not.
+            #
+            # "or earlier" matters twice. Orders are scheduled for the next
+            # calendar weekday, which lands on a market holiday often enough to
+            # matter; those now fill at the next session's open instead of
+            # sitting in the book with a date that could never come round
+            # again. And an order that could not be funded is dropped rather
+            # than left queued forever — pending_orders used to grow without
+            # bound for the whole run.
+            orders_to_remove.append(i)
+
             ticker = order['ticker']
             action = order['action']
             quantity = order['quantity']
-            
+
             if ticker in self.untradeable_tickers:
-                orders_to_remove.append(i)
                 continue
-            
+
             # Get open price for execution
             open_price = self._get_price_at_date(ticker, execution_date, 'open')
             
@@ -665,9 +815,8 @@ class BacktestEngine:
                 open_price = self._get_last_valid_price(ticker, execution_date)
             
             if open_price is None:
-                orders_to_remove.append(i)
                 continue
-            
+
             # Get market data for slippage calculation
             df = self.ticker_data.get(ticker)
             avg_daily_volume = 0
@@ -708,9 +857,9 @@ class BacktestEngine:
             
             if not should_execute:
                 logger.info(f"Skipping {action} order for {ticker}: friction exceeds expected reward")
-                orders_to_remove.append(i)
                 continue
-            
+
+
             # Get adjusted execution price with slippage
             adjusted_price = exec_info['adjusted_price']
             trade_value = quantity * adjusted_price
@@ -721,7 +870,8 @@ class BacktestEngine:
                 if self.cash >= total_cost:
                     self.cash -= total_cost
                     self.holdings[ticker] = self.holdings.get(ticker, 0) + quantity
-                    
+                    self._open_position(ticker, quantity, adjusted_price, execution_date)
+
                     # Set stop-loss and take-profit levels
                     # Stop-loss at 5% below entry
                     self.stop_loss_levels[ticker] = adjusted_price * 0.95
@@ -749,14 +899,19 @@ class BacktestEngine:
                     }
                     self.trade_log.append(trade_record)
                     executed_trades.append(trade_record)
-                    orders_to_remove.append(i)
-                    
+                else:
+                    logger.debug(
+                        f"Insufficient cash to fill BUY {quantity} {ticker} "
+                        f"@ {adjusted_price:.2f} (need {total_cost:.2f}, have {self.cash:.2f})"
+                    )
+
             elif action == 'SELL':
                 if ticker in self.holdings and self.holdings[ticker] >= quantity:
                     # Get holding info for capital gains tax calculation
                     entry_price = self._get_entry_price_for_tax(ticker)
                     holding_days = self._get_holding_days(ticker, execution_date)
-                    
+                    entry_date_str = self._get_entry_date_for_ticker(ticker)
+
                     # Calculate capital gains tax
                     cap_gains_tax = self.execution_sim.calculate_capital_gains_tax(
                         entry_price=entry_price,
@@ -764,10 +919,15 @@ class BacktestEngine:
                         quantity=quantity,
                         holding_days=holding_days
                     )
-                    
+
                     self.holdings[ticker] -= quantity
-                    self.cash += trade_value - cap_gains_tax  # Deduct tax from cash
-                    
+                    self._close_position(ticker, quantity)
+                    # Sale proceeds net of tax AND transaction costs; the
+                    # brokerage/STT/GST on the sell leg was previously reported
+                    # in the trade log but never deducted from cash, so the
+                    # equity curve overstated every exit.
+                    self.cash += trade_value - cap_gains_tax - txn_cost
+
                     # Clear stop/target levels
                     if ticker in self.stop_loss_levels:
                         del self.stop_loss_levels[ticker]
@@ -793,7 +953,7 @@ class BacktestEngine:
                     trade_record = {
                         'trade_id': f"T{len(self.trade_log) + 1:06d}",
                         'ticker': ticker,
-                        'entry_date': self._get_entry_date_for_ticker(ticker),
+                        'entry_date': entry_date_str,
                         'entry_price': entry_price,
                         'exit_date': execution_date.strftime('%Y-%m-%d'),
                         'exit_price': adjusted_price,
@@ -810,16 +970,16 @@ class BacktestEngine:
                     }
                     self.trade_log.append(trade_record)
                     executed_trades.append(trade_record)
-                    orders_to_remove.append(i)
-                    
+
                     # Remove holding if zero
                     if self.holdings[ticker] == 0:
                         del self.holdings[ticker]
-        
-        # Remove executed orders
+
+        # Remove processed orders (indices are unique and ascending, so popping
+        # from the back keeps the remaining indices valid)
         for i in sorted(orders_to_remove, reverse=True):
             self.pending_orders.pop(i)
-        
+
         return executed_trades
     
     def _kelly_quantity(self, entry_price: float) -> int:
@@ -829,9 +989,13 @@ class BacktestEngine:
         there aren't yet enough realized trades to estimate Kelly inputs
         reliably (see risk.py::estimate_kelly_inputs).
         """
+        # Only *closed* round trips are realized outcomes. Open BUY legs carry
+        # net_pnl = -transaction_costs, so counting them here classified every
+        # open position as a loss and dragged the Kelly win probability down.
         realized = [
             {"outcome": "WIN" if t.get("net_pnl", 0.0) > 0 else "LOSS", "return_pct": t.get("return_pct", 0.0)}
             for t in self.trade_log
+            if t.get("exit_date") is not None
         ]
         kelly_inputs = estimate_kelly_inputs(realized, min_trades=self.kelly_min_trades)
         if kelly_inputs is None:
@@ -850,6 +1014,15 @@ class BacktestEngine:
         """
         Create pending orders for T+1 execution based on signals.
 
+        Orders are queued in a deterministic, economically sensible order:
+        every SELL first (freeing capital for the same execution date), then
+        BUYs by descending signal score with the ticker as tie-breaker. Cash
+        is finite, so whichever BUY is queued first is the one that gets
+        filled — leaving that to dict iteration order made results depend on
+        how the strategy happened to be scored (serial vs. parallel, and which
+        worker finished first). Ranking by conviction is both reproducible and
+        the behaviour a capital-constrained portfolio actually wants.
+
         Args:
             signals: Dictionary of ticker -> StrategySignal.
             current_date: Current date (orders will execute at T+1 open).
@@ -860,38 +1033,44 @@ class BacktestEngine:
         while execution_date.weekday() >= 5:
             execution_date += pd.Timedelta(days=1)
 
-        for ticker, sig in signals.items():
-            signal = sig.signal
+        sells = sorted(
+            (t for t, s in signals.items() if s.signal == 'SELL' and t in self.holdings)
+        )
+        for ticker in sells:
+            quantity = self.holdings[ticker]
+            if quantity > 0:
+                self.pending_orders.append({
+                    'ticker': ticker,
+                    'action': 'SELL',
+                    'quantity': quantity,
+                    'execution_date': execution_date,
+                    'trigger': signals[ticker].trigger or 'SIGNAL'
+                })
 
-            if signal == 'BUY' and ticker not in self.holdings:
-                price = sig.entry_price or 100
-                quantity = self._kelly_quantity(price) if self.use_kelly_sizing else 0
+        buys = sorted(
+            (t for t, s in signals.items() if s.signal == 'BUY' and t not in self.holdings),
+            key=lambda t: (-signals[t].score, t),
+        )
+        for ticker in buys:
+            sig = signals[ticker]
+            price = sig.entry_price or 100
+            quantity = self._kelly_quantity(price) if self.use_kelly_sizing else 0
 
-                if quantity <= 0:
-                    # Default / Kelly-unavailable fallback: 10% of portfolio per position.
-                    position_value = self.portfolio_value * 0.10
-                    quantity = int(position_value / price)
+            if quantity <= 0:
+                # Default / Kelly-unavailable fallback: 10% of portfolio per position.
+                position_value = self.portfolio_value * 0.10
+                quantity = int(position_value / price)
 
-                if quantity > 0:
-                    self.pending_orders.append({
-                        'ticker': ticker,
-                        'action': 'BUY',
-                        'quantity': quantity,
-                        'execution_date': execution_date,
-                        'trigger': sig.trigger or 'SIGNAL'
-                    })
+            if quantity > 0:
+                self.pending_orders.append({
+                    'ticker': ticker,
+                    'action': 'BUY',
+                    'quantity': quantity,
+                    'execution_date': execution_date,
+                    'trigger': sig.trigger or 'SIGNAL'
+                })
 
-            elif signal == 'SELL' and ticker in self.holdings:
-                quantity = self.holdings[ticker]
-                if quantity > 0:
-                    self.pending_orders.append({
-                        'ticker': ticker,
-                        'action': 'SELL',
-                        'quantity': quantity,
-                        'execution_date': execution_date,
-                        'trigger': sig.trigger or 'SIGNAL'
-                    })
-    
+
     def _evaluate_and_learn(self, learning_rate: float = 0.15, min_trades_for_learning: int = 3) -> None:
         """
         Trigger agent learning every N trading days.
@@ -927,67 +1106,99 @@ class BacktestEngine:
     def _handle_delisted_tickers(self, current_date: pd.Timestamp) -> None:
         """
         Handle delisted tickers or those with NaN issues.
-        
-        Force liquidation at last known price.
+
+        Force liquidation at last known price. A holding already marked
+        untradeable is liquidated too: skipping those (as this used to) left
+        the position on the books forever, marked at a stale price that could
+        never move again.
         """
         for ticker in list(self.holdings.keys()):
-            if ticker in self.untradeable_tickers:
-                continue
-            
             df = self.ticker_data.get(ticker)
             if df is None:
                 self.untradeable_tickers.add(ticker)
                 continue
-            
-            # Check if current date is in data
-            if current_date not in df.index:
-                # Check if we've passed the last available date
-                last_date = df.index.max()
-                if current_date > last_date:
-                    # Ticker appears to be delisted
-                    self.untradeable_tickers.add(ticker)
-                    
-                    # Force liquidation
-                    quantity = self.holdings[ticker]
-                    last_price = self._get_last_valid_price(ticker, current_date)
-                    entry_price = self._get_entry_price_for_tax(ticker)
-                    
-                    if last_price is not None and quantity > 0:
-                        sale_value = quantity * last_price
-                        self.cash += sale_value
-                        
-                        # Calculate return percentage
-                        entry_val = (entry_price or 0) * quantity
-                        gross_pnl = (last_price - (entry_price or 0)) * quantity
-                        return_pct = (gross_pnl / entry_val * 100) if entry_val > 0 else 0.0
-                        
-                        # Record SELL trade with all 16 required fields
-                        trade_record = {
-                            'trade_id': f"T{len(self.trade_log) + 1:06d}",
-                            'ticker': ticker,
-                            'entry_date': self._get_entry_date_for_ticker(ticker),
-                            'entry_price': entry_price,
-                            'exit_date': current_date.strftime('%Y-%m-%d'),
-                            'exit_price': last_price,
-                            'quantity': quantity,
-                            'side': 'LONG',
-                            'signal_trigger': 'DELISTED',
-                            'gross_pnl': gross_pnl,
-                            'transaction_costs': 0.0,
-                            'taxes': 0.0,
-                            'net_pnl': gross_pnl,
-                            'return_pct': return_pct,
-                            'holding_days': self._get_holding_days(ticker, current_date),
-                            'exit_reason': 'delisted'
-                        }
-                        self.trade_log.append(trade_record)
-                        
-                        del self.holdings[ticker]
-    
+
+            # Liquidate when the ticker has stopped trading: either it is
+            # already flagged untradeable, or today is past its last bar.
+            last_date = df.index.max()
+            delisted = ticker in self.untradeable_tickers or (
+                current_date not in df.index and current_date > last_date
+            )
+            if delisted:
+                # Ticker appears to be delisted
+                self.untradeable_tickers.add(ticker)
+
+                # Force liquidation
+                quantity = self.holdings[ticker]
+                last_price = self._get_last_valid_price(ticker, current_date)
+                if last_price is None:
+                    last_price = self._get_price_at_date(ticker, last_date, 'close')
+                entry_price = self._get_entry_price_for_tax(ticker)
+                holding_days = self._get_holding_days(ticker, current_date)
+
+                if last_price is not None and quantity > 0:
+                    sale_value = quantity * last_price
+                    txn_cost = self.execution_sim.calculate_transaction_costs(
+                        side='SELL', price=last_price, quantity=quantity
+                    )
+                    cap_gains_tax = self.execution_sim.calculate_capital_gains_tax(
+                        entry_price=entry_price,
+                        exit_price=last_price,
+                        quantity=quantity,
+                        holding_days=holding_days,
+                    )
+                    self.cash += sale_value - txn_cost - cap_gains_tax
+
+                    # Calculate return percentage
+                    entry_val = (entry_price or 0) * quantity
+                    gross_pnl = (last_price - (entry_price or 0)) * quantity
+                    net_pnl = gross_pnl - txn_cost - cap_gains_tax
+                    return_pct = (gross_pnl / entry_val * 100) if entry_val > 0 else 0.0
+
+                    # Record SELL trade with all 16 required fields
+                    trade_record = {
+                        'trade_id': f"T{len(self.trade_log) + 1:06d}",
+                        'ticker': ticker,
+                        'entry_date': self._get_entry_date_for_ticker(ticker),
+                        'entry_price': entry_price,
+                        'exit_date': current_date.strftime('%Y-%m-%d'),
+                        'exit_price': last_price,
+                        'quantity': quantity,
+                        'side': 'LONG',
+                        'signal_trigger': 'DELISTED',
+                        'gross_pnl': gross_pnl,
+                        'transaction_costs': txn_cost,
+                        'taxes': cap_gains_tax,
+                        'net_pnl': net_pnl,
+                        'return_pct': return_pct,
+                        'holding_days': holding_days,
+                        'exit_reason': 'delisted'
+                    }
+                    self.trade_log.append(trade_record)
+
+                    del self.holdings[ticker]
+                    self._close_position(ticker, quantity)
+                    self.stop_loss_levels.pop(ticker, None)
+                    self.take_profit_levels.pop(ticker, None)
+
+
     def run_backtest(self) -> Dict[str, Any]:
         """
         Run the complete backtest through the time-travel loop.
-        
+
+        Each trading day T is replayed in real market order:
+
+        1. Fill orders queued yesterday, at T's open.
+        2. Check stops/targets against T's intraday high/low.
+        3. Liquidate anything that stopped trading.
+        4. Mark to market at T's close -> that day's equity point.
+        5. Score the universe using data strictly before T.
+        6. Queue tomorrow's orders, sized off T's end-of-day equity.
+
+        The mark-to-market deliberately comes *after* the day's fills: it used
+        to run first, so the equity curve (and every metric derived from it)
+        ignored the trades that happened that same day.
+
         Returns:
             Dictionary containing:
             - daily_equity_curve: pd.Series
@@ -996,111 +1207,109 @@ class BacktestEngine:
             - daily_activity_log: list of dicts with day-by-day activity
         """
         equity_curve = {}
-        
-        for i, current_date in enumerate(self.master_date_index):
-            self.trading_day_count = i + 1
-            date_str = current_date.strftime('%Y-%m-%d')
-            
-            # Step A: Mark-to-Market portfolio using T's closing prices
-            self._mark_to_market(current_date)
-            equity_curve[current_date] = self.portfolio_value
-            
-            # Log end-of-day mark-to-market (always one per day for PORTFOLIO)
-            self.daily_activity_log.append({
-                'date': date_str,
-                'ticker': 'PORTFOLIO',
-                'action': 'MARK_TO_MARKET',
-                'price': None,
-                'quantity': None,
-                'position_value': None,
-                'cash_balance': round(self.cash, 2),
-                'total_portfolio_value': round(self.portfolio_value, 2),
-                'score': None,
-                'signal': None,
-                'notes': 'EOD valuation'
-            })
-            
-            # Step B: Check for stop-losses and take-profits based on T's intraday High/Low
-            executed_sl_tp = self._check_stop_loss_take_profit(current_date)
-            
-            # Log stop-loss/take-profit events
-            for trade in executed_sl_tp:
-                ticker = trade['ticker']
-                action = 'STOP_LOSS_HIT' if trade.get('exit_reason') == 'stop_loss' else 'TARGET_HIT'
-                close_price = self._get_price_at_date(ticker, current_date, 'close')
-                position_val = self.holdings.get(ticker, 0) * close_price if close_price and self.holdings.get(ticker, 0) > 0 else None
-                
+
+        try:
+            for i, current_date in enumerate(self.master_date_index):
+                self.trading_day_count = i + 1
+                date_str = current_date.strftime('%Y-%m-%d')
+
+                # Step A: Fill orders queued on T-1, at T's open.
+                executed_orders = self._execute_pending_orders(current_date)
+
+                for trade in executed_orders:
+                    ticker = trade['ticker']
+                    action = 'BUY' if trade.get('exit_date') is None else 'SELL'
+                    notes = f"Order executed at {trade.get('entry_price') or trade.get('exit_price')}"
+                    if trade.get('transaction_costs', 0) > 0:
+                        notes += f", cost: {trade['transaction_costs']:.2f}"
+
+                    self.daily_activity_log.append({
+                        'date': date_str,
+                        'ticker': ticker,
+                        'action': action,
+                        'price': trade.get('entry_price') if action == 'BUY' else trade.get('exit_price'),
+                        'quantity': trade['quantity'],
+                        'position_value': self._position_value(ticker, current_date),
+                        'cash_balance': round(self.cash, 2),
+                        'total_portfolio_value': round(self.portfolio_value, 2),
+                        'score': None,
+                        'signal': trade.get('signal_trigger'),
+                        'notes': notes
+                    })
+
+                # Step B: Check for stop-losses and take-profits based on T's intraday High/Low
+                executed_sl_tp = self._check_stop_loss_take_profit(current_date)
+
+                for trade in executed_sl_tp:
+                    ticker = trade['ticker']
+                    action = 'STOP_LOSS_HIT' if trade.get('exit_reason') == 'stop_loss' else 'TARGET_HIT'
+
+                    self.daily_activity_log.append({
+                        'date': date_str,
+                        'ticker': ticker,
+                        'action': action,
+                        'price': trade['exit_price'],
+                        'quantity': trade['quantity'],
+                        'position_value': self._position_value(ticker, current_date),
+                        'cash_balance': round(self.cash, 2),
+                        'total_portfolio_value': round(self.portfolio_value, 2),
+                        'score': None,
+                        'signal': None,
+                        'notes': f"{action.replace('_', ' ')} triggered"
+                    })
+
+                # Step C: Liquidate holdings that have stopped trading
+                self._handle_delisted_tickers(current_date)
+
+                # Step D: Mark to market on T's close — this is the day's
+                # equity point, and it now includes everything above.
+                self._mark_to_market(current_date)
+                equity_curve[current_date] = self.portfolio_value
+
                 self.daily_activity_log.append({
                     'date': date_str,
-                    'ticker': ticker,
-                    'action': action,
-                    'price': trade['exit_price'],
-                    'quantity': trade['quantity'],
-                    'position_value': position_val,
+                    'ticker': 'PORTFOLIO',
+                    'action': 'MARK_TO_MARKET',
+                    'price': None,
+                    'quantity': None,
+                    'position_value': None,
                     'cash_balance': round(self.cash, 2),
                     'total_portfolio_value': round(self.portfolio_value, 2),
                     'score': None,
                     'signal': None,
-                    'notes': f"{action.replace('_', ' ')} triggered"
+                    'notes': 'EOD valuation'
                 })
-            
-            # Step C: Run Agent's signal generation using data up to T-1
-            signals = self._generate_signals(current_date)
-            
-            # Log signal evaluations
-            for ticker, sig in signals.items():
-                self.daily_activity_log.append({
-                    'date': date_str,
-                    'ticker': ticker,
-                    'action': 'HOLD',  # Signal evaluation, not an actual trade yet
-                    'price': sig.entry_price,
-                    'quantity': None,
-                    'position_value': self.holdings.get(ticker, 0) * sig.entry_price if self.holdings.get(ticker, 0) > 0 and sig.entry_price else None,
-                    'cash_balance': round(self.cash, 2),
-                    'total_portfolio_value': round(self.portfolio_value, 2),
-                    'score': sig.score,
-                    'signal': sig.signal,
-                    'notes': f"Signal evaluated: {sig.signal}"
-                })
-            
-            # Step D: Create pending orders for T+1 execution
-            self._create_pending_orders(signals, current_date)
-            
-            # Execute any pending orders for today (from previous day's signals)
-            executed_orders = self._execute_pending_orders(current_date)
-            
-            # Log BUY/SELL executions
-            for trade in executed_orders:
-                ticker = trade['ticker']
-                action = 'BUY' if trade['side'] == 'LONG' and trade.get('exit_date') is None else 'SELL'
-                close_price = self._get_price_at_date(ticker, current_date, 'close')
-                position_val = self.holdings.get(ticker, 0) * close_price if close_price and self.holdings.get(ticker, 0) > 0 else None
-                
-                notes = f"Order executed at {trade.get('entry_price') or trade.get('exit_price')}"
-                if trade.get('transaction_costs', 0) > 0:
-                    notes += f", cost: {trade['transaction_costs']:.2f}"
-                
-                self.daily_activity_log.append({
-                    'date': date_str,
-                    'ticker': ticker,
-                    'action': action,
-                    'price': trade.get('entry_price') or trade.get('exit_price'),
-                    'quantity': trade['quantity'],
-                    'position_value': position_val,
-                    'cash_balance': round(self.cash, 2),
-                    'total_portfolio_value': round(self.portfolio_value, 2),
-                    'score': None,
-                    'signal': trade.get('signal_trigger'),
-                    'notes': notes
-                })
-            
-            # Handle delisted tickers
-            self._handle_delisted_tickers(current_date)
-            
-            # Step E: Every 20 trading days, trigger evaluate_and_learn
-            if self.trading_day_count % 20 == 0:
-                self._evaluate_and_learn()
-        
+
+                # Step E: Run the agent's signal generation using data up to T-1
+                signals = self._generate_signals(current_date)
+
+                for ticker in sorted(signals):
+                    sig = signals[ticker]
+                    self.daily_activity_log.append({
+                        'date': date_str,
+                        'ticker': ticker,
+                        'action': 'HOLD',  # Signal evaluation, not an actual trade yet
+                        'price': sig.entry_price,
+                        'quantity': None,
+                        'position_value': self._position_value(ticker, current_date),
+                        'cash_balance': round(self.cash, 2),
+                        'total_portfolio_value': round(self.portfolio_value, 2),
+                        'score': sig.score,
+                        'signal': sig.signal,
+                        'notes': f"Signal evaluated: {sig.signal}"
+                    })
+
+                # Step F: Queue orders for T+1 execution
+                self._create_pending_orders(signals, current_date)
+
+                # Step G: Every 20 trading days, trigger evaluate_and_learn
+                if self.trading_day_count % 20 == 0:
+                    self._evaluate_and_learn()
+        finally:
+            # Workers are per-run, so they are released here whether the run
+            # finished or raised.
+            self.shutdown_workers()
+
         # Final brain snapshot
         final_snapshot = {
             'trading_day': self.trading_day_count,
@@ -1108,16 +1317,26 @@ class BacktestEngine:
             'trade_count': len(self.agent_brain.trade_history)
         }
         self.brain_evolution.append(final_snapshot)
-        
+
         # Store results
         self.daily_equity_curve = pd.Series(equity_curve)
-        
+
         return {
             'daily_equity_curve': self.daily_equity_curve,
             'trade_log': self.trade_log,
             'brain_evolution': self.brain_evolution,
             'daily_activity_log': self.daily_activity_log
         }
+
+    def _position_value(self, ticker: str, current_date: pd.Timestamp) -> Optional[float]:
+        """Mark an open position to T's close for the daily activity log."""
+        quantity = self.holdings.get(ticker, 0)
+        if quantity <= 0:
+            return None
+        close_price = self._get_price_at_date(ticker, current_date, 'close')
+        if close_price is None or pd.isna(close_price):
+            return None
+        return round(quantity * close_price, 2)
     
     def get_performance_metrics(self) -> Dict[str, Any]:
         """
@@ -1152,9 +1371,12 @@ class BacktestEngine:
         drawdowns = (equity - rolling_max) / rolling_max
         max_drawdown = drawdowns.min()
         
-        # Win rate
-        winning_trades = sum(1 for t in self.trade_log if t.get('pnl', 0) > 0)
-        total_trades = len([t for t in self.trade_log if 'pnl' in t])
+        # Win rate over closed round trips (open BUY legs have no realized P&L).
+        # Reads 'net_pnl', the key this engine actually writes — looking for a
+        # 'pnl' key that never existed reported every run as zero trades.
+        closed_trades = [t for t in self.trade_log if t.get('exit_date') is not None]
+        winning_trades = sum(1 for t in closed_trades if t.get('net_pnl', 0) > 0)
+        total_trades = len(closed_trades)
         win_rate = winning_trades / total_trades if total_trades > 0 else 0
         
         return {

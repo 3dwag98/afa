@@ -7,6 +7,7 @@ Uses pandas and parquet for efficient local caching of OHLCV data.
 import os
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta
@@ -110,28 +111,31 @@ def batch_download_and_cache(
     start_date: str,
     end_date: str,
     chunk_size: int = 50,
-    skip_existing: bool = True
+    skip_existing: bool = True,
+    max_workers: Optional[int] = None,
 ) -> bool:
     """
     Download and cache data for multiple tickers (module-level convenience function).
-    
+
     Args:
         tickers: List of ticker symbols.
         start_date: Start date (YYYY-MM-DD).
         end_date: End date (YYYY-MM-DD).
         chunk_size: Number of tickers per batch.
         skip_existing: Skip tickers that already have valid cached data.
-        
+        max_workers: Concurrent chunk downloads (default: DataStore's default).
+
     Returns:
         True on success, False on failure.
     """
     ds = DataStore(cache_dir=DATA_DIR)
     ds.chunk_size = chunk_size
-    
+
     stats = ds.batch_download_and_cache(
         tickers, start_date, end_date,
         chunk_size=chunk_size,
-        skip_existing=skip_existing
+        skip_existing=skip_existing,
+        max_workers=max_workers,
     )
     
     # Return True if all tickers were successfully downloaded or skipped
@@ -257,6 +261,7 @@ def load_or_fetch_data(
             start_date=start_date.strftime('%Y-%m-%d'),
             end_date=end_date.strftime('%Y-%m-%d'),
             skip_existing=False,
+            max_workers=getattr(config.data, 'download_workers', None),
         )
         for ticker in missing:
             df = load_ticker_data(ticker)
@@ -552,11 +557,16 @@ class DataStore:
         Initialize the DataStore.
         
         Args:
-            cache_dir: Directory for storing parquet files. 
-                      Defaults to data/market_data/ directory.
+            cache_dir: Directory for storing parquet files.
+                      Defaults to DATA_DIR (data/market_data, resolved
+                      relative to the current working directory).
         """
+        # Must default to the same DATA_DIR the module-level helpers read from.
+        # It used to default to `<package>/data/market_data` instead, so a
+        # DataStore() built without an explicit cache_dir wrote parquet files
+        # into the source tree where load_ticker_data() would never find them.
         if cache_dir is None:
-            cache_dir = Path(__file__).parent.parent / "data" / "market_data"
+            cache_dir = DATA_DIR
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
@@ -564,6 +574,7 @@ class DataStore:
         self.chunk_size = 50  # Tickers per batch
         self.max_retries = 3
         self.base_delay = 1.0  # Base delay in seconds for backoff
+        self.download_workers = 4  # Concurrent chunk downloads (network-bound)
     
     def _get_ticker_path(self, ticker: str) -> Path:
         """
@@ -636,72 +647,11 @@ class DataStore:
         
         return path
     
-    def load_ticker_data(
-        self,
-        ticker: str,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None
-    ) -> Optional[pd.DataFrame]:
-        """
-        Load ticker data from local parquet cache.
-        
-        Args:
-            ticker: Ticker symbol.
-            start_date: Optional start date (YYYY-MM-DD).
-            end_date: Optional end date (YYYY-MM-DD).
-            
-        Returns:
-            DataFrame with OHLCV data, or None if file doesn't exist or is empty.
-        """
-        # Build path using self.cache_dir to match save_ticker_data
-        path = self.cache_dir / _ticker_filename(ticker)
-        
-        if not path.exists():
-            return None
-        
-        try:
-            df = pd.read_parquet(path)
-            
-            if df.empty:
-                return None
-            
-            # Restore datetime index
-            if 'Date' in df.columns:
-                df['Date'] = pd.to_datetime(df['Date'])
-                df = df.set_index('Date')
-            elif 'date' in df.columns:
-                df['date'] = pd.to_datetime(df['date'])
-                df = df.set_index('date')
-            elif 'index' in df.columns:
-                df['index'] = pd.to_datetime(df['index'])
-                df = df.set_index('index')
-            
-            # Ensure index is datetime and sorted ascending
-            if not isinstance(df.index, pd.DatetimeIndex):
-                try:
-                    df.index = pd.to_datetime(df.index)
-                except Exception:
-                    return None
-            
-            df = df.sort_index()
-            
-            # Filter by date range if provided
-            if start_date is not None:
-                df = df[df.index >= pd.to_datetime(start_date)]
-            
-            if end_date is not None:
-                df = df[df.index <= pd.to_datetime(end_date)]
-            
-            # After filtering, check if empty
-            if df.empty:
-                return None
-            
-            return df
-            
-        except Exception as e:
-            logger.error(f"Error loading {ticker}: {e}")
-            return None
-    
+    # NOTE: a first, shadowed copy of load_ticker_data() used to sit here. Two
+    # definitions of the same method in one class means only the last one is
+    # ever callable — the dead copy was removed so the forward-filling version
+    # below is unambiguously the implementation.
+
     def _fetch_chunk(
         self,
         tickers: List[str],
@@ -825,21 +775,28 @@ class DataStore:
         start_date: str,
         end_date: str,
         chunk_size: Optional[int] = None,
-        skip_existing: bool = True
+        skip_existing: bool = True,
+        max_workers: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Download and cache data for multiple tickers in batches.
-        
-        Downloads data in chunks to avoid API rate limits.
-        Saves each ticker's OHLCV data as a separate parquet file.
-        
+
+        Downloads data in chunks to avoid API rate limits. Chunks are fetched
+        concurrently on a small thread pool — downloading is network-bound, so
+        threads (not processes) are the right tool and the GIL is released
+        while waiting on the socket. Parquet writes and statistics stay on the
+        calling thread, keeping file I/O serialized and the returned stats
+        deterministic regardless of which chunk lands first.
+
         Args:
             tickers: List of ticker symbols.
             start_date: Start date (YYYY-MM-DD).
             end_date: End date (YYYY-MM-DD).
             chunk_size: Number of tickers per batch. Defaults to self.chunk_size.
             skip_existing: Skip tickers that already have valid cached data.
-            
+            max_workers: Concurrent chunk downloads. Defaults to
+                self.download_workers. Use 1 for strictly sequential downloads.
+
         Returns:
             Dictionary with download statistics:
             - total: Total number of tickers
@@ -850,7 +807,9 @@ class DataStore:
         """
         if chunk_size is None:
             chunk_size = self.chunk_size
-        
+        if max_workers is None:
+            max_workers = self.download_workers
+
         stats = {
             'total': len(tickers),
             'downloaded': 0,
@@ -858,47 +817,66 @@ class DataStore:
             'failed': 0,
             'errors': []
         }
-        
-        # Process in chunks
+
+        # Build the chunks up front, resolving what actually needs fetching.
+        chunks: List[List[str]] = []
         for i in range(0, len(tickers), chunk_size):
-            chunk = tickers[i:i + chunk_size]
-            print(f"Processing chunk {i // chunk_size + 1}/{(len(tickers) + chunk_size - 1) // chunk_size}")
-            
-            # Normalize tickers in chunk
             normalized_chunk = []
-            for ticker in chunk:
+            for ticker in tickers[i:i + chunk_size]:
                 if not ticker.endswith('.NS'):
                     ticker = f"{ticker}.NS"
-                ticker = ticker.upper()
-                normalized_chunk.append(ticker)
-            
-            # Check which tickers need downloading
+                normalized_chunk.append(ticker.upper())
+
             to_download = []
             for ticker in normalized_chunk:
                 if skip_existing and self._is_cache_valid(ticker, start_date, end_date):
                     stats['skipped'] += 1
                 else:
                     to_download.append(ticker)
-            
-            # Download the chunk with retry logic
+
             if to_download:
-                results = self._fetch_chunk(to_download, start_date, end_date)
-                
-                for ticker, df in results.items():
-                    if df is not None and not df.empty:
-                        self.save_ticker_data(ticker, df)
-                        stats['downloaded'] += 1
-                    else:
-                        stats['failed'] += 1
-                        stats['errors'].append(ticker)
-            
-            # Small delay between chunks
-            if i + chunk_size < len(tickers):
-                time.sleep(1.0)
-        
+                chunks.append(to_download)
+
+        if not chunks:
+            print(f"Download complete: 0 downloaded, {stats['skipped']} skipped, 0 failed")
+            return stats
+
+        total_chunks = len(chunks)
+        workers = max(1, min(max_workers, total_chunks))
+
+        def _record(chunk_index: int, results: Dict[str, Optional[pd.DataFrame]]) -> None:
+            print(f"Processing chunk {chunk_index + 1}/{total_chunks}")
+            for ticker, df in results.items():
+                if df is not None and not df.empty:
+                    self.save_ticker_data(ticker, df)
+                    stats['downloaded'] += 1
+                else:
+                    stats['failed'] += 1
+                    stats['errors'].append(ticker)
+
+        if workers == 1:
+            for index, chunk in enumerate(chunks):
+                _record(index, self._fetch_chunk(chunk, start_date, end_date))
+                if index + 1 < total_chunks:
+                    time.sleep(1.0)  # be polite to the provider
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [
+                    executor.submit(self._fetch_chunk, chunk, start_date, end_date)
+                    for chunk in chunks
+                ]
+                # Consumed in submission order so stats['errors'] is stable.
+                for index, future in enumerate(futures):
+                    try:
+                        _record(index, future.result())
+                    except Exception as e:
+                        logger.error(f"Chunk {index + 1} failed: {e}")
+                        stats['failed'] += len(chunks[index])
+                        stats['errors'].extend(chunks[index])
+
         print(f"Download complete: {stats['downloaded']} downloaded, "
               f"{stats['skipped']} skipped, {stats['failed']} failed")
-        
+
         return stats
     
     def load_ticker_data(
