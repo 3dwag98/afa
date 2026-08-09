@@ -148,6 +148,64 @@ class TestTradeLogAccounting:
         assert engine._get_entry_date_for_ticker("UP.NS") == first.strftime('%Y-%m-%d')
 
 
+class TestOrderBook:
+    """Queued orders must be resolved, never silently stranded."""
+
+    def _engine(self):
+        return BacktestEngine(
+            start_date="2023-01-02", end_date="2023-06-16",
+            initial_capital=500_000.0, universe_tickers=["UP.NS"],
+        )
+
+    def test_order_dated_on_a_market_holiday_still_fills(self, rising_market):
+        """Orders are scheduled for the next weekday, which is sometimes closed.
+
+        Such an order used to carry a date that could never come round again,
+        so it sat in the book forever and the signal was silently lost.
+        """
+        engine = self._engine()
+        session = engine.master_date_index[10]
+        holiday = session - pd.Timedelta(days=1)
+        assert holiday not in engine.master_date_index, "fixture must place a closed day here"
+
+        engine.pending_orders.append({
+            'ticker': "UP.NS", 'action': 'BUY', 'quantity': 10,
+            'execution_date': holiday, 'trigger': 'SIGNAL',
+        })
+
+        executed = engine._execute_pending_orders(session)
+
+        assert len(executed) == 1
+        assert executed[0]['ticker'] == "UP.NS"
+        assert engine.pending_orders == []
+
+    def test_unaffordable_order_leaves_the_book(self, rising_market):
+        """An order that cannot be funded is dropped, not retried forever."""
+        engine = self._engine()
+        engine.cash = 1.0
+        session = engine.master_date_index[10]
+
+        engine.pending_orders.append({
+            'ticker': "UP.NS", 'action': 'BUY', 'quantity': 10_000,
+            'execution_date': session, 'trigger': 'SIGNAL',
+        })
+
+        executed = engine._execute_pending_orders(session)
+
+        assert executed == []
+        assert engine.pending_orders == []
+
+    def test_order_book_does_not_grow_across_a_run(self, rising_market):
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-06-16",
+            initial_capital=50_000.0, universe_tickers=["UP.NS"],
+        )
+        engine.run_backtest()
+
+        # Only orders queued on the final day can still be outstanding.
+        assert len(engine.pending_orders) <= 1
+
+
 class TestEquityCurve:
     """The equity point for day T must include day T's trading."""
 

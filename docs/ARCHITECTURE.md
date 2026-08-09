@@ -340,6 +340,11 @@ Look-ahead prevention is structural, not incidental:
   when the decision was made.
 - Position sizing uses T's end-of-day equity, which is known before T+1's open.
 
+Orders are scheduled for the next calendar weekday, which is sometimes a
+market holiday; those fill at the **next session's** open. Everything due
+today or earlier leaves the order book on that day's pass, filled or not, so
+an order can neither be silently stranded nor retried indefinitely.
+
 Position accounting is tracked explicitly in `open_positions` (cost basis,
 first entry date, quantity), which is what makes realized P&L, holding period
 and STCG/LTCG classification correct in the trade log.

@@ -788,15 +788,17 @@ class BacktestEngine:
             if order['execution_date'] > execution_date:
                 continue
 
-            # Day orders: anything scheduled for today or earlier leaves the
-            # book on this pass, filled or not. Previously an order that could
-            # not be funded stayed queued forever (its execution date could
-            # never match again), so pending_orders grew without bound for the
-            # whole run.
+            # Anything due today or earlier is handled on this pass and leaves
+            # the book, filled or not.
+            #
+            # "or earlier" matters twice. Orders are scheduled for the next
+            # calendar weekday, which lands on a market holiday often enough to
+            # matter; those now fill at the next session's open instead of
+            # sitting in the book with a date that could never come round
+            # again. And an order that could not be funded is dropped rather
+            # than left queued forever — pending_orders used to grow without
+            # bound for the whole run.
             orders_to_remove.append(i)
-
-            if order['execution_date'] != execution_date:
-                continue
 
             ticker = order['ticker']
             action = order['action']
@@ -804,7 +806,6 @@ class BacktestEngine:
 
             if ticker in self.untradeable_tickers:
                 continue
-
 
             # Get open price for execution
             open_price = self._get_price_at_date(ticker, execution_date, 'open')
