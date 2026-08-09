@@ -14,6 +14,8 @@ Usage:
 import argparse
 import sys
 import signal
+import time
+import multiprocessing as mp
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -234,7 +236,14 @@ def run_parallel_backtest(
         print(f"  Workers: {engine.num_workers}")
         print()
         
+        # Track execution start time for parallel metrics
+        exec_start_time = time.time()
+        
         result = engine.run_backtest()
+        
+        # Calculate execution time
+        exec_end_time = time.time()
+        execution_time_seconds = exec_end_time - exec_start_time
         
         if _shutdown_requested:
             return False
@@ -248,8 +257,33 @@ def run_parallel_backtest(
         
         analytics_report = analyzer.generate_analytics_report()
         
-        # Step 6: Generate Excel Report
-        print("Generating Excel Report...")
+        # Step 6: Prepare Parallel Execution Metrics
+        print("Preparing Parallel Execution Summary...")
+        
+        # Calculate success/failure rate from signal generation
+        total_tickers_processed = len(engine.ticker_data)
+        failed_tickers = len(engine.untradeable_tickers)
+        successful_tickers = total_tickers_processed - failed_tickers
+        success_rate = (successful_tickers / total_tickers_processed * 100) if total_tickers_processed > 0 else 0
+        
+        parallel_metrics = {
+            'execution_time_seconds': round(execution_time_seconds, 2),
+            'num_workers': engine.num_workers,
+            'success_rate': round(success_rate, 2),
+            'total_tickers': total_tickers_processed,
+            'failed_tickers': failed_tickers,
+            'worker_type': 'ProcessPoolExecutor' if use_processes else 'ThreadPoolExecutor',
+            'worker_details': {
+                'CPU Count': mp.cpu_count(),
+                'Workers Used': engine.num_workers,
+                'Learning Interval (days)': learning_interval,
+                'Trading Days Simulated': len(engine.master_date_index),
+                'Brain Evolution Snapshots': len(engine.brain_evolution)
+            }
+        }
+        
+        # Step 7: Generate Excel Report with Aggregated Data
+        print("Generating Excel Report with Centralized Aggregation...")
         
         analytics_for_export = {
             'cagr': analytics_report.get('cagr', 0),
@@ -278,13 +312,15 @@ def run_parallel_backtest(
         # Ensure output directory exists
         Path(output_file).parent.mkdir(parents=True, exist_ok=True)
         
+        # Export with parallel metrics included
         export_backtest_excel(
             analytics=analytics_for_export,
             equity_curve=engine.daily_equity_curve,
             trade_log=engine.trade_log,
             brain_evolution=engine.brain_evolution,
             daily_activity_log=engine.daily_activity_log,
-            filepath=output_file
+            filepath=output_file,
+            parallel_metrics=parallel_metrics
         )
         
         # Print summary

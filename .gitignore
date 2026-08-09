@@ -4,26 +4,30 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.py~
+*.py.class
+*.py.backup
 
 # Dependencies
-venv/
 .venv/
+venv/
+env/
 .env
 .env.local
-*.env.*
+.env.*
 
 # Logs and temp files
 *.log
 *.tmp
+*.swp
+*.swo
 
 # Editors
 .vscode/
 .idea/
-*.swp
-*.swo
 
-# Build artifacts
-dist/
-build/
-target/
+# Coverage
+.coverage
+htmlcov/
+coverage/
 ```

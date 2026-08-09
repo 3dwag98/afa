@@ -6,9 +6,11 @@ This module implements a high-performance, parallelized backtest engine that:
 2. Trains the agent with PIT data from the last 5 years
 3. Parallelizes signal generation across tickers for speed
 4. Maintains strict look-ahead bias prevention
+5. Supports intermediate result storage for fault tolerance
 """
 
 import copy
+import json
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
@@ -45,6 +47,9 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+# Directory for intermediate backtest results (thread-safe worker output)
+TEMP_BACKTESTS_DIR = Path("data/temp_backtests")
 
 
 def _process_single_ticker_signal(args):
