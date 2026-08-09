@@ -26,6 +26,7 @@ try:
     from .reporting import export_excel_report
     from .models import Recommendation, TradeOutcome, AgentBrain
     from .outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
+    from .logging_utils import get_logger, ContextualLogger
 except ImportError:
     from config import AppConfig, get_config
     from storage import (
@@ -43,37 +44,26 @@ except ImportError:
     from reporting import export_excel_report
     from models import Recommendation, TradeOutcome, AgentBrain
     from outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
+    from logging_utils import get_logger, ContextualLogger
 
 
-def _setup_logging(log_file: str) -> logging.Logger:
-    """Setup logging configuration."""
-    logger = logging.getLogger('portfolio_agent')
-    logger.setLevel(logging.INFO)
-
-    # Clear existing handlers to avoid duplicates
-    if logger.handlers:
-        logger.handlers.clear()
-
-    # File handler
-    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-
-    fh = logging.FileHandler(log_file)
-    fh.setLevel(logging.INFO)
-
-    # Console handler
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-
-    formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+def _setup_logging(log_file: str, run_id: str) -> ContextualLogger:
+    """Setup logging configuration with contextual identifiers.
+    
+    Args:
+        log_file: Path to the log file.
+        run_id: Unique run identifier (UUID).
+        
+    Returns:
+        ContextualLogger instance.
+    """
+    return get_logger(
+        module_name='orchestrator',
+        log_file=log_file,
+        run_id=run_id,
+        worker_id='main',
+        level=logging.INFO
     )
-    fh.setFormatter(formatter)
-    ch.setFormatter(formatter)
-
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-
-    return logger
 
 
 def run_orchestrator(
@@ -117,187 +107,206 @@ def run_orchestrator(
     # Step 1: Load config
     if config is None:
         config = get_config()
-    logger = _setup_logging(config.log_file)
+    logger = _setup_logging(config.log_file, run_id)
     logger.info(f"Starting orchestrator run with run_id={run_id}")
 
-    # Step 2: Initialize SQLite
-    init_db(config.sqlite_path)
-    logger.info("SQLite initialized")
+    try:
+        # Step 2: Initialize SQLite
+        init_db(config.sqlite_path)
+        logger.info("SQLite initialized")
 
-    # Step 3: Load brain from config.brain_file
-    brain = load_brain(config.brain_file)
-    logger.info(f"Loaded brain from {config.brain_file}")
+        # Step 3: Load brain from config.brain_file
+        brain = load_brain(config.brain_file)
+        logger.info(f"Loaded brain from {config.brain_file}")
 
-    # Step 4: Load trade outcomes from SQLite into brain.trade_history
-    trade_outcomes = get_trade_history(config.sqlite_path)
-    for outcome in trade_outcomes:
-        brain.trade_history.append({
-            "trade_id": outcome.trade_id,
-            "symbol": outcome.symbol,
-            "signal_trigger": outcome.signal_trigger,
-            "entry_date": outcome.entry_date,
-            "entry_price": outcome.entry_price,
-            "exit_date": outcome.exit_date,
-            "exit_price": outcome.exit_price,
-            "outcome": outcome.outcome,
-            "return_pct": outcome.return_pct,
-            "outcome_source": outcome.outcome_source
-        })
-    logger.info(f"Loaded {len(trade_outcomes)} trade outcomes from SQLite")
+        # Step 4: Load trade outcomes from SQLite into brain.trade_history
+        trade_outcomes = get_trade_history(config.sqlite_path)
+        for outcome in trade_outcomes:
+            brain.trade_history.append({
+                "trade_id": outcome.trade_id,
+                "symbol": outcome.symbol,
+                "signal_trigger": outcome.signal_trigger,
+                "entry_date": outcome.entry_date,
+                "entry_price": outcome.entry_price,
+                "exit_date": outcome.exit_date,
+                "exit_price": outcome.exit_price,
+                "outcome": outcome.outcome,
+                "return_pct": outcome.return_pct,
+                "outcome_source": outcome.outcome_source
+            })
+        logger.info(f"Loaded {len(trade_outcomes)} trade outcomes from SQLite")
 
-    # Step 5: Run evaluate_and_learn()
-    brain = evaluate_and_learn(brain, config)
-    logger.info("Learning evaluation complete")
+        # Step 5: Run evaluate_and_learn()
+        brain = evaluate_and_learn(brain, config)
+        logger.info("Learning evaluation complete")
 
-    # Step 6: Fetch data using load_or_fetch_data()
-    data = load_or_fetch_data(config, force_refresh=force_refresh)
-    logger.info(f"Fetched data for {len(data)} tickers")
+        # Step 6: Fetch data using load_or_fetch_data()
+        data = load_or_fetch_data(config, force_refresh=force_refresh)
+        logger.info(f"Fetched data for {len(data)} tickers")
 
-    # Prepare containers for results
-    recommendations: List[Recommendation] = []
-    mc_results: List[MonteCarloResult] = []
-    indicator_snapshots = []
+        # Prepare containers for results
+        recommendations: List[Recommendation] = []
+        mc_results: List[MonteCarloResult] = []
+        indicator_snapshots = []
 
-    # Step 7-11: Process each ticker
-    for ticker, df in data.items():
-        # Calculate indicators
-        indicator = calculate_indicators(ticker, df)
-        indicator_snapshots.append(indicator)
+        # Step 7-11: Process each ticker
+        for ticker, df in data.items():
+            try:
+                # Calculate indicators
+                indicator = calculate_indicators(ticker, df)
+                indicator_snapshots.append(indicator)
+                logger.debug(f"Calculated indicators for {ticker}")
 
-        # Run Monte Carlo using daily returns
-        daily_returns = df['close'].pct_change().dropna().tolist()
-        mc_result = run_monte_carlo(
-            symbol=ticker,
-            daily_returns=daily_returns,
-            horizon_days=config.mc_horizon_days,
-            simulations=config.mc_simulations,
-            seed=config.random_seed
-        )
-        mc_results.append(mc_result)
+                # Run Monte Carlo using daily returns
+                daily_returns = df['close'].pct_change().dropna().tolist()
+                mc_result = run_monte_carlo(
+                    symbol=ticker,
+                    daily_returns=daily_returns,
+                    horizon_days=config.mc_horizon_days,
+                    simulations=config.mc_simulations,
+                    seed=config.random_seed
+                )
+                mc_results.append(mc_result)
+                logger.debug(f"Monte Carlo complete for {ticker}")
 
-        # Get current price
-        current_price = float(df['close'].iloc[-1])
+                # Get current price
+                current_price = float(df['close'].iloc[-1])
 
-        # Calculate entry, stop, target using ATR
-        atr = indicator.atr14
-        stop_price, target_price = calculate_stop_target(current_price, atr, config)
+                # Calculate entry, stop, target using ATR
+                atr = indicator.atr14
+                stop_price, target_price = calculate_stop_target(current_price, atr, config)
 
-        # Score candidate
-        scored = score_candidate(
-            indicator=indicator,
-            mc_result=mc_result,
-            brain=brain,
+                # Score candidate
+                scored = score_candidate(
+                    indicator=indicator,
+                    mc_result=mc_result,
+                    brain=brain,
+                    config=config,
+                    entry_price=current_price,
+                    stop_price=stop_price,
+                    target_price=target_price,
+                    run_id=run_id
+                )
+
+                # Calculate quantity
+                quantity = calculate_quantity(
+                    entry_price=current_price,
+                    stop_price=stop_price,
+                    config=config
+                )
+
+                # Calculate investment and max loss
+                investment_inr = quantity * current_price
+                max_loss_inr = quantity * (current_price - stop_price)
+
+                # Run compliance
+                compliance_status, failed_reasons = run_compliance_checks(
+                    symbol=ticker,
+                    close=current_price,
+                    quantity=quantity,
+                    investment_inr=investment_inr,
+                    config=config
+                )
+
+                # Create Recommendation object
+                rec = Recommendation(
+                    recommendation_id=str(uuid.uuid4()),
+                    created_at=datetime.now(timezone.utc).isoformat(),
+                    symbol=ticker,
+                    signal=scored["signal"],
+                    score=scored["score"],
+                    trigger=scored["trigger"],
+                    entry_price=scored["entry_price"],
+                    stop_price=scored["stop_price"],
+                    target_price=scored["target_price"],
+                    reward_risk=scored["reward_risk"],
+                    quantity=quantity,
+                    investment_inr=investment_inr,
+                    max_loss_inr=max_loss_inr,
+                    mc_probability_profit=scored["mc_probability_profit"],
+                    mc_var_95_pct=mc_result.var_95,
+                    mc_cvar_95_pct=mc_result.cvar_95,
+                    compliance_status=compliance_status,
+                    rationale=scored["rationale"]
+                )
+                recommendations.append(rec)
+                logger.info(f"Processed {ticker}: signal={rec.signal}, score={rec.score:.2f}")
+            except Exception as e:
+                logger.exception(f"Error processing ticker {ticker}: {e}")
+                continue
+
+        # Step 8: Sort recommendations by score descending
+        recommendations.sort(key=lambda r: r.score, reverse=True)
+
+        # Step 9: Save recommendations to SQLite
+        save_recommendations(config.sqlite_path, recommendations)
+        logger.info(f"Saved {len(recommendations)} recommendations to SQLite")
+
+        # Step 10: Optionally simulate outcome for top recommendation
+        if simulate_outcome and recommendations:
+            top_rec = recommendations[0]
+            simulated = simulate_outcome_fn(top_rec)
+            save_trade_outcome(config.sqlite_path, simulated)
+
+            # Also add to brain's trade_history
+            brain.trade_history.append({
+                "trade_id": simulated.trade_id,
+                "symbol": simulated.symbol,
+                "signal_trigger": simulated.signal_trigger,
+                "entry_date": simulated.entry_date,
+                "entry_price": simulated.entry_price,
+                "exit_date": simulated.exit_date,
+                "exit_price": simulated.exit_price,
+                "outcome": simulated.outcome,
+                "return_pct": simulated.return_pct,
+                "outcome_source": simulated.outcome_source
+            })
+            logger.info(f"Added simulated outcome for {top_rec.symbol}: {simulated.outcome}")
+
+        # Step 11: Optionally update outcomes from market data
+        if update_outcomes:
+            updated = update_outcomes_from_market(config.sqlite_path, data)
+            logger.info(f"Updated {len(updated)} trade outcomes from market data")
+
+        # Step 12: Save updated brain
+        brain.updated_at = datetime.now(timezone.utc).isoformat()
+        save_brain(config.brain_file, brain)
+        logger.info(f"Saved brain to {config.brain_file}")
+
+        # Step 13: Export Excel
+        excel_path = export_excel_report(
             config=config,
-            entry_price=current_price,
-            stop_price=stop_price,
-            target_price=target_price
+            brain=brain,
+            recommendations=recommendations,
+            indicators=indicator_snapshots,
+            mc_results=mc_results,
+            run_id=run_id
         )
+        logger.info(f"Exported Excel report to {excel_path}")
 
-        # Calculate quantity
-        quantity = calculate_quantity(
-            entry_price=current_price,
-            stop_price=stop_price,
-            config=config
+        # Step 14: Log run result
+        log_run(
+            sqlite_path=config.sqlite_path,
+            run_id=run_id,
+            status="SUCCESS",
+            message=f"Generated {len(recommendations)} recommendations",
+            recommendations_count=len(recommendations)
         )
+        logger.info(f"Logged run status: SUCCESS")
 
-        # Calculate investment and max loss
-        investment_inr = quantity * current_price
-        max_loss_inr = quantity * (current_price - stop_price)
-
-        # Run compliance
-        compliance_status, failed_reasons = run_compliance_checks(
-            symbol=ticker,
-            close=current_price,
-            quantity=quantity,
-            investment_inr=investment_inr,
-            config=config
+        # Step 15: Return Excel file path
+        return excel_path
+    except Exception as e:
+        logger.exception(f"Orchestrator run failed: {e}")
+        # Log run failure
+        log_run(
+            sqlite_path=config.sqlite_path,
+            run_id=run_id,
+            status="FAILED",
+            message=str(e),
+            recommendations_count=0
         )
-
-        # Create Recommendation object
-        rec = Recommendation(
-            recommendation_id=str(uuid.uuid4()),
-            created_at=datetime.now(timezone.utc).isoformat(),
-            symbol=ticker,
-            signal=scored["signal"],
-            score=scored["score"],
-            trigger=scored["trigger"],
-            entry_price=scored["entry_price"],
-            stop_price=scored["stop_price"],
-            target_price=scored["target_price"],
-            reward_risk=scored["reward_risk"],
-            quantity=quantity,
-            investment_inr=investment_inr,
-            max_loss_inr=max_loss_inr,
-            mc_probability_profit=scored["mc_probability_profit"],
-            mc_var_95_pct=mc_result.var_95,
-            mc_cvar_95_pct=mc_result.cvar_95,
-            compliance_status=compliance_status,
-            rationale=scored["rationale"]
-        )
-        recommendations.append(rec)
-        logger.info(f"Processed {ticker}: signal={rec.signal}, score={rec.score:.2f}")
-
-    # Step 8: Sort recommendations by score descending
-    recommendations.sort(key=lambda r: r.score, reverse=True)
-
-    # Step 9: Save recommendations to SQLite
-    save_recommendations(config.sqlite_path, recommendations)
-    logger.info(f"Saved {len(recommendations)} recommendations to SQLite")
-
-    # Step 10: Optionally simulate outcome for top recommendation
-    if simulate_outcome and recommendations:
-        top_rec = recommendations[0]
-        simulated = simulate_outcome_fn(top_rec)
-        save_trade_outcome(config.sqlite_path, simulated)
-
-        # Also add to brain's trade_history
-        brain.trade_history.append({
-            "trade_id": simulated.trade_id,
-            "symbol": simulated.symbol,
-            "signal_trigger": simulated.signal_trigger,
-            "entry_date": simulated.entry_date,
-            "entry_price": simulated.entry_price,
-            "exit_date": simulated.exit_date,
-            "exit_price": simulated.exit_price,
-            "outcome": simulated.outcome,
-            "return_pct": simulated.return_pct,
-            "outcome_source": simulated.outcome_source
-        })
-        logger.info(f"Added simulated outcome for {top_rec.symbol}: {simulated.outcome}")
-
-    # Step 11: Optionally update outcomes from market data
-    if update_outcomes:
-        updated = update_outcomes_from_market(config.sqlite_path, data)
-        logger.info(f"Updated {len(updated)} trade outcomes from market data")
-
-    # Step 12: Save updated brain
-    brain.updated_at = datetime.now(timezone.utc).isoformat()
-    save_brain(config.brain_file, brain)
-    logger.info(f"Saved brain to {config.brain_file}")
-
-    # Step 13: Export Excel
-    excel_path = export_excel_report(
-        config=config,
-        brain=brain,
-        recommendations=recommendations,
-        indicators=indicator_snapshots,
-        mc_results=mc_results,
-        run_id=run_id
-    )
-    logger.info(f"Exported Excel report to {excel_path}")
-
-    # Step 14: Log run result
-    log_run(
-        sqlite_path=config.sqlite_path,
-        run_id=run_id,
-        status="SUCCESS",
-        message=f"Generated {len(recommendations)} recommendations",
-        recommendations_count=len(recommendations)
-    )
-    logger.info(f"Logged run status: SUCCESS")
-
-    # Step 15: Return Excel file path
-    return excel_path
+        raise
 
 
 class PortfolioOrchestrator:

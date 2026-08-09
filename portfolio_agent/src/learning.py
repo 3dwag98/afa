@@ -1,6 +1,7 @@
 """Self-learning module for agent adaptation."""
 
 import json
+import logging
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
@@ -8,111 +9,140 @@ from typing import Dict, Any, List, Optional
 try:
     from .models import AgentBrain, TradeOutcome
     from .config import AppConfig
+    from .logging_utils import get_logger, ContextualLogger
 except ImportError:
     from models import AgentBrain, TradeOutcome
     from config import AppConfig
+    from logging_utils import get_logger, ContextualLogger
 
 
-def evaluate_and_learn(brain: AgentBrain, config: AppConfig) -> AgentBrain:
+def _get_logger(run_id: Optional[str] = None, log_file: str = "logs/afa_pipeline.log") -> ContextualLogger:
+    """Get a contextual logger for learning module."""
+    return get_logger(
+        module_name='learning',
+        log_file=log_file,
+        run_id=run_id,
+        worker_id='main',
+        level=logging.INFO
+    )
+
+
+def evaluate_and_learn(brain: AgentBrain, config: AppConfig, run_id: Optional[str] = None) -> AgentBrain:
     """Update agent signal weights based on trade outcomes.
     
     Args:
         brain: AgentBrain with trade_history and current weights.
         config: AppConfig with learning_rate and min_trades_for_learning.
+        run_id: Unique run identifier for logging context.
     
     Returns:
         Updated AgentBrain with new weights and learning_log entry.
     """
-    # Filter trades where outcome is WIN or LOSS (ignore OPEN/PENDING)
-    realized_trades = [
-        t for t in brain.trade_history 
-        if t.get("outcome") in ("WIN", "LOSS")
-    ]
+    logger = _get_logger(run_id=run_id, log_file=config.log_file)
+    logger.info("Starting learning evaluation")
     
-    # Check minimum trades threshold
-    if len(realized_trades) < config.min_trades_for_learning:
-        # Add log entry without changing weights
-        log_entry = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "message": "Not enough realized trades to learn."
-        }
-        brain.learning_log.append(log_entry)
+    try:
+        # Filter trades where outcome is WIN or LOSS (ignore OPEN/PENDING)
+        realized_trades = [
+            t for t in brain.trade_history 
+            if t.get("outcome") in ("WIN", "LOSS")
+        ]
+        
+        logger.debug(f"Found {len(realized_trades)} realized trades for learning")
+        
+        # Check minimum trades threshold
+        if len(realized_trades) < config.min_trades_for_learning:
+            # Add log entry without changing weights
+            log_entry = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "message": f"Not enough realized trades to learn (have {len(realized_trades)}, need {config.min_trades_for_learning})."
+            }
+            brain.learning_log.append(log_entry)
+            brain.updated_at = datetime.now().isoformat()
+            logger.info(f"Skipping learning: insufficient trades ({len(realized_trades)}/{config.min_trades_for_learning})")
+            return brain
+        
+        # Group by signal_trigger
+        trigger_stats: Dict[str, Dict[str, int]] = {}
+        for trade in realized_trades:
+            trigger = trade.get("signal_trigger", "Unknown")
+            if trigger not in trigger_stats:
+                trigger_stats[trigger] = {"total": 0, "wins": 0}
+            trigger_stats[trigger]["total"] += 1
+            if trade.get("outcome") == "WIN":
+                trigger_stats[trigger]["wins"] += 1
+        
+        logger.debug(f"Analyzing {len(trigger_stats)} signal triggers")
+        
+        # Start with existing weights
+        new_weights: Dict[str, float] = dict(brain.weights)
+        
+        # Calculate win rates and weight adjustments for triggers with trades
+        for trigger, stats in trigger_stats.items():
+            total = stats["total"]
+            wins = stats["wins"]
+            win_rate = wins / total if total > 0 else 0.5
+            
+            # Get old weight (use existing or default)
+            old_weight = brain.weights.get(trigger, 25.0)
+            
+            # Weight update formula
+            adjustment = (win_rate - 0.5) * config.learning_rate
+            new_weight = old_weight * (1 + adjustment)
+            
+            # Apply floor: minimum weight = 5.0
+            new_weight = max(5.0, new_weight)
+            
+            new_weights[trigger] = new_weight
+            logger.debug(f"Trigger {trigger}: win_rate={win_rate:.2f}, weight {old_weight:.1f} -> {new_weight:.1f}")
+        
+        # Normalize weights to sum exactly 100
+        total_weight = sum(new_weights.values())
+        if total_weight > 0:
+            scale_factor = 100.0 / total_weight
+            for trigger in new_weights:
+                new_weights[trigger] = new_weights[trigger] * scale_factor
+        
+        # Round to 1 decimal place for cleaner output while ensuring sum is 100
+        # First round all values
+        rounded_weights = {k: round(v, 1) for k, v in new_weights.items()}
+        
+        # Adjust for rounding errors to ensure exact sum of 100
+        current_sum = sum(rounded_weights.values())
+        if abs(current_sum - 100.0) > 0.001:
+            # Find the weight with largest fractional part and adjust
+            diff = 100.0 - current_sum
+            # Simply add the difference to the largest weight
+            max_key = max(rounded_weights.keys(), key=lambda k: rounded_weights[k])
+            rounded_weights[max_key] = round(rounded_weights[max_key] + diff, 1)
+        
+        brain.weights = rounded_weights
+        
+        # Create learning log entry
+        log_parts = []
+        for trigger in sorted(trigger_stats.keys()):
+            stats = trigger_stats.get(trigger, {"total": 0, "wins": 0})
+            total = stats["total"]
+            wins = stats["wins"]
+            wr_pct = int(round(wins / total * 100)) if total > 0 else 50
+            wt = rounded_weights.get(trigger, 0)
+            log_parts.append(f"{trigger} WR:{wr_pct}% (Wt:{wt:.1f})")
+        
+        log_entry = f"{datetime.now().strftime('%Y-%m-%d')} Learning Update: {' | '.join(log_parts)}"
+        brain.learning_log.append({
+            "timestamp": datetime.now().isoformat(),
+            "entry": log_entry
+        })
+        
+        # Update updated_at
         brain.updated_at = datetime.now().isoformat()
+        
+        logger.info(f"Learning complete: {log_entry}")
+        
         return brain
-    
-    # Group by signal_trigger
-    trigger_stats: Dict[str, Dict[str, int]] = {}
-    for trade in realized_trades:
-        trigger = trade.get("signal_trigger", "Unknown")
-        if trigger not in trigger_stats:
-            trigger_stats[trigger] = {"total": 0, "wins": 0}
-        trigger_stats[trigger]["total"] += 1
-        if trade.get("outcome") == "WIN":
-            trigger_stats[trigger]["wins"] += 1
-    
-    # Start with existing weights
-    new_weights: Dict[str, float] = dict(brain.weights)
-    
-    # Calculate win rates and weight adjustments for triggers with trades
-    for trigger, stats in trigger_stats.items():
-        total = stats["total"]
-        wins = stats["wins"]
-        win_rate = wins / total if total > 0 else 0.5
-        
-        # Get old weight (use existing or default)
-        old_weight = brain.weights.get(trigger, 25.0)
-        
-        # Weight update formula
-        adjustment = (win_rate - 0.5) * config.learning_rate
-        new_weight = old_weight * (1 + adjustment)
-        
-        # Apply floor: minimum weight = 5.0
-        new_weight = max(5.0, new_weight)
-        
-        new_weights[trigger] = new_weight
-    
-    # Normalize weights to sum exactly 100
-    total_weight = sum(new_weights.values())
-    if total_weight > 0:
-        scale_factor = 100.0 / total_weight
-        for trigger in new_weights:
-            new_weights[trigger] = new_weights[trigger] * scale_factor
-    
-    # Round to 1 decimal place for cleaner output while ensuring sum is 100
-    # First round all values
-    rounded_weights = {k: round(v, 1) for k, v in new_weights.items()}
-    
-    # Adjust for rounding errors to ensure exact sum of 100
-    current_sum = sum(rounded_weights.values())
-    if abs(current_sum - 100.0) > 0.001:
-        # Find the weight with largest fractional part and adjust
-        diff = 100.0 - current_sum
-        # Simply add the difference to the largest weight
-        max_key = max(rounded_weights.keys(), key=lambda k: rounded_weights[k])
-        rounded_weights[max_key] = round(rounded_weights[max_key] + diff, 1)
-    
-    brain.weights = rounded_weights
-    
-    # Create learning log entry
-    log_parts = []
-    for trigger in sorted(trigger_stats.keys()):
-        stats = trigger_stats.get(trigger, {"total": 0, "wins": 0})
-        total = stats["total"]
-        wins = stats["wins"]
-        wr_pct = int(round(wins / total * 100)) if total > 0 else 50
-        wt = rounded_weights.get(trigger, 0)
-        log_parts.append(f"{trigger} WR:{wr_pct}% (Wt:{wt:.1f})")
-    
-    log_entry = f"{datetime.now().strftime('%Y-%m-%d')} Learning Update: {' | '.join(log_parts)}"
-    brain.learning_log.append({
-        "timestamp": datetime.now().isoformat(),
-        "entry": log_entry
-    })
-    
-    # Update updated_at
-    brain.updated_at = datetime.now().isoformat()
-    
-    return brain
+    except Exception as e:
+        logger.exception(f"Error during learning evaluation: {e}")
+        raise
 
 
 class LearningAgent:

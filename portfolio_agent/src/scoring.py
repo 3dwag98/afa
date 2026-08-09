@@ -1,5 +1,6 @@
 """Stock scoring module."""
 
+import logging
 import pandas as pd
 from typing import Dict, Any, Optional
 
@@ -8,10 +9,23 @@ try:
     from .models import IndicatorSnapshot, AgentBrain, Recommendation
     from .config import AppConfig
     from .monte_carlo import MonteCarloResult
+    from .logging_utils import get_logger, ContextualLogger
 except ImportError:
     from models import IndicatorSnapshot, AgentBrain, Recommendation
     from config import AppConfig
     from monte_carlo import MonteCarloResult
+    from logging_utils import get_logger, ContextualLogger
+
+
+def _get_logger(run_id: Optional[str] = None, log_file: str = "logs/afa_pipeline.log") -> ContextualLogger:
+    """Get a contextual logger for scoring module."""
+    return get_logger(
+        module_name='scoring',
+        log_file=log_file,
+        run_id=run_id,
+        worker_id='main',
+        level=logging.INFO
+    )
 
 
 def calculate_technical_score(df: pd.DataFrame) -> float:
@@ -187,7 +201,8 @@ def score_candidate(
     config: AppConfig,
     entry_price: float,
     stop_price: float,
-    target_price: float
+    target_price: float,
+    run_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """Score a stock candidate and generate recommendation.
     
@@ -199,156 +214,166 @@ def score_candidate(
         entry_price: Proposed entry price.
         stop_price: Stop loss price.
         target_price: Target price.
+        run_id: Unique run identifier for logging context.
         
     Returns:
         Recommendation-like dict with score, signal, trigger, and rationale.
     """
-    close = indicator.sma20  # Use sma20 as proxy for close if not available
-    # Actually, we need the actual close price. Let's use entry_price as close.
-    close = entry_price
+    logger = _get_logger(run_id=run_id, log_file=config.log_file)
+    logger.debug(f"Scoring candidate {indicator.symbol}")
     
-    # 1. Trend score
-    sma50 = indicator.sma50
-    sma200 = indicator.sma200
-    
-    if sma200 is None:
-        trend_score = 0.0
-    elif close > sma50 and close > sma200 and sma50 > sma200:
-        trend_score = 1.0
-    elif close > sma200:
-        trend_score = 0.5
-    else:
-        trend_score = 0.0
-    
-    # 2. Breakout score
-    prev_donchian_upper_20 = indicator.prev_donchian_upper_20
-    if prev_donchian_upper_20 is None:
-        breakout_score = 0.0
-    elif close > prev_donchian_upper_20:
-        breakout_score = 1.0
-    else:
-        breakout_score = 0.0
-    
-    # 3. Volume score
-    volume_ratio = indicator.volume_ratio
-    if volume_ratio is None:
-        volume_score = 0.0
-    else:
-        volume_score = min(volume_ratio / 2.0, 1.0)
-    
-    # 4. MC score
-    mc_score = max(0.0, min(1.0, mc_result.probability_profit))
-    
-    # Normalize weights to sum to 100
-    raw_weights = brain.weights.copy()
-    normalized_weights = _normalize_weights(raw_weights)
-    
-    weight_trend = normalized_weights.get("Trend", 0.0)
-    weight_breakout = normalized_weights.get("Breakout", 0.0)
-    weight_volume = normalized_weights.get("Volume", 0.0)
-    weight_mc_prob = normalized_weights.get("MC_Prob", 0.0)
-    
-    # 5. Final score
-    final_score = (
-        weight_trend * trend_score +
-        weight_breakout * breakout_score +
-        weight_volume * volume_score +
-        weight_mc_prob * mc_score
-    )
-    
-    # 6. Trigger
-    if breakout_score == 1.0:
-        trigger = "Breakout"
-    elif trend_score == 1.0:
-        trigger = "Trend"
-    elif volume_score >= 0.75:
-        trigger = "Volume"
-    else:
-        trigger = "None"
-    
-    # Calculate reward_risk safely
-    if entry_price > stop_price:
-        reward = target_price - entry_price
-        risk = entry_price - stop_price
-        reward_risk = reward / risk if risk != 0 else 0.0
-    else:
-        # Stop >= entry is invalid
-        reward_risk = 0.0
-    
-    # Build rationale
-    rationale_parts = []
-    
-    # Check conditions for BUY signal
-    prob_profit = mc_result.probability_profit
-    target_prob_profit = config.target_prob_profit
-    min_reward_risk = config.min_reward_risk
-    min_price_inr = config.min_price_inr
-    
-    passed_score = final_score >= 60
-    passed_prob = prob_profit >= target_prob_profit
-    passed_rr = reward_risk >= min_reward_risk
-    passed_price = close >= min_price_inr
-    stop_valid = stop_price < entry_price
-    
-    rationale_parts.append(f"Score={final_score:.1f}")
-    rationale_parts.append(f"trend={trend_score:.1f}")
-    rationale_parts.append(f"breakout={breakout_score:.1f}")
-    rationale_parts.append(f"volume={volume_score:.2f}")
-    rationale_parts.append(f"mc_prob={mc_score:.2f}")
-    
-    if passed_score:
-        rationale_parts.append("score>=60:PASS")
-    else:
-        rationale_parts.append("score>=60:FAIL")
-    
-    if passed_prob:
-        rationale_parts.append(f"prob({prob_profit:.2f})>={target_prob_profit}:PASS")
-    else:
-        rationale_parts.append(f"prob({prob_profit:.2f})>={target_prob_profit}:FAIL")
-    
-    if passed_rr:
-        rationale_parts.append(f"rr({reward_risk:.2f})>={min_reward_risk}:PASS")
-    else:
-        rationale_parts.append(f"rr({reward_risk:.2f})>={min_reward_risk}:FAIL")
-    
-    if passed_price:
-        rationale_parts.append(f"price({close:.2f})>={min_price_inr}:PASS")
-    else:
-        rationale_parts.append(f"price({close:.2f})>={min_price_inr}:FAIL")
-    
-    if stop_valid:
-        rationale_parts.append("stop<entry:VALID")
-    else:
-        rationale_parts.append("stop>=entry:INVALID")
-    
-    rationale = "; ".join(rationale_parts)
-    
-    # 7. Signal determination
-    if not stop_valid:
-        signal = "AVOID"
-    elif passed_score and passed_prob and passed_rr and passed_price:
-        signal = "BUY"
-    elif final_score >= 45:
-        signal = "WATCH"
-    else:
-        signal = "AVOID"
-    
-    return {
-        "symbol": indicator.symbol,
-        "signal": signal,
-        "score": round(final_score, 2),
-        "trigger": trigger,
-        "entry_price": entry_price,
-        "stop_price": stop_price,
-        "target_price": target_price,
-        "reward_risk": round(reward_risk, 4) if reward_risk != 0 else 0.0,
-        "mc_probability_profit": round(prob_profit, 6),
-        "rationale": rationale,
-        # These fields are set by caller (quantity calculated elsewhere)
-        "quantity": 0,
-        "investment_inr": 0.0,
-        "max_loss_inr": 0.0,
-        "mc_var_95_pct": round(mc_result.var_95, 6),
-        "mc_cvar_95_pct": round(mc_result.cvar_95, 6),
-        "compliance_status": "PENDING",
-    }
+    try:
+        close = indicator.sma20  # Use sma20 as proxy for close if not available
+        # Actually, we need the actual close price. Let's use entry_price as close.
+        close = entry_price
+        
+        # 1. Trend score
+        sma50 = indicator.sma50
+        sma200 = indicator.sma200
+        
+        if sma200 is None:
+            trend_score = 0.0
+        elif close > sma50 and close > sma200 and sma50 > sma200:
+            trend_score = 1.0
+        elif close > sma200:
+            trend_score = 0.5
+        else:
+            trend_score = 0.0
+        
+        # 2. Breakout score
+        prev_donchian_upper_20 = indicator.prev_donchian_upper_20
+        if prev_donchian_upper_20 is None:
+            breakout_score = 0.0
+        elif close > prev_donchian_upper_20:
+            breakout_score = 1.0
+        else:
+            breakout_score = 0.0
+        
+        # 3. Volume score
+        volume_ratio = indicator.volume_ratio
+        if volume_ratio is None:
+            volume_score = 0.0
+        else:
+            volume_score = min(volume_ratio / 2.0, 1.0)
+        
+        # 4. MC score
+        mc_score = max(0.0, min(1.0, mc_result.probability_profit))
+        
+        # Normalize weights to sum to 100
+        raw_weights = brain.weights.copy()
+        normalized_weights = _normalize_weights(raw_weights)
+        
+        weight_trend = normalized_weights.get("Trend", 0.0)
+        weight_breakout = normalized_weights.get("Breakout", 0.0)
+        weight_volume = normalized_weights.get("Volume", 0.0)
+        weight_mc_prob = normalized_weights.get("MC_Prob", 0.0)
+        
+        # 5. Final score
+        final_score = (
+            weight_trend * trend_score +
+            weight_breakout * breakout_score +
+            weight_volume * volume_score +
+            weight_mc_prob * mc_score
+        )
+        
+        # 6. Trigger
+        if breakout_score == 1.0:
+            trigger = "Breakout"
+        elif trend_score == 1.0:
+            trigger = "Trend"
+        elif volume_score >= 0.75:
+            trigger = "Volume"
+        else:
+            trigger = "None"
+        
+        # Calculate reward_risk safely
+        if entry_price > stop_price:
+            reward = target_price - entry_price
+            risk = entry_price - stop_price
+            reward_risk = reward / risk if risk != 0 else 0.0
+        else:
+            # Stop >= entry is invalid
+            reward_risk = 0.0
+        
+        # Build rationale
+        rationale_parts = []
+        
+        # Check conditions for BUY signal
+        prob_profit = mc_result.probability_profit
+        target_prob_profit = config.target_prob_profit
+        min_reward_risk = config.min_reward_risk
+        min_price_inr = config.min_price_inr
+        
+        passed_score = final_score >= 60
+        passed_prob = prob_profit >= target_prob_profit
+        passed_rr = reward_risk >= min_reward_risk
+        passed_price = close >= min_price_inr
+        stop_valid = stop_price < entry_price
+        
+        rationale_parts.append(f"Score={final_score:.1f}")
+        rationale_parts.append(f"trend={trend_score:.1f}")
+        rationale_parts.append(f"breakout={breakout_score:.1f}")
+        rationale_parts.append(f"volume={volume_score:.2f}")
+        rationale_parts.append(f"mc_prob={mc_score:.2f}")
+        
+        if passed_score:
+            rationale_parts.append("score>=60:PASS")
+        else:
+            rationale_parts.append("score>=60:FAIL")
+        
+        if passed_prob:
+            rationale_parts.append(f"prob({prob_profit:.2f})>={target_prob_profit}:PASS")
+        else:
+            rationale_parts.append(f"prob({prob_profit:.2f})>={target_prob_profit}:FAIL")
+        
+        if passed_rr:
+            rationale_parts.append(f"rr({reward_risk:.2f})>={min_reward_risk}:PASS")
+        else:
+            rationale_parts.append(f"rr({reward_risk:.2f})>={min_reward_risk}:FAIL")
+        
+        if passed_price:
+            rationale_parts.append(f"price({close:.2f})>={min_price_inr}:PASS")
+        else:
+            rationale_parts.append(f"price({close:.2f})>={min_price_inr}:FAIL")
+        
+        if stop_valid:
+            rationale_parts.append("stop<entry:VALID")
+        else:
+            rationale_parts.append("stop>=entry:INVALID")
+        
+        rationale = "; ".join(rationale_parts)
+        
+        # 7. Signal determination
+        if not stop_valid:
+            signal = "AVOID"
+        elif passed_score and passed_prob and passed_rr and passed_price:
+            signal = "BUY"
+        elif final_score >= 45:
+            signal = "WATCH"
+        else:
+            signal = "AVOID"
+        
+        logger.debug(f"Scored {indicator.symbol}: signal={signal}, score={final_score:.2f}, trigger={trigger}")
+        
+        return {
+            "symbol": indicator.symbol,
+            "signal": signal,
+            "score": round(final_score, 2),
+            "trigger": trigger,
+            "entry_price": entry_price,
+            "stop_price": stop_price,
+            "target_price": target_price,
+            "reward_risk": round(reward_risk, 4) if reward_risk != 0 else 0.0,
+            "mc_probability_profit": round(prob_profit, 6),
+            "rationale": rationale,
+            # These fields are set by caller (quantity calculated elsewhere)
+            "quantity": 0,
+            "investment_inr": 0.0,
+            "max_loss_inr": 0.0,
+            "mc_var_95_pct": round(mc_result.var_95, 6),
+            "mc_cvar_95_pct": round(mc_result.cvar_95, 6),
+            "compliance_status": "PENDING",
+        }
+    except Exception as e:
+        logger.exception(f"Error scoring candidate {indicator.symbol}: {e}")
+        raise
