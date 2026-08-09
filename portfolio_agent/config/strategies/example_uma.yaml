@@ -1,0 +1,32 @@
+# Example UMA (Unified Multi-strategy Agent) — combines two strategies into one.
+#
+# A UMA is loaded via strategies/ensemble.py::EnsembleStrategy, registered as
+# strategy type "ensemble". Point config.strategy.config_path (or the
+# `--strategy-config` CLI flag) at a YAML file shaped like this one to use it:
+#
+#   portfolio-agent backtest --strategy ensemble --strategy-config config/strategies/example_uma.yaml
+#
+# Each member is itself a strategy config (any registered type: rule_based,
+# lstm, or even another ensemble). `weight` only matters for method:
+# weighted_blend; it's ignored by method: vote.
+
+name: "Trend+ML Blend"
+description: "Blends the rule-based trend/breakout/volume/MC strategy with the trained LSTM forecaster"
+
+# Combination method: "weighted_blend" (default) or "vote"
+method: weighted_blend
+
+# Only used when method: vote
+vote:
+  mode: majority   # "majority" (>50% agree) or "unanimous" (all agree)
+
+members:
+  - type: rule_based
+    weight: 0.6
+    config_path: config/strategies/trend_breakout.yaml
+
+  - type: lstm
+    weight: 0.4
+    params:
+      model_name: lstm
+      models_dir: models

@@ -33,6 +33,9 @@ except ImportError:
     # torch (the `gpu` extra) is not installed; the "lstm" strategy is unavailable.
     pass
 
+from .ensemble import EnsembleStrategy
+register_strategy("ensemble", EnsembleStrategy)
+
 
 def load_strategy(config: StrategyConfig) -> BaseStrategy:
     """Load a strategy based on configuration.

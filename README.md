@@ -10,7 +10,9 @@ A lightweight, CLI-first platform for training and backtesting trading strategie
 
 - [Quick Start](#quick-start)
 - [CLI Reference](#cli-reference)
-- [Strategies](#strategies)
+- [Strategies (plug-and-play)](#strategies-plug-and-play)
+- [UMAs — combining strategies](#umas--combining-strategies)
+- [Training](#training)
 - [Configuration](#configuration)
 - [Scheduling (cron / Task Scheduler)](#scheduling-cron--task-scheduler)
 - [Testing](#testing)
@@ -55,7 +57,8 @@ portfolio-agent train [--device auto|cuda|mps|cpu]
     synthetic data instead (offline/CI testing only).
 
 portfolio-agent backtest
-    [--strategy rule_based|lstm]   Strategy to backtest (default: config.strategy.type)
+    [--strategy rule_based|lstm|ensemble|...]   Strategy to backtest (default: config.strategy.type)
+    [--strategy-config PATH]       Strategy YAML override (e.g. a UMA ensemble file)
     [--parallel] [--workers N]     Parallelize rule-based signal generation across CPU workers
     [--use-trained-model]          Shorthand for --strategy lstm
     [--years N | --start-date/--end-date]
@@ -65,16 +68,93 @@ portfolio-agent backtest
 portfolio-agent run-agent [--force-refresh] [--simulate-outcome] [--update-outcomes]
     Run the live daily paper-trading loop: fetch data, score every ticker with
     the configured strategy, save recommendations, export an Excel report.
+
+portfolio-agent list-strategies [--name NAME] [--strategy-config PATH]
+    List registered strategies. With --name, show that strategy's entry/exit
+    rules and required features (pass --strategy-config to inspect a UMA file).
 ```
 
-## Strategies
+`--strategy` and `--strategy-config` are also accepted by `backtest` (see below) to select any registered strategy — `rule_based`, `lstm`, `ensemble` (a UMA), or a custom one you register yourself.
 
-The platform trains and backtests strategies through a single canonical interface (`portfolio_agent/strategies/base.py::BaseStrategy`), so the live agent and the backtest engine always make identical decisions from identical inputs:
+## Strategies (plug-and-play)
 
-- **`rule_based`** (default) — "Trend + Breakout + Volume + Monte Carlo probability" scoring, configured via `config/strategies/trend_breakout.yaml`. Component weights self-adjust over time based on realized win rate (`strategies/weighting.py`). Cheap to evaluate; can be parallelized across CPU workers for large universes (`--parallel`).
+Every strategy — built-in or your own — implements one interface (`portfolio_agent/strategies/base.py::BaseStrategy`) and is looked up by name from `portfolio_agent/strategies/registry.py`. Because the live agent and the backtest engine both go through this same registry, they always make identical decisions from identical inputs — there's no separate "live" vs "backtest" scoring logic to keep in sync.
+
+Built-in strategies:
+
+- **`rule_based`** (default) — "Trend + Breakout + Volume + Monte Carlo probability" scoring, configured via `config/strategies/trend_breakout.yaml`. Component weights self-adjust over time based on realized win rate (`strategies/weighting.py`). Cheap to evaluate; parallelizes across CPU workers for large universes (`--parallel`).
 - **`lstm`** — a trained sequence-forecasting model (`portfolio_agent/models/pytorch_models.py`). During backtesting, all eligible tickers on a given date are batched into a single GPU forward pass (`strategies/ml_strategy.py::score_batch`) rather than scored one at a time.
+- **`ensemble`** — combines multiple strategies into one; see [UMAs](#umas--combining-strategies) below.
 
-Add a new strategy by implementing `BaseStrategy` and registering it in `portfolio_agent/strategies/registry.py`.
+**Adding your own strategy** is three steps:
+
+1. Subclass `BaseStrategy` (see `strategies/rule_based.py` for a rule-based example, `strategies/ml_strategy.py` for an ML example) and implement `name`, `required_features()`, and `score(symbol, features, context) -> StrategySignal`.
+2. Register it: `register_strategy("my_strategy", MyStrategy)` in `strategies/registry.py` (or call `register_strategy` yourself before running the CLI, e.g. from a small bootstrap script).
+3. Use it: `portfolio-agent backtest --strategy my_strategy`.
+
+No other code needs to change — `run-agent`, `backtest`, and any UMA that references your strategy by name all pick it up automatically through the registry.
+
+## UMAs — combining strategies
+
+A **UMA** (Unified Multi-strategy Agent) combines two or more registered strategies into a single strategy, so you can, for example, blend the rule-based strategy with a trained LSTM rather than choosing one or the other. A UMA is itself just a strategy (type `ensemble`) — it can be backtested, run live, or even nested inside another UMA.
+
+Define one in a YAML file (see `config/strategies/example_uma.yaml`):
+
+```yaml
+name: "Trend+ML Blend"
+method: weighted_blend      # or "vote"
+vote:
+  mode: majority            # "majority" or "unanimous" — only used by method: vote
+
+members:
+  - type: rule_based
+    weight: 0.6
+    config_path: config/strategies/trend_breakout.yaml
+  - type: lstm
+    weight: 0.4
+    params:
+      model_name: lstm
+```
+
+Run it:
+
+```bash
+portfolio-agent backtest --strategy ensemble --strategy-config config/strategies/example_uma.yaml
+portfolio-agent list-strategies --name ensemble --strategy-config config/strategies/example_uma.yaml
+```
+
+Two combination methods, selectable per UMA:
+
+- **`weighted_blend`** (default) — each member's signal is mapped to a strength (BUY=1, WATCH=0.3, HOLD=0, AVOID=-0.3, SELL=-1) and averaged by weight; score, entry/stop/target, and probability-of-profit are likewise weighted averages. Good default for mixing strategies of different character (e.g. a fast rule-based signal with a slower ML one).
+- **`vote`** — each member casts a BUY/SELL/HOLD-bucketed vote; `vote.mode: majority` requires >50% agreement, `vote.mode: unanimous` requires all members to agree. More conservative — fewer but higher-conviction signals.
+
+Notes:
+- Member weights only matter for `weighted_blend`; they're ignored by `vote`.
+- A UMA is not GPU-batched even if one of its members is (correctness — a rule-based member needs a genuine per-ticker Monte Carlo result, which the batched path skips). If you want maximum ML-inference throughput, run that strategy directly (`--strategy lstm`) rather than wrapping it in a UMA.
+- `list-strategies --name ensemble --strategy-config <file>` shows you the resolved member list and weights for a given UMA file.
+
+## Training
+
+```bash
+uv sync --extra gpu
+uv run portfolio-agent train --device auto
+```
+
+`train` builds its training panel from the **full cached ticker universe** (whatever's in `data/market_data/*.parquet` — no separate download needed if you've already run `download-data` or otherwise populated that cache) rather than a synthetic stand-in. Each ticker is loaded, featurized, and chronologically split (70/15/15) individually, then concatenated so validation/test proportionally represent every ticker, not just the last one processed.
+
+Optimizations already applied, controlled via `config.yaml`'s `training` section:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `parallel_data_loading` | `true` | Loads and featurizes tickers across a CPU process pool (`data_load_workers`, default: CPU count) instead of one at a time — this is what makes training on ~2,400 tickers practical. |
+| `use_mixed_precision` | `true` | Automatic mixed precision (`torch.amp`) on CUDA. |
+| `use_torch_compile` | `false` | Wraps the model with `torch.compile()` for faster training (PyTorch 2.0+, biggest win on CUDA). Off by default — enable it once you're doing longer training runs. |
+| `batch_size` | `128` | Sized for GPU throughput; lower it on CPU-only or memory-constrained machines. |
+| `num_workers` | `2` | PyTorch `DataLoader` workers (separate from `data_load_workers`, which is for building the panel, not iterating it). |
+
+Plus, already in place from the underlying `DataLoader`/device setup: `pin_memory` on CUDA, `persistent_workers`/`prefetch_factor` for the training loop, and `cudnn.benchmark` enabled on fixed-size CUDA inputs.
+
+Set `training.use_synthetic_data: true` to fall back to generated random-walk data instead (offline/CI testing only — real training should leave this `false`).
 
 ## Configuration
 
@@ -122,8 +202,8 @@ afa/
 ├── config.yaml                 # single nested config (see Configuration)
 ├── portfolio_agent/            # the package
 │   ├── cli.py                  # single CLI entry point
-│   ├── config/                 # schema.py, loader.py, strategies/*.yaml
-│   ├── strategies/             # base.py, rule_based.py, ml_strategy.py, weighting.py, registry.py
+│   ├── config/                 # schema.py, loader.py, strategies/*.yaml (incl. example_uma.yaml)
+│   ├── strategies/             # base.py, types.py, rule_based.py, ml_strategy.py, ensemble.py, weighting.py, registry.py
 │   ├── features/               # lag-safe technical indicators + pipeline
 │   ├── models/                 # PyTorch model definitions
 │   ├── agents/                 # trainer.py, backtester.py

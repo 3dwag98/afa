@@ -31,6 +31,7 @@ class BacktesterAgent:
         self,
         config: AppConfig,
         strategy_type: Optional[str] = None,
+        strategy_config_path: Optional[str] = None,
         inference_device: str = "cpu",
         parallel: bool = False,
         max_workers: Optional[int] = None,
@@ -39,8 +40,11 @@ class BacktesterAgent:
 
         Args:
             config: Application configuration.
-            strategy_type: Registered strategy name (e.g. "rule_based", "lstm").
-                Defaults to config.strategy.type.
+            strategy_type: Registered strategy name (e.g. "rule_based", "lstm",
+                "ensemble"). Defaults to config.strategy.type.
+            strategy_config_path: Optional override for the strategy's YAML
+                config file (e.g. a UMA ensemble file under
+                config/strategies/). Defaults to config.strategy.config_path.
             inference_device: Device for ML strategy inference ("cpu", "cuda", "mps").
             parallel: Whether to parallelize rule-based signal generation across CPU workers.
             max_workers: Max worker processes when parallel=True.
@@ -49,6 +53,8 @@ class BacktesterAgent:
         self.strategy_config = config.strategy.model_copy(deep=True)
         if strategy_type:
             self.strategy_config.type = strategy_type
+        if strategy_config_path:
+            self.strategy_config.config_path = strategy_config_path
         self.strategy_config.params = {**self.strategy_config.params, "device": inference_device}
         self.inference_device = inference_device
         self.parallel = parallel
@@ -154,6 +160,7 @@ class BacktesterAgent:
 def run_backtest_cli(
     config: AppConfig,
     strategy_type: Optional[str] = None,
+    strategy_config_path: Optional[str] = None,
     device: str = "cpu",
     output_file: Optional[str] = None,
     parallel: bool = False,
@@ -166,6 +173,7 @@ def run_backtest_cli(
     Args:
         config: Application configuration.
         strategy_type: Registered strategy name override (defaults to config.strategy.type).
+        strategy_config_path: Optional strategy YAML override (e.g. a UMA ensemble file).
         device: Device for ML strategy inference.
         output_file: Optional output file path override.
         parallel: Whether to parallelize rule-based signal generation across CPU workers.
@@ -197,6 +205,7 @@ def run_backtest_cli(
     agent = BacktesterAgent(
         config=config,
         strategy_type=strategy_type,
+        strategy_config_path=strategy_config_path,
         inference_device=device,
         parallel=parallel,
         max_workers=max_workers,

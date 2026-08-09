@@ -6,6 +6,7 @@ Commands:
     train: Train the ML model on historical data
     backtest: Run backtesting simulation
     run-agent: Run the daily portfolio agent
+    list-strategies: List registered strategies (rule-based, ML, UMA ensembles)
 """
 
 from __future__ import annotations
@@ -130,6 +131,8 @@ def cmd_backtest(args) -> int:
 
     print(f"Running backtest...")
     print(f"  Strategy: {strategy_type or config.strategy.type}")
+    if args.strategy_config:
+        print(f"  Strategy config: {args.strategy_config}")
     print(f"  Inference device: {inference_device}")
     print(f"  Parallel: {args.parallel} (workers={args.workers or 'auto'})")
     print(f"  Output file: {output_file}")
@@ -138,6 +141,7 @@ def cmd_backtest(args) -> int:
         result = run_backtest_cli(
             config=config,
             strategy_type=strategy_type,
+            strategy_config_path=args.strategy_config,
             device=inference_device,
             output_file=output_file,
             parallel=args.parallel,
@@ -183,6 +187,52 @@ def cmd_run_agent(args) -> int:
         import traceback
         traceback.print_exc()
         return 1
+
+
+def cmd_list_strategies(args) -> int:
+    """List registered strategies, and optionally describe one in detail."""
+    from portfolio_agent.strategies.registry import get_available_strategies
+
+    strategies = get_available_strategies()
+
+    if args.name:
+        if args.name not in strategies:
+            print(f"Unknown strategy: {args.name!r}. Available: {sorted(strategies)}")
+            return 1
+
+        config = get_config()
+        strategy_config = config.strategy.model_copy(deep=True)
+        strategy_config.type = args.name
+        if args.strategy_config:
+            strategy_config.config_path = args.strategy_config
+
+        try:
+            strategy = strategies[args.name](strategy_config)
+        except Exception as e:
+            print(f"Could not load strategy config for {args.name!r}: {e}")
+            return 1
+
+        print(f"{strategy.name}  (type={args.name})")
+        print(f"  supports_gpu_batch: {strategy.supports_gpu_batch}")
+        entry = strategy.entry_rules()
+        if entry:
+            print(f"  entry_rules: {entry}")
+        exit_ = strategy.exit_rules()
+        if exit_:
+            print(f"  exit_rules: {exit_}")
+        try:
+            print(f"  required_features: {strategy.required_features()}")
+        except Exception as e:
+            print(f"  required_features: unavailable ({e})")
+        return 0
+
+    print("Registered strategies:")
+    for strategy_name in sorted(strategies):
+        print(f"  - {strategy_name}")
+    print("\nUse --name <strategy> [--strategy-config PATH] to see details for one strategy.")
+    print("Combine multiple strategies into a UMA (Unified Multi-strategy Agent) via a YAML file")
+    print("(see config/strategies/example_uma.yaml) and run it with --strategy ensemble.")
+    return 0
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -235,7 +285,14 @@ def create_parser() -> argparse.ArgumentParser:
         "--strategy",
         type=str,
         default=None,
-        help="Registered strategy to backtest (e.g. 'rule_based', 'lstm'). Defaults to config.strategy.type"
+        help="Registered strategy to backtest (e.g. 'rule_based', 'lstm', 'ensemble'). Defaults to config.strategy.type"
+    )
+    backtest_parser.add_argument(
+        "--strategy-config",
+        type=str,
+        default=None,
+        help="Path to the strategy's YAML config (e.g. a UMA ensemble file under config/strategies/). "
+             "Defaults to config.strategy.config_path"
     )
     backtest_parser.add_argument(
         "--use-trained-model",
@@ -308,7 +365,26 @@ def create_parser() -> argparse.ArgumentParser:
         help="Update outcomes from market data"
     )
     agent_parser.set_defaults(func=cmd_run_agent)
-    
+
+    # list-strategies command
+    list_strategies_parser = subparsers.add_parser(
+        "list-strategies",
+        help="List registered strategies (rule-based, ML, UMA ensembles)"
+    )
+    list_strategies_parser.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        help="Show details (entry/exit rules, required features) for one strategy"
+    )
+    list_strategies_parser.add_argument(
+        "--strategy-config",
+        type=str,
+        default=None,
+        help="Strategy YAML to load when using --name (e.g. a UMA ensemble file)"
+    )
+    list_strategies_parser.set_defaults(func=cmd_list_strategies)
+
     return parser
 
 

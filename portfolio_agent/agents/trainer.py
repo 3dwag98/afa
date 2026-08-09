@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -51,16 +52,55 @@ def _generate_synthetic_ohlcv(n_samples: int = 1000, seed: int = 42) -> pd.DataF
     }, index=dates)
 
 
+def _load_and_split_ticker(
+    ticker: str, config: AppConfig
+) -> Optional[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    """Load, featurize, and chronologically split (70/15/15) one ticker.
+
+    Module-level (not a nested closure) so it can be dispatched across a
+    ProcessPoolExecutor for parallel training-panel construction. Returns
+    None if the ticker has insufficient cached history.
+    """
+    df = load_ticker_data(ticker)
+    if df is None or len(df) < config.data.min_history_days:
+        return None
+    df = df.copy()
+    df.columns = [c.lower() for c in df.columns]
+
+    try:
+        feature_df = prepare_features(df, config, verbose=False)
+    except Exception:
+        return None
+    if len(feature_df) < config.training.sequence_length * 2:
+        return None
+
+    n = len(feature_df)
+    train_end = int(n * 0.70)
+    val_end = int(n * 0.85)
+    return (
+        feature_df.iloc[:train_end],
+        feature_df.iloc[train_end:val_end],
+        feature_df.iloc[val_end:],
+    )
+
+
 def load_data(config: AppConfig) -> pd.DataFrame:
     """Load and featurize training data.
 
-    By default, loads real cached multi-ticker OHLCV data (via data_store) and
-    builds a concatenated training panel: each ticker is featurized and split
-    70/15/15 chronologically *individually*, then all tickers' train portions
-    are concatenated, followed by all val portions, then all test portions.
-    This ordering lets create_dataloaders()'s single top-level 70/15/15 index
-    split land exactly on those boundaries, so validation/test proportionally
+    By default, loads real cached multi-ticker OHLCV data — the full 5-year
+    cached universe (via data_store), not a synthetic stand-in — and builds a
+    concatenated training panel: each ticker is featurized and split 70/15/15
+    chronologically *individually*, then all tickers' train portions are
+    concatenated, followed by all val portions, then all test portions. This
+    ordering lets create_dataloaders()'s single top-level 70/15/15 index split
+    land exactly on those boundaries, so validation/test proportionally
     represent every ticker rather than only the last one in the panel.
+
+    Per-ticker loading + feature computation is CPU-bound (parquet decode +
+    indicator math), so when config.training.parallel_data_loading is set
+    (the default), tickers are dispatched across a ProcessPoolExecutor sized
+    by config.training.data_load_workers (default: CPU count) — this is what
+    makes training on the full ~2,400-ticker cached universe practical.
 
     Sequence windows that straddle two concatenated tickers' boundaries mix
     data from different instruments; this is a bounded, documented limitation
@@ -88,40 +128,39 @@ def load_data(config: AppConfig) -> pd.DataFrame:
             "training.use_synthetic_data=true for offline testing."
         )
 
-    train_parts: List[pd.DataFrame] = []
-    val_parts: List[pd.DataFrame] = []
-    test_parts: List[pd.DataFrame] = []
+    results: List[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = []
+    show_progress = len(tickers) > 20
 
-    for ticker in tickers:
-        df = load_ticker_data(ticker)
-        if df is None or len(df) < config.data.min_history_days:
-            continue
-        df = df.copy()
-        df.columns = [c.lower() for c in df.columns]
+    if config.training.parallel_data_loading and len(tickers) > 1:
+        with ProcessPoolExecutor(max_workers=config.training.data_load_workers) as executor:
+            futures = {executor.submit(_load_and_split_ticker, t, config): t for t in tickers}
+            iterator = as_completed(futures)
+            if show_progress:
+                iterator = tqdm(iterator, total=len(futures), desc="Loading training data", unit="ticker")
+            for future in iterator:
+                result = future.result()
+                if result is not None:
+                    results.append(result)
+    else:
+        ticker_iter = tqdm(tickers, desc="Loading training data", unit="ticker") if show_progress else tickers
+        for ticker in ticker_iter:
+            result = _load_and_split_ticker(ticker, config)
+            if result is not None:
+                results.append(result)
 
-        try:
-            feature_df = prepare_features(df, config, verbose=False)
-        except Exception:
-            continue
-        if len(feature_df) < config.training.sequence_length * 2:
-            continue
-
-        n = len(feature_df)
-        train_end = int(n * 0.70)
-        val_end = int(n * 0.85)
-        train_parts.append(feature_df.iloc[:train_end])
-        val_parts.append(feature_df.iloc[train_end:val_end])
-        test_parts.append(feature_df.iloc[val_end:])
-
-    if not train_parts:
+    if not results:
         raise RuntimeError(
             "None of the resolved tickers had enough cached history to build a "
             "training panel. Run `portfolio-agent download-data` first, or set "
             "training.use_synthetic_data=true for offline testing."
         )
 
+    train_parts = [r[0] for r in results]
+    val_parts = [r[1] for r in results]
+    test_parts = [r[2] for r in results]
+
     combined = pd.concat(train_parts + val_parts + test_parts, ignore_index=True)
-    print(f"Built training panel from {len(train_parts)} tickers: {len(combined)} total rows")
+    print(f"Built training panel from {len(results)}/{len(tickers)} tickers: {len(combined)} total rows")
     return combined
 
 
@@ -256,6 +295,13 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
     model = model.to(device)
     print(f"Model moved to device: {device}")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    if config.training.use_torch_compile:
+        try:
+            model = torch.compile(model)
+            print("torch.compile: Enabled")
+        except Exception as e:
+            print(f"torch.compile unavailable, continuing uncompiled: {e}")
     
     # =========================================================================
     # 5. Initialize Optimizer and Loss Function

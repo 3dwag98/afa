@@ -110,6 +110,21 @@ class TrainingConfig(BaseModel):
         description="If True, train on generated synthetic OHLCV data instead of real cached tickers "
         "(offline/CI testing only; real training should leave this False)",
     )
+    parallel_data_loading: bool = Field(
+        default=True,
+        description="Load and featurize per-ticker training data across a CPU process pool "
+        "instead of sequentially. Recommended when training on the full cached ticker universe.",
+    )
+    data_load_workers: Optional[int] = Field(
+        default=None,
+        description="Max worker processes for parallel data loading (default: CPU count).",
+    )
+    use_torch_compile: bool = Field(
+        default=False,
+        description="If True, wrap the model with torch.compile() for faster training (PyTorch 2.0+; "
+        "biggest benefit on CUDA). Off by default since compile overhead isn't worth it for very "
+        "short runs and isn't supported on every platform.",
+    )
 
 
 class BacktestConfig(BaseModel):
