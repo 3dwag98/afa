@@ -3,13 +3,15 @@
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
+
+import pandas as pd
 
 from portfolio_agent.config.schema import AppConfig
 from portfolio_agent.config.loader import load_config as get_config
 from portfolio_agent.features.pipeline import build_features
 from portfolio_agent.strategies.registry import load_strategy
-from portfolio_agent.strategies.types import RiskParams, StrategyContext
+from portfolio_agent.strategies.types import RiskParams, StrategyContext, StrategySignal
 
 # Use absolute imports for CLI execution
 try:
@@ -20,8 +22,8 @@ try:
     )
     from .data_store import load_or_fetch_data
     from .indicators import calculate_indicators
-    from .monte_carlo import run_monte_carlo, MonteCarloResult
-    from .risk import calculate_quantity
+    from .monte_carlo import run_monte_carlo, run_monte_carlo_garch, MonteCarloResult
+    from .risk import calculate_position_quantity
     from .compliance import run_compliance_checks
     from .learning import evaluate_and_learn
     from .reporting import export_excel_report
@@ -36,8 +38,8 @@ except ImportError:
     )
     from data_store import load_or_fetch_data
     from indicators import calculate_indicators
-    from monte_carlo import run_monte_carlo, MonteCarloResult
-    from risk import calculate_quantity
+    from monte_carlo import run_monte_carlo, run_monte_carlo_garch, MonteCarloResult
+    from risk import calculate_position_quantity
     from compliance import run_compliance_checks
     from learning import evaluate_and_learn
     from reporting import export_excel_report
@@ -155,43 +157,67 @@ def run_orchestrator(
         mc_results: List[MonteCarloResult] = []
         indicator_snapshots = []
 
-        # Step 8-11: Process each ticker
+        # Step 8: Calculate indicators + Monte Carlo + features for every ticker up front.
+        mc_by_ticker: Dict[str, MonteCarloResult] = {}
+        features_by_ticker: Dict[str, pd.DataFrame] = {}
+        mc_fn = run_monte_carlo_garch if config.simulation.use_garch_volatility else run_monte_carlo
+
         for ticker, df in data.items():
             try:
-                # Calculate indicators (used for the Excel indicator sheet only)
                 indicator = calculate_indicators(ticker, df)
                 indicator_snapshots.append(indicator)
-                logger.debug(f"Calculated indicators for {ticker}")
 
-                # Run Monte Carlo using daily returns
                 daily_returns = df['close'].pct_change().dropna().tolist()
-                mc_result = run_monte_carlo(
+                mc_result = mc_fn(
                     symbol=ticker,
                     daily_returns=daily_returns,
                     horizon_days=config.simulation.mc_horizon_days,
                     simulations=config.simulation.mc_simulations,
                     seed=config.simulation.random_seed
                 )
+                mc_by_ticker[ticker] = mc_result
                 mc_results.append(mc_result)
-                logger.debug(f"Monte Carlo complete for {ticker}")
 
-                # Build lag-safe features and score via the strategy — the same
-                # code path the backtest engine uses, so live and backtest
-                # decisions can never drift apart again.
-                features = build_features(df, strategy.required_features())
+                features_by_ticker[ticker] = build_features(df, strategy.required_features())
+            except Exception as e:
+                logger.exception(f"Error preparing ticker {ticker}: {e}")
+                continue
+
+        # Step 9: Score via the strategy — the same code path the backtest engine
+        # uses, so live and backtest decisions can never drift apart. Strategies
+        # that need the full universe at once (cross-sectional momentum/
+        # low-volatility ranking) are scored in a single score_batch() call;
+        # everything else is scored per-ticker with its own Monte Carlo result.
+        signals: Dict[str, StrategySignal] = {}
+        if strategy.requires_full_batch or strategy.supports_gpu_batch:
+            batch_context = StrategyContext(risk=risk_params, weights=dict(brain.weights), run_id=run_id)
+            signals = strategy.score_batch(features_by_ticker, batch_context)
+        else:
+            for ticker, features in features_by_ticker.items():
                 context = StrategyContext(
                     risk=risk_params,
                     weights=dict(brain.weights),
-                    mc_result=mc_result,
+                    mc_result=mc_by_ticker.get(ticker),
                     run_id=run_id,
                 )
-                sig = strategy.score(ticker, features, context)
+                try:
+                    signals[ticker] = strategy.score(ticker, features, context)
+                except Exception as e:
+                    logger.exception(f"Error scoring ticker {ticker}: {e}")
 
-                # Calculate quantity
-                quantity = calculate_quantity(
+        # Step 10-11: Turn each signal into a Recommendation.
+        for ticker, sig in signals.items():
+            try:
+                mc_result = mc_by_ticker.get(ticker)
+
+                # Calculate quantity (fixed-fractional, or fractional-Kelly
+                # once config.risk.use_kelly_sizing is set and enough
+                # realized trade history exists — see risk.py)
+                quantity = calculate_position_quantity(
                     entry_price=sig.entry_price,
                     stop_price=sig.stop_price,
-                    config=config
+                    config=config,
+                    trade_history=brain.trade_history,
                 )
 
                 # Calculate investment and max loss
@@ -223,8 +249,8 @@ def run_orchestrator(
                     investment_inr=investment_inr,
                     max_loss_inr=max_loss_inr,
                     mc_probability_profit=sig.probability_profit,
-                    mc_var_95_pct=mc_result.var_95,
-                    mc_cvar_95_pct=mc_result.cvar_95,
+                    mc_var_95_pct=mc_result.var_95 if mc_result else 0.0,
+                    mc_cvar_95_pct=mc_result.cvar_95 if mc_result else 0.0,
                     compliance_status=compliance_status,
                     rationale=sig.rationale
                 )

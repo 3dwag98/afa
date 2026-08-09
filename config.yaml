@@ -52,6 +52,9 @@ training:
   use_mixed_precision: true
   num_workers: 2
   use_synthetic_data: false
+  parallel_data_loading: true
+  data_load_workers: null
+  use_torch_compile: false
 
 # Backtest configuration
 backtest:

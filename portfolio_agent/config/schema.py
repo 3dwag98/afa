@@ -110,6 +110,21 @@ class TrainingConfig(BaseModel):
         description="If True, train on generated synthetic OHLCV data instead of real cached tickers "
         "(offline/CI testing only; real training should leave this False)",
     )
+    parallel_data_loading: bool = Field(
+        default=True,
+        description="Load and featurize per-ticker training data across a CPU process pool "
+        "instead of sequentially. Recommended when training on the full cached ticker universe.",
+    )
+    data_load_workers: Optional[int] = Field(
+        default=None,
+        description="Max worker processes for parallel data loading (default: CPU count).",
+    )
+    use_torch_compile: bool = Field(
+        default=False,
+        description="If True, wrap the model with torch.compile() for faster training (PyTorch 2.0+; "
+        "biggest benefit on CUDA). Off by default since compile overhead isn't worth it for very "
+        "short runs and isn't supported on every platform.",
+    )
 
 
 class BacktestConfig(BaseModel):
@@ -147,6 +162,22 @@ class RiskConfig(BaseModel):
     max_single_position_pct: float = Field(
         default=0.03, description="Maximum allocation to a single position"
     )
+    use_kelly_sizing: bool = Field(
+        default=False,
+        description="If True, size positions with fractional-Kelly once enough realized trade "
+        "history exists (see risk.py::calculate_kelly_quantity), falling back to fixed-fractional "
+        "sizing otherwise. Off by default since it needs real trade history to be meaningful.",
+    )
+    kelly_fraction: float = Field(
+        default=0.5,
+        description="Fractional-Kelly multiplier kappa in [0, 1] (0.5 = half-Kelly, the common "
+        "practitioner default that captures ~75% of full-Kelly's growth rate at lower drawdown risk).",
+    )
+    kelly_min_trades: int = Field(
+        default=20,
+        description="Minimum realized (WIN/LOSS) trades required before Kelly sizing is trusted; "
+        "below this, sizing falls back to fixed-fractional.",
+    )
 
 
 class LearningConfig(BaseModel):
@@ -166,6 +197,14 @@ class SimulationConfig(BaseModel):
     mc_horizon_days: int = Field(default=20, description="Forward simulation horizon in trading days")
     mc_simulations: int = Field(default=1000, description="Number of Monte Carlo simulation paths")
     random_seed: int = Field(default=42, description="Random seed for reproducible simulations")
+    use_garch_volatility: bool = Field(
+        default=False,
+        description="If True, forecast each ticker's forward volatility with GJR-GARCH(1,1) "
+        "(src/volatility_models.py) instead of assuming a flat historical standard deviation. "
+        "Falls back to the flat assumption automatically when there isn't enough history to fit "
+        "GARCH reliably. Off by default since per-ticker GARCH fitting is much slower than the "
+        "closed-form flat-vol path.",
+    )
 
 
 class ComplianceConfig(BaseModel):

@@ -229,16 +229,59 @@ def return_1d(df: pd.DataFrame) -> pd.Series:
 @register_feature('return_5d')
 def return_5d(df: pd.DataFrame) -> pd.Series:
     """Calculate 5-day simple return.
-    
+
     Uses only past data: (close_t-1 - close_t-6) / close_t-6
     This ensures the return at time t reflects what was known at t-1.
-    
+
     Args:
         df: DataFrame with 'close' column.
-    
+
     Returns:
         Series with 5-day returns (lagged by 1 period).
     """
     # Shift by 1 first, then calculate 5-period return
     close_shifted = df['close'].shift(1)
     return close_shifted.pct_change(periods=5)
+
+
+@register_feature('mom_9m_skip1m')
+def mom_9m_skip1m(df: pd.DataFrame) -> pd.Series:
+    """Cross-sectional momentum formation return (Jegadeesh-Titman convention).
+
+    MOM(t) = P(t - 1mo) / P(t - 1mo - 9mo) - 1, skipping the most recent
+    month to avoid short-term reversal contamination. India-specific studies
+    support 6-12 month formation windows; this platform defaults to 9 months
+    (see docs/QUANT_RESEARCH.md section 1). Approximates months as 21 trading
+    days. Already look-ahead safe: the most recent price used is 21 trading
+    days in the past.
+
+    Args:
+        df: DataFrame with 'close' column.
+
+    Returns:
+        Series with the formation-period return (lagged by the 1-month skip).
+    """
+    skip_days = 21
+    formation_days = 189  # ~9 months
+    close = df['close']
+    return close.shift(skip_days) / close.shift(skip_days + formation_days) - 1
+
+
+@register_feature('realized_vol_60')
+def realized_vol_60(df: pd.DataFrame) -> pd.Series:
+    """Trailing 60-day annualized realized volatility of daily returns.
+
+    Used by the low-volatility anomaly strategy (docs/QUANT_RESEARCH.md
+    section 2): stocks are ranked ascending by this metric and the platform
+    goes long the lowest-volatility decile. Uses close shifted by 1 to avoid
+    look-ahead bias.
+
+    Args:
+        df: DataFrame with 'close' column.
+
+    Returns:
+        Series with annualized realized volatility (lagged by 1 period).
+    """
+    close_shifted = df['close'].shift(1)
+    daily_returns = close_shifted.pct_change()
+    return daily_returns.rolling(window=60).std() * np.sqrt(252)

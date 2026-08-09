@@ -3,7 +3,7 @@
 import math
 import pandas as pd
 import numpy as np
-from typing import Dict, Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from portfolio_agent.config.schema import AppConfig
 
@@ -75,6 +75,134 @@ def calculate_quantity(
         quantity = math.floor(max_position_value / entry_price)
 
     return max(0, quantity)
+
+
+def estimate_kelly_inputs(
+    trade_history: List[Dict[str, Any]],
+    min_trades: int = 20,
+) -> Optional[Tuple[float, float]]:
+    """Estimate (win_probability, reward:risk ratio) from realized trade history.
+
+    Per docs/QUANT_RESEARCH.md section 4: p is the realized win rate and b is
+    the average win magnitude divided by the average loss magnitude (in the
+    same reward:risk units this platform already reports on StrategySignal).
+
+    Args:
+        trade_history: Trade dicts with "outcome" ("WIN"/"LOSS"/other) and
+            "return_pct" keys (same shape as AgentBrain.trade_history).
+        min_trades: Minimum realized (WIN/LOSS) trades required to trust the
+            estimate; matches the sample-size gate already used by
+            strategies/weighting.py::evaluate_and_learn.
+
+    Returns:
+        (win_probability, reward_risk_ratio), or None when there isn't enough
+        realized history, or losses average to zero (b undefined) — callers
+        should fall back to fixed-fractional sizing in that case.
+    """
+    realized = [t for t in trade_history if t.get("outcome") in ("WIN", "LOSS")]
+    if len(realized) < min_trades:
+        return None
+
+    wins = [t for t in realized if t.get("outcome") == "WIN"]
+    losses = [t for t in realized if t.get("outcome") == "LOSS"]
+    if not wins or not losses:
+        return None
+
+    win_probability = len(wins) / len(realized)
+    avg_win_pct = float(np.mean([abs(t.get("return_pct", 0.0)) for t in wins]))
+    avg_loss_pct = float(np.mean([abs(t.get("return_pct", 0.0)) for t in losses]))
+    if avg_loss_pct <= 0:
+        return None
+
+    reward_risk_ratio = avg_win_pct / avg_loss_pct
+    return win_probability, reward_risk_ratio
+
+
+def calculate_kelly_fraction(win_probability: float, reward_risk_ratio: float) -> float:
+    """Full-Kelly capital fraction: f* = p - (1-p)/b.
+
+    Clamped to [0, 1] — a negative f* (an unprofitable edge) becomes 0 so
+    callers fall back to fixed-fractional sizing rather than sizing a
+    "negative" position (this platform never shorts).
+    """
+    if reward_risk_ratio <= 0:
+        return 0.0
+    f_star = win_probability - (1.0 - win_probability) / reward_risk_ratio
+    return max(0.0, min(1.0, f_star))
+
+
+def calculate_kelly_quantity(
+    entry_price: float,
+    portfolio_value_inr: float,
+    max_single_position_pct: float,
+    win_probability: float,
+    reward_risk_ratio: float,
+    kelly_fraction: float = 0.5,
+) -> int:
+    """Fractional-Kelly position sizing.
+
+    Args:
+        entry_price: Entry price per share.
+        portfolio_value_inr: Total portfolio value in INR.
+        max_single_position_pct: Hard cap on position value as a fraction of
+            portfolio value — Kelly sizing can never exceed this, matching
+            the platform's existing fixed-fractional cap.
+        win_probability: Realized win rate p (see estimate_kelly_inputs).
+        reward_risk_ratio: Realized average win:loss ratio b.
+        kelly_fraction: Fractional-Kelly multiplier kappa in [0, 1] (default
+            0.5 = half-Kelly).
+
+    Returns:
+        Integer quantity >= 0.
+    """
+    if entry_price <= 0:
+        return 0
+
+    f_star = calculate_kelly_fraction(win_probability, reward_risk_ratio)
+    position_fraction = f_star * kelly_fraction
+
+    position_value = portfolio_value_inr * position_fraction
+    max_position_value = portfolio_value_inr * max_single_position_pct
+    position_value = min(position_value, max_position_value)
+
+    return max(0, math.floor(position_value / entry_price))
+
+
+def calculate_position_quantity(
+    entry_price: float,
+    stop_price: float,
+    config: AppConfig,
+    trade_history: Optional[List[Dict[str, Any]]] = None,
+) -> int:
+    """Single position-sizing entry point: fixed-fractional by default,
+    switching to fractional-Kelly once config.risk.use_kelly_sizing is set
+    and enough realized trade history exists to estimate it reliably.
+
+    Args:
+        entry_price: Entry price per share.
+        stop_price: Stop loss price per share.
+        config: Application configuration.
+        trade_history: Realized trade history (e.g. AgentBrain.trade_history
+            or a backtest engine's trade_log) used to estimate Kelly inputs.
+            Ignored when config.risk.use_kelly_sizing is False.
+
+    Returns:
+        Integer quantity >= 0.
+    """
+    if config.risk.use_kelly_sizing and trade_history:
+        kelly_inputs = estimate_kelly_inputs(trade_history, min_trades=config.risk.kelly_min_trades)
+        if kelly_inputs is not None:
+            win_probability, reward_risk_ratio = kelly_inputs
+            return calculate_kelly_quantity(
+                entry_price=entry_price,
+                portfolio_value_inr=config.risk.portfolio_value_inr,
+                max_single_position_pct=config.risk.max_single_position_pct,
+                win_probability=win_probability,
+                reward_risk_ratio=reward_risk_ratio,
+                kelly_fraction=config.risk.kelly_fraction,
+            )
+
+    return calculate_quantity(entry_price, stop_price, config)
 
 
 def calculate_max_loss(quantity: int, entry_price: float, stop_price: float) -> float:

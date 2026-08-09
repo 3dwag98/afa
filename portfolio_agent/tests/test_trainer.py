@@ -63,7 +63,7 @@ class TestLoadDataUsesRealDataByDefault:
         monkeypatch.setattr("portfolio_agent.agents.trainer.load_ticker_data", fake_load_ticker_data)
 
         config = AppConfig.model_validate({
-            "training": {"use_synthetic_data": False, "sequence_length": 10},
+            "training": {"use_synthetic_data": False, "sequence_length": 10, "parallel_data_loading": False},
             "data": {"universe_size": 5, "min_history_days": 50},
         })
 
@@ -80,6 +80,38 @@ class TestLoadDataUsesRealDataByDefault:
 
         with pytest.raises(RuntimeError, match="No cached tickers"):
             load_data(config)
+
+
+class TestParallelDataLoading:
+    """Tests for the multiprocessing training-panel construction path."""
+
+    def test_parallel_loading_matches_serial_loading(self, monkeypatch):
+        """parallel_data_loading=True is a performance change only — it must
+        build an equivalent panel (same tickers contribute, same row count)
+        as the serial path."""
+
+        def fake_resolve_backtest_universe(max_tickers=None):
+            return ["FAKE1.NS", "FAKE2.NS", "FAKE3.NS"]
+
+        def fake_load_ticker_data(ticker, start_date=None, end_date=None):
+            return _make_ohlcv(seed=hash(ticker) % 1000)
+
+        monkeypatch.setattr("portfolio_agent.agents.trainer.resolve_backtest_universe", fake_resolve_backtest_universe)
+        monkeypatch.setattr("portfolio_agent.agents.trainer.load_ticker_data", fake_load_ticker_data)
+
+        base = {
+            "training": {"use_synthetic_data": False, "sequence_length": 10},
+            "data": {"universe_size": 5, "min_history_days": 50},
+        }
+
+        serial_config = AppConfig.model_validate({**base, "training": {**base["training"], "parallel_data_loading": False}})
+        parallel_config = AppConfig.model_validate({**base, "training": {**base["training"], "parallel_data_loading": True}})
+
+        serial_df = load_data(serial_config)
+        parallel_df = load_data(parallel_config)
+
+        assert len(serial_df) == len(parallel_df)
+        assert list(serial_df.columns) == list(parallel_df.columns)
 
 
 if __name__ == "__main__":
