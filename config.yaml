@@ -11,6 +11,13 @@ data:
   tickers: []
   min_history_days: 250
   allow_synthetic_fallback: true
+  # Concurrent chunk downloads (network-bound work -> threads). Set to 1 if
+  # the data provider rate-limits you.
+  download_workers: 4
+  # Prepare per-ticker indicators/Monte Carlo/features across a CPU process
+  # pool during `run-agent`. Speed only: results are order-stable.
+  parallel_ticker_prep: true
+  ticker_prep_workers: null
 
 # Feature engineering configuration
 features:

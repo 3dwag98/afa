@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from portfolio_agent.config.schema import TrainingConfig
-from portfolio_agent.utils.device import get_device
+from portfolio_agent.utils.device import resolve_device
 
 
 class TimeSeriesDataset(Dataset):
@@ -40,8 +40,10 @@ class TimeSeriesDataset(Dataset):
         if isinstance(targets, torch.Tensor):
             targets = targets.numpy()
 
-        self.features = torch.FloatTensor(features)
-        self.targets = torch.FloatTensor(targets)
+        # torch.tensor() copies, which also sidesteps the "given NumPy array is
+        # not writable" warning raised when wrapping a read-only view.
+        self.features = torch.tensor(np.asarray(features), dtype=torch.float32)
+        self.targets = torch.tensor(np.asarray(targets), dtype=torch.float32)
 
         # Calculate valid indices for sequence creation
         # We need sequence_length points before each target
@@ -105,9 +107,16 @@ def create_dataloaders(
     Returns:
         Tuple of (train_loader, val_loader, test_loader)
     """
-    # Determine device for pin_memory setting
-    device = get_device(config.device)
-    use_cuda = device.type == "cuda" and torch.cuda.is_available()
+    # Determine device for pin_memory setting. resolve_device() never returns
+    # an unusable accelerator, so this agrees with the device training runs on.
+    use_cuda = resolve_device(config.device).type == "cuda"
+
+    # One resolved worker count, used consistently for every DataLoader knob:
+    # persistent_workers/prefetch_factor are only valid when workers > 0.
+    num_workers = max(0, min(config.num_workers, 2))
+    worker_kwargs = (
+        {"persistent_workers": True, "prefetch_factor": 2} if num_workers > 0 else {}
+    )
 
     # Extract features and targets
     # Assume last column is target, rest are features
@@ -151,31 +160,28 @@ def create_dataloaders(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=False,  # NO SHUFFLING - preserve temporal order
-        num_workers=min(config.num_workers, 2),  # Limit workers on Windows to avoid overhead
+        num_workers=num_workers,  # Limit workers on Windows to avoid overhead
         pin_memory=use_cuda,
         drop_last=True,  # Drop incomplete batches for stable training
-        persistent_workers=True if config.num_workers > 0 else False,
-        prefetch_factor=2 if config.num_workers > 0 else None,
+        **worker_kwargs,
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
-        num_workers=min(config.num_workers, 2),
+        num_workers=num_workers,
         pin_memory=use_cuda,
-        persistent_workers=True if config.num_workers > 0 else False,
-        prefetch_factor=2 if config.num_workers > 0 else None,
+        **worker_kwargs,
     )
 
     test_loader = DataLoader(
         test_dataset,
         batch_size=config.batch_size,
         shuffle=False,
-        num_workers=min(config.num_workers, 2),
+        num_workers=num_workers,
         pin_memory=use_cuda,
-        persistent_workers=True if config.num_workers > 0 else False,
-        prefetch_factor=2 if config.num_workers > 0 else None,
+        **worker_kwargs,
     )
 
     print(

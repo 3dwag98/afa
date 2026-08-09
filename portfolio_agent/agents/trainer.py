@@ -100,7 +100,10 @@ def load_data(config: AppConfig) -> pd.DataFrame:
     indicator math), so when config.training.parallel_data_loading is set
     (the default), tickers are dispatched across a ProcessPoolExecutor sized
     by config.training.data_load_workers (default: CPU count) — this is what
-    makes training on the full ~2,400-ticker cached universe practical.
+    makes training on the full ~2,400-ticker cached universe practical. The
+    parallel path reassembles results in resolved-universe order, so it builds
+    exactly the same panel as the serial path (workers completing out of order
+    must not change what the model trains on).
 
     Sequence windows that straddle two concatenated tickers' boundaries mix
     data from different instruments; this is a bounded, documented limitation
@@ -128,8 +131,14 @@ def load_data(config: AppConfig) -> pd.DataFrame:
             "training.use_synthetic_data=true for offline testing."
         )
 
-    results: List[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = []
+    # Keyed by ticker rather than appended in completion order: workers finish
+    # in a nondeterministic order, and appending in that order would make the
+    # concatenated panel's row order (and therefore training) differ run to
+    # run for identical inputs. Reassembling in `tickers` order below makes the
+    # parallel path produce byte-identical output to the serial path.
+    by_ticker: Dict[str, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = {}
     show_progress = len(tickers) > 20
+    failures = 0
 
     if config.training.parallel_data_loading and len(tickers) > 1:
         with ProcessPoolExecutor(max_workers=config.training.data_load_workers) as executor:
@@ -138,15 +147,32 @@ def load_data(config: AppConfig) -> pd.DataFrame:
             if show_progress:
                 iterator = tqdm(iterator, total=len(futures), desc="Loading training data", unit="ticker")
             for future in iterator:
-                result = future.result()
+                ticker = futures[future]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    # One unloadable ticker must not abort a multi-hour run.
+                    failures += 1
+                    print(f"Warning: failed to load training data for {ticker}: {e}")
+                    continue
                 if result is not None:
-                    results.append(result)
+                    by_ticker[ticker] = result
     else:
         ticker_iter = tqdm(tickers, desc="Loading training data", unit="ticker") if show_progress else tickers
         for ticker in ticker_iter:
-            result = _load_and_split_ticker(ticker, config)
+            try:
+                result = _load_and_split_ticker(ticker, config)
+            except Exception as e:
+                failures += 1
+                print(f"Warning: failed to load training data for {ticker}: {e}")
+                continue
             if result is not None:
-                results.append(result)
+                by_ticker[ticker] = result
+
+    results = [by_ticker[t] for t in tickers if t in by_ticker]
+
+    if failures:
+        print(f"Warning: {failures}/{len(tickers)} tickers failed to load and were skipped")
 
     if not results:
         raise RuntimeError(
@@ -235,20 +261,23 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
     # =========================================================================
     # 1. Resolve device
     # =========================================================================
+    # get_device() has already downgraded an unavailable accelerator, so
+    # device.type is what this process will really run on.
     device = get_device(config.training.device)
-    
-    # Check mixed precision availability
-    use_mixed_precision = (
-        config.training.use_mixed_precision 
-        and device.type == "cuda" 
-        and torch.cuda.is_available()
-    )
-    
+    config.training.device = device.type
+
+    # Mixed precision is a CUDA-only win here; torch.amp's CPU path would add
+    # overhead without the tensor-core speedup.
+    use_mixed_precision = config.training.use_mixed_precision and device.type == "cuda"
+
     if use_mixed_precision:
         print("Mixed Precision: Enabled")
         scaler = torch.amp.GradScaler('cuda')
     else:
-        print("Mixed Precision: Disabled")
+        if config.training.use_mixed_precision and device.type != "cuda":
+            print(f"Mixed Precision: Disabled (requires CUDA; running on {device.type})")
+        else:
+            print("Mixed Precision: Disabled")
         scaler = None
     
     # =========================================================================
@@ -363,7 +392,7 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
             optimizer.zero_grad()
             
             if use_mixed_precision:
-                with torch.autocast('cuda' if device.type == 'cuda' else 'cpu'):
+                with torch.autocast('cuda'):
                     outputs = model(batch_x)
                     loss = loss_fn(outputs.squeeze(), batch_y)
                 
@@ -393,7 +422,7 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
                 batch_y = batch_y.to(device, non_blocking=True)
                 
                 if use_mixed_precision:
-                    with torch.autocast('cuda' if device.type == 'cuda' else 'cpu'):
+                    with torch.autocast('cuda'):
                         outputs = model(batch_x)
                         loss = loss_fn(outputs.squeeze(), batch_y)
                 else:

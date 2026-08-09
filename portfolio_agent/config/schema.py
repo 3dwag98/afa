@@ -30,6 +30,22 @@ class DataConfig(BaseModel):
     allow_synthetic_fallback: bool = Field(
         default=True, description="Whether to fall back to synthetic OHLCV data when real data is unavailable"
     )
+    download_workers: int = Field(
+        default=4,
+        description="Concurrent chunk downloads when fetching market data. Downloading is "
+        "network-bound, so threads (not processes) are the right tool. Set to 1 to download "
+        "strictly one chunk at a time if the data provider rate-limits you.",
+    )
+    parallel_ticker_prep: bool = Field(
+        default=True,
+        description="Compute per-ticker indicators, Monte Carlo and features across a CPU "
+        "process pool during the live agent run instead of one ticker at a time. Results are "
+        "reassembled in universe order, so this changes speed only, never recommendations.",
+    )
+    ticker_prep_workers: Optional[int] = Field(
+        default=None,
+        description="Max worker processes for parallel_ticker_prep (default: CPU count).",
+    )
 
 
 class FeaturesConfig(BaseModel):

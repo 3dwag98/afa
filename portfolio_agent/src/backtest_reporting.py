@@ -35,6 +35,37 @@ EXPECTED_COLUMNS = [
     'exit_reason'
 ]
 
+# Executive_Summary rows: (label, analytics key, unit).
+#
+# The unit is declared here rather than guessed from the value at write time.
+# The old code inferred it with `value / 100 if abs(value) > 1 else value`,
+# which silently multiplied any genuine sub-1% figure by 100 (a 0.5% win rate
+# was written to Excel as 50%) and formatted the Sharpe ratio as a percentage.
+#
+# CONTRACT: every 'percent' metric is passed in PERCENT units (18.5 == 18.5%),
+# never as a 0-1 decimal. See agents/backtester.py, which builds this dict.
+SUMMARY_PERCENT = 'percent'
+SUMMARY_RATIO = 'ratio'
+SUMMARY_CURRENCY = 'currency'
+SUMMARY_COUNT = 'count'
+
+SUMMARY_METRICS = [
+    ('CAGR (%)', 'cagr', SUMMARY_PERCENT),
+    ('Sharpe Ratio', 'sharpe', SUMMARY_RATIO),
+    ('Sortino Ratio', 'sortino', SUMMARY_RATIO),
+    ('Max Drawdown (%)', 'max_drawdown', SUMMARY_PERCENT),
+    ('Profit Factor', 'profit_factor', SUMMARY_RATIO),
+    ('Probability of Ruin (%)', 'probability_of_ruin', SUMMARY_PERCENT),
+    ('Total Return (%)', 'total_return', SUMMARY_PERCENT),
+    ('Annualized Volatility (%)', 'volatility', SUMMARY_PERCENT),
+    ('Win Rate (%)', 'win_rate', SUMMARY_PERCENT),
+    ('Total Trades', 'total_trades', SUMMARY_COUNT),
+    ('Final Portfolio Value (₹)', 'final_portfolio_value', SUMMARY_CURRENCY),
+    ('Initial Capital (₹)', 'initial_capital', SUMMARY_CURRENCY),
+]
+
+SUMMARY_UNITS = {label: unit for label, _, unit in SUMMARY_METRICS}
+
 # Expected columns for Daily_Trade_Log sheet (11 columns in exact order)
 EXPECTED_DAILY_COLUMNS = [
     'date',
@@ -302,27 +333,31 @@ def export_backtest_excel(
         worksheet_summary.write('A1', 'Metric', header_format)
         worksheet_summary.write('B1', 'Value', header_format)
 
-        # Apply formatting to data rows
+        # Apply formatting to data rows. The unit comes from SUMMARY_METRICS,
+        # so each value is scaled exactly once and ratios are never rendered
+        # as percentages.
         for row_idx in range(1, len(summary_df) + 1):
-            worksheet_summary.write(row_idx, 0, summary_df.iloc[row_idx - 1, 0])
+            label = summary_df.iloc[row_idx - 1, 0]
             value = summary_df.iloc[row_idx - 1, 1]
+            worksheet_summary.write(row_idx, 0, label)
 
-            # Determine format based on metric type
-            if isinstance(value, (int, float)):
-                if 'Sharpe' in summary_df.iloc[row_idx - 1, 0]:
-                    fmt = percent_positive if value > 0 else percent_negative
-                    worksheet_summary.write_number(row_idx, 1, value, fmt)
-                elif 'Drawdown' in summary_df.iloc[row_idx - 1, 0] or '%' in summary_df.iloc[row_idx - 1, 0]:
-                    fmt = percent_negative if value < -0.20 else percent_format
-                    worksheet_summary.write_number(row_idx, 1, value / 100 if abs(value) > 1 else value, fmt)
-                elif 'Ruin' in summary_df.iloc[row_idx - 1, 0] or 'Probability' in summary_df.iloc[row_idx - 1, 0]:
-                    worksheet_summary.write_number(row_idx, 1, value, percent_format)
-                elif 'CAGR' in summary_df.iloc[row_idx - 1, 0] or 'Return' in summary_df.iloc[row_idx - 1, 0]:
-                    worksheet_summary.write_number(row_idx, 1, value / 100 if abs(value) > 1 else value, percent_format)
-                else:
-                    worksheet_summary.write_number(row_idx, 1, value, number_format)
-            else:
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
                 worksheet_summary.write(row_idx, 1, str(value))
+                continue
+
+            unit = SUMMARY_UNITS.get(label, SUMMARY_RATIO)
+            if unit == SUMMARY_PERCENT:
+                # Excel percent formats multiply by 100 on display, so a
+                # percent-unit input has to be written as a fraction.
+                fraction = value / 100.0
+                fmt = percent_negative if fraction < 0 else percent_format
+                worksheet_summary.write_number(row_idx, 1, fraction, fmt)
+            elif unit == SUMMARY_CURRENCY:
+                worksheet_summary.write_number(row_idx, 1, value, currency_format)
+            elif unit == SUMMARY_COUNT:
+                worksheet_summary.write_number(row_idx, 1, value, number_format)
+            else:
+                worksheet_summary.write_number(row_idx, 1, value, number_format)
 
         # Conditional formatting for Sharpe and MaxDD
         _apply_conditional_formatting_summary(worksheet_summary, summary_df, workbook)
@@ -335,14 +370,21 @@ def export_backtest_excel(
 
         worksheet_equity = writer.sheets['Equity_Curve']
         worksheet_equity.set_column('A:A', 12)  # Date
-        worksheet_equity.set_column('B:B', 18)  # Portfolio Value
-        worksheet_equity.set_column('C:C', 18)  # Benchmark (if exists)
-        worksheet_equity.set_column('D:D', 12)  # Drawdown %
+        worksheet_equity.set_column('B:E', 18)  # value columns
 
-        # Format header
-        for col_num, col_name in enumerate(equity_df.columns):
-            worksheet_equity.write(0, col_num + 1, col_name, header_format)
+        # Format header (column A is the Date index, then one per column)
         worksheet_equity.write(0, 0, 'Date', header_format)
+        for col_num, col_name in enumerate(equity_df.columns, start=1):
+            worksheet_equity.write(0, col_num, col_name, header_format)
+
+        # Column letters are derived from the actual layout: 'Benchmark' is
+        # only present for some runs, and hard-coding B/C/D made the equity
+        # chart plot the date column as its values whenever it was missing.
+        def _column_letter(name: str) -> str:
+            return chr(ord('A') + 1 + list(equity_df.columns).index(name))
+
+        last_row = len(equity_df) + 1
+        dates_ref = f'=Equity_Curve!$A$2:$A${last_row}'
 
         # Create chart for Equity Curve
         chart_equity = workbook.add_chart({'type': 'line'})
@@ -351,37 +393,40 @@ def export_backtest_excel(
         chart_equity.set_y_axis({'name': 'Portfolio Value (₹)'})
 
         # Add portfolio value series
+        value_col = _column_letter('Portfolio_Value')
         chart_equity.add_series({
             'name': 'Portfolio Value',
-            'categories': f'=Equity_Curve!$A$2:$A${len(equity_df) + 1}',
-            'values': f'=Equity_Curve!$B$2:$B${len(equity_df) + 1}',
+            'categories': dates_ref,
+            'values': f'=Equity_Curve!${value_col}$2:${value_col}${last_row}',
             'line': {'color': '#2F5597', 'width': 2}
         })
 
         # Add benchmark series if available
         if 'Benchmark' in equity_df.columns:
+            bench_col = _column_letter('Benchmark')
             chart_equity.add_series({
                 'name': 'Nifty 50 Benchmark',
-                'categories': f'=Equity_Curve!$A$2:$A${len(equity_df) + 1}',
-                'values': f'=Equity_Curve!$C$2:$C${len(equity_df) + 1}',
+                'categories': dates_ref,
+                'values': f'=Equity_Curve!${bench_col}$2:${bench_col}${last_row}',
                 'line': {'color': '#ED7D31', 'width': 2, 'dash_type': 'dash'}
             })
 
-        worksheet_equity.insert_chart('E2', chart_equity)
+        worksheet_equity.insert_chart('G2', chart_equity)
 
         # Create secondary axis chart for Drawdown
         chart_dd = workbook.add_chart({'type': 'line'})
         chart_dd.set_title({'name': 'Drawdown %'})
         chart_dd.set_y_axis({'name': 'Drawdown %', 'position': 'right'})
 
+        dd_col = _column_letter('Drawdown_%')
         chart_dd.add_series({
             'name': 'Drawdown %',
-            'categories': f'=Equity_Curve!$A$2:$A${len(equity_df) + 1}',
-            'values': f'=Equity_Curve!$D$2:$D${len(equity_df) + 1}',
+            'categories': dates_ref,
+            'values': f'=Equity_Curve!${dd_col}$2:${dd_col}${last_row}',
             'line': {'color': '#C00000', 'width': 1.5}
         })
 
-        worksheet_equity.insert_chart('E20', chart_dd)
+        worksheet_equity.insert_chart('G20', chart_dd)
 
         # =========================================================================
         # Sheet 3: Trade_Log
@@ -429,55 +474,44 @@ def export_backtest_excel(
             net_pnl_col = trade_df.columns.get_loc('net_pnl')
             return_pct_col = trade_df.columns.get_loc('return_pct')
 
-            # Apply formatting to each row
+            # Apply formatting to each row.
+            #
+            # Every write targets the column looked up above, never a hardcoded
+            # index. The hardcoded version wrote exit_price into position 4 —
+            # which is exit_DATE — so the exported Trade_Log showed a price
+            # where every trade's exit date should have been.
             for row_idx in range(1, len(trade_df) + 1):
-                # Entry Price (column D)
-                val_entry = trade_df.iloc[row_idx - 1, entry_price_col]
-                if pd.notna(val_entry):
-                    worksheet_trades.write_number(row_idx, 3, val_entry, currency_format)
+                row = trade_df.iloc[row_idx - 1]
 
-                # Exit Price (column E)
-                val_exit = trade_df.iloc[row_idx - 1, exit_price_col]
-                if pd.notna(val_exit):
-                    worksheet_trades.write_number(row_idx, 4, val_exit, currency_format)
+                for col in (entry_price_col, exit_price_col,
+                            transaction_costs_col, taxes_col):
+                    value = row.iloc[col]
+                    if pd.notna(value):
+                        worksheet_trades.write_number(row_idx, col, value, currency_format)
 
-                # Gross PnL (column J)
-                val_gross = trade_df.iloc[row_idx - 1, gross_pnl_col]
-                if pd.notna(val_gross):
-                    fmt = currency_positive if val_gross >= 0 else currency_negative
-                    worksheet_trades.write_number(row_idx, 9, val_gross, fmt)
+                for col in (gross_pnl_col, net_pnl_col):
+                    value = row.iloc[col]
+                    if pd.notna(value):
+                        fmt = currency_positive if value >= 0 else currency_negative
+                        worksheet_trades.write_number(row_idx, col, value, fmt)
 
-                # Transaction Costs (column K)
-                val_txn = trade_df.iloc[row_idx - 1, transaction_costs_col]
-                if pd.notna(val_txn):
-                    worksheet_trades.write_number(row_idx, 10, val_txn, currency_format)
-
-                # Taxes (column L)
-                val_taxes = trade_df.iloc[row_idx - 1, taxes_col]
-                if pd.notna(val_taxes):
-                    worksheet_trades.write_number(row_idx, 11, val_taxes, currency_format)
-
-                # Net PnL (column M)
-                val_net = trade_df.iloc[row_idx - 1, net_pnl_col]
-                if pd.notna(val_net):
-                    fmt = currency_positive if val_net >= 0 else currency_negative
-                    worksheet_trades.write_number(row_idx, 12, val_net, fmt)
-
-                # Return Pct (column N) - stored as decimal (e.g., 0.05 for 5%)
-                val_return = trade_df.iloc[row_idx - 1, return_pct_col]
+                # BacktestEngine writes return_pct in PERCENT units (5.0 ==
+                # +5%), so it is always divided by 100 to get the fraction
+                # Excel's percent format expects. The old `if abs(val) > 1`
+                # guard left every trade between -1% and +1% scaled up 100x.
+                val_return = row.iloc[return_pct_col]
                 if pd.notna(val_return):
-                    # Ensure value is stored as decimal
-                    return_val = val_return / 100 if abs(val_return) > 1 else val_return
+                    return_val = val_return / 100.0
                     fmt = percent_positive if return_val >= 0 else percent_negative
-                    worksheet_trades.write_number(row_idx, 13, return_val, fmt)
+                    worksheet_trades.write_number(row_idx, return_pct_col, return_val, fmt)
 
-            # Apply conditional formatting for Net PnL column (M)
+            # Apply conditional formatting for the Net PnL column
             worksheet_trades.conditional_format(
-                1, 12, len(trade_df), 12,
+                1, net_pnl_col, len(trade_df), net_pnl_col,
                 {'type': 'cell', 'criteria': '>=', 'value': 0, 'format': currency_positive}
             )
             worksheet_trades.conditional_format(
-                1, 12, len(trade_df), 12,
+                1, net_pnl_col, len(trade_df), net_pnl_col,
                 {'type': 'cell', 'criteria': '<', 'value': 0, 'format': currency_negative}
             )
             
@@ -533,53 +567,32 @@ def export_backtest_excel(
             total_portfolio_value_col = daily_df.columns.get_loc('total_portfolio_value')
             action_col = daily_df.columns.get_loc('action')
 
-            # Apply number formatting to numeric columns
+            # Apply number formatting to numeric columns (written at the
+            # looked-up column index, not a hardcoded one)
+            numeric_cols = (price_col, position_value_col, cash_balance_col,
+                            total_portfolio_value_col)
             for row_idx in range(1, len(daily_df) + 1):
-                # Price (column D)
-                val_price = daily_df.iloc[row_idx - 1, price_col]
-                if pd.notna(val_price):
-                    worksheet_daily.write_number(row_idx, 3, val_price, number_format)
+                row = daily_df.iloc[row_idx - 1]
+                for col in numeric_cols:
+                    value = row.iloc[col]
+                    if pd.notna(value):
+                        worksheet_daily.write_number(row_idx, col, value, number_format)
 
-                # Position Value (column F)
-                val_pos = daily_df.iloc[row_idx - 1, position_value_col]
-                if pd.notna(val_pos):
-                    worksheet_daily.write_number(row_idx, 5, val_pos, number_format)
-
-                # Cash Balance (column G)
-                val_cash = daily_df.iloc[row_idx - 1, cash_balance_col]
-                if pd.notna(val_cash):
-                    worksheet_daily.write_number(row_idx, 6, val_cash, number_format)
-
-                # Total Portfolio Value (column H)
-                val_total = daily_df.iloc[row_idx - 1, total_portfolio_value_col]
-                if pd.notna(val_total):
-                    worksheet_daily.write_number(row_idx, 7, val_total, number_format)
-
-            # Conditional formatting on action column
-            # "BUY" green font
-            worksheet_daily.conditional_format(
-                1, action_col + 1, len(daily_df), action_col + 1,
-                {'type': 'text', 'criteria': 'containing', 'value': 'BUY', 
-                 'format': workbook.add_format({'font_color': 'green', 'bold': True})}
-            )
-            # "SELL" red font
-            worksheet_daily.conditional_format(
-                1, action_col + 1, len(daily_df), action_col + 1,
-                {'type': 'text', 'criteria': 'containing', 'value': 'SELL', 
-                 'format': workbook.add_format({'font_color': 'red', 'bold': True})}
-            )
-            # "STOP_LOSS_HIT" red fill
-            worksheet_daily.conditional_format(
-                1, action_col + 1, len(daily_df), action_col + 1,
-                {'type': 'text', 'criteria': 'containing', 'value': 'STOP_LOSS', 
-                 'format': workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})}
-            )
-            # "TARGET_HIT" green fill
-            worksheet_daily.conditional_format(
-                1, action_col + 1, len(daily_df), action_col + 1,
-                {'type': 'text', 'criteria': 'containing', 'value': 'TARGET', 
-                 'format': workbook.add_format({'bg_color': '#C6EFCE', 'font_color': '#006100'})}
-            )
+            # Conditional formatting on the action column. The sheet is written
+            # with index=False, so the DataFrame position IS the worksheet
+            # column — the old `action_col + 1` painted the price column
+            # instead, leaving the actions themselves unformatted.
+            for match, fmt_spec in (
+                ('BUY', {'font_color': 'green', 'bold': True}),
+                ('SELL', {'font_color': 'red', 'bold': True}),
+                ('STOP_LOSS', {'bg_color': '#FFC7CE', 'font_color': '#9C0006'}),
+                ('TARGET', {'bg_color': '#C6EFCE', 'font_color': '#006100'}),
+            ):
+                worksheet_daily.conditional_format(
+                    1, action_col, len(daily_df), action_col,
+                    {'type': 'text', 'criteria': 'containing', 'value': match,
+                     'format': workbook.add_format(fmt_spec)}
+                )
             
             # Freeze the header row
             worksheet_daily.freeze_panes(1, 0)
@@ -620,12 +633,14 @@ def export_backtest_excel(
             }
         )
 
-        # Format as percentages
+        # Format as percentages. _create_monthly_heatmap_df returns monthly
+        # returns in PERCENT units, so every cell is divided by 100 — the old
+        # magnitude guess turned a quiet +0.4% month into +40%.
         for row_idx in range(1, len(monthly_df) + 1):
             for col_idx in range(1, 13):
                 val = monthly_df.iloc[row_idx - 1, col_idx - 1] if col_idx - 1 < len(monthly_df.columns) else None
                 if val is not None and pd.notna(val):
-                    worksheet_heatmap.write_number(row_idx, col_idx, val / 100 if abs(val) > 1 else val, percent_format)
+                    worksheet_heatmap.write_number(row_idx, col_idx, val / 100.0, percent_format)
 
         # =========================================================================
         # Sheet 5: Brain_Evolution
@@ -641,25 +656,30 @@ def export_backtest_excel(
         worksheet_brain.set_column('E:E', 10)  # Volume
         worksheet_brain.set_column('F:F', 12)  # MC_Prob
 
-        # Create chart for brain evolution
-        chart_brain = workbook.add_chart({'type': 'line'})
-        chart_brain.set_title({'name': 'Agent Weights Evolution Over Time'})
-        chart_brain.set_x_axis({'name': 'Trading Day'})
-        chart_brain.set_y_axis({'name': 'Weight (%)'})
-
+        # Create chart for brain evolution (only when there is data to plot —
+        # xlsxwriter refuses to save a workbook containing a seriesless chart)
         colors = ['#4472C4', '#ED7D31', '#70AD47', '#264478']
         weight_cols = ['Trend', 'Breakout', 'Volume', 'MC_Prob']
+        plottable = [c for c in weight_cols if c in brain_df.columns]
 
-        for idx, col in enumerate(weight_cols):
-            if col in brain_df.columns:
+        if len(brain_df) > 0 and plottable:
+            chart_brain = workbook.add_chart({'type': 'line'})
+            chart_brain.set_title({'name': 'Agent Weights Evolution Over Time'})
+            chart_brain.set_x_axis({'name': 'Trading Day'})
+            chart_brain.set_y_axis({'name': 'Weight (%)'})
+
+            for idx, col in enumerate(weight_cols):
+                if col not in brain_df.columns:
+                    continue
+                letter = chr(ord("A") + list(brain_df.columns).index(col))
                 chart_brain.add_series({
                     'name': col,
                     'categories': f'=Brain_Evolution!$A$2:$A${len(brain_df) + 1}',
-                    'values': f'=Brain_Evolution!${chr(ord("C") + idx)}$2:${chr(ord("C") + idx)}${len(brain_df) + 1}',
+                    'values': f'=Brain_Evolution!${letter}$2:${letter}${len(brain_df) + 1}',
                     'line': {'color': colors[idx], 'width': 2}
                 })
 
-        worksheet_brain.insert_chart('H2', chart_brain)
+            worksheet_brain.insert_chart('H2', chart_brain)
 
         # =========================================================================
         # Sheet 6: Monte_Carlo_Simulations
@@ -764,22 +784,8 @@ def _create_parallel_execution_sheet(
 
 
 def _create_executive_summary_df(analytics: Dict[str, Any]) -> pd.DataFrame:
-    """Create Executive Summary DataFrame."""
-    metrics = [
-        ('CAGR', analytics.get('cagr', 0)),
-        ('Sharpe Ratio', analytics.get('sharpe', 0)),
-        ('Sortino Ratio', analytics.get('sortino', 0)),
-        ('Max Drawdown (%)', analytics.get('max_drawdown', 0)),
-        ('Profit Factor', analytics.get('profit_factor', 0)),
-        ('Probability of Ruin (%)', analytics.get('probability_of_ruin', 0)),
-        ('Total Return (%)', analytics.get('total_return', 0)),
-        ('Annualized Volatility (%)', analytics.get('volatility', 0)),
-        ('Win Rate (%)', analytics.get('win_rate', 0)),
-        ('Total Trades', analytics.get('total_trades', 0)),
-        ('Final Portfolio Value (₹)', analytics.get('final_portfolio_value', 0)),
-        ('Initial Capital (₹)', analytics.get('initial_capital', 0))
-    ]
-
+    """Create Executive Summary DataFrame (see SUMMARY_METRICS for units)."""
+    metrics = [(label, analytics.get(key, 0)) for label, key, _ in SUMMARY_METRICS]
     return pd.DataFrame(metrics, columns=['Metric', 'Value'])
 
 
@@ -814,9 +820,14 @@ def _apply_conditional_formatting_summary(worksheet, df: pd.DataFrame, workbook)
 
 
 def _prepare_equity_curve_df(equity_curve: pd.Series) -> pd.DataFrame:
-    """Prepare Equity Curve DataFrame for export."""
-    df = pd.DataFrame()
-    df['Date'] = equity_curve.index
+    """Prepare Equity Curve DataFrame for export.
+
+    Indexed by date (rather than carrying Date as a column alongside a
+    meaningless RangeIndex), so writing it with index=True produces
+    Date | Portfolio_Value | [Benchmark] | Drawdown_% and the sheet's charts
+    line up with the columns they are supposed to plot.
+    """
+    df = pd.DataFrame(index=pd.Index(equity_curve.index, name='Date'))
 
     # Portfolio Value
     df['Portfolio_Value'] = equity_curve.values
@@ -836,47 +847,11 @@ def _prepare_equity_curve_df(equity_curve: pd.Series) -> pd.DataFrame:
     return df
 
 
-def _prepare_trade_log_df(trade_log: List[Dict[str, Any]]) -> pd.DataFrame:
-    """Prepare Trade Log DataFrame for export."""
-    if not trade_log:
-        return pd.DataFrame()
-
-    required_columns = [
-        'entry_date', 'exit_date', 'ticker', 'side', 'entry_price', 'exit_price',
-        'qty', 'gross_pnl', 'stt_taxes', 'slippage', 'net_pnl', 'holding_days', 'signal_trigger'
-    ]
-
-    # Normalize trade log entries
-    normalized_trades = []
-    for trade in trade_log:
-        normalized = {}
-        for col in required_columns:
-            # Handle different naming conventions
-            val = trade.get(col, trade.get(col.replace('_', ' '), ''))
-            normalized[col] = val if val != '' else None
-        normalized_trades.append(normalized)
-
-    df = pd.DataFrame(normalized_trades)
-
-    # Rename columns for display
-    column_mapping = {
-        'entry_date': 'Entry Date',
-        'exit_date': 'Exit Date',
-        'ticker': 'Ticker',
-        'side': 'Side',
-        'entry_price': 'Entry Price',
-        'exit_price': 'Exit Price',
-        'qty': 'Qty',
-        'gross_pnl': 'Gross PnL',
-        'stt_taxes': 'STT/Taxes',
-        'slippage': 'Slippage',
-        'net_pnl': 'Net PnL',
-        'holding_days': 'Holding Days',
-        'signal_trigger': 'Signal Trigger'
-    }
-
-    df = df.rename(columns=column_mapping)
-    return df
+# NOTE: an unused _prepare_trade_log_df() lived here, producing a *second*,
+# display-name trade-log schema ('Entry Date', 'Qty', 'STT/Taxes', ...) that
+# nothing exported. It was deleted: _normalize_trade_log() + EXPECTED_COLUMNS
+# is the single Trade_Log schema, and the stale duplicate was what tests were
+# still asserting against.
 
 
 def _create_monthly_heatmap_df(equity_curve: pd.Series) -> pd.DataFrame:
@@ -905,10 +880,18 @@ def _create_monthly_heatmap_df(equity_curve: pd.Series) -> pd.DataFrame:
     return df
 
 
+BRAIN_COLUMNS = ['Trading Day', 'Date', 'Trend', 'Breakout', 'Volume', 'MC_Prob']
+
+
 def _prepare_brain_evolution_df(brain_evolution: List[Dict[str, Any]]) -> pd.DataFrame:
-    """Prepare Brain Evolution DataFrame for export."""
+    """Prepare Brain Evolution DataFrame for export.
+
+    Always returns the full column set, even with no snapshots — an empty,
+    column-less frame produced a chart with no series, and xlsxwriter refuses
+    to save a workbook containing one, so the whole export died at close().
+    """
     if not brain_evolution:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=BRAIN_COLUMNS)
 
     records = []
     for entry in brain_evolution:

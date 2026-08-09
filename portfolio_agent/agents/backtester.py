@@ -115,15 +115,25 @@ class BacktesterAgent:
 
         analyzer = RiskAnalyzer(
             daily_equity_curve=engine.daily_equity_curve,
-            trade_log=engine.trade_log
+            trade_log=engine.trade_log,
+            random_seed=self.config.simulation.random_seed,
         )
         analytics_report = analyzer.generate_analytics_report()
 
+        # Percentage metrics are handed to the exporter in PERCENT units
+        # (18.5 == 18.5%) — the contract documented in
+        # src/backtest_reporting.py::SUMMARY_METRICS. CAGR used to be passed as
+        # a 0-1 decimal here while everything beside it was already a percent,
+        # so the sheet's scaling could only be right for one of them.
         analytics_for_export = {
-            'cagr': analytics_report.get('cagr', 0),
+            'cagr': analytics_report.get('cagr_pct', 0),
             'sharpe': analytics_report.get('sharpe_ratio', 0),
             'sortino': analytics_report.get('sortino_ratio', 0),
-            'max_drawdown': analytics_report.get('max_drawdown_pct', 0),
+            # Negated: RiskAnalyzer reports drawdown as a positive magnitude,
+            # but a drawdown reads as a loss in the report (and the sheet's
+            # "worse than -20%" conditional formatting can only fire on a
+            # negative number).
+            'max_drawdown': -abs(analytics_report.get('max_drawdown_pct', 0)),
             'profit_factor': analytics_report.get('profit_factor', 0),
             'probability_of_ruin': analytics_report.get('mc_probability_of_ruin_pct', 0),
             'total_return': analytics_report.get('total_return_pct', 0),

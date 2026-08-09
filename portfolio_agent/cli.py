@@ -7,6 +7,7 @@ Commands:
     backtest: Run backtesting simulation
     run-agent: Run the daily portfolio agent
     list-strategies: List registered strategies (rule-based, ML, UMA ensembles)
+    gpu-check: Report which compute devices this install can actually use
 """
 
 from __future__ import annotations
@@ -49,12 +50,15 @@ def cmd_download_data(args) -> int:
     start_date = end_date - timedelta(days=config.data.default_history_years * 365)
     
     # Download and cache
+    workers = args.workers or config.data.download_workers
+    print(f"Downloading with {workers} concurrent chunk request(s)")
     success = batch_download_and_cache(
         tickers=tickers,
         start_date=start_date.strftime('%Y-%m-%d'),
         end_date=end_date.strftime('%Y-%m-%d'),
         chunk_size=50,
-        skip_existing=not args.force
+        skip_existing=not args.force,
+        max_workers=workers,
     )
     
     if success:
@@ -67,24 +71,29 @@ def cmd_download_data(args) -> int:
 
 def cmd_train(args) -> int:
     """Train model command."""
-    import torch
-    from portfolio_agent.agents.trainer import run_training
-    from portfolio_agent.utils.device import get_device
-    
+    try:
+        from portfolio_agent.agents.trainer import run_training
+        from portfolio_agent.utils.device import get_device
+    except ImportError as e:
+        print(f"Error: training requires PyTorch, which is not installed ({e}).")
+        print("Install it with: uv sync --extra gpu")
+        return 1
+
     config = get_config()
-    
+
     # Override device if specified
     if args.device:
         config.training.device = args.device
-    
-    # Validate device
+
+    # Resolve the device once, here. get_device() downgrades an unavailable
+    # accelerator to CPU itself, so writing the resolved type back to the
+    # config guarantees every later consumer (dataloaders, mixed precision,
+    # the checkpoint metadata) agrees with what was printed.
     device = get_device(config.training.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        print("Warning: CUDA requested but not available, falling back to CPU")
-        config.training.device = "cpu"
-    
+    config.training.device = device.type
+
     print(f"Starting training with device: {device}")
-    
+
     try:
         metadata = run_training(config)
         print("\nTraining complete!")
@@ -96,6 +105,24 @@ def cmd_train(args) -> int:
         import traceback
         traceback.print_exc()
         return 1
+
+
+def _resolve_inference_device(requested: str) -> str:
+    """Resolve a --device request for inference, downgrading if unavailable.
+
+    Kept string-typed (and torch-optional) because rule-based backtests must
+    run without PyTorch installed at all.
+    """
+    try:
+        from portfolio_agent.utils.device import get_device
+    except ImportError:
+        if requested != "cpu":
+            print(
+                f"Warning: PyTorch is not installed, so '{requested}' is unavailable — "
+                "using CPU. Install it with: uv sync --extra gpu"
+            )
+        return "cpu"
+    return get_device(requested).type
 
 
 def cmd_backtest(args) -> int:
@@ -111,7 +138,7 @@ def cmd_backtest(args) -> int:
 
     # Determine inference device
     if args.device:
-        inference_device = args.device
+        inference_device = _resolve_inference_device(args.device)
     elif strategy_type == "lstm":
         # Use CPU for inference by default to save VRAM; pass --device cuda to override
         inference_device = "cpu"
@@ -235,6 +262,32 @@ def cmd_list_strategies(args) -> int:
     return 0
 
 
+def cmd_gpu_check(args) -> int:
+    """Report what compute devices this install can actually use."""
+    try:
+        from portfolio_agent.utils.device import cuda_is_available, describe_devices, get_device
+    except ImportError as e:
+        print(f"PyTorch is not installed ({e}).")
+        print("GPU acceleration requires the optional 'gpu' extra: uv sync --extra gpu")
+        print("Everything except `train` and the 'lstm' strategy works without it.")
+        return 1
+
+    print("=" * 60)
+    print("Device diagnostics")
+    print("=" * 60)
+    for line in describe_devices():
+        print(line)
+
+    config = get_config()
+    print("-" * 60)
+    print(f"config.training.device: {config.training.device!r}")
+    resolved = get_device(config.training.device, verbose=False)
+    print(f"Resolves to:            {resolved}")
+    print("=" * 60)
+
+    return 0 if cuda_is_available() or config.training.device in ("cpu", "auto") else 1
+
+
 def create_parser() -> argparse.ArgumentParser:
     """Create the argument parser."""
     parser = argparse.ArgumentParser(
@@ -259,6 +312,13 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Number of tickers to download (default: from config)"
+    )
+    download_parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Concurrent chunk downloads (default: config.data.download_workers). "
+             "Use 1 if the data provider rate-limits you."
     )
     download_parser.set_defaults(func=cmd_download_data)
     
@@ -384,6 +444,13 @@ def create_parser() -> argparse.ArgumentParser:
         help="Strategy YAML to load when using --name (e.g. a UMA ensemble file)"
     )
     list_strategies_parser.set_defaults(func=cmd_list_strategies)
+
+    # gpu-check command
+    gpu_check_parser = subparsers.add_parser(
+        "gpu-check",
+        help="Show which compute devices (CUDA/MPS/CPU) this install can actually use"
+    )
+    gpu_check_parser.set_defaults(func=cmd_gpu_check)
 
     return parser
 
