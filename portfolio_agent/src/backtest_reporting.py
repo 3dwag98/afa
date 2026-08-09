@@ -137,7 +137,8 @@ def export_backtest_excel(
     trade_log: List[Dict[str, Any]],
     brain_evolution: List[Dict[str, Any]],
     daily_activity_log: List[Dict[str, Any]],
-    filepath: str
+    filepath: str,
+    parallel_metrics: Optional[Dict[str, Any]] = None
 ) -> str:
     """
     Export backtest results to a formatted Excel workbook.
@@ -162,15 +163,70 @@ def export_backtest_excel(
             - date, ticker, action, price, quantity, position_value, cash_balance,
               total_portfolio_value, score, signal, notes
         filepath: Output file path for the Excel workbook.
-
+        parallel_metrics: Optional dict with parallel execution info:
+            - execution_time_seconds: Total execution time
+            - num_workers: Number of parallel workers used
+            - success_rate: Success/failure rate of parallel runs
+            - total_tickers: Total tickers processed
+            - failed_tickers: Number of tickers that failed
+    
     Returns:
         str: Path to the created Excel file.
+    
+    Raises:
+        ValueError: If aggregated data is empty or invalid.
     """
+    # =========================================================================
+    # DATA INTEGRITY CHECK - Critical validation before writing
+    # =========================================================================
+    logger.info("Validating backtest data before Excel export...")
+    
+    # Check equity curve
+    if equity_curve is None or len(equity_curve) == 0:
+        raise ValueError("Equity curve is empty. Cannot generate report with no portfolio data.")
+    
+    # Check analytics
+    if not analytics:
+        logger.warning("Analytics dictionary is empty. Using default values.")
+        analytics = {
+            'cagr': 0, 'sharpe': 0, 'sortino': 0, 'max_drawdown': 0,
+            'profit_factor': 0, 'probability_of_ruin': 0, 'total_return': 0,
+            'volatility': 0, 'win_rate': 0, 'total_trades': 0,
+            'final_portfolio_value': equity_curve.iloc[-1] if len(equity_curve) > 0 else 0,
+            'initial_capital': analytics.get('initial_capital', 1000000)
+        }
+    
+    # Normalize and validate trade log
+    trade_df = _normalize_trade_log(trade_log)
+    if len(trade_df) == 0:
+        logger.warning("Trade log is empty. Report will show no trades.")
+    
+    # Normalize and validate daily activity log
+    daily_df = _normalize_daily_log(daily_activity_log)
+    if len(daily_df) == 0:
+        logger.warning("Daily activity log is empty. Report will show no daily activities.")
+    
+    # Validate brain evolution
+    if not brain_evolution:
+        logger.warning("Brain evolution is empty. Report will show no learning history.")
+    
+    logger.info(f"Data validation complete: {len(equity_curve)} equity points, "
+                f"{len(trade_df)} trades, {len(daily_df)} daily activities")
+    
     # Ensure output directory exists
     output_path = Path(filepath)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Create Excel writer with xlsxwriter engine
+    # Remove existing file to ensure clean write (avoid conflicts with sheet management)
+    if output_path.exists():
+        try:
+            output_path.unlink()
+            logger.info(f"Removed existing Excel file: {filepath}")
+        except Exception as e:
+            logger.warning(f"Could not remove existing file: {e}")
+
+    # Create Excel writer with xlsxwriter engine for full formatting support
+    # xlsxwriter provides better support for charts, conditional formatting, and data bars
     with pd.ExcelWriter(filepath, engine='xlsxwriter') as writer:
         workbook = writer.book
 
@@ -621,8 +677,90 @@ def export_backtest_excel(
             if pd.notna(val):
                 worksheet_mc.write_number(row_idx, 1, val, currency_format)
 
+        # =========================================================================
+        # Sheet 7: Parallel_Execution_Summary (only if parallel_metrics provided)
+        # =========================================================================
+        if parallel_metrics:
+            _create_parallel_execution_sheet(workbook, writer, parallel_metrics, header_format, number_format)
+
     logger.info(f"Backtest report exported to: {filepath}")
     return filepath
+
+
+def _create_parallel_execution_sheet(
+    workbook,
+    writer: pd.ExcelWriter,
+    parallel_metrics: Dict[str, Any],
+    header_format,
+    number_format
+) -> None:
+    """
+    Create Parallel Execution Summary sheet showing execution metrics.
+    
+    Args:
+        workbook: xlsxwriter workbook object.
+        writer: pandas ExcelWriter object.
+        parallel_metrics: Dictionary with parallel execution info.
+        header_format: Format for header cells.
+        number_format: Format for numeric cells.
+    """
+    worksheet = workbook.add_worksheet('Parallel_Execution_Summary')
+    
+    # Define additional formats
+    success_format = workbook.add_format({'bg_color': '#C6EFCE', 'font_color': '#006100'})
+    warning_format = workbook.add_format({'bg_color': '#FFEB9C', 'font_color': '#9C6500'})
+    error_format = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
+    
+    # Header row
+    worksheet.write('A1', 'Parallel Execution Summary', header_format)
+    worksheet.merge_range('A1:B1', 'Parallel Execution Summary', header_format)
+    
+    # Metrics data
+    metrics_data = [
+        ('Execution Time (seconds)', parallel_metrics.get('execution_time_seconds', 0)),
+        ('Number of Workers', parallel_metrics.get('num_workers', 0)),
+        ('Success Rate (%)', parallel_metrics.get('success_rate', 0)),
+        ('Total Tickers Processed', parallel_metrics.get('total_tickers', 0)),
+        ('Failed Tickers', parallel_metrics.get('failed_tickers', 0)),
+        ('Worker Type', parallel_metrics.get('worker_type', 'N/A')),
+    ]
+    
+    # Write metrics
+    for row_idx, (metric_name, value) in enumerate(metrics_data, start=1):
+        worksheet.write(row_idx, 0, metric_name)
+        
+        if isinstance(value, (int, float)):
+            if metric_name == 'Success Rate (%)':
+                # Apply color based on success rate
+                if value >= 95:
+                    fmt = success_format
+                elif value >= 80:
+                    fmt = warning_format
+                else:
+                    fmt = error_format
+                worksheet.write_number(row_idx, 1, value, fmt)
+            elif metric_name == 'Failed Tickers' and value > 0:
+                worksheet.write_number(row_idx, 1, value, error_format)
+            else:
+                worksheet.write_number(row_idx, 1, value, number_format)
+        else:
+            worksheet.write(row_idx, 1, str(value))
+    
+    # Auto-fit columns
+    worksheet.set_column('A:A', 30)
+    worksheet.set_column('B:B', 15)
+    
+    # Add worker breakdown if available
+    if 'worker_details' in parallel_metrics:
+        details = parallel_metrics['worker_details']
+        start_row = len(metrics_data) + 3
+        
+        worksheet.write(start_row, 0, 'Worker Details', header_format)
+        
+        if isinstance(details, dict):
+            for idx, (key, value) in enumerate(details.items()):
+                worksheet.write(start_row + 1 + idx, 0, f'  {key}')
+                worksheet.write(start_row + 1 + idx, 1, value)
 
 
 def _create_executive_summary_df(analytics: Dict[str, Any]) -> pd.DataFrame:
