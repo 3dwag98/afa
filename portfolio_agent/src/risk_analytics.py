@@ -1,8 +1,12 @@
 """
 Risk Analytics Module for Portfolio Agent.
 
-Provides institutional-grade risk metrics for evaluating 5-year backtest results.
-Uses advanced mathematical methods beyond basic returns analysis.
+Provides institutional-grade risk metrics for evaluating a completed backtest's
+PORTFOLIO-LEVEL performance: CAGR/Sharpe/Sortino/Calmar, drawdown analysis, and
+bootstrap-resampling Monte Carlo simulation of the realized trade distribution
+(probability of ruin). This is a distinct concern from src/monte_carlo.py,
+which runs a forward-looking, per-symbol lognormal simulation that feeds
+strategy *scoring* decisions during a run — not a backtest report metric.
 """
 
 import numpy as np

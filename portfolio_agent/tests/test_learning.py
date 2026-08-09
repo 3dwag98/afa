@@ -5,32 +5,25 @@ from datetime import datetime
 from typing import Dict, Any
 
 from src.models import AgentBrain
-from src.config import AppConfig
+from portfolio_agent.config.schema import AppConfig
 from src.learning import evaluate_and_learn
 
 
 def make_config(learning_rate: float = 0.15, min_trades: int = 5) -> AppConfig:
     """Create a test AppConfig."""
-    return AppConfig(
-        portfolio_value_inr=300000,
-        risk_per_trade_pct=0.01,
-        max_single_position_pct=0.03,
-        min_price_inr=20,
-        target_prob_profit=0.55,
-        min_reward_risk=1.5,
-        learning_rate=learning_rate,
-        min_trades_for_learning=min_trades,
-        mc_horizon_days=20,
-        mc_simulations=1000,
-        random_seed=42,
-        tickers=["NIFTYBEES.NS"],
-        brain_file="data/agent_brain.json",
-        sqlite_path="data/portfolio_agent.db",
-        excel_output="output/output.xlsx",
-        log_file="logs/agent.log",
-        paper_trading_mode=True,
-        min_history_days=250,
-    )
+    return AppConfig.model_validate({
+        "risk": {"portfolio_value_inr": 300000, "risk_per_trade_pct": 0.01, "max_single_position_pct": 0.03},
+        "compliance": {"min_price_inr": 20, "target_prob_profit": 0.55, "min_reward_risk": 1.5, "paper_trading_mode": True},
+        "learning": {"learning_rate": learning_rate, "min_trades_for_learning": min_trades},
+        "simulation": {"mc_horizon_days": 20, "mc_simulations": 1000, "random_seed": 42},
+        "data": {"tickers": ["NIFTYBEES.NS"], "min_history_days": 250},
+        "paths": {
+            "brain_file": "data/agent_brain.json",
+            "sqlite_path": "data/portfolio_agent.db",
+            "excel_output": "output/output.xlsx",
+            "log_file": "logs/agent.log",
+        },
+    })
 
 
 def make_trade(

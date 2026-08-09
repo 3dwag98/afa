@@ -99,44 +99,53 @@ def cmd_train(args) -> int:
 
 def cmd_backtest(args) -> int:
     """Run backtest command."""
-    import pandas as pd
     from portfolio_agent.agents.backtester import run_backtest_cli
-    
+
     config = get_config()
-    
-    # Override use_trained_model from args
-    if args.use_trained_model:
-        config.backtest.use_trained_model = True
-    
+
+    # Resolve strategy: --use-trained-model is a shorthand for --strategy lstm
+    strategy_type = args.strategy
+    if args.use_trained_model and strategy_type is None:
+        strategy_type = "lstm"
+
     # Determine inference device
     if args.device:
         inference_device = args.device
-    elif config.backtest.use_trained_model:
-        # Auto-detect for inference
-        from portfolio_agent.utils.device import get_device
-        device = get_device("auto")
-        # Use CPU for inference by default to save VRAM
+    elif strategy_type == "lstm":
+        # Use CPU for inference by default to save VRAM; pass --device cuda to override
         inference_device = "cpu"
-        print(f"Using {inference_device} for model inference (to save VRAM)")
+        print(f"Using {inference_device} for model inference (pass --device cuda to override)")
     else:
         inference_device = "cpu"
-    
-    # Set output file
-    output_file = args.output or "output/Backtest_Report.xlsx"
-    
+
+    # Resolve date range
+    start_date = args.start_date
+    end_date = args.end_date
+    if args.years and start_date is None:
+        import pandas as pd
+        end = pd.Timestamp(end_date) if end_date else pd.Timestamp.now()
+        start_date = (end - pd.Timedelta(days=args.years * 365)).strftime('%Y-%m-%d')
+
+    output_file = args.output or config.paths.backtest_excel_output
+
     print(f"Running backtest...")
-    print(f"  Use trained model: {config.backtest.use_trained_model}")
+    print(f"  Strategy: {strategy_type or config.strategy.type}")
     print(f"  Inference device: {inference_device}")
+    print(f"  Parallel: {args.parallel} (workers={args.workers or 'auto'})")
     print(f"  Output file: {output_file}")
-    
+
     try:
         result = run_backtest_cli(
             config=config,
-            use_trained_model=config.backtest.use_trained_model,
+            strategy_type=strategy_type,
             device=inference_device,
-            output_file=output_file
+            output_file=output_file,
+            parallel=args.parallel,
+            max_workers=args.workers,
+            start_date=start_date,
+            end_date=end_date,
         )
-        
+
         if result.get('status') == 'success':
             print(f"\nBacktest complete!")
             print(f"  Trades executed: {result.get('trade_count', 0)}")
@@ -145,7 +154,7 @@ def cmd_backtest(args) -> int:
         else:
             print("Backtest failed")
             return 1
-            
+
     except Exception as e:
         print(f"Error during backtest: {e}")
         import traceback
@@ -155,18 +164,25 @@ def cmd_backtest(args) -> int:
 
 def cmd_run_agent(args) -> int:
     """Run the daily portfolio agent."""
-    from portfolio_agent.main import main as run_main
-    
-    # Build arguments for main.py
-    sys.argv = ['main.py']
-    if args.force_refresh:
-        sys.argv.append('--force-refresh')
-    if args.simulate_outcome:
-        sys.argv.append('--simulate-outcome')
-    if args.update_outcomes:
-        sys.argv.append('--update-outcomes')
-    
-    return run_main()
+    from portfolio_agent.src.orchestrator import run_orchestrator
+
+    config = get_config()
+
+    print("Running orchestrator...")
+    try:
+        excel_path = run_orchestrator(
+            force_refresh=args.force_refresh,
+            simulate_outcome=args.simulate_outcome,
+            update_outcomes=args.update_outcomes,
+            config=config,
+        )
+        print(f"Done. Report saved to: {excel_path}")
+        return 0
+    except Exception as e:
+        print(f"Error during execution: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -216,9 +232,44 @@ def create_parser() -> argparse.ArgumentParser:
         help="Run backtesting simulation"
     )
     backtest_parser.add_argument(
+        "--strategy",
+        type=str,
+        default=None,
+        help="Registered strategy to backtest (e.g. 'rule_based', 'lstm'). Defaults to config.strategy.type"
+    )
+    backtest_parser.add_argument(
         "--use-trained-model",
         action="store_true",
-        help="Use trained PyTorch model for predictions"
+        help="Shorthand for --strategy lstm"
+    )
+    backtest_parser.add_argument(
+        "--parallel",
+        action="store_true",
+        help="Parallelize rule-based signal generation across CPU workers"
+    )
+    backtest_parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Max worker processes when --parallel is set (default: CPU count)"
+    )
+    backtest_parser.add_argument(
+        "--years",
+        type=int,
+        default=None,
+        help="Number of years of history to backtest (default: config.backtest.start_years_ago)"
+    )
+    backtest_parser.add_argument(
+        "--start-date",
+        type=str,
+        default=None,
+        help="Explicit backtest start date (YYYY-MM-DD), overrides --years"
+    )
+    backtest_parser.add_argument(
+        "--end-date",
+        type=str,
+        default=None,
+        help="Explicit backtest end date (YYYY-MM-DD), defaults to today"
     )
     backtest_parser.add_argument(
         "--device",

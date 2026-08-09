@@ -1,4 +1,14 @@
-"""Monte Carlo simulation module for risk analysis."""
+"""Per-symbol forward Monte Carlo simulation feeding strategy scoring.
+
+Simulates a single ticker's forward price path from its historical daily
+return distribution (lognormal-shock model) to estimate probability-of-profit
+over a horizon — this is an INPUT to RuleBasedStrategy's scoring
+(StrategyContext.mc_result), computed fresh per ticker per scoring round.
+
+This is a distinct concern from src/risk_analytics.py::RiskAnalyzer, which
+runs a portfolio-level bootstrap resampling of a completed backtest's realized
+trade log to report risk-of-ruin as an output metric, not a scoring input.
+"""
 
 import numpy as np
 from dataclasses import dataclass

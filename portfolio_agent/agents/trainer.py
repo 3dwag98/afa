@@ -18,67 +18,132 @@ from portfolio_agent.config.schema import AppConfig, TrainingConfig
 from portfolio_agent.data.dataset import TimeSeriesDataset, create_dataloaders
 from portfolio_agent.features.pipeline import build_features
 from portfolio_agent.models.registry import get_model
+from portfolio_agent.src.data_store import load_ticker_data
+from portfolio_agent.src.universe import resolve_backtest_universe
 from portfolio_agent.utils.device import get_device
 
+TRAINING_FEATURE_NAMES = [
+    'sma_20', 'sma_50', 'rsi_14', 'macd',
+    'bollinger_pct_b', 'atr_14', 'return_1d', 'return_5d'
+]
 
-def load_data(config: AppConfig) -> pd.DataFrame:
-    """Load market data and prepare feature matrix.
-    
-    Args:
-        config: Application configuration.
-        
-    Returns:
-        DataFrame with features and target columns.
+
+def _generate_synthetic_ohlcv(n_samples: int = 1000, seed: int = 42) -> pd.DataFrame:
+    """Generate a single synthetic random-walk OHLCV series.
+
+    Used only when config.training.use_synthetic_data is set (offline/CI
+    testing where no cached market data is available) — real training runs
+    load actual cached tickers via load_data() below.
     """
-    # For now, we'll generate synthetic data for testing
-    # In production, this would load from data store
     import numpy as np
-    
-    n_samples = 1000
-    n_features = 10
-    
-    # Generate synthetic OHLCV-like data
+
     dates = pd.date_range(start='2020-01-01', periods=n_samples, freq='D')
-    
-    # Simulate price series with trend and noise
-    np.random.seed(42)
+
+    np.random.seed(seed)
     close_prices = 100 + np.cumsum(np.random.randn(n_samples) * 0.5)
-    
-    df = pd.DataFrame({
+
+    return pd.DataFrame({
         'open': close_prices + np.random.randn(n_samples) * 0.1,
         'high': close_prices + np.abs(np.random.randn(n_samples)) * 0.3,
         'low': close_prices - np.abs(np.random.randn(n_samples)) * 0.3,
         'close': close_prices,
         'volume': np.random.randint(1000000, 10000000, n_samples),
     }, index=dates)
-    
-    return df
 
 
-def prepare_features(df: pd.DataFrame, config: AppConfig) -> pd.DataFrame:
-    """Build feature matrix from raw data.
-    
+def load_data(config: AppConfig) -> pd.DataFrame:
+    """Load and featurize training data.
+
+    By default, loads real cached multi-ticker OHLCV data (via data_store) and
+    builds a concatenated training panel: each ticker is featurized and split
+    70/15/15 chronologically *individually*, then all tickers' train portions
+    are concatenated, followed by all val portions, then all test portions.
+    This ordering lets create_dataloaders()'s single top-level 70/15/15 index
+    split land exactly on those boundaries, so validation/test proportionally
+    represent every ticker rather than only the last one in the panel.
+
+    Sequence windows that straddle two concatenated tickers' boundaries mix
+    data from different instruments; this is a bounded, documented limitation
+    of pooling multiple series through a single-series windowing dataset
+    (TimeSeriesDataset), not a look-ahead bias — it affects at most
+    sequence_length * (n_tickers - 1) windows out of the full panel.
+
+    Falls back to synthetic random-walk data only when
+    config.training.use_synthetic_data is set.
+
+    Args:
+        config: Application configuration.
+
+    Returns:
+        DataFrame with computed features and target column (already featurized).
+    """
+    if config.training.use_synthetic_data:
+        return prepare_features(_generate_synthetic_ohlcv(), config)
+
+    tickers = resolve_backtest_universe(max_tickers=config.data.universe_size)
+    if not tickers:
+        raise RuntimeError(
+            "No cached tickers found to build a training panel. Run "
+            "`portfolio-agent download-data` first, or set "
+            "training.use_synthetic_data=true for offline testing."
+        )
+
+    train_parts: List[pd.DataFrame] = []
+    val_parts: List[pd.DataFrame] = []
+    test_parts: List[pd.DataFrame] = []
+
+    for ticker in tickers:
+        df = load_ticker_data(ticker)
+        if df is None or len(df) < config.data.min_history_days:
+            continue
+        df = df.copy()
+        df.columns = [c.lower() for c in df.columns]
+
+        try:
+            feature_df = prepare_features(df, config, verbose=False)
+        except Exception:
+            continue
+        if len(feature_df) < config.training.sequence_length * 2:
+            continue
+
+        n = len(feature_df)
+        train_end = int(n * 0.70)
+        val_end = int(n * 0.85)
+        train_parts.append(feature_df.iloc[:train_end])
+        val_parts.append(feature_df.iloc[train_end:val_end])
+        test_parts.append(feature_df.iloc[val_end:])
+
+    if not train_parts:
+        raise RuntimeError(
+            "None of the resolved tickers had enough cached history to build a "
+            "training panel. Run `portfolio-agent download-data` first, or set "
+            "training.use_synthetic_data=true for offline testing."
+        )
+
+    combined = pd.concat(train_parts + val_parts + test_parts, ignore_index=True)
+    print(f"Built training panel from {len(train_parts)} tickers: {len(combined)} total rows")
+    return combined
+
+
+def prepare_features(df: pd.DataFrame, config: AppConfig, verbose: bool = True) -> pd.DataFrame:
+    """Build feature matrix from raw OHLCV data.
+
     Args:
         df: Raw OHLCV DataFrame.
         config: Application configuration.
-        
+        verbose: Whether to print a summary (disabled when called per-ticker
+            from load_data()'s multi-ticker panel construction).
+
     Returns:
         DataFrame with computed features and target.
     """
-    # Get list of available features
-    feature_names = [
-        'sma_20', 'sma_50', 'rsi_14', 'macd', 
-        'bollinger_pct_b', 'atr_14', 'return_1d', 'return_5d'
-    ]
-    
-    # Build features
     feature_df = build_features(
-        df, 
-        feature_names,
+        df,
+        TRAINING_FEATURE_NAMES,
         normalize=config.features.normalize,
         normalize_window=config.features.normalize_window
     )
-    
+
     # Add target (next period return as example)
     target_name = config.training.target
     if target_name not in feature_df.columns:
@@ -91,14 +156,15 @@ def prepare_features(df: pd.DataFrame, config: AppConfig) -> pd.DataFrame:
                 feature_df[target_name] = df['close'].shift(-1).pct_change()
         else:
             feature_df[target_name] = df['close'].shift(-1).pct_change()
-    
+
     # Drop NaN values
     feature_df = feature_df.dropna()
-    
-    print(f"Built feature matrix with {len(feature_df)} samples and {len(feature_df.columns)} columns")
-    print(f"Features: {list(feature_df.columns[:-1])}")
-    print(f"Target: {feature_df.columns[-1]}")
-    
+
+    if verbose:
+        print(f"Built feature matrix with {len(feature_df)} samples and {len(feature_df.columns)} columns")
+        print(f"Features: {list(feature_df.columns[:-1])}")
+        print(f"Target: {feature_df.columns[-1]}")
+
     return feature_df
 
 
@@ -147,14 +213,12 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
         scaler = None
     
     # =========================================================================
-    # 2. Load data and build features
+    # 2. Load and featurize training data (real cached tickers by default)
     # =========================================================================
-    print("\nLoading data...")
-    raw_df = load_data(config)
-    
-    print("Building features...")
-    feature_df = prepare_features(raw_df, config)
-    
+    print("\nLoading and featurizing training data...")
+    feature_df = load_data(config)
+
+
     # =========================================================================
     # 3. Create DataLoaders
     # =========================================================================

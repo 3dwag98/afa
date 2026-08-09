@@ -12,7 +12,13 @@ import pytest
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
-from backtest_reporting import export_backtest_excel
+from backtest_reporting import (
+    export_backtest_excel,
+    _normalize_trade_log,
+    EXPECTED_COLUMNS,
+    _normalize_daily_log,
+    EXPECTED_DAILY_COLUMNS,
+)
 
 
 def generate_dummy_analytics() -> dict:
@@ -210,7 +216,8 @@ class TestBacktestReporting:
             'analytics': analytics,
             'equity_curve': equity_curve,
             'trade_log': trade_log,
-            'brain_evolution': brain_evolution
+            'brain_evolution': brain_evolution,
+            'daily_activity_log': [],
         }
     
     def test_export_backtest_excel_creates_file(self, dummy_data, output_dir):
@@ -222,6 +229,7 @@ class TestBacktestReporting:
             equity_curve=dummy_data['equity_curve'],
             trade_log=dummy_data['trade_log'],
             brain_evolution=dummy_data['brain_evolution'],
+            daily_activity_log=dummy_data['daily_activity_log'],
             filepath=filepath
         )
         
@@ -238,6 +246,7 @@ class TestBacktestReporting:
             equity_curve=dummy_data['equity_curve'],
             trade_log=dummy_data['trade_log'],
             brain_evolution=dummy_data['brain_evolution'],
+            daily_activity_log=dummy_data['daily_activity_log'],
             filepath=filepath
         )
         
@@ -254,6 +263,7 @@ class TestBacktestReporting:
             equity_curve=dummy_data['equity_curve'],
             trade_log=dummy_data['trade_log'],
             brain_evolution=dummy_data['brain_evolution'],
+            daily_activity_log=dummy_data['daily_activity_log'],
             filepath=filepath
         )
         
@@ -284,6 +294,7 @@ class TestBacktestReporting:
             equity_curve=dummy_data['equity_curve'],
             trade_log=dummy_data['trade_log'],
             brain_evolution=dummy_data['brain_evolution'],
+            daily_activity_log=dummy_data['daily_activity_log'],
             filepath=filepath
         )
         
@@ -304,6 +315,7 @@ class TestBacktestReporting:
             equity_curve=dummy_data['equity_curve'],
             trade_log=dummy_data['trade_log'],
             brain_evolution=dummy_data['brain_evolution'],
+            daily_activity_log=dummy_data['daily_activity_log'],
             filepath=filepath
         )
         
@@ -327,6 +339,7 @@ class TestBacktestReporting:
             equity_curve=dummy_data['equity_curve'],
             trade_log=dummy_data['trade_log'],
             brain_evolution=dummy_data['brain_evolution'],
+            daily_activity_log=dummy_data['daily_activity_log'],
             filepath=filepath
         )
         
@@ -348,6 +361,7 @@ class TestBacktestReporting:
             equity_curve=dummy_data['equity_curve'],
             trade_log=dummy_data['trade_log'],
             brain_evolution=dummy_data['brain_evolution'],
+            daily_activity_log=dummy_data['daily_activity_log'],
             filepath=filepath
         )
         
@@ -370,6 +384,7 @@ class TestBacktestReporting:
             equity_curve=dummy_data['equity_curve'],
             trade_log=dummy_data['trade_log'],
             brain_evolution=dummy_data['brain_evolution'],
+            daily_activity_log=dummy_data['daily_activity_log'],
             filepath=filepath
         )
         
@@ -393,6 +408,7 @@ class TestBacktestReporting:
             equity_curve=dummy_data['equity_curve'],
             trade_log=dummy_data['trade_log'],
             brain_evolution=dummy_data['brain_evolution'],
+            daily_activity_log=dummy_data['daily_activity_log'],
             filepath=filepath
         )
         
@@ -413,6 +429,7 @@ class TestBacktestReporting:
             equity_curve=dummy_data['equity_curve'],
             trade_log=dummy_data['trade_log'],
             brain_evolution=dummy_data['brain_evolution'],
+            daily_activity_log=dummy_data['daily_activity_log'],
             filepath=filepath
         )
         
@@ -425,6 +442,162 @@ class TestBacktestReporting:
         
         # Should have Drawdown calculation
         assert 'Drawdown_%' in equity_df.columns, "Drawdown_% column not found"
+
+
+class TestTradeLogNormalization:
+    """Test class for trade log normalization functionality (_normalize_trade_log)."""
+
+    def test_trade_log_columns(self):
+        """_normalize_trade_log should produce exactly 16 columns matching EXPECTED_COLUMNS."""
+        trade_log = [
+            {
+                'trade_id': 'T000001', 'ticker': 'RELIANCE.NS', 'entry_date': '2020-01-15',
+                'entry_price': 1500.0, 'exit_date': '2020-02-15', 'exit_price': 1600.0,
+                'quantity': 100, 'side': 'LONG', 'signal_trigger': 'Trend',
+                'gross_pnl': 10000.0, 'transaction_costs': 50.0, 'taxes': 10.0,
+                'net_pnl': 9940.0, 'return_pct': 6.67, 'holding_days': 31, 'exit_reason': 'target'
+            },
+            {
+                'trade_id': 'T000002', 'ticker': 'TCS.NS', 'entry_date': '2020-01-20',
+                'entry_price': 3200.0, 'exit_date': '2020-02-10', 'exit_price': 3100.0,
+                'quantity': 50, 'side': 'LONG', 'signal_trigger': 'Breakout',
+                'gross_pnl': -5000.0, 'transaction_costs': 80.0, 'taxes': 0.0,
+                'net_pnl': -5080.0, 'return_pct': -3.125, 'holding_days': 21, 'exit_reason': 'stop_loss'
+            },
+            {
+                'trade_id': 'T000003', 'ticker': 'HDFCBANK.NS', 'entry_date': '2020-02-01',
+                'entry_price': 1400.0, 'exit_date': None, 'exit_price': None,
+                'quantity': 75, 'side': 'LONG', 'signal_trigger': 'Volume',
+                'gross_pnl': 0.0, 'transaction_costs': 52.5, 'taxes': 0.0,
+                'net_pnl': -52.5, 'return_pct': 0.0, 'holding_days': 0, 'exit_reason': None
+            }
+        ]
+
+        result_df = _normalize_trade_log(trade_log)
+
+        assert result_df.shape[1] == 16
+        assert list(result_df.columns) == EXPECTED_COLUMNS
+        assert result_df.shape[0] == 3
+
+    def test_normalize_handles_nested_dict(self):
+        """Nested dict/list values in trade entries should become None, not crash."""
+        trade_log = [
+            {
+                'trade_id': 'T000001', 'ticker': 'RELIANCE.NS', 'entry_date': '2020-01-15',
+                'entry_price': 1500.0, 'exit_date': '2020-02-15', 'exit_price': 1600.0,
+                'quantity': 100, 'side': 'LONG', 'signal_trigger': 'Trend',
+                'gross_pnl': 10000.0, 'transaction_costs': 50.0, 'taxes': 10.0,
+                'net_pnl': 9940.0, 'return_pct': 6.67, 'holding_days': 31, 'exit_reason': 'target'
+            },
+            {
+                'trade_id': 'T000002', 'ticker': 'TCS.NS', 'entry_date': '2020-01-20',
+                'nested_data': {'foo': 'bar'},
+                'entry_price': 3200.0, 'exit_date': '2020-02-10', 'exit_price': 3100.0,
+                'quantity': 50, 'side': 'LONG', 'signal_trigger': 'Breakout',
+                'gross_pnl': -5000.0, 'transaction_costs': 80.0, 'taxes': 0.0,
+                'net_pnl': -5080.0, 'return_pct': -3.125, 'holding_days': 21, 'exit_reason': 'stop_loss'
+            },
+            {
+                'trade_id': 'T000003', 'ticker': 'INFY.NS', 'entry_date': '2020-02-01',
+                'entry_price': 1400.0, 'exit_date': '2020-03-01', 'exit_price': 1500.0,
+                'quantity': 75, 'side': 'LONG', 'signal_trigger': ['Volume', 'Trend'],
+                'gross_pnl': 7500.0, 'transaction_costs': 52.5, 'taxes': 0.0,
+                'net_pnl': 7447.5, 'return_pct': 7.14, 'holding_days': 29, 'exit_reason': 'target'
+            }
+        ]
+
+        result_df = _normalize_trade_log(trade_log)
+
+        assert result_df.shape[1] == 16
+        assert result_df.shape[0] == 3
+        assert pd.isna(result_df.iloc[2]['signal_trigger']) or result_df.iloc[2]['signal_trigger'] is None
+
+    def test_normalize_empty_trade_log(self):
+        result_df = _normalize_trade_log([])
+        assert result_df.shape == (0, 16)
+        assert list(result_df.columns) == EXPECTED_COLUMNS
+
+    def test_normalize_none_trade_log(self):
+        result_df = _normalize_trade_log(None)
+        assert result_df.shape == (0, 16)
+        assert list(result_df.columns) == EXPECTED_COLUMNS
+
+    def test_normalize_dict_input(self):
+        """Dict input (keyed by trade id) should convert to a list of rows."""
+        trade_log_dict = {
+            'trade1': {
+                'trade_id': 'T000001', 'ticker': 'RELIANCE.NS', 'entry_date': '2020-01-15',
+                'entry_price': 1500.0, 'exit_date': '2020-02-15', 'exit_price': 1600.0,
+                'quantity': 100, 'side': 'LONG', 'signal_trigger': 'Trend',
+                'gross_pnl': 10000.0, 'transaction_costs': 50.0, 'taxes': 10.0,
+                'net_pnl': 9940.0, 'return_pct': 6.67, 'holding_days': 31, 'exit_reason': 'target'
+            }
+        }
+
+        result_df = _normalize_trade_log(trade_log_dict)
+
+        assert result_df.shape == (1, 16)
+
+
+class TestDailyLogNormalization:
+    """Test class for daily activity log normalization functionality (_normalize_daily_log)."""
+
+    def test_daily_log_structure(self):
+        """_normalize_daily_log should produce exactly 11 columns, with a
+        MARK_TO_MARKET row for every unique date."""
+        daily_log = [
+            {'date': '2023-01-02', 'ticker': 'PORTFOLIO', 'action': 'MARK_TO_MARKET',
+             'price': None, 'quantity': None, 'position_value': None,
+             'cash_balance': 1000000.0, 'total_portfolio_value': 1000000.0,
+             'score': None, 'signal': None, 'notes': 'EOD valuation'},
+            {'date': '2023-01-02', 'ticker': 'RELIANCE.NS', 'action': 'HOLD',
+             'price': 2500.0, 'quantity': None, 'position_value': None,
+             'cash_balance': 1000000.0, 'total_portfolio_value': 1000000.0,
+             'score': 0.5, 'signal': 'BUY', 'notes': 'Signal evaluated: BUY'},
+            {'date': '2023-01-03', 'ticker': 'PORTFOLIO', 'action': 'MARK_TO_MARKET',
+             'price': None, 'quantity': None, 'position_value': None,
+             'cash_balance': 950000.0, 'total_portfolio_value': 950000.0,
+             'score': None, 'signal': None, 'notes': 'EOD valuation'},
+            {'date': '2023-01-03', 'ticker': 'RELIANCE.NS', 'action': 'BUY',
+             'price': 2500.0, 'quantity': 20, 'position_value': 50000.0,
+             'cash_balance': 950000.0, 'total_portfolio_value': 1000000.0,
+             'score': None, 'signal': 'Trend', 'notes': 'Order executed at 2500.0'},
+            {'date': '2023-01-04', 'ticker': 'RELIANCE.NS', 'action': 'STOP_LOSS_HIT',
+             'price': 2375.0, 'quantity': 20, 'position_value': 0.0,
+             'cash_balance': 997500.0, 'total_portfolio_value': 997500.0,
+             'score': None, 'signal': None, 'notes': 'Stop loss triggered'},
+            {'date': '2023-01-04', 'ticker': 'PORTFOLIO', 'action': 'MARK_TO_MARKET',
+             'price': None, 'quantity': None, 'position_value': None,
+             'cash_balance': 997500.0, 'total_portfolio_value': 997500.0,
+             'score': None, 'signal': None, 'notes': 'EOD valuation'}
+        ]
+
+        result_df = _normalize_daily_log(daily_log)
+
+        assert result_df.shape[1] == 11
+        assert list(result_df.columns) == EXPECTED_DAILY_COLUMNS
+        assert result_df.shape[0] == 6
+
+        unique_dates = set(d['date'] for d in daily_log)
+        mtm_dates = set(result_df[result_df['action'] == 'MARK_TO_MARKET']['date'].tolist())
+        assert unique_dates == mtm_dates
+
+        for idx, row in result_df.iterrows():
+            assert pd.notna(row['date']), f"Row {idx} missing 'date'"
+            assert pd.notna(row['ticker']), f"Row {idx} missing 'ticker'"
+            assert pd.notna(row['action']), f"Row {idx} missing 'action'"
+            assert pd.notna(row['cash_balance']), f"Row {idx} missing 'cash_balance'"
+            assert pd.notna(row['total_portfolio_value']), f"Row {idx} missing 'total_portfolio_value'"
+
+    def test_normalize_empty_daily_log(self):
+        result_df = _normalize_daily_log([])
+        assert result_df.shape == (0, 11)
+        assert list(result_df.columns) == EXPECTED_DAILY_COLUMNS
+
+    def test_normalize_none_daily_log(self):
+        result_df = _normalize_daily_log(None)
+        assert result_df.shape == (0, 11)
+        assert list(result_df.columns) == EXPECTED_DAILY_COLUMNS
 
 
 if __name__ == '__main__':

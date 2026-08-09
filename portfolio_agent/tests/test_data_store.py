@@ -12,28 +12,37 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from data_store import (
-    DataStore, 
-    DATA_DIR, 
-    _ticker_filename, 
+    DataStore,
+    DATA_DIR,
+    _ticker_filename,
     _extract_ticker_df,
     _fill_missing_days,
-    generate_data_quality_report
+    generate_data_quality_report,
+    generate_synthetic_ohlcv,
+    get_cached_tickers,
+    load_or_fetch_data,
 )
 
 
 @pytest.fixture
-def clean_data_dir():
-    """Clean up DATA_DIR before and after tests."""
-    # Clean before test
-    if DATA_DIR.exists():
-        shutil.rmtree(DATA_DIR)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    
+def clean_data_dir(tmp_path, monkeypatch):
+    """Redirect DATA_DIR to an isolated tmp directory for the test's duration.
+
+    IMPORTANT: this used to shutil.rmtree() the real, cwd-relative
+    data/market_data/ directory directly — which, when pytest is invoked from
+    certain working directories, deleted the real committed market-data cache
+    (thousands of parquet files) from the working tree. Never operate
+    destructively on a real, non-tmp-path directory from a test fixture.
+    """
+    import data_store as data_store_module
+
+    test_dir = tmp_path / "market_data"
+    test_dir.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(data_store_module, "DATA_DIR", test_dir)
+    monkeypatch.setattr(sys.modules[__name__], "DATA_DIR", test_dir)
+
     yield
-    
-    # Clean after test
-    if DATA_DIR.exists():
-        shutil.rmtree(DATA_DIR)
 
 
 class TestTickerFilename:
@@ -511,3 +520,110 @@ class TestDataQualityReport:
         
         for key in required_keys:
             assert key in report, f"Missing required key: {key}"
+
+
+class TestGenerateSyntheticOhlcv:
+    """Tests for generate_synthetic_ohlcv (moved here from the deleted
+    src/data_ingestion.py, which duplicated this module's caching logic)."""
+
+    def test_creates_valid_ohlcv(self):
+        df = generate_synthetic_ohlcv("TEST.NS", days=100, seed=42)
+
+        assert isinstance(df, pd.DataFrame)
+        for col in ("open", "high", "low", "close", "volume"):
+            assert col in df.columns, f"Missing column: {col}"
+        assert len(df) >= 50
+        assert (df["close"] > 0).all()
+        assert (df["high"] >= df["low"]).all()
+        assert (df["volume"] > 0).all()
+        assert isinstance(df.index, pd.DatetimeIndex)
+        assert not df.index.duplicated().any()
+
+    def test_deterministic_with_seed(self):
+        df1 = generate_synthetic_ohlcv("TEST.NS", days=100, seed=42)
+        df2 = generate_synthetic_ohlcv("TEST.NS", days=100, seed=42)
+        pd.testing.assert_frame_equal(df1, df2)
+
+    def test_different_seeds_produce_different_data(self):
+        df1 = generate_synthetic_ohlcv("TEST.NS", days=100, seed=42)
+        df2 = generate_synthetic_ohlcv("TEST.NS", days=100, seed=123)
+        assert not df1["close"].equals(df2["close"])
+
+
+class TestGetCachedTickers:
+    """Tests for get_cached_tickers (the single canonical ticker-discovery
+    implementation, also used by DataStore.get_cached_tickers() and
+    universe.py::discover_available_tickers())."""
+
+    def test_empty_directory_returns_empty_list(self, clean_data_dir):
+        assert get_cached_tickers() == []
+
+    def test_discovers_cached_tickers(self, clean_data_dir):
+        df = generate_synthetic_ohlcv("AAA.NS", days=60)
+        df.to_parquet(DATA_DIR / _ticker_filename("AAA.NS"))
+        df.to_parquet(DATA_DIR / _ticker_filename("BBB.NS"))
+
+        tickers = get_cached_tickers()
+
+        assert tickers == ["AAA.NS", "BBB.NS"]
+
+
+class TestLoadOrFetchData:
+    """Tests for load_or_fetch_data (moved here from the deleted
+    src/data_ingestion.py and rewritten onto this module's per-ticker cache
+    instead of a second, non-interoperating combined-file cache)."""
+
+    def test_uses_cached_data_without_network(self, clean_data_dir):
+        df = generate_synthetic_ohlcv("CACHED.NS", days=300)
+        df.to_parquet(DATA_DIR / _ticker_filename("CACHED.NS"))
+
+        config = _make_config(tickers=["CACHED.NS"], allow_synthetic_fallback=False)
+        result = load_or_fetch_data(config, force_refresh=False, use_auto_discovery=False)
+
+        assert "CACHED.NS" in result
+        assert len(result["CACHED.NS"]) > 0
+
+    def test_auto_discovers_when_tickers_empty(self, clean_data_dir):
+        df = generate_synthetic_ohlcv("AUTO.NS", days=300)
+        df.to_parquet(DATA_DIR / _ticker_filename("AUTO.NS"))
+
+        config = _make_config(tickers=[], allow_synthetic_fallback=False)
+        result = load_or_fetch_data(config, force_refresh=False, use_auto_discovery=True)
+
+        assert "AUTO.NS" in result
+
+    def test_falls_back_to_synthetic_when_nothing_available(self, clean_data_dir, monkeypatch):
+        monkeypatch.setattr(
+            "data_store.batch_download_and_cache", lambda *a, **k: False
+        )
+        config = _make_config(tickers=["NEVERCACHED.NS"], allow_synthetic_fallback=True)
+
+        result = load_or_fetch_data(config, force_refresh=False, use_auto_discovery=False)
+
+        assert "NEVERCACHED.NS" in result
+        assert len(result["NEVERCACHED.NS"]) > 0
+
+    def test_returns_empty_when_unavailable_and_fallback_disabled(self, clean_data_dir, monkeypatch):
+        monkeypatch.setattr(
+            "data_store.batch_download_and_cache", lambda *a, **k: False
+        )
+        config = _make_config(tickers=["NEVERCACHED.NS"], allow_synthetic_fallback=False)
+
+        result = load_or_fetch_data(config, force_refresh=False, use_auto_discovery=False)
+
+        assert result == {}
+
+
+def _make_config(tickers, allow_synthetic_fallback: bool, min_history_days: int = 250):
+    """Minimal AppConfig for load_or_fetch_data tests."""
+    from portfolio_agent.config.schema import AppConfig
+
+    return AppConfig.model_validate({
+        "data": {
+            "tickers": tickers,
+            "allow_synthetic_fallback": allow_synthetic_fallback,
+            "min_history_days": min_history_days,
+            "default_history_years": 1,
+        },
+        "simulation": {"random_seed": 42},
+    })

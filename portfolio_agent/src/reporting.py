@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
-from src.config import AppConfig
+from portfolio_agent.config.schema import AppConfig
 from src.models import Recommendation, IndicatorSnapshot, AgentBrain
 from src.monte_carlo import MonteCarloResult
 
@@ -31,7 +31,7 @@ def export_excel_report(
     Returns:
         Path to created Excel file.
     """
-    output_path = config.excel_output
+    output_path = config.paths.excel_output
     
     # Ensure output directory exists
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -137,8 +137,8 @@ def _create_summary_sheet(
     summary_data = [
         ['Run ID', run_id],
         ['Generated at', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-        ['Portfolio value', f'₹{config.portfolio_value_inr:,.0f}'],
-        ['Paper trading mode', config.paper_trading_mode],
+        ['Portfolio value', f'₹{config.risk.portfolio_value_inr:,.0f}'],
+        ['Paper trading mode', config.compliance.paper_trading_mode],
         ['Number of recommendations', num_recommendations],
         ['Number of BUY signals', num_buy],
         ['Number of WATCH signals', num_watch],

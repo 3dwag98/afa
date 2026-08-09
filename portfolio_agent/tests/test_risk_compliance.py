@@ -1,7 +1,7 @@
 """Tests for risk and compliance modules."""
 
 import pytest
-from src.config import AppConfig
+from portfolio_agent.config.schema import AppConfig
 from src.risk import calculate_quantity, calculate_stop_target, calculate_max_loss
 from src.compliance import run_compliance_checks, estimate_capital_gains_tax
 
@@ -14,26 +14,28 @@ def _make_config(
     paper_trading_mode: bool = True,
 ) -> AppConfig:
     """Create a minimal AppConfig for testing."""
-    return AppConfig(
-        portfolio_value_inr=portfolio_value_inr,
-        risk_per_trade_pct=risk_per_trade_pct,
-        max_single_position_pct=max_single_position_pct,
-        min_price_inr=min_price_inr,
-        target_prob_profit=0.55,
-        min_reward_risk=1.5,
-        learning_rate=0.01,
-        min_trades_for_learning=10,
-        mc_horizon_days=20,
-        mc_simulations=1000,
-        random_seed=42,
-        tickers=["RELIANCE"],
-        brain_file="brain.yaml",
-        sqlite_path=":memory:",
-        excel_output="output.xlsx",
-        log_file="test.log",
-        paper_trading_mode=paper_trading_mode,
-        min_history_days=200,
-    )
+    return AppConfig.model_validate({
+        "risk": {
+            "portfolio_value_inr": portfolio_value_inr,
+            "risk_per_trade_pct": risk_per_trade_pct,
+            "max_single_position_pct": max_single_position_pct,
+        },
+        "compliance": {
+            "min_price_inr": min_price_inr,
+            "target_prob_profit": 0.55,
+            "min_reward_risk": 1.5,
+            "paper_trading_mode": paper_trading_mode,
+        },
+        "learning": {"learning_rate": 0.01, "min_trades_for_learning": 10},
+        "simulation": {"mc_horizon_days": 20, "mc_simulations": 1000, "random_seed": 42},
+        "data": {"tickers": ["RELIANCE"], "min_history_days": 200},
+        "paths": {
+            "brain_file": "brain.yaml",
+            "sqlite_path": ":memory:",
+            "excel_output": "output.xlsx",
+            "log_file": "test.log",
+        },
+    })
 
 
 class TestCalculateQuantity:
@@ -128,7 +130,7 @@ class TestCalculateStopTarget:
 
         # Stop = 100 - 1.5 * 2 = 97.0
         # Target = 100 + 2.0 * 2 = 104.0
-        stop, target = calculate_stop_target(entry_price, atr, config)
+        stop, target = calculate_stop_target(entry_price, atr)
 
         assert stop == 97.0
         assert target == 104.0
@@ -140,7 +142,7 @@ class TestCalculateStopTarget:
 
         # Stop = 100 * 0.98 = 98.0
         # Target = 100 * 1.03 = 103.0
-        stop, target = calculate_stop_target(entry_price, None, config)
+        stop, target = calculate_stop_target(entry_price, None)
 
         assert stop == 98.0
         assert target == 103.0
@@ -150,7 +152,7 @@ class TestCalculateStopTarget:
         config = _make_config()
         entry_price = 100.0
 
-        stop, target = calculate_stop_target(entry_price, 0.0, config)
+        stop, target = calculate_stop_target(entry_price, 0.0)
 
         assert stop == 98.0
         assert target == 103.0
@@ -160,7 +162,7 @@ class TestCalculateStopTarget:
         config = _make_config()
         entry_price = 100.0
 
-        stop, target = calculate_stop_target(entry_price, -1.0, config)
+        stop, target = calculate_stop_target(entry_price, -1.0)
 
         assert stop == 98.0
         assert target == 103.0
@@ -172,7 +174,7 @@ class TestCalculateStopTarget:
         atr = 10.0  # Large ATR
 
         # Stop = 10 - 1.5 * 10 = -5, but should be clamped to 0
-        stop, target = calculate_stop_target(entry_price, atr, config)
+        stop, target = calculate_stop_target(entry_price, atr)
 
         assert stop == 0.0
         assert target == 30.0
@@ -185,7 +187,7 @@ class TestCalculateStopTarget:
 
         # Stop = 100 - 1.5 * 1.111 = 98.3335 -> 98.33
         # Target = 100 + 2.0 * 1.111 = 102.222 -> 102.22
-        stop, target = calculate_stop_target(entry_price, atr, config)
+        stop, target = calculate_stop_target(entry_price, atr)
 
         assert stop == 98.33
         assert target == 102.22

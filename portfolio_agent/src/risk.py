@@ -5,20 +5,22 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Any, Optional, Tuple
 
-# Use absolute imports for CLI execution
-try:
-    from .config import AppConfig
-except ImportError:
-    from config import AppConfig
+from portfolio_agent.config.schema import AppConfig
 
 
-def calculate_stop_target(entry_price: float, atr: Optional[float], config: AppConfig) -> Tuple[float, float]:
+def calculate_stop_target(
+    entry_price: float,
+    atr: Optional[float],
+    stop_multiplier: float = 1.5,
+    target_multiplier: float = 2.0,
+) -> Tuple[float, float]:
     """Calculate stop loss and target prices based on ATR.
 
     Args:
         entry_price: Entry price of the position.
         atr: Average True Range value, or None.
-        config: Application configuration.
+        stop_multiplier: ATR multiple below entry for the stop (default 1.5).
+        target_multiplier: ATR multiple above entry for the target (default 2.0).
 
     Returns:
         Tuple of (stop_price, target_price), both rounded.
@@ -28,8 +30,8 @@ def calculate_stop_target(entry_price: float, atr: Optional[float], config: AppC
         stop = entry_price * 0.98  # 2% fallback stop
         target = entry_price * 1.03  # 3% fallback target
     else:
-        stop = entry_price - 1.5 * atr
-        target = entry_price + 2.0 * atr
+        stop = entry_price - stop_multiplier * atr
+        target = entry_price + target_multiplier * atr
 
     # Stop cannot be negative
     stop = max(0.0, stop)
@@ -53,7 +55,7 @@ def calculate_quantity(
         Integer quantity >= 0.
     """
     # Risk amount = portfolio_value_inr * risk_per_trade_pct
-    risk_amount = config.portfolio_value_inr * config.risk_per_trade_pct
+    risk_amount = config.risk.portfolio_value_inr * config.risk.risk_per_trade_pct
 
     # Risk per share = entry_price - stop_price
     risk_per_share = entry_price - stop_price
@@ -66,7 +68,7 @@ def calculate_quantity(
     quantity = math.floor(risk_amount / risk_per_share)
 
     # Max position value = portfolio_value_inr * max_single_position_pct
-    max_position_value = config.portfolio_value_inr * config.max_single_position_pct
+    max_position_value = config.risk.portfolio_value_inr * config.risk.max_single_position_pct
 
     # Reduce quantity if quantity * entry_price > max position value
     if quantity * entry_price > max_position_value:

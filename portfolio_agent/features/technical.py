@@ -12,6 +12,40 @@ from typing import Callable
 from .registry import register_feature
 
 
+@register_feature('close')
+def close(df: pd.DataFrame) -> pd.Series:
+    """Pass through the raw close price.
+
+    Not lagged: the current day's close is the reference/entry price known at
+    decision time, not a look-ahead concern.
+
+    Args:
+        df: DataFrame with 'close' column.
+
+    Returns:
+        The 'close' column unchanged.
+    """
+    return df['close']
+
+
+@register_feature('volume_ratio_20')
+def volume_ratio_20(df: pd.DataFrame) -> pd.Series:
+    """Calculate volume strength as 5-day average volume over 20-day average.
+
+    Uses volume shifted by 1 to avoid look-ahead bias.
+
+    Args:
+        df: DataFrame with 'volume' column.
+
+    Returns:
+        Series with volume ratio values (lagged by 1 period).
+    """
+    volume_shifted = df['volume'].shift(1)
+    avg_5d = volume_shifted.rolling(window=5).mean()
+    avg_20d = volume_shifted.rolling(window=20).mean()
+    return avg_5d / avg_20d
+
+
 @register_feature('sma_20')
 def sma_20(df: pd.DataFrame) -> pd.Series:
     """Calculate 20-period Simple Moving Average.

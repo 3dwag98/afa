@@ -2,7 +2,7 @@
 
 from typing import Dict, Any, List, Optional, Tuple
 
-from .config import AppConfig
+from portfolio_agent.config.schema import AppConfig
 
 
 def run_compliance_checks(
@@ -30,21 +30,21 @@ def run_compliance_checks(
     if not symbol or symbol.strip() == "":
         failed_reasons.append("Symbol is empty")
 
-    # Check: close >= config.min_price_inr
-    if close < config.min_price_inr:
-        failed_reasons.append(f"Price {close} below minimum {config.min_price_inr}")
+    # Check: close >= config.compliance.min_price_inr
+    if close < config.compliance.min_price_inr:
+        failed_reasons.append(f"Price {close} below minimum {config.compliance.min_price_inr}")
 
     # Check: quantity > 0
     if quantity <= 0:
         failed_reasons.append("Quantity must be greater than 0")
 
     # Check: investment_inr <= portfolio_value_inr * max_single_position_pct
-    max_position_value = config.portfolio_value_inr * config.max_single_position_pct
+    max_position_value = config.risk.portfolio_value_inr * config.risk.max_single_position_pct
     if investment_inr > max_position_value:
         failed_reasons.append(f"Investment {investment_inr} exceeds max position {max_position_value}")
 
     # Check: paper_trading_mode must be true for now
-    if not config.paper_trading_mode:
+    if not config.compliance.paper_trading_mode:
         failed_reasons.append("Paper trading mode must be enabled")
 
     # Check: no F&O symbol suffix like "-FUT" or "-OPT"

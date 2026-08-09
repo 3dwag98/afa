@@ -1,6 +1,6 @@
 # Portfolio Agent Configuration
-# These values can be overridden by environment variables with AFA_ prefix
-# Example: AFA_TRAINING__DEVICE="cuda" overrides training.device
+# These values can be overridden by environment variables with the AFA_ prefix
+# and double-underscore nesting, e.g. AFA_TRAINING__DEVICE="cuda" overrides training.device
 
 # Data configuration
 data:
@@ -8,35 +8,35 @@ data:
   market_data_dir: data/market_data
   default_history_years: 5
   universe_size: 4000
+  tickers: []
+  min_history_days: 250
+  allow_synthetic_fallback: true
 
-# Features configuration
+# Feature engineering configuration
 features:
-  lookbacks:
-    short: 5
-    medium: 20
-    long: 60
-  normalize: true
+  normalize: false
+  normalize_window: 252
   feature_sets:
-    price:
-      - open
-      - high
-      - low
-      - close
-      - volume
-    technical:
-      - rsi
+    core:
+      - sma_20
+      - sma_50
+      - sma_200
+    momentum:
+      - rsi_14
       - macd
-      - bollinger
-    fundamental:
-      - pe_ratio
-      - market_cap
-      - dividend_yield
+      - return_1d
+      - return_5d
+    volatility:
+      - atr_14
+      - bollinger_pct_b
+      - donchian_upper_20
 
 # Strategy configuration
 strategy:
   enabled: true
+  type: rule_based
   module: portfolio_agent.strategies
-  config_path: strategies/default.yaml
+  config_path: config/strategies/trend_breakout.yaml
   params: {}
 
 # Training configuration
@@ -45,12 +45,13 @@ training:
   target: return_5d
   sequence_length: 60
   train_fraction: 0.8
-  batch_size: 32
+  batch_size: 128
   epochs: 100
-  learning_rate: 0.001
+  learning_rate: 0.003
   device: auto
   use_mixed_precision: true
-  num_workers: 4
+  num_workers: 2
+  use_synthetic_data: false
 
 # Backtest configuration
 backtest:
@@ -58,9 +59,39 @@ backtest:
   start_years_ago: 5
   use_trained_model: false
   model_path: ""
+  parallel: false
+  max_workers: null
 
 # Risk configuration
 risk:
   portfolio_value_inr: 308733.0
   risk_per_trade_pct: 0.01
   max_single_position_pct: 0.03
+
+# Self-learning weight adaptation
+learning:
+  learning_rate: 0.15
+  min_trades_for_learning: 5
+
+# Per-symbol Monte Carlo forward simulation (feeds strategy scoring)
+simulation:
+  mc_horizon_days: 20
+  mc_simulations: 1000
+  random_seed: 42
+
+# Trade compliance / eligibility checks
+compliance:
+  min_price_inr: 20.0
+  target_prob_profit: 0.55
+  min_reward_risk: 1.5
+  paper_trading_mode: true
+
+# File/directory locations
+paths:
+  brain_file: data/agent_brain.json
+  sqlite_path: data/portfolio_agent.db
+  excel_output: output/Agent_Orchestrator_Output.xlsx
+  backtest_excel_output: output/Backtest_Report.xlsx
+  log_file: logs/agent.log
+  log_dir: logs
+  output_dir: output
