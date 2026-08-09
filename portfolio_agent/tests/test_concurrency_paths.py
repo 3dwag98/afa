@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 import data_store as data_store_module
 from data_store import DataStore
 from portfolio_agent.config.schema import AppConfig
+from src.monte_carlo import MonteCarloSettings
 from src.orchestrator import _prepare_all_tickers, _prepare_one_ticker
 
 
@@ -180,6 +181,9 @@ class TestParallelTickerPrep:
 
     def test_single_ticker_helper_returns_none_on_failure(self):
         result = _prepare_one_ticker(
-            "BAD.NS", pd.DataFrame({'close': [1.0]}), self.FEATURES, 20, 100, 42, False
+            "BAD.NS",
+            pd.DataFrame({'close': [1.0]}),
+            self.FEATURES,
+            MonteCarloSettings(horizon_days=20, simulations=100, seed=42),
         )
         assert result is None

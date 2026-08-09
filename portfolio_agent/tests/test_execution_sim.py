@@ -38,18 +38,23 @@ class TestTransactionCosts:
         # Brokerage: min(20, 100000 * 0.0003) = min(20, 30) = ₹20
         # STT: 100000 * 0.001 = ₹100
         # Exchange Txn: 100000 * 0.0000345 = ₹3.45
-        # GST: 18% of (20 + 3.45) = 0.18 * 23.45 = ₹4.221
+        # SEBI turnover fee: 100000 * 0.000001 = ₹0.10
+        # GST: 18% of (20 + 3.45 + 0.10) = 0.18 * 23.55 = ₹4.239
         # Stamp Duty: 100000 * 0.00015 = ₹15 (BUY only)
-        # Total: 20 + 100 + 3.45 + 4.221 + 15 = ₹142.671
-        
+        # Total: 20 + 100 + 3.45 + 0.10 + 4.239 + 15 = ₹142.789
+
         expected_brokerage = 20.0
         expected_stt = 100.0
         expected_exchange_txn = 3.45
-        expected_gst_base = expected_brokerage + expected_exchange_txn
+        expected_sebi_fee = 0.10
+        expected_gst_base = expected_brokerage + expected_exchange_txn + expected_sebi_fee
         expected_gst = expected_gst_base * 0.18
         expected_stamp_duty = 15.0
-        expected_total = expected_brokerage + expected_stt + expected_exchange_txn + expected_gst + expected_stamp_duty
-        
+        expected_total = (
+            expected_brokerage + expected_stt + expected_exchange_txn
+            + expected_sebi_fee + expected_gst + expected_stamp_duty
+        )
+
         assert abs(costs - expected_total) < 0.01, f"Expected {expected_total}, got {costs}"
     
     def test_stt_calculation_on_sell_order(self):

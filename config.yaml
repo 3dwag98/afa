@@ -55,6 +55,10 @@ training:
   batch_size: 128
   epochs: 100
   learning_rate: 0.003
+  # Expanding-window walk-forward validation: 5 folds, each re-trained on all
+  # prior data and tested on the next contiguous block. Set to 0 to skip.
+  walk_forward_splits: 5
+  walk_forward_min_train_fraction: 0.4
   device: auto
   use_mixed_precision: true
   num_workers: 2
@@ -77,6 +81,19 @@ risk:
   portfolio_value_inr: 308733.0
   risk_per_trade_pct: 0.01
   max_single_position_pct: 0.03
+  # Fractional-Kelly sizing (off by default; needs real realized trades).
+  # 50 trades is the floor at which a win-rate estimate is worth betting on,
+  # and the win rate is shrunk toward 0.5 with a 20-pseudo-trade Beta prior
+  # before it reaches the Kelly formula.
+  kelly_min_trades: 50
+  kelly_shrinkage_strength: 20.0
+  # Portfolio-level concentration and drawdown guardrails.
+  max_sector_pct: 0.25            # max share of portfolio in any one sector
+  max_portfolio_drawdown_pct: 0.15  # halt new buys past this drawdown
+  drawdown_reentry_pct: 0.10        # resume buying once recovered to here
+  # Per-side slippage assumed when charging round-trip costs against a
+  # signal's reward:risk (realized fills price slippage off ATR and volume).
+  slippage_pct_per_side: 0.0025
 
 # Self-learning weight adaptation
 learning:
@@ -88,6 +105,16 @@ simulation:
   mc_horizon_days: 20
   mc_simulations: 1000
   random_seed: 42
+  # gaussian | block_bootstrap | jump_diffusion. Block bootstrap resamples
+  # contiguous runs of the ticker's own returns, so the simulated tails and
+  # volatility clustering come from real Indian market behaviour rather than
+  # a normal distribution that understates both.
+  method: block_bootstrap
+  block_size_days: 5
+  # Only used when method: jump_diffusion
+  jump_intensity_per_year: 12.0
+  jump_mean: -0.02
+  jump_volatility: 0.05
 
 # Trade compliance / eligibility checks
 compliance:
@@ -102,6 +129,9 @@ paths:
   sqlite_path: data/portfolio_agent.db
   excel_output: output/Agent_Orchestrator_Output.xlsx
   backtest_excel_output: output/Backtest_Report.xlsx
+  # Optional ticker,sector CSV backing risk.max_sector_pct. Without it every
+  # holding is pooled into a single UNKNOWN sector and capped together.
+  sector_map_csv: data/sector_map.csv
   log_file: logs/agent.log
   log_dir: logs
   output_dir: output

@@ -99,11 +99,13 @@ class TestRuleBasedStrategyScoring:
 
     def test_perfect_bullish_gives_buy_with_breakout_trigger(self):
         strategy = RuleBasedStrategy(_strategy_config())
-        # Note: the YAML's default ATR multipliers (1.5 stop / 2.0 target) yield a fixed
-        # reward:risk of 2.0/1.5 ~= 1.33 regardless of ATR magnitude, so min_reward_risk
-        # must be <= that to be satisfiable via pure ATR-derived stop/target.
+        # The YAML's default ATR multipliers (1.5 stop / 2.0 target) yield a fixed
+        # *gross* reward:risk of 2.0/1.5 ~= 1.33 regardless of ATR magnitude. The
+        # strategy now reports reward:risk NET of round-trip friction, which on a
+        # 2%-of-price ATR costs roughly a third of that ratio (~0.83), so
+        # min_reward_risk has to be below the net figure to be satisfiable at all.
         context = StrategyContext(
-            risk=_risk_params(min_reward_risk=1.2),
+            risk=_risk_params(min_reward_risk=0.8),
             weights={"Trend": 25.0, "Breakout": 25.0, "Volume": 20.0, "MC_Prob": 30.0},
             mc_result=_mc_result(0.70),
         )
@@ -115,6 +117,50 @@ class TestRuleBasedStrategyScoring:
         assert sig.signal == "BUY", sig.rationale
         assert sig.score >= 60
         assert sig.trigger == "Breakout"
+
+    def test_reward_risk_is_net_of_round_trip_costs(self):
+        """The reported ratio must be the after-friction one, and strictly worse
+        than gross — otherwise the min_reward_risk gate flatters every trade."""
+        strategy = RuleBasedStrategy(_strategy_config())
+        context = StrategyContext(
+            risk=_risk_params(min_reward_risk=0.8),
+            weights={"Trend": 25.0, "Breakout": 25.0, "Volume": 20.0, "MC_Prob": 30.0},
+            mc_result=_mc_result(0.70),
+        )
+        features = _features(close=150.0, atr_14=3.0)
+
+        sig = strategy.score("TEST", features, context)
+
+        # 2.0x ATR target over 1.5x ATR stop = 1.333 gross, always.
+        assert sig.extra["gross_reward_risk"] == pytest.approx(1.3333, abs=1e-3)
+        assert sig.reward_risk < sig.extra["gross_reward_risk"]
+        assert sig.extra["round_trip_cost_pct"] > 0
+
+    def test_high_cost_assumption_can_flip_buy_to_watch(self):
+        """A setup that passes on gross reward:risk but not on net must not BUY."""
+        strategy = RuleBasedStrategy(_strategy_config())
+        features = _features(close=150.0, sma_50=140.0, sma_200=120.0,
+                             donchian_upper_20=145.0, volume_ratio_20=2.0, atr_14=3.0)
+
+        cheap = _risk_params(min_reward_risk=0.8)
+        cheap.buy_cost_pct = 0.0
+        cheap.sell_cost_pct = 0.0
+        expensive = _risk_params(min_reward_risk=0.8)
+        expensive.buy_cost_pct = 0.02
+        expensive.sell_cost_pct = 0.02
+
+        weights = {"Trend": 25.0, "Breakout": 25.0, "Volume": 20.0, "MC_Prob": 30.0}
+        cheap_sig = strategy.score(
+            "TEST", features,
+            StrategyContext(risk=cheap, weights=weights, mc_result=_mc_result(0.70)),
+        )
+        expensive_sig = strategy.score(
+            "TEST", features,
+            StrategyContext(risk=expensive, weights=weights, mc_result=_mc_result(0.70)),
+        )
+
+        assert cheap_sig.signal == "BUY"
+        assert expensive_sig.signal == "WATCH", expensive_sig.rationale
 
     def test_missing_sma200_lowers_trend_score(self):
         strategy = RuleBasedStrategy(_strategy_config())

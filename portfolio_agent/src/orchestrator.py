@@ -23,13 +23,14 @@ try:
     )
     from .data_store import load_or_fetch_data
     from .indicators import calculate_indicators
-    from .monte_carlo import run_monte_carlo, run_monte_carlo_garch, MonteCarloResult
+    from .monte_carlo import MonteCarloResult, MonteCarloSettings
     from .risk import calculate_position_quantity
     from .compliance import run_compliance_checks
     from .learning import evaluate_and_learn
     from .reporting import export_excel_report
     from .models import Recommendation
     from .outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
+    from .sectors import load_sector_map, sector_capacity_inr, sector_of
     from .logging_utils import get_logger, ContextualLogger
 except ImportError:
     from storage import (
@@ -39,13 +40,14 @@ except ImportError:
     )
     from data_store import load_or_fetch_data
     from indicators import calculate_indicators
-    from monte_carlo import run_monte_carlo, run_monte_carlo_garch, MonteCarloResult
+    from monte_carlo import MonteCarloResult, MonteCarloSettings
     from risk import calculate_position_quantity
     from compliance import run_compliance_checks
     from learning import evaluate_and_learn
     from reporting import export_excel_report
     from models import Recommendation
     from outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
+    from sectors import load_sector_map, sector_capacity_inr, sector_of
     from logging_utils import get_logger, ContextualLogger
 
 
@@ -72,10 +74,7 @@ def _prepare_one_ticker(
     ticker: str,
     df: pd.DataFrame,
     required_features: List[str],
-    mc_horizon_days: int,
-    mc_simulations: int,
-    mc_seed: int,
-    use_garch: bool,
+    mc_settings: MonteCarloSettings,
 ):
     """Indicators + Monte Carlo + features for one ticker.
 
@@ -85,14 +84,7 @@ def _prepare_one_ticker(
     try:
         indicator = calculate_indicators(ticker, df)
         daily_returns = df['close'].pct_change().dropna().tolist()
-        mc_fn = run_monte_carlo_garch if use_garch else run_monte_carlo
-        mc_result = mc_fn(
-            symbol=ticker,
-            daily_returns=daily_returns,
-            horizon_days=mc_horizon_days,
-            simulations=mc_simulations,
-            seed=mc_seed,
-        )
+        mc_result = mc_settings.run(symbol=ticker, daily_returns=daily_returns)
         features = build_features(df, required_features)
         return ticker, indicator, mc_result, features
     except Exception:
@@ -111,13 +103,7 @@ def _prepare_all_tickers(
     parallel path, so downstream scoring, ranking and the exported report do
     not depend on which worker finished first.
     """
-    args = (
-        required_features,
-        config.simulation.mc_horizon_days,
-        config.simulation.mc_simulations,
-        config.simulation.random_seed,
-        config.simulation.use_garch_volatility,
-    )
+    args = (required_features, MonteCarloSettings.from_simulation_config(config.simulation))
 
     if not (config.data.parallel_ticker_prep and len(data) > 1):
         results = []
@@ -158,6 +144,65 @@ def _prepare_all_tickers(
         return results
 
     return [by_ticker[t] for t in data if t in by_ticker]
+
+
+def _scaled_quantity(quantity: int, signal: StrategySignal) -> int:
+    """Apply a signal's `position_scale` to a sized quantity.
+
+    Mirrors BacktestEngine._apply_position_scale so live and backtested
+    sizing cannot drift: strategies that measure their own risk environment
+    (cross-sectional momentum's volatility targeting and market-regime filter,
+    src/regime.py) publish a multiplier in [0, 1], and every sizing rule
+    honours it here rather than each strategy applying it itself.
+    """
+    scale = signal.extra.get("position_scale") if signal.extra else None
+    if scale is None:
+        return quantity
+    try:
+        scale = float(scale)
+    except (TypeError, ValueError):
+        return quantity
+    if scale >= 1.0:
+        return quantity
+    return int(quantity * max(0.0, scale))
+
+
+def _sector_capped_quantity(
+    ticker: str,
+    quantity: int,
+    price: float,
+    config: AppConfig,
+    sector_map: Dict[str, str],
+    planned_sector_values: Dict[str, float],
+    logger,
+) -> int:
+    """Trim a recommendation so its sector stays under risk.max_sector_pct.
+
+    `planned_sector_values` accumulates this run's already-recommended
+    positions, so a set of recommendations that each fit under the cap alone
+    cannot collectively breach it — the failure mode a per-position check
+    would miss entirely.
+    """
+    if config.risk.max_sector_pct <= 0 or config.risk.max_sector_pct >= 1 or price <= 0:
+        return quantity
+
+    capacity = sector_capacity_inr(
+        ticker=ticker,
+        portfolio_value_inr=config.risk.portfolio_value_inr,
+        position_values=planned_sector_values,
+        sector_map=sector_map,
+        max_sector_pct=config.risk.max_sector_pct,
+    )
+    max_quantity = int(capacity / price)
+    if max_quantity >= quantity:
+        return quantity
+
+    logger.info(
+        f"Sector cap trimmed {ticker} from {quantity} to {max(0, max_quantity)} shares "
+        f"(sector '{sector_of(ticker, sector_map)}' at "
+        f"{config.risk.max_sector_pct:.0%} portfolio limit)"
+    )
+    return max(0, max_quantity)
 
 
 def run_orchestrator(
@@ -288,7 +333,22 @@ def run_orchestrator(
                     logger.exception(f"Error scoring ticker {ticker}: {e}")
 
         # Step 10-11: Turn each signal into a Recommendation.
-        for ticker, sig in signals.items():
+        #
+        # BUY candidates are processed highest-score-first so the sector cap
+        # below allocates its remaining capacity to the strongest names, then
+        # everything else follows. Sizing is the live mirror of the backtest
+        # engine's order path: base quantity, then the signal's own
+        # position_scale (volatility targeting / market regime), then the
+        # sector concentration cap.
+        sector_map = load_sector_map(config.paths.sector_map_csv) if config.risk.max_sector_pct > 0 else {}
+        planned_sector_values: Dict[str, float] = {}
+
+        ordered_tickers = sorted(
+            signals,
+            key=lambda t: (signals[t].signal != "BUY", -signals[t].score, t),
+        )
+        for ticker in ordered_tickers:
+            sig = signals[ticker]
             try:
                 mc_result = mc_by_ticker.get(ticker)
 
@@ -301,6 +361,20 @@ def run_orchestrator(
                     config=config,
                     trade_history=brain.trade_history,
                 )
+                quantity = _scaled_quantity(quantity, sig)
+
+                if sig.signal == "BUY" and quantity > 0:
+                    quantity = _sector_capped_quantity(
+                        ticker=ticker,
+                        quantity=quantity,
+                        price=sig.entry_price,
+                        config=config,
+                        sector_map=sector_map,
+                        planned_sector_values=planned_sector_values,
+                        logger=logger,
+                    )
+                    if quantity > 0:
+                        planned_sector_values[ticker] = quantity * sig.entry_price
 
                 # Calculate investment and max loss
                 investment_inr = quantity * sig.entry_price

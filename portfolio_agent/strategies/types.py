@@ -31,10 +31,23 @@ class RiskParams:
     max_single_position_pct: float
     atr_stop_multiplier: float = 1.5
     atr_target_multiplier: float = 2.0
+    # Estimated per-leg friction as a fraction of turnover (brokerage, STT,
+    # exchange and SEBI charges, GST, stamp duty and assumed slippage). Charged
+    # against a signal's reward:risk before any quantity exists, so the
+    # min_reward_risk gate compares net-of-cost trades — see
+    # src/execution_sim.py::cost_fraction_per_side and
+    # src/risk.py::net_reward_risk. Defaults match the platform's default
+    # slippage assumption so hand-built RiskParams (tests, fixtures) are
+    # cost-aware without extra wiring.
+    buy_cost_pct: float = field(default_factory=lambda: _default_cost_pct("BUY"))
+    sell_cost_pct: float = field(default_factory=lambda: _default_cost_pct("SELL"))
 
     @classmethod
     def from_app_config(cls, config: "AppConfig") -> "RiskParams":
         """Build RiskParams from the nested AppConfig."""
+        from portfolio_agent.src.execution_sim import cost_fraction_per_side
+
+        slippage = config.risk.slippage_pct_per_side
         return cls(
             target_prob_profit=config.compliance.target_prob_profit,
             min_reward_risk=config.compliance.min_reward_risk,
@@ -42,7 +55,20 @@ class RiskParams:
             portfolio_value_inr=config.risk.portfolio_value_inr,
             risk_per_trade_pct=config.risk.risk_per_trade_pct,
             max_single_position_pct=config.risk.max_single_position_pct,
+            buy_cost_pct=cost_fraction_per_side("BUY", slippage),
+            sell_cost_pct=cost_fraction_per_side("SELL", slippage),
         )
+
+
+def _default_cost_pct(side: str) -> float:
+    """Per-leg cost fraction at the platform's default slippage assumption.
+
+    Imported lazily: strategies/types.py is imported by the strategy layer,
+    which src/execution_sim.py must not depend on in reverse.
+    """
+    from portfolio_agent.src.execution_sim import cost_fraction_per_side
+
+    return cost_fraction_per_side(side)
 
 
 @dataclass

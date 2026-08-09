@@ -23,9 +23,9 @@ from .weighting import combine_weighted
 from portfolio_agent.config.schema import StrategyConfig
 
 try:
-    from src.risk import calculate_stop_target
+    from src.risk import calculate_stop_target, net_reward_risk
 except ImportError:
-    from risk import calculate_stop_target
+    from risk import calculate_stop_target, net_reward_risk
 
 
 def _clean(value: Any) -> Optional[float]:
@@ -148,13 +148,25 @@ class RuleBasedStrategy(BaseStrategy):
         target_mult = exit_rules.get("take_profit", {}).get("multiplier", context.risk.atr_target_multiplier)
         stop_price, target_price = calculate_stop_target(close, atr, stop_mult, target_mult)
 
+        # Reward:risk is measured net of estimated round-trip friction
+        # (brokerage, STT, exchange and SEBI charges, GST, stamp duty and
+        # slippage) rather than gross, so the min_reward_risk gate below is a
+        # statement about money actually kept — see src/risk.py::net_reward_risk.
         stop_valid = stop_price < close
         if stop_valid:
-            reward = target_price - close
-            risk = close - stop_price
-            reward_risk = reward / risk if risk != 0 else 0.0
+            reward_risk = net_reward_risk(
+                entry_price=close,
+                stop_price=stop_price,
+                target_price=target_price,
+                buy_cost_pct=context.risk.buy_cost_pct,
+                sell_cost_pct=context.risk.sell_cost_pct,
+            )
+            gross_reward_risk = (
+                (target_price - close) / (close - stop_price) if close != stop_price else 0.0
+            )
         else:
             reward_risk = 0.0
+            gross_reward_risk = 0.0
 
         passed_score = final_score >= 60
         passed_prob = prob_profit >= context.risk.target_prob_profit
@@ -198,5 +210,14 @@ class RuleBasedStrategy(BaseStrategy):
             extra={
                 "mc_var_95_pct": round(context.mc_result.var_95, 6) if context.mc_result else 0.0,
                 "mc_cvar_95_pct": round(context.mc_result.cvar_95, 6) if context.mc_result else 0.0,
+                # Reported alongside the (net) reward_risk so the gap between
+                # them is visible: on ATR-tight stops, round-trip friction is a
+                # large fraction of the risk being taken, and a strategy whose
+                # gross ratio clears the gate but whose net ratio does not is
+                # the exact failure this platform is meant to surface.
+                "gross_reward_risk": round(gross_reward_risk, 4),
+                "round_trip_cost_pct": round(
+                    context.risk.buy_cost_pct + context.risk.sell_cost_pct, 6
+                ),
             },
         )

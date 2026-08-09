@@ -41,7 +41,28 @@ class TestMomentumStrategy:
         strategy = MomentumStrategy(_momentum_config())
         assert strategy.name == "momentum"
         assert strategy.requires_full_batch is True
-        assert strategy.required_features() == ["close", "mom_9m_skip1m", "atr_14"]
+        # realized_vol_60 is required for per-position volatility targeting,
+        # not for the ranking metric itself.
+        assert strategy.required_features() == [
+            "close", "mom_9m_skip1m", "atr_14", "realized_vol_60"
+        ]
+
+    def test_min_universe_default_is_statistically_meaningful(self):
+        """A 'top decile' of 5 names is one stock, which is not a ranking."""
+        strategy = MomentumStrategy(_momentum_config())
+        assert strategy.entry_rules()["min_universe"] >= 30
+
+    def test_default_universe_of_ten_is_rejected(self):
+        strategy = MomentumStrategy(_momentum_config())
+        features_by_symbol = {
+            f"SYM{i}": _features(close=100.0, mom_9m_skip1m=i / 100.0) for i in range(1, 11)
+        }
+        context = StrategyContext(risk=_risk_params())
+
+        signals = strategy.score_batch(features_by_symbol, context)
+
+        assert all(s.signal == "AVOID" for s in signals.values())
+        assert "too small" in signals["SYM10"].rationale
 
     def test_custom_name_and_percentile(self):
         strategy = MomentumStrategy(_momentum_config(name="my_momentum", top_percentile=0.2))
@@ -114,6 +135,13 @@ class TestLowVolatilityStrategy:
         assert strategy.name == "low_volatility"
         assert strategy.requires_full_batch is True
         assert strategy.required_features() == ["close", "realized_vol_60", "atr_14"]
+        assert strategy.entry_rules()["min_universe"] >= 30
+
+    def test_regime_filter_off_by_default(self):
+        """Low-volatility is the defensive sleeve — it is meant to keep working
+        through the drawdowns that stand momentum down."""
+        strategy = LowVolatilityStrategy(_low_vol_config())
+        assert strategy.entry_rules()["crash_protection"]["regime_filter"] is False
 
     def test_lowest_volatility_gets_buy(self):
         strategy = LowVolatilityStrategy(_low_vol_config(top_percentile=0.1, min_universe=5))

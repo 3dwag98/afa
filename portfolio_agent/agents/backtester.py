@@ -105,9 +105,19 @@ class BacktesterAgent:
             mc_simulations=self.config.simulation.mc_simulations,
             mc_seed=self.config.simulation.random_seed,
             use_garch_volatility=self.config.simulation.use_garch_volatility,
+            mc_method=self.config.simulation.method,
+            mc_block_size_days=self.config.simulation.block_size_days,
+            mc_jump_intensity_per_year=self.config.simulation.jump_intensity_per_year,
+            mc_jump_mean=self.config.simulation.jump_mean,
+            mc_jump_volatility=self.config.simulation.jump_volatility,
             use_kelly_sizing=self.config.risk.use_kelly_sizing,
             kelly_fraction=self.config.risk.kelly_fraction,
             kelly_min_trades=self.config.risk.kelly_min_trades,
+            kelly_shrinkage_strength=self.config.risk.kelly_shrinkage_strength,
+            max_sector_pct=self.config.risk.max_sector_pct,
+            sector_map_csv=self.config.paths.sector_map_csv,
+            max_portfolio_drawdown_pct=self.config.risk.max_portfolio_drawdown_pct,
+            drawdown_reentry_pct=self.config.risk.drawdown_reentry_pct,
         )
 
         logger.info(f"Running backtest from {start_date} to {end_date} with strategy '{strategy.name}'")
@@ -161,6 +171,12 @@ class BacktesterAgent:
         )
 
         logger.info(f"Backtest complete. Report saved to: {output_file}")
+        if engine.circuit_breaker_log:
+            halts = sum(1 for e in engine.circuit_breaker_log if e['event'] == 'HALT')
+            logger.warning(
+                f"Drawdown circuit breaker tripped {halts} time(s) during this run; "
+                f"see 'circuit_breaker_log' in the returned results"
+            )
 
         return {
             'status': 'success',
@@ -168,6 +184,7 @@ class BacktesterAgent:
             'metrics': analytics_report,
             'trade_count': len(engine.trade_log),
             'strategy': strategy.name,
+            'circuit_breaker_log': engine.circuit_breaker_log,
         }
 
 
