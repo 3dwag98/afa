@@ -323,6 +323,17 @@ class RiskConfig(BaseModel):
         "Kept below max_portfolio_drawdown_pct so the breaker cannot flicker on and off at "
         "the trip point.",
     )
+    drawdown_halt_max_days: int = Field(
+        default=60,
+        description="Trading days after which a halted drawdown breaker re-arms regardless of "
+        "recovery, resetting the equity peak to current equity. Recovery-only re-arming "
+        "deadlocks and does so silently: the breaker halts buying, the open positions exit "
+        "through their own stops, the book is now all cash — and cash cannot appreciate back "
+        "toward a peak it is measured against, so the halt is permanent. A 5-year backtest hit "
+        "exactly this, tripping in month 7 and sitting in cash for four years, which reads in "
+        "the report as a flat equity curve rather than a stuck flag. Set to 0 to disable the "
+        "cooldown and restore recovery-only behaviour.",
+    )
     exit_on_lower_circuit_lock: bool = Field(
         default=True,
         description="Queue an immediate exit when a holding closes pinned at its lower circuit. "

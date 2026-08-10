@@ -119,6 +119,7 @@ class BacktesterAgent:
             sector_map_csv=self.config.paths.sector_map_csv,
             max_portfolio_drawdown_pct=self.config.risk.max_portfolio_drawdown_pct,
             drawdown_reentry_pct=self.config.risk.drawdown_reentry_pct,
+            drawdown_halt_max_days=self.config.risk.drawdown_halt_max_days,
             benchmark_symbol=self.config.data.benchmark_symbol,
             exit_on_lower_circuit_lock=self.config.risk.exit_on_lower_circuit_lock,
             liquidate_on_drawdown_halt=self.config.risk.liquidate_on_drawdown_halt,

@@ -849,3 +849,103 @@ class TestTriggerUMAThroughTheEngine:
         )
 
         assert engine._apply_position_scale(100, half) == 50
+
+
+class TestDrawdownBreakerCooldown:
+    """Recovery-only re-arming deadlocks: the breaker halts buying, the open
+    positions exit through their stops, and a book that is entirely cash can
+    never appreciate back toward the peak it is measured against."""
+
+    @staticmethod
+    def _engine(synthetic_data, **kwargs):
+        params = dict(
+            start_date="2023-01-02",
+            end_date="2023-12-29",
+            initial_capital=1_000_000.0,
+            universe_tickers=synthetic_data['tickers'],
+            max_portfolio_drawdown_pct=0.15,
+            drawdown_reentry_pct=0.10,
+        )
+        params.update(kwargs)
+        return BacktestEngine(**params)
+
+    def test_a_cash_book_re_arms_on_the_cooldown(self, synthetic_data):
+        engine = self._engine(synthetic_data, drawdown_halt_max_days=30)
+        engine.portfolio_value = 800_000.0  # 20% below the initial peak
+
+        engine.trading_day_count = 10
+        engine._update_circuit_breaker(pd.Timestamp("2023-03-01"))
+        assert engine.buying_halted is True
+
+        # Equity frozen: nothing is invested, so it cannot recover on its own.
+        engine.trading_day_count = 39
+        engine._update_circuit_breaker(pd.Timestamp("2023-04-10"))
+        assert engine.buying_halted is True
+
+        engine.trading_day_count = 40
+        engine._update_circuit_breaker(pd.Timestamp("2023-04-11"))
+        assert engine.buying_halted is False
+
+    def test_the_cooldown_resets_the_peak(self):
+        """Without the reset the very next bar trips the breaker again, because
+        the old peak is still 20% above current equity."""
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-12-29",
+            initial_capital=1_000_000.0, universe_tickers=[],
+            max_portfolio_drawdown_pct=0.15, drawdown_reentry_pct=0.10,
+            drawdown_halt_max_days=5,
+        )
+        engine.portfolio_value = 800_000.0
+        engine.trading_day_count = 1
+        engine._update_circuit_breaker(pd.Timestamp("2023-03-01"))
+        engine.trading_day_count = 6
+        engine._update_circuit_breaker(pd.Timestamp("2023-03-08"))
+
+        assert engine.equity_peak == pytest.approx(800_000.0)
+
+        engine.trading_day_count = 7
+        engine._update_circuit_breaker(pd.Timestamp("2023-03-09"))
+        assert engine.buying_halted is False
+
+    def test_the_resume_entry_reports_the_drawdown_that_justified_it(self):
+        """Logging after the peak reset would report a meaningless 0%."""
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-12-29",
+            initial_capital=1_000_000.0, universe_tickers=[],
+            max_portfolio_drawdown_pct=0.15, drawdown_reentry_pct=0.10,
+            drawdown_halt_max_days=5,
+        )
+        engine.portfolio_value = 800_000.0
+        engine.trading_day_count = 1
+        engine._update_circuit_breaker(pd.Timestamp("2023-03-01"))
+        engine.trading_day_count = 6
+        engine._update_circuit_breaker(pd.Timestamp("2023-03-08"))
+
+        resume = [e for e in engine.circuit_breaker_log if e['event'] == 'RESUME'][0]
+        assert resume['drawdown_pct'] == pytest.approx(20.0)
+        assert 'cooldown' in resume['note']
+
+    def test_recovery_still_re_arms_before_the_cooldown(self, synthetic_data):
+        engine = self._engine(synthetic_data, drawdown_halt_max_days=60)
+        engine.portfolio_value = 800_000.0
+        engine.trading_day_count = 1
+        engine._update_circuit_breaker(pd.Timestamp("2023-03-01"))
+
+        engine.portfolio_value = 950_000.0  # 5% below peak
+        engine.trading_day_count = 5
+        engine._update_circuit_breaker(pd.Timestamp("2023-03-06"))
+
+        assert engine.buying_halted is False
+        assert engine.equity_peak == pytest.approx(1_000_000.0)
+
+    def test_the_cooldown_can_be_disabled(self, synthetic_data):
+        """0 restores the recovery-only behaviour for callers that want it."""
+        engine = self._engine(synthetic_data, drawdown_halt_max_days=0)
+        engine.portfolio_value = 800_000.0
+        engine.trading_day_count = 1
+        engine._update_circuit_breaker(pd.Timestamp("2023-03-01"))
+
+        engine.trading_day_count = 5_000
+        engine._update_circuit_breaker(pd.Timestamp("2023-12-01"))
+
+        assert engine.buying_halted is True

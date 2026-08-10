@@ -161,6 +161,7 @@ class BacktestEngine:
         sector_map_csv: Optional[str] = None,
         max_portfolio_drawdown_pct: float = 0.0,
         drawdown_reentry_pct: float = 0.10,
+        drawdown_halt_max_days: int = 60,
         benchmark_symbol: Optional[str] = None,
         exit_on_lower_circuit_lock: bool = True,
         liquidate_on_drawdown_halt: bool = False,
@@ -210,6 +211,11 @@ class BacktestEngine:
                 positions once drawdown from the equity peak reaches this
                 fraction. 0 disables it.
             drawdown_reentry_pct: Drawdown level at which buying resumes.
+            drawdown_halt_max_days: Trading days after which a halted breaker
+                re-arms regardless of recovery, resetting the equity peak to
+                current equity. Without it the breaker deadlocks — see
+                _update_circuit_breaker. 0 disables the cooldown and restores
+                the recovery-only behaviour.
             benchmark_symbol: Optional market index (e.g. "^NSEI") whose cached
                 history drives the momentum crash filter's trend and
                 volatility tests. Without it the filter falls back to a
@@ -315,8 +321,10 @@ class BacktestEngine:
         # Drawdown circuit breaker state.
         self.max_portfolio_drawdown_pct = max_portfolio_drawdown_pct
         self.drawdown_reentry_pct = drawdown_reentry_pct
+        self.drawdown_halt_max_days = drawdown_halt_max_days
         self.equity_peak = initial_capital
         self.buying_halted = False
+        self.halted_since_day: Optional[int] = None
         self.circuit_breaker_log: List[Dict[str, Any]] = []
 
         # Forced-exit triggers (see the constructor docstring).
@@ -1241,6 +1249,24 @@ class BacktestEngine:
         worst. Open positions are left alone — their stops and targets are
         already the exit plan, and force-liquidating a whole book at a
         drawdown trough is how a bad quarter becomes a permanent loss.
+
+        **The cooldown is not optional.** Recovery-only re-arming deadlocks,
+        and does so silently. The breaker halts buying; the open positions then
+        exit through their own stops and targets; the book is now entirely
+        cash. Cash does not appreciate, so equity is frozen at its trough
+        forever — permanently below the re-entry threshold, which is measured
+        against a peak it can no longer approach. A 5-year backtest observed
+        exactly this: the breaker tripped 15% down in month 7 and the strategy
+        sat in cash for the remaining four years, which reads in the report as
+        a flat equity curve rather than as a stuck flag.
+
+        After `drawdown_halt_max_days` trading days halted, the breaker
+        therefore re-arms regardless and **resets the peak to current equity**.
+        Resetting matters as much as re-arming: leaving the old peak in place
+        would put the very next bar straight back over the trip threshold. The
+        reset is an admission of what actually happened — this is the capital
+        the strategy has now, and the drawdown to measure from here is the one
+        that starts today.
         """
         if self.max_portfolio_drawdown_pct <= 0 or self.max_portfolio_drawdown_pct >= 1:
             return
@@ -1251,33 +1277,57 @@ class BacktestEngine:
 
         drawdown = (self.equity_peak - self.portfolio_value) / self.equity_peak
 
-        if not self.buying_halted and drawdown >= self.max_portfolio_drawdown_pct:
-            self.buying_halted = True
+        def _log(event: str, note: str) -> Dict[str, Any]:
             entry = {
                 'date': current_date.strftime('%Y-%m-%d'),
-                'event': 'HALT',
+                'event': event,
                 'drawdown_pct': round(drawdown * 100, 2),
                 'portfolio_value': round(self.portfolio_value, 2),
                 'peak_value': round(self.equity_peak, 2),
+                'note': note,
             }
             self.circuit_breaker_log.append(entry)
+            return entry
+
+        if not self.buying_halted and drawdown >= self.max_portfolio_drawdown_pct:
+            self.buying_halted = True
+            self.halted_since_day = self.trading_day_count
+            entry = _log('HALT', 'drawdown threshold reached')
             logger.warning(
                 f"Drawdown circuit breaker tripped on {entry['date']}: "
                 f"{entry['drawdown_pct']:.2f}% below peak; halting new BUY orders"
             )
-        elif self.buying_halted and drawdown <= self.drawdown_reentry_pct:
+            return
+
+        if not self.buying_halted:
+            return
+
+        if drawdown <= self.drawdown_reentry_pct:
             self.buying_halted = False
-            entry = {
-                'date': current_date.strftime('%Y-%m-%d'),
-                'event': 'RESUME',
-                'drawdown_pct': round(drawdown * 100, 2),
-                'portfolio_value': round(self.portfolio_value, 2),
-                'peak_value': round(self.equity_peak, 2),
-            }
-            self.circuit_breaker_log.append(entry)
+            self.halted_since_day = None
+            entry = _log('RESUME', 'recovered to the re-entry threshold')
             logger.info(
                 f"Drawdown circuit breaker re-armed on {entry['date']}: "
                 f"recovered to {entry['drawdown_pct']:.2f}% below peak; buying resumed"
+            )
+            return
+
+        halted_days = self.trading_day_count - (self.halted_since_day or self.trading_day_count)
+        if self.drawdown_halt_max_days > 0 and halted_days >= self.drawdown_halt_max_days:
+            self.buying_halted = False
+            self.halted_since_day = None
+            entry = _log(
+                'RESUME',
+                f'cooldown of {self.drawdown_halt_max_days} trading days elapsed; '
+                f'peak reset to current equity',
+            )
+            # Reset last: the log entry above should report the drawdown that
+            # justified the cooldown, not the 0% the reset creates.
+            self.equity_peak = self.portfolio_value
+            logger.info(
+                f"Drawdown circuit breaker re-armed on {entry['date']} after "
+                f"{halted_days} halted trading days at {entry['drawdown_pct']:.2f}% "
+                f"below peak; peak reset and buying resumed"
             )
 
     def _is_locked_down(self, ticker: str, current_date: pd.Timestamp) -> bool:
