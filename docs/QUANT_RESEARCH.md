@@ -22,6 +22,10 @@ This document is the mathematical/research foundation behind the platform's stra
 16. [Overnight gaps and GARCH stationarity](#16-overnight-gaps-and-garch-stationarity) — implemented (`src/volatility_models.py`)
 17. [The long-only constraint](#17-the-long-only-constraint) — a known, accepted limitation
 18. [Making the walk-forward measurement honest](#18-making-the-walk-forward-measurement-honest) — implemented (`agents/trainer.py`)
+19. [Combining models: arbitration, not averaging](#19-combining-models-arbitration-not-averaging) — implemented (`src/trigger_engine.py`)
+20. [Forecasting a distribution instead of a point](#20-forecasting-a-distribution-instead-of-a-point) — implemented (`models/pytorch_models.py`, `src/calibration.py`)
+
+Closing: [what to combine into a UMA](#summary-what-to-combine-into-a-uma)
 
 ---
 
@@ -86,7 +90,9 @@ $$
 - Student-\(t\) innovations (\(z_t \sim t_\nu\)) rather than Gaussian, since equity returns — especially in an emerging market with retail-heavy participation and circuit-limit dynamics — are fat-tailed.
 - Fit via maximum likelihood using the `arch` package (Sheppard et al.) rather than hand-rolled optimization — this is standard practice and avoids numerical-optimization bugs.
 
-**Use in the platform:** `src/volatility_models.py::forecast_volatility()` fits this model per ticker and produces a one-step-ahead conditional volatility forecast, used as a (better) input to the same lognormal Monte Carlo machinery in `monte_carlo.py`, and to volatility-targeted position sizing (`risk.py`) — position size scaled inversely to *forecasted* (not just trailing historical) volatility, per the volatility-targeting literature below. Falls back to the existing flat historical-std approach when there isn't enough history to fit GARCH reliably (needs ~250+ observations for stable MLE convergence) or when the `arch` package isn't available.
+**Use in the platform:** `src/volatility_models.py::forecast_volatility()` fits this model per ticker and produces a forward conditional volatility path, used as a (better) input to the lognormal Monte Carlo machinery in `monte_carlo.py` — enable it with `simulation.use_garch_volatility: true`, which is off by default because per-ticker MLE is much slower than the closed-form flat-vol path. It falls back to the flat historical standard deviation when there isn't enough history to fit reliably (~250+ observations for stable convergence) or when the `arch` package isn't installed.
+
+Note what it does *not* currently drive: the volatility-targeting scalar in §12 keys off trailing realized volatility (`realized_vol_60`), not off this forecast. Feeding the GARCH path into position sizing is the natural next step and the literature below supports it, but it is not what the code does today.
 
 **Sources:**
 - [Modeling and Forecasting the Volatility of NIFTY 50 Using GARCH and RNN Models](https://www.mdpi.com/2227-7099/10/5/102)
@@ -107,11 +113,18 @@ $$
 f^{*} = p - \frac{1-p}{b}
 $$
 
-Position size uses a fractional Kelly \(f = \kappa f^{*}\) with \(\kappa \in [0.25, 0.5]\) (configurable; default 0.5), clamped to \([0, \text{max\_single\_position\_pct}]\) so it can never exceed the platform's existing hard position cap, and clamped to \(\ge 0\) (a negative \(f^*\) — an unprofitable edge — falls back to the existing fixed-fractional sizing rather than sizing a "negative" position, since this platform never shorts).
+Position size uses a fractional Kelly \(f = \kappa f^{*}\). \(\kappa\) is configurable through `risk.kelly_fraction` but **hard-capped at 0.25 (quarter-Kelly) at the point of use**, so no config, environment override or test fixture can size above it. The result is clamped to \([0, \text{max\_single\_position\_pct}]\) so Kelly can never exceed the platform's existing hard position cap, and clamped to \(\ge 0\) — a negative \(f^*\) (an unprofitable edge) falls back to fixed-fractional sizing rather than sizing a "negative" position, since this platform never shorts.
 
 \(p\) and \(b\) are estimated from realized trade history, gated by a 50-trade floor and with \(p\) shrunk toward 0.5 by a Beta prior (§12 of this section's rationale applies: over-betting off a noisy estimate costs far more long-run growth than under-betting). With too few realized trades, Kelly sizing falls back to the existing ATR/fixed-fractional sizing (`risk.py::calculate_quantity`).
 
-**Both inputs are measured net of friction.** The backtest trade log's `return_pct` field is a *gross* figure (gross P&L over cost basis), while the WIN/LOSS classification uses `net_pnl` — so feeding the log directly to Kelly paired a net win rate with a gross payoff ratio. Since \(f^*\) is more sensitive to \(b\) than to anything except \(p\), that combination systematically overstates the edge: a trade whose gross reward:risk is 2.0 realizes nearer 1.8 after ~0.8% of round-trip cost. `BacktestEngine._net_return_pct()` recomputes the return from `net_pnl`, which already has brokerage, STT, exchange and SEBI charges, GST, stamp duty and capital-gains tax deducted. \(\kappa\) is additionally hard-capped at 0.25 at the point of use, because a lower-circuit lock (§15) realizes far worse than the modelled stop and biases the measured \(b\) upward in a way no estimator can see.
+**Both inputs are measured net of friction, on both paths.** Stored trade logs are deliberately gross — `return_pct` is the price move, which is what a report should show — and that is the wrong input here for two reasons that both push the same way:
+
+- **\(b\) is overstated.** With ~0.8% of round-trip friction, a trade whose gross reward:risk is 2.0 realizes nearer 1.8. \(f^*\) is more sensitive to \(b\) than to anything except \(p\).
+- **\(p\) is overstated.** A trade that gained 0.3% gross *lost* money. Counting it as a win adds a phantom win and simultaneously drags the average win magnitude down by less than the loss it actually was.
+
+Both call sites therefore restate before estimating, and do it identically. The backtest engine divides `net_pnl` — already net of brokerage, STT, exchange and SEBI charges, GST, stamp duty and capital-gains tax — by the cost basis (`BacktestEngine._net_return_pct`). The live orchestrator restates its stored SQLite history through `risk.py::to_net_realized_trades()` as it loads it into `brain.trade_history`, which also keeps the weight learner and the sizer using one definition of a winning trade.
+
+The quarter-Kelly cap exists on top of all that because a lower-circuit lock (§15) realizes far worse than the modelled stop, biasing the measured \(b\) upward in a way no estimator can see.
 
 **Sources:**
 - Kelly, J. L. (1956), "A New Interpretation of Information Rate", *Bell System Technical Journal*
@@ -201,21 +214,6 @@ The platform's original strategy (`strategies/rule_based.py`, predating this doc
 
 ---
 
-## Summary: what to combine into a UMA
-
-Given the above, a reasonable evidence-backed UMA (see `config/strategies/example_uma.yaml` for the YAML mechanics) blending fully-implemented, orthogonal signals:
-
-| Strategy | Signal type | Data required | Rebalance cadence |
-|---|---|---|---|
-| `rule_based` | Trend/breakout/volume/MC (technical) | OHLCV | Daily |
-| `momentum` | Cross-sectional 9-month momentum | OHLCV | Monthly |
-| `low_volatility` | Cross-sectional trailing volatility | OHLCV | Monthly |
-| `lstm` | Learned sequence pattern | OHLCV | Daily |
-
-Momentum and low-volatility are close to orthogonal in the literature (momentum profits from continuation, low-vol profits from an entirely different risk-pricing anomaly), making them a good `weighted_blend` pair; `rule_based` and `lstm` add faster-moving, daily-refreshed signals on top.
-
----
-
 ## 12. Momentum crash protection
 
 **The problem.** Momentum is the factor most prone to catastrophic, fat-tailed failure, and its crashes are not random draws from a fat tail — they cluster in an identifiable *panic state*: after a bear market, during the rebound, when the recent losers a momentum book is underweight rally hardest and market volatility is elevated. In Indian equities pure momentum has drawn down roughly 45–55% in 2011, 2018 and the COVID crash, and the Nifty 200 Momentum 30 index's worst drawdown (−70.25%) is materially deeper than the Nifty's (−55.12%). A long-only implementation with no volatility scaling and no regime awareness inherits all of that.
@@ -240,7 +238,27 @@ with \(\sigma_{\text{target}} = 20\%\) annualized by default. \(w_{\max} = 1\), 
 
 Both conditions are required for the hard stand-down because the crash literature puts the danger in the *rebound out of* a bear market, not in the decline itself — a quiet downtrend is a warning, so it dampens rather than halts.
 
+**A second, separate classification answers a different question.** The table above says *how much exposure*; it does not say *what kind of market this is*, and those come apart — a directionless chop and a calm uptrend can call for an identical exposure scalar while suiting completely different strategies. `regime.py::classify_regime()` therefore also labels the state, and the meta-orchestrator (§19) keys its model-permission map off that label:
+
+| Classification | Condition |
+|---|---|
+| `BULL_RISK_ON` | index above its 200-day MA, realized vol below target |
+| `BEAR_CRASH_RISK` | index below its 200-day MA, **or** realized vol above 1.5× target |
+| `SIDEWAYS_CHOP` | index within 2% of its 200-day MA **and** ADX below 20 |
+| `NEUTRAL` | above the MA, vol between target and the crash multiple |
+| `UNKNOWN` | not enough history to judge |
+
+Those definitions overlap as stated, so the order of evaluation is load-bearing rather than incidental:
+
+1. **A volatility spike wins first.** Vol above 1.5× target is unambiguous panic wherever price sits, and misreading a crash as a chop would leave mean reversion buying into it.
+2. **Chop is checked before the bear branch's trend clause**, because it is the more specific condition and because an index sitting 1% below its 200-day average in a calm market is a range, not a bear market. Reading "below the MA" literally there would mute the trend sleeves during exactly the drift they handle fine.
+3. Then the trend clauses. What is left — above the average but jittery — is named `NEUTRAL` rather than forced into one of the three, since the strategies suited to a calm uptrend are not the ones suited to a nervous one.
+
+`SIDEWAYS_CHOP` is the only branch needing ADX, and ADX is the only statistic here needing the daily high/low range. A benchmark cached as closes alone falls back to a close-only directional index (`indicators.py::calculate_adx`), which is well defined — true range collapses to \(|\Delta \text{close}|\) — but coarser, and reads somewhat higher than the OHLC version on the same market.
+
 **The market series.** When `data.benchmark_symbol` (default `^NSEI`, the Nifty 50) is cached, the trend and volatility tests key off the real index — "the market is below its 200-day average" is a statement about the index the research studied. Without one, `src/regime.py::build_market_proxy()` falls back to an equal-weighted composite of the traded universe, which needs no extra data but is only a proxy: it reflects whatever is in today's universe, and idiosyncratic noise diversifies out of it in a way real index volatility does not.
+
+That fallback is not a rare edge case, and treating it as one was a live defect. An index only reaches the cache if someone downloads one, so on a default install the classification was `UNKNOWN`, every model was permitted in every regime, and the gating quietly did nothing — with nothing in the logs to say so. The backtest engine and the live orchestrator now both derive the composite when no index is cached, so the map works out of the box. On the repository's own 120-ticker cache it produces a regime series that tracks the market: `BEAR_CRASH_RISK` through the 2022 small-cap drawdown, `BULL_RISK_ON` across 2023, `NEUTRAL` from mid-2024.
 
 The composite averages **daily returns** and cumulates them, rather than averaging rebased price levels. Real universes have ragged start dates and the eligible set changes daily during a backtest; averaging rebased levels makes a newly-listed ticker join at its own base of 1.0 while incumbents sit at 1.4, printing a double-digit synthetic drop on a day every constituent rose — and the filter would read that construction artifact as a trend break and as realized volatility. A return average has no such discontinuity.
 
@@ -307,7 +325,33 @@ So the two cases are separated. With **no map at all** the cap is unenforceable:
 
 ### 13.4 Drawdown circuit breaker
 
-`risk.max_portfolio_drawdown_pct` (15%) halts *new* entries once peak-to-trough drawdown reaches it; buying resumes at `drawdown_reentry_pct` (10%). Two thresholds rather than one, so the breaker cannot flicker on and off as equity wobbles across a single line — and a config validator rejects `drawdown_reentry_pct >= max_portfolio_drawdown_pct`, since that setting re-creates the single-threshold flicker the pair exists to prevent. Open positions keep their stops and targets: force-liquidating a whole book at a drawdown trough is how a bad quarter becomes a permanent loss.
+`risk.max_portfolio_drawdown_pct` (15%) halts *new* entries once peak-to-trough drawdown reaches it; buying resumes at `drawdown_reentry_pct` (10%). Two thresholds rather than one, so the breaker cannot flicker on and off as equity wobbles across a single line — and a config validator rejects `drawdown_reentry_pct >= max_portfolio_drawdown_pct`, since that setting re-creates the single-threshold flicker the pair exists to prevent. Open positions keep their stops and targets by default: force-liquidating a whole book at a drawdown trough is how a bad quarter becomes a permanent loss. `risk.liquidate_on_drawdown_halt` turns that into a full liquidation for mandates where a hard equity floor outranks recovery potential.
+
+**Recovery alone is not a sufficient re-arming condition**, and assuming it was produced a silent deadlock. Halting buys does not freeze the book — open positions keep exiting through their own stops and targets until nothing is left but cash, and cash does not appreciate. Equity is then pinned at its trough, permanently below a re-entry threshold measured against a peak it can no longer approach. In a five-year backtest the breaker tripped in month seven and the strategy sat in cash for the remaining four years, reporting a 15.04% maximum drawdown that actually meant "stopped trading". `risk.drawdown_halt_max_days` (60 trading days) re-arms regardless after a cooldown and resets the equity peak to current equity — resetting matters as much as re-arming, since leaving the old peak in place puts the very next bar back over the trip threshold.
+
+### 13.5 Exit triggers
+
+Stops and targets assume a fill is available near them. Two conditions invalidate that assumption rather than merely arguing against holding, so they force an exit outside the normal rules:
+
+- **Locked at the lower circuit** (`risk.exit_on_lower_circuit_lock`, on by default). On a lock there is no bid, so the modelled stop is not a stop — it is a hope. Every further locked session realizes a loss the sizing never priced, which is the same asymmetry that biases the \(b\) Kelly reads (§4). The exit is queued for the next session, the earliest a real order could work.
+- **The drawdown breaker tripping**, when `liquidate_on_drawdown_halt` is set.
+
+### 13.6 The exit plan has to reach the fill
+
+A defect worth recording because of how quietly it corrupted everything upstream: the backtest engine used to overwrite every filled position's stop and target with a hardcoded 5% / 10% pair, discarding whatever the strategy computed. It was found by an experiment that should have changed the results and did not — widening `atr_stop_multiplier` from 1.5 to 6.0 produced a byte-identical backtest.
+
+The damage was not confined to the exit. `compliance.min_reward_risk` screened signals on a net-of-cost reward:risk derived from ATR levels the engine then ignored, so the platform was gating on one exit plan and trading another; the quantile model's distribution-derived levels (§20) went the same way; and Kelly's \(b\) was estimated from trades exited under the 5/10 rule while the signals feeding it were screened under the ATR rule. On Indian small- and mid-caps a flat 5% stop is roughly one session of noise, which is why backtests showed a 2-day median holding period with 82% of exits at the stop.
+
+Fills now carry the signal's own levels, as *distances* re-applied to the price actually paid — the signal's levels are computed off T−1's close while the fill lands at T+1's open plus slippage, so copying absolute levels across would put a gapped-up entry immediately through its own target.
+
+**The measured consequence, and the configuration lesson.** With the exit plan actually reaching the fill, the same cross-sectional momentum signal over the same universe and window behaves completely differently depending on the stop width:
+
+| `atr_stop_multiplier` | Round trips | Median hold | Stop-loss exits | Gross return on deployed |
+|---|---|---|---|---|
+| 1.5 | 590 | 5 days | 71% | **−2.02%** |
+| 6.0 | 113 | **94 days** | 31% | **+4.44%** |
+
+Momentum forms on a 9-month window (§1). At 1.5× ATR it was exiting in a working week — a multi-month factor traded on a two-day exit rule, paying ~0.8% of round-trip friction each time. The signal has edge; the stop was cutting the thesis short rather than protecting it. **Match the exit horizon to the signal's formation horizon**; the default stays 1.5 because it suits the per-ticker trend/breakout strategy, not because it suits everything.
 
 ---
 
@@ -341,15 +385,19 @@ The rescaling matters: \(t_\nu\) has variance \(\nu/(\nu-2)\), so an unrescaled 
 
 Every ranking formula in this platform assumes continuous price discovery and that a printed close is a price you could have transacted at. On the NSE/BSE mid- and small-cap segments neither holds, in two specific ways that are both detectable from OHLCV alone.
 
-**Circuit locks.** Stocks lock at 5%/10%/20% bands. An operator-driven pump locks a stock in the upper circuit for consecutive sessions: \(P(t)/P(t-J)\) registers a huge formation return and momentum screams BUY, while there is no offer to lift. On the way back down the stock locks in the lower circuit and the position cannot be exited at all, so the realized loss blows through the modelled stop — which in turn inflates the payoff ratio \(b\) that Kelly sizes off (§4).
+**Circuit locks.** Stocks lock at statutory price bands. An operator-driven pump locks a stock in the upper circuit for consecutive sessions: \(P(t)/P(t-J)\) registers a huge formation return and momentum screams BUY, while there is no offer to lift. On the way back down the stock locks in the lower circuit and the position cannot be exited at all, so the realized loss blows through the modelled stop — which in turn inflates the payoff ratio \(b\) that Kelly sizes off (§4). §13.5's exit trigger addresses the down-lock directly.
 
-A locked session is identified by a **zero intraday range** (high == low) together with a move from the prior close that lands on a statutory band. Both conditions are needed: a zero range alone is an untraded day, a band-sized move alone is an ordinary volatile session that traded through a range.
+The ladder is **1/2/5/10/20%**, matched within a tick-rounding tolerance rather than screened by a single "at least 5%" floor. The 1% and 2% bands are the ones exchanges impose ad hoc through the ASM and GSM surveillance frameworks on volatile, news-driven or operator-suspected scrips — that is, on precisely the names most likely to be operator-driven, which makes them the bands that matter most. A floor set at 5% waves them straight through: a small-cap pinned at a 1% upper circuit prints +1% on zero volume, and momentum reads it as strength for a stock nobody can buy.
 
-The ladder is 2/5/10/20%, matched within a tick-rounding tolerance — not a single "at least 5%" floor. Exchanges impose **ad-hoc 2% bands** on volatile, news-driven or operator-suspected scrips, and a floor set at 5% waves those straight through: a small-cap pinned at a 2% upper circuit prints +2% on zero volume, and momentum reads it as strength for a stock nobody can buy. Matching the ladder rather than lowering the floor catches the 2% lock without also classifying every zero-range day above 2% as one; moves beyond the widest band still count, since nothing legitimate moves 20% with no intraday range.
+The matching tolerance narrows with the band. A flat 40 bp window is proportionate around 5% and absurd around 1%, where it would accept anything from 0.6% to 1.4% — half the ordinary quiet days on the tape. Tick rounding on a circuit price is worth a few basis points, not tens. Moves beyond the widest band still count, since nothing legitimate moves 20% with no intraday range.
+
+**Two lock signatures, not one.** The original detector required a **zero intraday range** (high == low) alongside the band-sized move. Both conditions are needed for *that* signature — a zero range alone is an untraded day, a band-sized move alone is an ordinary volatile session — but it only describes the stock that gapped straight to its limit and never traded off it.
+
+The more common footprint is weaker and was being missed entirely: a stock walked up through the session that locks late, closing pinned at the limit (**high == close**) after printing a perfectly real intraday range. `operator_trap_days()` detects that separately. Both are untradeable *at the close*, which is the price every signal in this platform is generated from. The condition is asymmetric on purpose — a lower-circuit close (`low == close`) is a different problem, an exit that cannot be taken rather than an entry that cannot be filled, and is reported by `lower_circuit_locked_days()`.
 
 **The illiquidity illusion.** Low realized volatility is supposed to proxy for a stable business. In India it frequently proxies for *nothing trading*: an illiquid stock carries yesterday's close forward, printing \(r = 0\) rather than a small return, which mechanically suppresses \(\sigma_i\) and walks the stock into the low-volatility buy decile. The anomaly the strategy is trying to harvest is not the one it ends up holding — these "quiet" names carry exactly the governance risk that ends in a forensic audit or a SEBI suspension.
 
-`src/liquidity.py` screens on three trailing-60-session statistics — median rupee turnover, the share of unchanged closes, and the share of circuit-locked sessions — plus a "locked on the decision date" check for whether an order could be filled at all. Screened names are **removed from the ranking**, not merely marked un-buyable: leaving an untradeable stock in the cross-section would still shift every other name's percentile. Statistics that cannot be computed (short cache) pass, since the screen's job is to exclude on positive evidence of untradeability, not on absence of evidence.
+`src/liquidity.py` screens on four trailing-60-session statistics — median rupee turnover, the share of unchanged closes, the share of circuit-locked sessions and the share of upper-circuit closes — plus two "on the decision date" checks for whether an order could be filled at all. Screened names are **removed from the ranking**, not merely marked un-buyable: leaving an untradeable stock in the cross-section would still shift every other name's percentile. Statistics that cannot be computed (short cache) pass, since the screen's job is to exclude on positive evidence of untradeability, not on absence of evidence.
 
 **A related bias this does not fix.** \(p\) and \(b\) estimated only from currently-listed stocks ignore suspensions and delistings, inflating the apparent win rate. The backtest engine does force-liquidate delisted holdings and books the loss, so a *backtest's* Kelly inputs see them; a universe list built from today's constituents still cannot.
 
@@ -397,3 +445,84 @@ Section 12–17's controls are only as good as the evidence that they help, and 
 **Normalization must be causal.** Fitting a scaler over the whole panel before splitting is the classic route to a 2.0 walk-forward Sharpe that dies live, because every training row then knows the future's volatility and price level. `features/pipeline.py::_normalize_features` uses `shift(1)` plus a rolling window, so each row's z-score is computed from strictly prior observations — appending future bars does not change a single earlier value, which is what `test_features.py::TestNormalizationIsCausal` pins. (`features.normalize` is also `false` in the shipped config, so the default path does not normalize at all.)
 
 Reported metrics are directional accuracy plus the annualized Sharpe of a long-only signal-following rule, always against an always-long benchmark on the identical sample. A model that cannot beat always-long is adding turnover, not alpha, and the trainer says so in as many words. The held-out test evaluation reloads the best checkpoint first, so the numbers describe the weights `MLStrategy` will actually load rather than whatever the last epoch of overfitting produced.
+
+---
+
+## 19. Combining models: arbitration, not averaging
+
+Every section above produces *one* opinion. Combining several is its own problem, and the obvious answer is wrong in a specific and expensive way.
+
+**The failure.** A weighted blend maps each member's signal to a strength and takes a weighted mean. Give it a momentum model at BUY with 0.90 conviction and a mean-reversion model at SELL with 0.85, and it reports a mild BUY. But those two models do not disagree *mildly*. They disagree maximally, which is the strongest available evidence that nobody knows what this stock is about to do — and it is precisely the setup that produces whipsaw: entered on a blended signal neither member would have taken alone, then stopped out by whichever of them was right.
+
+Averaging is the correct operation for **estimates of the same quantity**. It is the wrong operation for **votes on a decision**. `src/trigger_engine.py` treats them as votes.
+
+**A common contract.** `StrategySignal` is a trade plan, and its 0-100 `score` means a momentum percentile in one strategy and a forecast probability in another — averaging those is meaningless before it is dangerous. Each member is first flattened into a `ModelVerdict`: a direction, a conviction on a comparable 0-1 scale, an expected value, and two admissibility flags. Conviction maps from the native score (a model emitting SELL at score 15 is 85% convinced, not 15%), and expected value is derived in "R units" from the reward:risk the signal already carries:
+
+$$
+\text{EV}_R = p\,b - (1-p), \qquad \text{EV}_\% = \text{EV}_R \cdot \frac{P_{\text{entry}} - P_{\text{stop}}}{P_{\text{entry}}} \cdot 100
+$$
+
+Deriving it from \(b\) rather than re-costing target and stop is deliberate: \(b\) is already net of the §13 friction stack, and charging it twice would double-count. A model with no probability estimate reports `None`, not zero — otherwise the expected-value hurdle would bite hardest on the models most honest about their uncertainty.
+
+**The conflict penalty.** Buy-side conviction is discounted multiplicatively by the strongest opposing conviction:
+
+$$
+c_{\text{eff}} = c_{\text{buy}} \cdot \big(1 - \max_j c_{\text{opposing},j}\big)
+$$
+
+The 0.90-against-0.85 case leaves 0.135 of usable conviction, not a positive average. An opposing conviction above `conflict_veto_confidence` blocks outright, so the decision's stated reason is "models disagree" rather than a confidence number that happened to land low. An `AVOID` verdict is an *abstention* and carries no opposing weight — a model declining to call a name is not evidence the name is bad.
+
+**Vetoes before arithmetic.** A veto is not a low score to be outweighed. Untradeable instruments (§15), models the regime does not permit (§12), and trades whose expected value misses the hurdle are blocked outright, in that order, before any confidence is combined.
+
+**Firing rules and size.** A trade needs either one genuinely strong model (`strong_single`) or several independent models agreeing (`consensus`) — "several models each mildly positive" is evidence, "one model mildly positive" is noise. What survives is a **position-size multiplier** rather than a boolean: a trade that only just clears its threshold is a trade the evidence only just supports, so it is taken at half size and scales to full size at full conviction.
+
+**Regime-incompatible models are muted, not vetoing.** A veto reading means any single out-of-season sleeve stands the entire book down, which makes the §12 regime map useless — one sleeve being out of season must not stop the sleeve that is in it. `regime_policy: veto` restores the strict reading for callers who want it.
+
+---
+
+## 20. Forecasting a distribution instead of a point
+
+**Why squared error fails here.** MSE is minimized by the conditional mean, and the conditional mean of a 5-day equity return is very close to a constant. A network trained on it converges to a near-constant output that scores excellently on the loss curve and forecasts nothing — the mean-reversion trap, and the most common way a financial deep-learning result is fooled. It also produces a bare point estimate, which §19's expected-value calculation cannot use without inventing a distribution around it.
+
+**Pinball loss.** For quantile \(q\), prediction \(\hat y\) and realized \(y\):
+
+$$
+L_q(y, \hat y) = \max\big(q\,(y - \hat y),\ (q-1)(y - \hat y)\big)
+$$
+
+The penalty is asymmetric, so the minimizer of \(L_{0.9}\) is the true 90th percentile rather than the mean. Fitting \(q \in \{0.1, 0.5, 0.9\}\) jointly means a constant answer cannot satisfy all three at once, and the outer pair is a confidence interval that falls out of the fit rather than being bolted on afterwards — `MLStrategy` derives its stop and target from those percentiles, so a name the model reads as wide gets a wide stop. Quantile crossing is repaired by sorting at inference, which is exact and free, rather than penalized during training, where the penalty would distort the quantiles it was protecting.
+
+**Architecture.** A vanilla LSTM compresses a 60-day multi-feature window into a single hidden vector and predicts from the final timestep, so everything the sequence contained must survive one bottleneck. **PatchTST** (Nie et al.) instead cuts the window into 5-day patches and attends over them: a single day's return is nearly pure noise, a week of them carries a shape worth attending to, and attention costs \(12^2\) rather than \(60^2\). Encoding is **channel-independent** — every feature passes through the same encoder weights separately — because mixing channels inside attention lets the model fit spurious cross-feature relationships that a few years of daily bars cannot support. Per-window instance normalization is what lets one set of weights serve a ₹30 small-cap and a ₹3,000 large-cap.
+
+**Calibration.** A raw network score is not a probability, and networks on noisy financial data are systematically overconfident — the score at which the model says 80% is typically won far less than 80% of the time. That matters more here than in most settings, because the number feeds Kelly (§4) and the §19 expected-value hurdle, both far more sensitive to an optimistic \(p\) than a pessimistic one.
+
+`src/calibration.py` fits an **isotonic** (monotone) map from score to realized win rate by the Pool-Adjacent-Violators Algorithm:
+
+$$
+\min_f \sum_i w_i\,(y_i - f(x_i))^2 \quad \text{subject to } f \text{ non-decreasing}
+$$
+
+Monotonicity is the whole trick: it preserves the model's *ranking*, which is where the alpha is and which walk-forward actually measured, while discarding its *scale*, which nothing measured. The fit runs on the **walk-forward test folds** — the only genuinely out-of-sample scores a training run produces. Fitting on training predictions would measure memorization and hand back a map that makes an overfitted model look perfectly calibrated. Training reports the expected calibration error before and after, so the correction is auditable rather than a black box.
+
+**Sources:**
+- Nie, Nguyen, Sinthong & Kalagnanam, ["A Time Series is Worth 64 Words: Long-term Forecasting with Transformers"](https://arxiv.org/abs/2211.14730), ICLR 2023 (PatchTST)
+- Koenker & Bassett, "Regression Quantiles", *Econometrica* 46(1), 1978 (the pinball loss)
+- Zadrozny & Elkan, ["Transforming Classifier Scores into Accurate Multiclass Probability Estimates"](https://dl.acm.org/doi/10.1145/775047.775151), KDD 2002 (isotonic calibration)
+- Guo, Pleiss, Sun & Weinberger, ["On Calibration of Modern Neural Networks"](https://arxiv.org/abs/1706.04599), ICML 2017
+
+---
+
+## Summary: what to combine into a UMA
+
+Given the above, a reasonable evidence-backed UMA blends the fully-implemented, roughly orthogonal signals. `config/strategies/uma_meta_orchestrator.yaml` is that configuration; `config/strategies/example_uma.yaml` is the minimal two-member version if you want to see the YAML mechanics alone.
+
+| Strategy | Signal type | Data required | Signal horizon |
+|---|---|---|---|
+| `rule_based` | Trend/breakout/volume/MC (technical) | OHLCV | Days |
+| `momentum` | Cross-sectional 9-month momentum | OHLCV | Months |
+| `low_volatility` | Cross-sectional trailing volatility | OHLCV | Months |
+| `lstm` / `patchtst` | Learned sequence pattern | OHLCV | 5-day forward return |
+
+Momentum and low-volatility are close to orthogonal in the literature — momentum profits from continuation, low-vol from an entirely different risk-pricing anomaly — which makes them complementary sleeves; `rule_based` and the neural forecaster add faster-moving signals on top. Use `method: trigger` to combine them (§19), not `weighted_blend`: sleeves this different *will* disagree, and averaging disagreement is how you get a trade none of them wanted.
+
+**The column that is deliberately not here is "rebalance cadence."** The academic constructions rebalance monthly; this platform has no rebalance cadence at all. Every strategy is re-scored every trading day, and a name leaving the top decile simply stops being bought while the position already open rides its stop. That is workable — but only as long as the *exit* horizon matches the signal's, which is what §13.6 measures and why `atr_stop_multiplier` is the single most consequential setting for a months-horizon sleeve.
