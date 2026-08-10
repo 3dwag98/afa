@@ -1017,3 +1017,83 @@ class TestExitTriggerQueueing:
         engine._create_pending_orders({}, lock_date)
 
         assert len([o for o in engine.pending_orders if o['action'] == 'SELL']) == 1
+
+
+class TestExitLevelsComeFromTheSignal:
+    """The engine used to overwrite every strategy's exit plan with a flat
+    5%/10% pair, so `min_reward_risk` screened trades on ATR levels the engine
+    then ignored — gating on one exit plan and trading another."""
+
+    @staticmethod
+    def _engine(synthetic_data):
+        return BacktestEngine(
+            start_date="2023-01-02", end_date="2023-06-30",
+            initial_capital=1_000_000.0, universe_tickers=synthetic_data['tickers'],
+        )
+
+    def test_the_signals_distances_are_preserved(self, synthetic_data):
+        engine = self._engine(synthetic_data)
+        order = {
+            'signal_entry_price': 100.0, 'stop_price': 92.0, 'target_price': 116.0,
+        }
+
+        stop, target = engine._exit_levels(order, fill_price=200.0)
+
+        # 8% below and 16% above, re-applied to the price actually paid.
+        assert stop == pytest.approx(184.0)
+        assert target == pytest.approx(232.0)
+
+    def test_a_wider_atr_stop_produces_a_wider_engine_stop(self, synthetic_data):
+        """The regression: widening atr_stop_multiplier changed nothing,
+        because the engine never read the resulting stop."""
+        engine = self._engine(synthetic_data)
+
+        tight = engine._exit_levels(
+            {'signal_entry_price': 100.0, 'stop_price': 97.0, 'target_price': 104.0}, 100.0
+        )
+        wide = engine._exit_levels(
+            {'signal_entry_price': 100.0, 'stop_price': 88.0, 'target_price': 116.0}, 100.0
+        )
+
+        assert wide[0] < tight[0]
+        assert wide[1] > tight[1]
+
+    def test_a_strategy_with_no_exit_plan_gets_the_documented_fallback(self, synthetic_data):
+        engine = self._engine(synthetic_data)
+
+        stop, target = engine._exit_levels({}, fill_price=100.0)
+
+        assert stop == pytest.approx(95.0)
+        assert target == pytest.approx(110.0)
+
+    @pytest.mark.parametrize("bad", [
+        {'signal_entry_price': 100.0, 'stop_price': 105.0, 'target_price': 120.0},
+        {'signal_entry_price': 100.0, 'stop_price': 0.0, 'target_price': 120.0},
+        {'signal_entry_price': 0.0, 'stop_price': 90.0, 'target_price': 120.0},
+    ])
+    def test_an_unusable_stop_falls_back_rather_than_inverting(self, synthetic_data, bad):
+        """A stop at or above entry would otherwise become a stop *above* the
+        fill price, closing the position on any upward move."""
+        engine = self._engine(synthetic_data)
+
+        stop, _ = engine._exit_levels(bad, fill_price=100.0)
+
+        assert stop < 100.0
+
+    def test_the_exit_plan_travels_from_the_signal_onto_the_order(self, synthetic_data):
+        from portfolio_agent.strategies.types import StrategySignal
+
+        engine = self._engine(synthetic_data)
+        ticker = synthetic_data['tickers'][0]
+        signals = {ticker: StrategySignal(
+            symbol=ticker, signal="BUY", score=90.0, trigger="Momentum",
+            entry_price=100.0, stop_price=91.0, target_price=112.0,
+            reward_risk=1.33, probability_profit=0.6,
+        )}
+
+        engine._create_pending_orders(signals, pd.Timestamp("2023-03-01"))
+
+        buy = [o for o in engine.pending_orders if o['action'] == 'BUY'][0]
+        assert buy['stop_price'] == 91.0
+        assert buy['target_price'] == 112.0
+        assert buy['signal_entry_price'] == 100.0

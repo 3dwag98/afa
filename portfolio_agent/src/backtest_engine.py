@@ -1105,11 +1105,9 @@ class BacktestEngine:
                     self.holdings[ticker] = self.holdings.get(ticker, 0) + quantity
                     self._open_position(ticker, quantity, adjusted_price, execution_date)
 
-                    # Set stop-loss and take-profit levels
-                    # Stop-loss at 5% below entry
-                    self.stop_loss_levels[ticker] = adjusted_price * 0.95
-                    # Take-profit at 10% above entry
-                    self.take_profit_levels[ticker] = adjusted_price * 1.10
+                    stop_level, target_level = self._exit_levels(order, adjusted_price)
+                    self.stop_loss_levels[ticker] = stop_level
+                    self.take_profit_levels[ticker] = target_level
                     
                     # Record BUY trade with all 16 required fields
                     trade_record = {
@@ -1552,8 +1550,71 @@ class BacktestEngine:
                     'action': 'BUY',
                     'quantity': quantity,
                     'execution_date': execution_date,
-                    'trigger': sig.trigger or 'SIGNAL'
+                    'trigger': sig.trigger or 'SIGNAL',
+                    # The signal's own exit plan travels with the order; see
+                    # _exit_levels for why the distances rather than the levels.
+                    'signal_entry_price': sig.entry_price,
+                    'stop_price': sig.stop_price,
+                    'target_price': sig.target_price,
                 })
+
+    # Exit plan used when a strategy supplies no usable stop or target.
+    # Deliberately wide relative to the old hardcoded pair: these are a
+    # fallback for a strategy that declined to specify an exit, not a
+    # replacement for one that did.
+    DEFAULT_STOP_FRACTION = 0.05
+    DEFAULT_TARGET_FRACTION = 0.10
+
+    def _exit_levels(self, order: Dict[str, Any], fill_price: float) -> tuple:
+        """Stop and target for a filled BUY, from the signal that produced it.
+
+        This used to be a hardcoded 5% stop and 10% target, which silently
+        discarded every strategy's own exit plan. The consequences reached well
+        past the exit itself, because the rest of the platform gates on the
+        plan it thought was being used:
+
+        - `atr_stop_multiplier` / `atr_target_multiplier` were dead config.
+        - `min_reward_risk` screened signals on a net-of-cost reward:risk
+          computed from ATR levels the engine then ignored — gating on one exit
+          plan and trading another.
+        - The quantile model's stop and target, derived from its predicted
+          10th/90th percentiles, were thrown away along with them.
+        - Kelly's payoff ratio b was estimated from trades exited under the 5/10
+          rule while the signals feeding it were screened under the ATR rule.
+
+        On Indian small- and mid-caps a flat 5% stop is roughly one session of
+        noise, which is why backtests exited at a 2-day median holding period
+        with 82% of exits at the stop.
+
+        **Distances, not levels.** The signal's stop and target were computed
+        off T-1's close; the fill lands at T+1's open plus slippage. Copying the
+        absolute levels across would put a gapped-up entry immediately through
+        its own target, so the *fractional* distances are preserved and
+        re-applied to the price actually paid.
+
+        Args:
+            order: The pending order, carrying the signal's entry/stop/target.
+            fill_price: Slippage-adjusted execution price.
+
+        Returns:
+            (stop_price, target_price).
+        """
+        signal_entry = float(order.get('signal_entry_price') or 0.0)
+        signal_stop = float(order.get('stop_price') or 0.0)
+        signal_target = float(order.get('target_price') or 0.0)
+
+        stop_fraction = self.DEFAULT_STOP_FRACTION
+        target_fraction = self.DEFAULT_TARGET_FRACTION
+        if signal_entry > 0:
+            if 0 < signal_stop < signal_entry:
+                stop_fraction = (signal_entry - signal_stop) / signal_entry
+            if signal_target > signal_entry:
+                target_fraction = (signal_target - signal_entry) / signal_entry
+
+        return (
+            fill_price * (1.0 - stop_fraction),
+            fill_price * (1.0 + target_fraction),
+        )
 
     @staticmethod
     def _apply_position_scale(quantity: int, signal: StrategySignal) -> int:
