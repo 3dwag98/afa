@@ -263,6 +263,23 @@ class RiskConfig(BaseModel):
     max_single_position_pct: float = Field(
         default=0.03, description="Maximum allocation to a single position"
     )
+    atr_stop_multiplier: float = Field(
+        default=1.5,
+        description="ATR multiple below entry for the stop. **Match this to the signal's own "
+        "horizon.** A measured example: cross-sectional momentum forms on a 9-month window, and "
+        "at 1.5x ATR its positions exited at a 5-day median holding period with 71% of exits at "
+        "the stop, turning a multi-month factor into day-trading and losing 2.0% gross on "
+        "deployed capital. At 6.0x the same signal over the same universe and window held for a "
+        "94-day median and returned +4.4% gross. The stop was cutting the thesis short, not "
+        "protecting it. 1.5 is retained as the default because it suits the per-ticker "
+        "trend/breakout strategy this platform started with; raise it for anything with a "
+        "formation window measured in months.",
+    )
+    atr_target_multiplier: float = Field(
+        default=2.0,
+        description="ATR multiple above entry for the target. Scale it with atr_stop_multiplier "
+        "— the ratio between them is the gross reward:risk every signal is screened on.",
+    )
     use_kelly_sizing: bool = Field(
         default=False,
         description="If True, size positions with fractional-Kelly once enough realized trade "

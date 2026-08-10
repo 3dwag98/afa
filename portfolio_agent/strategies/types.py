@@ -31,6 +31,10 @@ class RiskParams:
     portfolio_value_inr: float
     risk_per_trade_pct: float
     max_single_position_pct: float
+    # ATR multiples defining the exit plan. These reach the fill: the backtest
+    # engine sizes a filled position's stop and target from the signal's own
+    # levels (BacktestEngine._exit_levels), so changing them changes both what
+    # gets screened by min_reward_risk and what actually happens on exit.
     atr_stop_multiplier: float = 1.5
     atr_target_multiplier: float = 2.0
     # Estimated per-leg friction as a fraction of turnover (brokerage, STT,
@@ -57,6 +61,8 @@ class RiskParams:
             portfolio_value_inr=config.risk.portfolio_value_inr,
             risk_per_trade_pct=config.risk.risk_per_trade_pct,
             max_single_position_pct=config.risk.max_single_position_pct,
+            atr_stop_multiplier=config.risk.atr_stop_multiplier,
+            atr_target_multiplier=config.risk.atr_target_multiplier,
             buy_cost_pct=cost_fraction_per_side("BUY", slippage),
             sell_cost_pct=cost_fraction_per_side("SELL", slippage),
         )

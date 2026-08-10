@@ -26,6 +26,7 @@ A lightweight, CLI-first platform for training and backtesting trading strategie
 - [Parallelism](#parallelism)
 - [Configuration](#configuration)
 - [Scheduling (cron / Task Scheduler)](#scheduling-cron--task-scheduler)
+- [Backtest findings and known limitations](#backtest-findings-and-known-limitations)
 - [Testing](#testing)
 - [Project Structure](#project-structure)
 - [Optional: Docker](#optional-docker)
@@ -377,6 +378,91 @@ There's no scheduler baked into the app — run the CLI on your own schedule.
 ```
 
 **Windows (Task Scheduler):** create a task that runs `uv run portfolio-agent run-agent` from the project directory on your desired schedule.
+
+## Backtest findings and known limitations
+
+Running the end-to-end backtest surfaced three defects that no unit test would
+have caught, because each one presents as a *plausible number* rather than an
+error. They are fixed; the findings are recorded here because two of them
+change how the platform should be configured.
+
+**The engine discarded every strategy's exit plan.** Filled positions were
+given a hardcoded 5% stop and 10% target regardless of what the strategy
+computed. That made `atr_stop_multiplier` dead config, and — worse — meant
+`min_reward_risk` screened signals on a net-of-cost reward:risk derived from
+ATR levels the engine then ignored, gating on one exit plan and trading
+another. The quantile model's distribution-derived stop and target went the
+same way, and Kelly's payoff ratio was estimated from trades exited under a
+rule the signals were never screened against. Fills now carry the signal's own
+levels, as distances re-applied to the price actually paid.
+
+**Exit horizon has to match signal horizon, and by default it did not.** Once
+the exit plan actually reached the fill, the same momentum signal over the same
+universe and window behaved completely differently depending on the stop width:
+
+| `atr_stop_multiplier` | Round trips | Median hold | Stop-loss exits | Gross return on deployed | Net P&L |
+|---|---|---|---|---|---|
+| 1.5 (default) | 590 | 5 days | 71% | **−2.02%** | −₹481,861 |
+| 6.0 | 113 | **94 days** | 31% | **+4.44%** | +₹55,807 |
+
+Cross-sectional momentum forms on a 9-month window. At 1.5× ATR it was exiting
+in a working week, which turns a multi-month factor into day-trading and pays
+~0.8% of round-trip friction for the privilege. The signal has edge; the stop
+was cutting the thesis short rather than protecting it. The default stays 1.5
+because it suits the per-ticker trend/breakout strategy the platform started
+with — **set `risk.atr_stop_multiplier` to match your signal's horizon.**
+
+**The drawdown breaker could deadlock.** It halts new buys at 15% drawdown and
+re-arms on recovery to 10%. But halting buys does not freeze the book: open
+positions keep exiting through their stops until only cash is left, and cash
+cannot appreciate back toward a peak it is measured against. A 5-year run
+tripped in month seven and sat in cash for four years, reporting a 15.04% max
+drawdown that actually meant "stopped trading". `risk.drawdown_halt_max_days`
+(60) now re-arms on a cooldown and resets the peak.
+
+### End-to-end results after the fixes
+
+120 tickers, 2021-01 to 2025-12 (~4.3 years of cached data), ₹10L initial
+capital, fractional-Kelly sizing, full friction stack (STT 0.1% both legs,
+stamp duty, GST, exchange and SEBI charges, ATR- and volume-scaled slippage,
+STCG/LTCG), `atr_stop_multiplier: 6.0`:
+
+| | Total return | CAGR | Max DD | Win rate | Profit factor | Sharpe |
+|---|---|---|---|---|---|---|
+| `momentum` alone | **+15.2%** | 3.27% | **12.9%** | 53.4% | 1.60 | −0.40 |
+| Meta-orchestrator UMA | +1.5% | 0.34% | 27.8% | 44.8% | 1.03 | −0.44 |
+
+Read the Sharpe carefully: it is negative *despite* a positive return, because
+`RiskAnalyzer` measures excess return over a 6.5% Indian risk-free rate. A
+3.3% CAGR loses to government bonds. The strategy survives the friction stack —
+profit factor 1.60 net of every cost the simulator models — but it does not
+yet clear the opportunity cost of not trading at all.
+
+The meta-orchestrator underperforming its own momentum sleeve is worth naming
+rather than hiding: on this universe the additional sleeves diluted the one
+that had edge, and the regime map was running off the composite fallback rather
+than a real index. That is a result about this configuration and this data, not
+a verdict on the architecture — but it is the result.
+
+### What is not verified here
+
+- **The performance target is not met.** The roadmap's goal of a net Sharpe
+  above 1.2 with max drawdown under 15% is not reached on the data available in
+  this repository. Max drawdown clears comfortably for the momentum sleeve
+  (12.9%); Sharpe does not, and nothing here should be read as claiming it does.
+- **The cache is ~4.5 years, not 10.** `data/market_data/` starts in 2021, so
+  the 2018 IL&FS crisis and the 2020 COVID crash are outside it. The regime
+  classifier is exercised on the 2022 small-cap drawdown and the 2023 mid-cap
+  rally only.
+- **The universe is an alphabetical slice, not the Nifty 500.**
+  `resolve_backtest_universe(max_tickers=N)` takes the first N cached tickers,
+  which is heavily micro-cap. Decile ranking over that is not the cross-section
+  the research describes.
+- **`^NSEI` is not cached**, so the regime filter runs off the equal-weighted
+  composite of the traded universe rather than the real index. That fallback is
+  what `src/regime.py` was designed for and it produces a sensible regime series
+  (bear through 2022, bull through 2023, neutral from mid-2024), but an index
+  feed is the better gauge.
 
 ## Testing
 
