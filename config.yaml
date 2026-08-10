@@ -108,6 +108,9 @@ risk:
   kelly_fraction: 0.25
   # Portfolio-level concentration and drawdown guardrails.
   max_sector_pct: 0.25            # max share of portfolio in any one sector
+  # Aggregate budget for tickers missing from the sector map, so an incomplete
+  # map cannot become a route around the cap. Inactive when no map is loaded.
+  max_unknown_sector_pct: 0.30
   max_portfolio_drawdown_pct: 0.15  # halt new buys past this drawdown
   drawdown_reentry_pct: 0.10        # resume buying once recovered to here
   # Per-side slippage assumed when charging round-trip costs against a

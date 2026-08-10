@@ -115,6 +115,7 @@ class BacktesterAgent:
             kelly_min_trades=self.config.risk.kelly_min_trades,
             kelly_shrinkage_strength=self.config.risk.kelly_shrinkage_strength,
             max_sector_pct=self.config.risk.max_sector_pct,
+            max_unknown_sector_pct=self.config.risk.max_unknown_sector_pct,
             sector_map_csv=self.config.paths.sector_map_csv,
             max_portfolio_drawdown_pct=self.config.risk.max_portfolio_drawdown_pct,
             drawdown_reentry_pct=self.config.risk.drawdown_reentry_pct,

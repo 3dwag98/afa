@@ -274,6 +274,15 @@ class RiskConfig(BaseModel):
         "one every holding counts as UNKNOWN and the cap applies to that single pooled bucket. "
         "Set to 0 (or >= 1) to disable.",
     )
+    max_unknown_sector_pct: float = Field(
+        default=0.30,
+        description="Aggregate cap on holdings whose ticker is missing from the sector map, as a "
+        "fraction of portfolio value. Wider than max_sector_pct because the pool spans many real "
+        "sectors, but finite: Indian sector maps are chronically incomplete in exactly the "
+        "small/micro-cap segment where concentration risk is worst, so an exempt pool would let "
+        "the entire book concentrate there and satisfy every cap. Only applies when a map is "
+        "loaded — with no map at all every holding is unmapped and the cap is inactive instead.",
+    )
     max_portfolio_drawdown_pct: float = Field(
         default=0.15,
         description="Circuit breaker: once peak-to-trough portfolio drawdown reaches this "

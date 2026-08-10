@@ -22,8 +22,12 @@ segments, neither holds:
 Both are detectable from OHLCV alone:
 
 - A circuit-locked session has **no intraday range** (high == low) together
-  with a move from the prior close at or near a statutory band. A stock that
+  with a move from the prior close landing on a statutory band. A stock that
   genuinely traded flat all day has a range; one pinned at its limit does not.
+  The ladder includes the **2% band** the exchanges impose ad hoc on volatile
+  or operator-suspected scrips, not just the 5/10/20% defaults — a small-cap
+  pinned at a 2% upper circuit prints +2% on zero volume, and a detector
+  keyed to "at least 5%" waves it straight through to the momentum ranking.
 - A zombie prints an unchanged close on a large share of sessions, and/or
   turns over trivial rupee value.
 
@@ -41,16 +45,22 @@ either window or threshold changed.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
 
-# Statutory NSE/BSE price bands. The smallest is what a "locked" move has to
-# clear before a zero-range session is read as a circuit lock rather than a
-# thinly-traded flat day.
-CIRCUIT_BANDS = (0.05, 0.10, 0.20)
-MIN_CIRCUIT_MOVE = 0.045  # just under the 5% band, allowing for tick rounding
+# Statutory NSE/BSE price bands, including the 2% band the exchanges impose
+# ad hoc on volatile, news-driven or operator-suspected scrips. A fixed
+# "must move at least 4.5%" floor missed those entirely: a small-cap pinned at
+# a 2% upper circuit prints +2% on zero range, which momentum reads as
+# strength for a stock nobody can buy.
+CIRCUIT_BANDS = (0.02, 0.05, 0.10, 0.20)
+
+# How far a move may sit from a band and still count as that band. Circuit
+# prices are computed off the previous close and rounded to the tick, so an
+# exact match is not something to rely on.
+CIRCUIT_BAND_TOLERANCE = 0.004
 
 # Screening defaults. Deliberately permissive: they are meant to exclude names
 # that are structurally untradeable, not to second-guess a strategy's ranking.
@@ -60,17 +70,53 @@ DEFAULT_MAX_ZERO_RETURN_FRACTION = 0.30
 DEFAULT_MAX_CIRCUIT_LOCK_FRACTION = 0.10
 
 
-def circuit_locked_days(df: pd.DataFrame, min_move: float = MIN_CIRCUIT_MOVE) -> pd.Series:
+def matches_circuit_band(
+    move: np.ndarray,
+    bands: Sequence[float] = CIRCUIT_BANDS,
+    tolerance: float = CIRCUIT_BAND_TOLERANCE,
+) -> np.ndarray:
+    """Whether each absolute move sits at (or beyond) a statutory price band.
+
+    Band *matching* rather than a single floor. A floor has to be set at the
+    smallest band to catch 2% locks, but then every zero-range day with a >=2%
+    move counts as a lock, including ordinary thin trading. Matching each move
+    against the actual band ladder (2/5/10/20%, within a tick-rounding
+    tolerance) catches the 2% lock without also sweeping up everything above
+    it. Moves beyond the widest band still count — nothing legitimate moves
+    20% with no intraday range.
+
+    Args:
+        move: Absolute returns from the prior close.
+        bands: Statutory band ladder as fractions.
+        tolerance: Absolute tolerance around each band.
+
+    Returns:
+        Boolean array of the same shape.
+    """
+    move = np.asarray(move, dtype=float)
+    matched = np.zeros(move.shape, dtype=bool)
+    for band in bands:
+        matched |= np.abs(move - band) <= tolerance
+    return matched | (move >= max(bands) - tolerance)
+
+
+def circuit_locked_days(
+    df: pd.DataFrame,
+    bands: Sequence[float] = CIRCUIT_BANDS,
+    tolerance: float = CIRCUIT_BAND_TOLERANCE,
+) -> pd.Series:
     """Boolean series marking sessions that locked at a circuit limit.
 
     A locked session is identified by a zero intraday range (high == low)
-    combined with a move from the previous close at or beyond the smallest
-    statutory band. Both conditions are needed: a zero range alone is just an
-    untraded day, and a large move alone is an ordinary volatile session.
+    combined with a move from the previous close that lands on a statutory
+    band. Both conditions are needed: a zero range alone is just an untraded
+    day, and a band-sized move alone is an ordinary volatile session that
+    traded through a range.
 
     Args:
         df: OHLCV frame with 'high', 'low' and 'close' columns.
-        min_move: Minimum absolute move from the prior close to count.
+        bands: Statutory band ladder to match against.
+        tolerance: Absolute tolerance around each band.
 
     Returns:
         Boolean Series aligned to df's index (False where undeterminable).
@@ -86,8 +132,9 @@ def circuit_locked_days(df: pd.DataFrame, min_move: float = MIN_CIRCUIT_MOVE) ->
     prev_close = close.shift(1)
     move = (close / prev_close - 1.0).abs()
     no_range = np.isclose(high, low, rtol=0.0, atol=1e-9)
+    at_band = matches_circuit_band(move.to_numpy(), bands, tolerance)
 
-    return pd.Series(no_range & (move >= min_move), index=df.index).fillna(False)
+    return pd.Series(no_range & at_band, index=df.index).fillna(False)
 
 
 def zero_return_days(df: pd.DataFrame) -> pd.Series:

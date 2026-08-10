@@ -109,7 +109,9 @@ $$
 
 Position size uses a fractional Kelly \(f = \kappa f^{*}\) with \(\kappa \in [0.25, 0.5]\) (configurable; default 0.5), clamped to \([0, \text{max\_single\_position\_pct}]\) so it can never exceed the platform's existing hard position cap, and clamped to \(\ge 0\) (a negative \(f^*\) — an unprofitable edge — falls back to the existing fixed-fractional sizing rather than sizing a "negative" position, since this platform never shorts).
 
-\(p\) and \(b\) are estimated from `AgentBrain.trade_history`, gated by the same `min_trades_for_learning` sample-size threshold already used by the weight-adaptation logic (`strategies/weighting.py`) — with too few realized trades, Kelly sizing falls back to the existing ATR/fixed-fractional sizing (`risk.py::calculate_quantity`) rather than sizing off noisy estimates.
+\(p\) and \(b\) are estimated from realized trade history, gated by a 50-trade floor and with \(p\) shrunk toward 0.5 by a Beta prior (§12 of this section's rationale applies: over-betting off a noisy estimate costs far more long-run growth than under-betting). With too few realized trades, Kelly sizing falls back to the existing ATR/fixed-fractional sizing (`risk.py::calculate_quantity`).
+
+**Both inputs are measured net of friction.** The backtest trade log's `return_pct` field is a *gross* figure (gross P&L over cost basis), while the WIN/LOSS classification uses `net_pnl` — so feeding the log directly to Kelly paired a net win rate with a gross payoff ratio. Since \(f^*\) is more sensitive to \(b\) than to anything except \(p\), that combination systematically overstates the edge: a trade whose gross reward:risk is 2.0 realizes nearer 1.8 after ~0.8% of round-trip cost. `BacktestEngine._net_return_pct()` recomputes the return from `net_pnl`, which already has brokerage, STT, exchange and SEBI charges, GST, stamp duty and capital-gains tax deducted. \(\kappa\) is additionally hard-capped at 0.25 at the point of use, because a lower-circuit lock (§15) realizes far worse than the modelled stop and biases the measured \(b\) upward in a way no estimator can see.
 
 **Sources:**
 - Kelly, J. L. (1956), "A New Interpretation of Information Rate", *Bell System Technical Journal*
@@ -296,7 +298,12 @@ Ranking on one characteristic and buying the extreme decile has no term in the o
 
 `src/sectors.py` caps any one sector at `risk.max_sector_pct` (25% by default), enforced at *order-creation* time in both the backtest engine and the live orchestrator, and accounting for orders queued in the same round — five BUYs in one sector each fit under the cap individually and blow straight through it together.
 
-The map comes from a `ticker,sector` CSV at `paths.sector_map_csv`. **Without one the cap is inactive, and both engines say so at WARNING level.** Pooling unmapped names into a single `UNKNOWN` bucket and capping *that* looks like the conservative choice and is in fact a completely different constraint: with no map at all, every holding is UNKNOWN, so a 25% "sector" limit silently becomes a 25% limit on total invested capital and leaves three quarters of the portfolio in cash forever. An unmapped ticker is likewise never charged against a mapped sector's allowance. A cap that cannot be computed is reported as unenforceable rather than quietly reinterpreted.
+The map comes from a `ticker,sector` CSV at `paths.sector_map_csv`, and unmapped tickers need their own treatment, because both obvious answers are wrong:
+
+- **Capping a pooled `UNKNOWN` bucket at `max_sector_pct`** looks conservative and is a different constraint entirely. With no map at all every holding is UNKNOWN, so a 25% *sector* limit silently becomes a 25% limit on total invested capital and leaves three quarters of the portfolio in cash forever.
+- **Exempting `UNKNOWN` outright** opens a bypass. Indian sector maps are chronically incomplete in exactly the small- and micro-cap segment where concentration risk is worst; a 500-name universe with 200 unmapped tickers could put the entire book into unmapped micro-caps and satisfy every cap.
+
+So the two cases are separated. With **no map at all** the cap is unenforceable: it is reported inactive and both engines log a WARNING, rather than freezing the portfolio. With a **partial map**, each mapped sector gets `max_sector_pct` and the whole unmapped pool gets its own wider budget, `risk.max_unknown_sector_pct` (30%) — finite, so an incomplete map is not a route around the limit. Unmapped exposure is never charged against a mapped sector's allowance either way.
 
 ### 13.4 Drawdown circuit breaker
 
@@ -314,7 +321,15 @@ The original Monte Carlo drew i.i.d. Gaussian shocks around a historical mean an
 - **`jump_diffusion`** — Merton: Gaussian diffusion plus a compound-Poisson jump component, \(N \sim \text{Poisson}(\lambda/252)\) jumps per day of size \(\sim \mathcal{N}(\mu_J, \sigma_J^2)\) with \(\mu_J < 0\). Diffusion cannot produce a gap; jumps can. The drift is jump-compensated, so adding jump risk widens the tails without also quietly shifting every expected return downward.
 - **`gaussian`** — the original, retained for comparison.
 
-All three compose with the GARCH volatility path (§3, §16): GARCH sets how large tomorrow's shocks should be, `method` sets what shape they take. A method whose preconditions do not hold — a block bootstrap over fewer than 60 observations just re-prints the same few days — degrades to the Gaussian path rather than failing the ticker, since a missing MC result is read downstream as zero probability-of-profit.
+All three compose with the GARCH volatility path (§3, §16): GARCH sets how large tomorrow's shocks should be, `method` sets what shape they take.
+
+**The innovation distribution has to travel with the volatility path.** GJR-GARCH is fitted with `dist="t"` precisely because Indian returns are fat-tailed — and the fitted degrees of freedom \(\nu\) are the estimate that fitting produces. Dropping \(\nu\) and simulating Gaussian shocks off a fat-tailed fit throws that estimate away and leaves VaR and CVaR optimistic in exactly the 5% tail `compliance.target_prob_profit` reads. `GarchForecast.distribution_df` now carries \(\nu\) through to the simulation, where shocks are drawn as standardized Student-t:
+
+$$
+z = \frac{t_\nu}{\sqrt{\nu / (\nu - 2)}}
+$$
+
+The rescaling matters: \(t_\nu\) has variance \(\nu/(\nu-2)\), so an unrescaled draw would inflate every path's volatility *as well as* widening its tails, and the two effects would be impossible to separate. A fit landing at \(\nu \le 2\) has infinite variance and is discarded in favour of Gaussian draws. This applies to the `gaussian` method and to `jump_diffusion`'s diffusion leg; `block_bootstrap` inherits the empirical tail shape by construction and ignores it. A method whose preconditions do not hold — a block bootstrap over fewer than 60 observations just re-prints the same few days — degrades to the Gaussian path rather than failing the ticker, since a missing MC result is read downstream as zero probability-of-profit.
 
 **Sources:**
 - Politis & Romano, ["The Stationary Bootstrap"](https://www.tandfonline.com/doi/abs/10.1080/01621459.1994.10476870), *JASA* 89(428), 1994
@@ -328,7 +343,9 @@ Every ranking formula in this platform assumes continuous price discovery and th
 
 **Circuit locks.** Stocks lock at 5%/10%/20% bands. An operator-driven pump locks a stock in the upper circuit for consecutive sessions: \(P(t)/P(t-J)\) registers a huge formation return and momentum screams BUY, while there is no offer to lift. On the way back down the stock locks in the lower circuit and the position cannot be exited at all, so the realized loss blows through the modelled stop — which in turn inflates the payoff ratio \(b\) that Kelly sizes off (§4).
 
-A locked session is identified by a **zero intraday range** (high == low) together with a move from the prior close at or beyond the smallest statutory band. Both conditions are needed: a zero range alone is an untraded day, a large move alone is an ordinary volatile session.
+A locked session is identified by a **zero intraday range** (high == low) together with a move from the prior close that lands on a statutory band. Both conditions are needed: a zero range alone is an untraded day, a band-sized move alone is an ordinary volatile session that traded through a range.
+
+The ladder is 2/5/10/20%, matched within a tick-rounding tolerance — not a single "at least 5%" floor. Exchanges impose **ad-hoc 2% bands** on volatile, news-driven or operator-suspected scrips, and a floor set at 5% waves those straight through: a small-cap pinned at a 2% upper circuit prints +2% on zero volume, and momentum reads it as strength for a stock nobody can buy. Matching the ladder rather than lowering the floor catches the 2% lock without also classifying every zero-range day above 2% as one; moves beyond the widest band still count, since nothing legitimate moves 20% with no intraday range.
 
 **The illiquidity illusion.** Low realized volatility is supposed to proxy for a stable business. In India it frequently proxies for *nothing trading*: an illiquid stock carries yesterday's close forward, printing \(r = 0\) rather than a small return, which mechanically suppresses \(\sigma_i\) and walks the stock into the low-volatility buy decile. The anomaly the strategy is trying to harvest is not the one it ends up holding — these "quiet" names carry exactly the governance risk that ends in a forensic audit or a SEBI suspension.
 
@@ -376,5 +393,7 @@ Section 12–17's controls are only as good as the evidence that they help, and 
 **Folds must split by date, not by row.** The stacked training panel is ordered *[every ticker's train block][every val block][every test block]*, an ordering chosen so `create_dataloaders()`'s single 70/15/15 index split represents every ticker. A row-index split of that same panel is not chronological: fold 1's "future" test rows and its training rows cover the *same calendar dates* for different tickers. Walk-forward therefore works from per-ticker frames (`load_panel_by_ticker()`) and splits each by date, concatenating the blocks afterwards — which keeps each ticker's rows contiguous, as the sequence windows require, while guaranteeing no training row is dated at or after its fold's test period.
 
 **Forward-looking labels need an embargo.** With a 5-day forward target, the last five training rows before a boundary carry labels computed from prices *inside* the test period. Those rows are dropped, or the model is fitted against labels encoding the moves it is about to be scored on.
+
+**Normalization must be causal.** Fitting a scaler over the whole panel before splitting is the classic route to a 2.0 walk-forward Sharpe that dies live, because every training row then knows the future's volatility and price level. `features/pipeline.py::_normalize_features` uses `shift(1)` plus a rolling window, so each row's z-score is computed from strictly prior observations — appending future bars does not change a single earlier value, which is what `test_features.py::TestNormalizationIsCausal` pins. (`features.normalize` is also `false` in the shipped config, so the default path does not normalize at all.)
 
 Reported metrics are directional accuracy plus the annualized Sharpe of a long-only signal-following rule, always against an always-long benchmark on the identical sample. A model that cannot beat always-long is adding turnover, not alpha, and the trainer says so in as many words. The held-out test evaluation reloads the best checkpoint first, so the numbers describe the weights `MLStrategy` will actually load rather than whatever the last epoch of overfitting produced.
