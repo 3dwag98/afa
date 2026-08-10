@@ -137,7 +137,13 @@ class StrategyConfig(BaseModel):
 class TrainingConfig(BaseModel):
     """Configuration for model training."""
 
-    model: str = Field(default="lstm", description="Model architecture to use")
+    model: str = Field(
+        default="lstm",
+        description="Registered model architecture (see models/registry.py). 'patchtst' is the "
+        "recommended one: it attends over 5-day patches rather than squeezing a 60-day window "
+        "through a single LSTM hidden state, and encodes each feature channel with shared weights "
+        "so attention cannot fit spurious cross-feature relationships.",
+    )
     target: str = Field(
         default="return_5d", description="Target variable for prediction"
     )
@@ -496,8 +502,12 @@ class PathsConfig(BaseModel):
     sector_map_csv: str = Field(
         default="data/sector_map.csv",
         description="CSV mapping tickers to sectors (columns: ticker,sector) used to enforce "
-        "risk.max_sector_pct. Optional — when absent, every holding is pooled into a single "
-        "UNKNOWN sector and the cap applies to that pool.",
+        "risk.max_sector_pct. Optional, but note what 'absent' means: with no map at all the "
+        "sector cap is reported INACTIVE and both engines log a warning, rather than falling back "
+        "to capping a single pooled UNKNOWN bucket — that fallback would constrain total invested "
+        "capital instead of sector concentration, leaving most of the portfolio in cash forever. "
+        "A partial map gives each mapped sector max_sector_pct and the unmapped pool its own "
+        "max_unknown_sector_pct.",
     )
     log_file: str = Field(default="logs/agent.log", description="Path to the log file")
     log_dir: str = Field(default="logs", description="Directory for log files")

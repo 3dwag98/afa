@@ -63,6 +63,10 @@ strategy:
 
 # Training configuration
 training:
+  # lstm | patchtst. PatchTST is the recommended one: it attends over 5-day
+  # patches instead of squeezing a 60-day window through a single LSTM hidden
+  # state, and encodes each feature channel with shared weights so attention
+  # cannot fit spurious cross-feature relationships.
   model: lstm
   target: return_5d
   sequence_length: 60
@@ -70,10 +74,23 @@ training:
   batch_size: 128
   epochs: 100
   learning_rate: 0.003
+  # quantile | mse. Squared error is minimized by the conditional mean, and the
+  # conditional mean of a 5-day return is nearly constant — so an MSE-trained
+  # network collapses to a near-constant output that validates beautifully and
+  # forecasts nothing. Pinball loss over the quantiles below asks for a
+  # distribution instead, which a constant cannot satisfy, and hands the
+  # trigger engine a native confidence interval.
+  loss: quantile
+  quantiles: [0.1, 0.5, 0.9]
+  # Fit an isotonic score -> win-rate map on the walk-forward test folds and
+  # ship it with the checkpoint. Networks on noisy financial data are
+  # systematically overconfident, and this score feeds Kelly sizing.
+  calibrate_confidence: true
   # Expanding-window walk-forward validation: 5 folds, each re-trained on all
   # prior data and tested on the next contiguous block. Set to 0 to skip.
   walk_forward_splits: 5
   walk_forward_min_train_fraction: 0.4
+  walk_forward_epochs: null   # default: min(20, epochs) — folds estimate, they don't ship
   device: auto
   use_mixed_precision: true
   num_workers: 2
@@ -96,7 +113,21 @@ risk:
   portfolio_value_inr: 308733.0
   risk_per_trade_pct: 0.01
   max_single_position_pct: 0.03
+  # The exit plan, in ATR multiples. These reach the fill: a filled position's
+  # stop and target are sized from the signal's own levels, so changing them
+  # changes both what min_reward_risk screens and what actually happens on exit.
+  #
+  # MATCH THESE TO YOUR SIGNAL'S HORIZON. Cross-sectional momentum forms on a
+  # 9-month window; at 1.5x ATR its positions exited at a 5-day median holding
+  # period and lost 2.0% gross, while at 6.0x the same signal over the same
+  # data held for 94 days and returned +4.4% gross. The stop was cutting the
+  # thesis short, not protecting it. 1.5/2.0 is kept as the default because it
+  # suits the per-ticker trend/breakout strategy (which overrides the target to
+  # 3.0x in its own YAML); raise it for anything forming over months.
+  atr_stop_multiplier: 1.5
+  atr_target_multiplier: 2.0
   # Fractional-Kelly sizing (off by default; needs real realized trades).
+  use_kelly_sizing: false
   # 50 trades is the floor at which a win-rate estimate is worth betting on,
   # and the win rate is shrunk toward 0.5 with a 20-pseudo-trade Beta prior
   # before it reaches the Kelly formula.
@@ -113,6 +144,20 @@ risk:
   max_unknown_sector_pct: 0.30
   max_portfolio_drawdown_pct: 0.15  # halt new buys past this drawdown
   drawdown_reentry_pct: 0.10        # resume buying once recovered to here
+  # Trading days after which a halted breaker re-arms anyway, resetting the
+  # equity peak. Recovery-only re-arming deadlocks: halting buys does not stop
+  # open positions exiting through their stops, and a book that is entirely
+  # cash cannot appreciate back toward the peak it is measured against. Set to
+  # 0 for the old recovery-only behaviour.
+  drawdown_halt_max_days: 60
+  # Exit a holding that closed pinned at its lower circuit, at the next
+  # session. Waiting for the modelled stop means waiting for a bid that is not
+  # there, and every further locked session realizes a loss sizing never priced.
+  exit_on_lower_circuit_lock: true
+  # Also sell the whole book when the breaker trips. Off by default: open
+  # positions already carry stops, and force-liquidating at a drawdown trough
+  # is how a bad quarter becomes a permanent loss.
+  liquidate_on_drawdown_halt: false
   # Per-side slippage assumed when charging round-trip costs against a
   # signal's reward:risk (realized fills price slippage off ATR and volume).
   slippage_pct_per_side: 0.0025
@@ -148,9 +193,10 @@ compliance:
   target_prob_profit: 0.55
   # Applied to reward:risk measured NET of round-trip friction (~0.79% of
   # turnover), which is a materially harder test than the gross ratio this
-  # threshold used to compare against. With the 1.5x/3.0x ATR exits above,
-  # net RR runs ~1.2-1.7 across realistic ATR levels, so 1.2 is a gate the
-  # strategy can actually clear on good setups and fail on marginal ones.
+  # threshold used to compare against. With the rule-based strategy's 1.5x/3.0x
+  # ATR exits (set in config/strategies/trend_breakout.yaml), net RR runs
+  # ~1.2-1.7 across realistic ATR levels, so 1.2 is a gate good setups clear
+  # and marginal ones fail.
   min_reward_risk: 1.2
   paper_trading_mode: true
 
@@ -160,8 +206,12 @@ paths:
   sqlite_path: data/portfolio_agent.db
   excel_output: output/Agent_Orchestrator_Output.xlsx
   backtest_excel_output: output/Backtest_Report.xlsx
-  # Optional ticker,sector CSV backing risk.max_sector_pct. Without it every
-  # holding is pooled into a single UNKNOWN sector and capped together.
+  # Optional ticker,sector CSV backing risk.max_sector_pct. With NO map the cap
+  # is inactive and both engines log a warning — capping a single pooled
+  # UNKNOWN bucket would limit total invested capital rather than sector
+  # concentration, freezing three quarters of the portfolio in cash. With a
+  # PARTIAL map, mapped sectors get max_sector_pct each and the unmapped pool
+  # gets max_unknown_sector_pct.
   sector_map_csv: data/sector_map.csv
   log_file: logs/agent.log
   log_dir: logs
