@@ -574,16 +574,28 @@ Combine registered strategies in a YAML file — no Python required:
 ```yaml
 # portfolio_agent/config/strategies/my_uma.yaml
 name: "Trend + Mean Reversion"
-method: weighted_blend      # or "vote"
-vote:
-  mode: majority            # "majority" or "unanimous"; only used by method: vote
+method: trigger             # or "weighted_blend" / "vote"
+
+trigger:
+  mode: strong_or_consensus # one convinced model, or several agreeing ones
+  strong_confidence: 0.75
+  consensus_confidence: 0.55
+  min_consensus_models: 2
+  min_net_ev_pct: 0.5       # % of entry, net of round-trip friction
+  conflict_veto_confidence: 0.5
+
+# Optional: which members may buy in which market state (src/regime.py).
+# Unlisted members are muted, not vetoed. An unmapped regime permits all.
+regimes:
+  BULL_RISK_ON: [trend_rules]
+  SIDEWAYS_CHOP: [reversion]
 
 members:
   - type: rule_based
-    weight: 0.5
+    name: trend_rules       # what `regimes:` refers to; must be unique
     config_path: config/strategies/trend_breakout.yaml
   - type: mean_reversion
-    weight: 0.5
+    name: reversion
     params:
       rsi_floor: 25
 ```
@@ -595,8 +607,30 @@ portfolio-agent list-strategies --name ensemble --strategy-config portfolio_agen
 
 | Method | How it decides | Use when |
 |---|---|---|
-| `weighted_blend` | Signals map to a strength (BUY=1, WATCH=0.3, HOLD=0, AVOID=-0.3, SELL=-1) and are averaged by weight; score and prices are weighted averages too | Mixing strategies of different character |
-| `vote` | Each member casts a BUY/SELL/HOLD vote; `majority` needs >50%, `unanimous` needs all | You want fewer, higher-conviction signals |
+| `trigger` | Members become `ModelVerdict`s and go through `src/trigger_engine.py`: buy-side conviction is discounted by the strongest opposing conviction, hard vetoes apply for tradability / regime / expected value, and the output carries a position-size multiplier | **Anything trading real money**, and mandatory for cross-sectional members |
+| `weighted_blend` | Signals map to a strength (BUY=1, WATCH=0.3, HOLD=0, AVOID=-0.3, SELL=-1) and are averaged by weight; score and prices are weighted averages too | Members that rarely conflict, and backwards compatibility |
+| `vote` | Each member casts a BUY/SELL/HOLD vote; `majority` needs >50%, `unanimous` needs all | You want fewer, higher-conviction signals without sizing |
+
+Why `trigger` matters: a weighted blend of a BUY at 0.90 conviction and a SELL
+at 0.85 reports a mild BUY. But those two models do not disagree mildly — they
+disagree maximally, which is the strongest available evidence that nobody knows
+what the stock is about to do, and it is exactly the setup that produces
+whipsaw. Averaging is the right operation for estimates of the same quantity
+and the wrong one for votes on a decision.
+
+Two rules to know when composing one:
+
+- Cross-sectional members (`momentum`, `low_volatility`) require
+  `method: trigger`, which scores every member across the whole eligible
+  universe before arbitrating. The averaging methods combine through per-ticker
+  `score()`, where decile ranking degenerates to a universe of one, so they
+  reject such members at construction.
+- A member's name comes from `name:` on the member (or `params.name`, or the
+  strategy's own name), and names must be unique — the trigger engine treats
+  each verdict as an independent voice, so a repeat double-counts one model.
+
+See `config/strategies/uma_meta_orchestrator.yaml` for the full four-sleeve,
+regime-gated production configuration.
 
 Weights are ignored by `vote`. A UMA is itself a strategy, so it can be nested
 inside another UMA.
