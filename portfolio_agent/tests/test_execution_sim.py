@@ -15,7 +15,67 @@ from pathlib import Path
 src_path = Path(__file__).parent.parent / 'src'
 sys.path.insert(0, str(src_path))
 
-from execution_sim import ExecutionSimulator
+from execution_sim import (
+    DEFAULT_SLIPPAGE_PCT_PER_SIDE,
+    ExecutionSimulator,
+    cost_fraction_per_side,
+    round_trip_cost_pct,
+)
+
+
+class TestRoundTripCostEstimate:
+    """The quantity-free estimator the strategy layer gates signals on."""
+
+    def test_buy_leg_costs_more_than_sell_leg_by_stamp_duty(self):
+        buy = cost_fraction_per_side('BUY', slippage_pct=0.0)
+        sell = cost_fraction_per_side('SELL', slippage_pct=0.0)
+
+        assert buy - sell == pytest.approx(ExecutionSimulator.STAMP_DUTY_RATE)
+
+    def test_includes_every_statutory_charge(self):
+        buy = cost_fraction_per_side('BUY', slippage_pct=0.0)
+
+        brokerage = ExecutionSimulator.BROKERAGE_PERCENT
+        exchange = ExecutionSimulator.EXCHANGE_TXN_CHARGE_RATE
+        sebi = ExecutionSimulator.SEBI_TURNOVER_FEE_RATE
+        expected = (
+            brokerage
+            + ExecutionSimulator.STT_RATE
+            + exchange
+            + sebi
+            + (brokerage + exchange + sebi) * ExecutionSimulator.GST_RATE
+            + ExecutionSimulator.STAMP_DUTY_RATE
+        )
+        assert buy == pytest.approx(expected)
+
+    def test_slippage_is_added_on_top(self):
+        without = cost_fraction_per_side('SELL', slippage_pct=0.0)
+        with_slippage = cost_fraction_per_side('SELL', slippage_pct=0.005)
+
+        assert with_slippage - without == pytest.approx(0.005)
+
+    def test_round_trip_is_the_sum_of_both_legs(self):
+        assert round_trip_cost_pct(slippage_pct=0.001) == pytest.approx(
+            cost_fraction_per_side('BUY', 0.001) + cost_fraction_per_side('SELL', 0.001)
+        )
+
+    def test_default_round_trip_lands_in_the_documented_range(self):
+        """0.5-1.5% per round trip is the band that erodes the Indian momentum
+        premium under monthly rebalancing — the default assumption must sit in
+        it, not an order of magnitude away."""
+        assert 0.005 < round_trip_cost_pct() < 0.015
+        assert DEFAULT_SLIPPAGE_PCT_PER_SIDE == 0.0025
+
+    def test_percentage_brokerage_is_an_upper_bound_on_realized_brokerage(self):
+        """The estimator uses the 0.03% rate; the flat ₹20 cap can only ever
+        make the realized rate lower, so the estimate stays conservative."""
+        sim = ExecutionSimulator()
+        for turnover in (10_000.0, 66_667.0, 1_000_000.0):
+            realized = sim.calculate_transaction_costs('BUY', 100.0, 1, turnover)
+            estimated = cost_fraction_per_side('BUY', slippage_pct=0.0) * turnover
+            # At exactly ₹66,667 the two brokerage rules coincide, so allow for
+            # float round-off rather than demanding a strict inequality there.
+            assert estimated >= realized * (1 - 1e-9)
 
 
 class TestTransactionCosts:

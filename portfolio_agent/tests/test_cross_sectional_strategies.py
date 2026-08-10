@@ -184,3 +184,155 @@ class TestEnsembleRejectsFullBatchMembers:
 
         with pytest.raises(ValueError, match="requires the full eligible universe"):
             EnsembleStrategy(config)
+
+
+def _universe(n_symbols=40, n=400, start=100, end=200, noise=0.004, atr=2.0, vol=0.20, seed=1):
+    """A universe with real price history, so the regime filter has something
+    to assess (a one-row fixture leaves it fail-neutral).
+
+    Every symbol shares one market shock series plus a small idiosyncratic
+    wobble. That common factor is the point: independent per-symbol noise
+    averages out of the equal-weighted composite, so a universe of 40
+    independently-noisy stocks looks *calm* at the market level no matter how
+    wild each one is — which is exactly the diversification a market-wide
+    crash does not offer.
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    ramp = np.linspace(start, end, n)
+    market_shock = rng.normal(0.0, noise, n)
+
+    universe = {}
+    for i in range(1, n_symbols + 1):
+        idio = rng.normal(0.0, noise * 0.1, n)
+        universe[f"SYM{i:02d}"] = pd.DataFrame({
+            "close": ramp * (1.0 + market_shock + idio),
+            "atr_14": [atr] * n,
+            "mom_9m_skip1m": [i / 100.0] * n,
+            "realized_vol_60": [vol] * n,
+        })
+    return universe
+
+
+class TestMomentumCrashProtection:
+    def test_stands_down_in_the_crash_regime(self):
+        """Falling market plus a volatility spike is the state momentum
+        crashes in — the top decile becomes WATCH, not BUY."""
+        strategy = MomentumStrategy(_momentum_config(top_percentile=0.1))
+        crash = _universe(n_symbols=40, n=400, start=200, end=100, noise=0.05)
+        context = StrategyContext(risk=_risk_params())
+
+        signals = strategy.score_batch(crash, context)
+
+        assert not any(s.signal == "BUY" for s in signals.values())
+        top = signals["SYM40"]
+        assert top.signal == "WATCH"
+        assert top.extra["regime"] == "crash_risk"
+        assert top.extra["position_scale"] == 0.0
+        assert "crash risk" in top.rationale
+
+    def test_buys_the_top_decile_in_a_calm_uptrend(self):
+        strategy = MomentumStrategy(_momentum_config(top_percentile=0.1))
+        calm = _universe(n_symbols=40, n=400, start=100, end=200, noise=0.004)
+        context = StrategyContext(risk=_risk_params())
+
+        signals = strategy.score_batch(calm, context)
+
+        assert signals["SYM40"].signal == "BUY"
+        assert signals["SYM40"].extra["regime"] == "risk_on"
+        assert signals["SYM40"].extra["position_scale"] > 0
+
+    def test_regime_filter_can_be_disabled(self):
+        strategy = MomentumStrategy(_momentum_config(top_percentile=0.1, regime_filter=False))
+        crash = _universe(n_symbols=40, n=400, start=200, end=100, noise=0.05)
+        context = StrategyContext(risk=_risk_params())
+
+        signals = strategy.score_batch(crash, context)
+
+        assert signals["SYM40"].signal == "BUY"
+        assert signals["SYM40"].extra["regime"] == "unknown"
+
+    def test_bear_exposure_dampens_instead_of_standing_down(self):
+        strategy = MomentumStrategy(_momentum_config(top_percentile=0.1, bear_exposure=0.3))
+        crash = _universe(n_symbols=40, n=400, start=200, end=100, noise=0.05)
+        context = StrategyContext(risk=_risk_params())
+
+        signals = strategy.score_batch(crash, context)
+
+        top = signals["SYM40"]
+        assert top.signal == "BUY"
+        assert 0.0 < top.extra["position_scale"] <= 0.3
+
+    def test_high_volatility_names_get_smaller_positions(self):
+        """Constant volatility scaling: twice the risk budget, half the money."""
+        strategy = MomentumStrategy(_momentum_config(top_percentile=0.5, volatility_target=0.20))
+        universe = _universe(n_symbols=40, n=400, start=100, end=200, noise=0.004)
+        universe["SYM40"]["realized_vol_60"] = 0.40  # 2x the 20% target
+        universe["SYM39"]["realized_vol_60"] = 0.10  # calm; scalar clamps at 1.0
+        context = StrategyContext(risk=_risk_params())
+
+        signals = strategy.score_batch(universe, context)
+
+        assert signals["SYM40"].extra["volatility_scalar"] == pytest.approx(0.5)
+        assert signals["SYM39"].extra["volatility_scalar"] == pytest.approx(1.0)
+        assert signals["SYM40"].extra["position_scale"] < signals["SYM39"].extra["position_scale"]
+
+    def test_volatility_scaling_can_be_disabled(self):
+        strategy = MomentumStrategy(
+            _momentum_config(top_percentile=0.5, scale_by_volatility=False)
+        )
+        universe = _universe(n_symbols=40, n=400, start=100, end=200, noise=0.004)
+        universe["SYM40"]["realized_vol_60"] = 0.80
+        context = StrategyContext(risk=_risk_params())
+
+        signals = strategy.score_batch(universe, context)
+
+        assert signals["SYM40"].extra["volatility_scalar"] == pytest.approx(1.0)
+
+    def test_single_row_fixtures_stay_fail_neutral(self):
+        """Too little history to judge the regime must not silently disable the
+        strategy — there is no evidence of a panic state to act on."""
+        strategy = MomentumStrategy(_momentum_config(top_percentile=0.1, min_universe=5))
+        features_by_symbol = {
+            f"SYM{i}": _features(close=100.0, mom_9m_skip1m=i / 100.0) for i in range(1, 11)
+        }
+        context = StrategyContext(risk=_risk_params())
+
+        signals = strategy.score_batch(features_by_symbol, context)
+
+        assert signals["SYM10"].signal == "BUY"
+        assert signals["SYM10"].extra["regime"] == "unknown"
+
+
+class TestCostAwareSignals:
+    def test_reward_risk_is_net_of_round_trip_costs(self):
+        strategy = MomentumStrategy(_momentum_config(top_percentile=0.1, min_universe=5))
+        features_by_symbol = {
+            f"SYM{i}": _features(close=100.0, atr=2.0, mom_9m_skip1m=i / 100.0)
+            for i in range(1, 11)
+        }
+        context = StrategyContext(risk=_risk_params())
+
+        signals = strategy.score_batch(features_by_symbol, context)
+
+        # Gross would be 2.0 ATR target over 1.5 ATR stop = 1.333.
+        assert 0 < signals["SYM10"].reward_risk < 1.333
+
+    def test_trade_that_cannot_pay_for_itself_is_not_a_buy(self):
+        """When friction exceeds the whole target move, the trade is a WATCH
+        regardless of how well it ranks."""
+        strategy = MomentumStrategy(_momentum_config(top_percentile=0.1, min_universe=5))
+        risk = _risk_params()
+        risk.buy_cost_pct = 0.20
+        risk.sell_cost_pct = 0.20
+        features_by_symbol = {
+            f"SYM{i}": _features(close=100.0, atr=2.0, mom_9m_skip1m=i / 100.0)
+            for i in range(1, 11)
+        }
+
+        signals = strategy.score_batch(features_by_symbol, StrategyContext(risk=risk))
+
+        assert signals["SYM10"].signal == "WATCH"
+        assert signals["SYM10"].reward_risk == 0.0
+        assert "net_rr(0.00)>0:FAIL" in signals["SYM10"].rationale
