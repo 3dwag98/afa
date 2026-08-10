@@ -87,6 +87,10 @@ risk:
   # before it reaches the Kelly formula.
   kelly_min_trades: 50
   kelly_shrinkage_strength: 20.0
+  # Hard-capped at 0.25 (quarter-Kelly) in src/risk.py: a lower-circuit lock
+  # realizes far worse than the modelled stop, so the measured payoff ratio —
+  # and therefore f* — is biased upward.
+  kelly_fraction: 0.25
   # Portfolio-level concentration and drawdown guardrails.
   max_sector_pct: 0.25            # max share of portfolio in any one sector
   max_portfolio_drawdown_pct: 0.15  # halt new buys past this drawdown
@@ -115,6 +119,10 @@ simulation:
   jump_intensity_per_year: 12.0
   jump_mean: -0.02
   jump_volatility: 0.05
+  # Fit GARCH to intraday sessions and add overnight gap risk separately —
+  # NSE opens after the US close, so gaps are frequent and destabilize a
+  # close-to-close fit.
+  separate_overnight_gaps: true
 
 # Trade compliance / eligibility checks
 compliance:

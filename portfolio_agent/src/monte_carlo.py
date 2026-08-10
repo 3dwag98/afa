@@ -35,7 +35,10 @@ trade log to report risk-of-ruin as an output metric, not a scoring input.
 
 import numpy as np
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import TYPE_CHECKING, Literal, Optional
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 # Minimum realized returns required before the block bootstrap is trusted; a
 # resample of a very short history just re-prints the same few days.
@@ -75,6 +78,7 @@ class MonteCarloSettings:
     jump_intensity_per_year: float = 12.0
     jump_mean: float = -0.02
     jump_volatility: float = 0.05
+    separate_overnight_gaps: bool = True
 
     @classmethod
     def from_simulation_config(cls, simulation) -> "MonteCarloSettings":
@@ -89,12 +93,50 @@ class MonteCarloSettings:
             jump_intensity_per_year=simulation.jump_intensity_per_year,
             jump_mean=simulation.jump_mean,
             jump_volatility=simulation.jump_volatility,
+            separate_overnight_gaps=simulation.separate_overnight_gaps,
         )
 
-    def run(self, symbol: str, daily_returns: list[float]) -> MonteCarloResult:
-        """Run the configured simulation for one ticker."""
-        mc_fn = run_monte_carlo_garch if self.use_garch_volatility else run_monte_carlo
-        return mc_fn(
+    def run(
+        self,
+        symbol: str,
+        daily_returns: list[float],
+        ohlcv: Optional["pd.DataFrame"] = None,
+    ) -> MonteCarloResult:
+        """Run the configured simulation for one ticker.
+
+        Args:
+            symbol: Ticker symbol.
+            daily_returns: Close-to-close simple returns.
+            ohlcv: Optional raw OHLCV frame. When supplied and GARCH volatility
+                and separate_overnight_gaps are both on, the close-to-close
+                series is decomposed into session and gap legs so the GARCH
+                recursion models only the session it is a model of.
+        """
+        if not self.use_garch_volatility:
+            return run_monte_carlo(
+                symbol=symbol,
+                daily_returns=daily_returns,
+                horizon_days=self.horizon_days,
+                simulations=self.simulations,
+                seed=self.seed,
+                method=self.method,
+                block_size_days=self.block_size_days,
+                jump_intensity_per_year=self.jump_intensity_per_year,
+                jump_mean=self.jump_mean,
+                jump_volatility=self.jump_volatility,
+            )
+
+        intraday = overnight = None
+        if self.separate_overnight_gaps and ohlcv is not None:
+            try:
+                from .liquidity import split_intraday_and_overnight
+            except ImportError:
+                from liquidity import split_intraday_and_overnight
+            split = split_intraday_and_overnight(ohlcv)
+            if split is not None:
+                intraday, overnight = split
+
+        return run_monte_carlo_garch(
             symbol=symbol,
             daily_returns=daily_returns,
             horizon_days=self.horizon_days,
@@ -105,6 +147,8 @@ class MonteCarloSettings:
             jump_intensity_per_year=self.jump_intensity_per_year,
             jump_mean=self.jump_mean,
             jump_volatility=self.jump_volatility,
+            intraday_returns=intraday,
+            overnight_returns=overnight,
         )
 
 
@@ -347,6 +391,8 @@ def run_monte_carlo_garch(
     jump_intensity_per_year: float = 12.0,
     jump_mean: float = -0.02,
     jump_volatility: float = 0.05,
+    intraday_returns: Optional[list[float]] = None,
+    overnight_returns: Optional[list[float]] = None,
 ) -> MonteCarloResult:
     """Like run_monte_carlo(), but forecasts volatility with GJR-GARCH(1,1)
     (see volatility_models.py) instead of assuming a flat historical
@@ -360,15 +406,29 @@ def run_monte_carlo_garch(
     returns and so carries its own scale, using the GARCH path only for the
     Ito drift correction.
 
+    When intraday and overnight return series are supplied, the fit is
+    gap-aware: GARCH describes the trading session and overnight gap risk is
+    added as a separate component, instead of the recursion attributing every
+    global-cue gap to yesterday's session shock (see
+    volatility_models.forecast_volatility_gap_aware). Each fallback is
+    independent — a failed gap-aware fit drops to close-to-close GARCH, and a
+    failed GARCH fit drops to constant volatility.
+
     Falls back to run_monte_carlo()'s constant-volatility path whenever
     there isn't enough history to fit GARCH reliably or the fit fails.
     """
     try:
-        from .volatility_models import forecast_volatility
+        from .volatility_models import forecast_volatility, forecast_volatility_gap_aware
     except ImportError:
-        from volatility_models import forecast_volatility
+        from volatility_models import forecast_volatility, forecast_volatility_gap_aware
 
-    forecast = forecast_volatility(daily_returns, horizon_days)
+    forecast = None
+    if intraday_returns is not None and overnight_returns is not None:
+        forecast = forecast_volatility_gap_aware(
+            intraday_returns, overnight_returns, horizon_days
+        )
+    if forecast is None:
+        forecast = forecast_volatility(daily_returns, horizon_days)
     daily_vol_forecast = forecast.daily_sigma if forecast is not None else None
 
     return run_monte_carlo(

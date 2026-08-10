@@ -28,14 +28,14 @@ try:
     from .models import AgentBrain
     from .execution_sim import ExecutionSimulator
     from .monte_carlo import MonteCarloSettings
-    from .risk import calculate_kelly_quantity, estimate_kelly_inputs
+    from .risk import MAX_KELLY_FRACTION, calculate_kelly_quantity, estimate_kelly_inputs
     from .sectors import load_sector_map, sector_capacity_inr, sector_of
 except ImportError:
     from data_store import load_ticker_data
     from models import AgentBrain
     from execution_sim import ExecutionSimulator
     from monte_carlo import MonteCarloSettings
-    from risk import calculate_kelly_quantity, estimate_kelly_inputs
+    from risk import MAX_KELLY_FRACTION, calculate_kelly_quantity, estimate_kelly_inputs
     from sectors import load_sector_map, sector_capacity_inr, sector_of
 
 
@@ -57,7 +57,9 @@ def _score_one_ticker(
     """
     try:
         daily_returns = hist_data['close'].pct_change().dropna().tolist()
-        mc_result = mc_settings.run(symbol=ticker, daily_returns=daily_returns)
+        mc_result = mc_settings.run(
+            symbol=ticker, daily_returns=daily_returns, ohlcv=hist_data
+        )
         features = build_features(hist_data, required_features)
         context = StrategyContext(risk=risk_params, weights=weights, mc_result=mc_result)
         return strategy.score(ticker, features, context)
@@ -131,7 +133,7 @@ class BacktestEngine:
         mc_jump_mean: float = -0.02,
         mc_jump_volatility: float = 0.05,
         use_kelly_sizing: bool = False,
-        kelly_fraction: float = 0.5,
+        kelly_fraction: float = MAX_KELLY_FRACTION,
         kelly_min_trades: int = 50,
         kelly_shrinkage_strength: float = 20.0,
         max_sector_pct: float = 0.0,
@@ -169,7 +171,8 @@ class BacktestEngine:
             use_kelly_sizing: If True, size positions with fractional-Kelly
                 once enough realized trades exist in this run's trade_log,
                 falling back to fixed-fractional sizing otherwise.
-            kelly_fraction: Fractional-Kelly multiplier kappa (default 0.5 = half-Kelly).
+            kelly_fraction: Fractional-Kelly multiplier kappa, hard-capped at
+                MAX_KELLY_FRACTION (quarter-Kelly) inside calculate_kelly_quantity.
             kelly_min_trades: Minimum realized trades required before Kelly sizing is trusted.
             kelly_shrinkage_strength: Beta-prior strength shrinking the realized
                 win rate toward 0.5 before it reaches Kelly (see src/risk.py).

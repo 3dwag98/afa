@@ -41,8 +41,16 @@ class TestMomentumStrategy:
         strategy = MomentumStrategy(_momentum_config())
         assert strategy.name == "momentum"
         assert strategy.requires_full_batch is True
-        # realized_vol_60 is required for per-position volatility targeting,
-        # not for the ranking metric itself.
+        # realized_vol_60 drives the per-position volatility-targeting scalar
+        # rather than the ranking; the rest back the tradability screen.
+        assert strategy.required_features() == [
+            "close", "mom_9m_skip1m", "atr_14", "realized_vol_60",
+            "traded_value_60", "zero_return_fraction_60",
+            "circuit_lock_fraction_60", "circuit_locked_today",
+        ]
+
+    def test_liquidity_filter_features_drop_out_when_disabled(self):
+        strategy = MomentumStrategy(_momentum_config(liquidity_filter=False))
         assert strategy.required_features() == [
             "close", "mom_9m_skip1m", "atr_14", "realized_vol_60"
         ]
@@ -134,7 +142,11 @@ class TestLowVolatilityStrategy:
         strategy = LowVolatilityStrategy(_low_vol_config())
         assert strategy.name == "low_volatility"
         assert strategy.requires_full_batch is True
-        assert strategy.required_features() == ["close", "realized_vol_60", "atr_14"]
+        assert strategy.required_features() == [
+            "close", "realized_vol_60", "atr_14",
+            "traded_value_60", "zero_return_fraction_60",
+            "circuit_lock_fraction_60", "circuit_locked_today",
+        ]
         assert strategy.entry_rules()["min_universe"] >= 30
 
     def test_regime_filter_off_by_default(self):
@@ -336,3 +348,115 @@ class TestCostAwareSignals:
         assert signals["SYM10"].signal == "WATCH"
         assert signals["SYM10"].reward_risk == 0.0
         assert "net_rr(0.00)>0:FAIL" in signals["SYM10"].rationale
+
+
+class TestTradabilityScreen:
+    """A printed close is only a price you could trade at if the stock was
+    actually trading. Screened names leave the ranking entirely."""
+
+    @staticmethod
+    def _liquid(**overrides):
+        row = {
+            "traded_value_60": 50_000_000.0,
+            "zero_return_fraction_60": 0.0,
+            "circuit_lock_fraction_60": 0.0,
+            "circuit_locked_today": 0.0,
+        }
+        row.update(overrides)
+        return row
+
+    def _universe_with(self, bad_symbol_overrides, n_symbols=10):
+        universe = {}
+        for i in range(1, n_symbols + 1):
+            symbol = f"SYM{i}"
+            extra = self._liquid(**bad_symbol_overrides) if symbol in ("SYM10",) else self._liquid()
+            universe[symbol] = _features(
+                close=100.0, mom_9m_skip1m=i / 100.0, realized_vol_60=0.20, **extra
+            )
+        return universe
+
+    def test_circuit_locked_leader_is_dropped_from_the_ranking(self):
+        """The classic operator pump: the top-ranked name is locked at its
+        upper circuit, so it is not merely un-buyable — it must not shift
+        everyone else's percentile either."""
+        strategy = MomentumStrategy(_momentum_config(top_percentile=0.2, min_universe=5))
+        universe = self._universe_with({"circuit_locked_today": 1.0})
+        context = StrategyContext(risk=_risk_params())
+
+        signals = strategy.score_batch(universe, context)
+
+        assert signals["SYM10"].signal == "AVOID"
+        assert "no fill available" in signals["SYM10"].rationale
+        assert signals["SYM10"].extra["position_scale"] == 0.0
+        # SYM9 is now the top of a 9-name cross-section, and scores 100.
+        assert signals["SYM9"].signal == "BUY"
+        assert signals["SYM9"].score == 100.0
+
+    def test_serially_circuit_locked_names_are_dropped(self):
+        strategy = MomentumStrategy(_momentum_config(top_percentile=0.2, min_universe=5))
+        universe = self._universe_with({"circuit_lock_fraction_60": 0.5})
+        context = StrategyContext(risk=_risk_params())
+
+        signals = strategy.score_batch(universe, context)
+
+        assert signals["SYM10"].signal == "AVOID"
+        assert "circuit-driven" in signals["SYM10"].rationale
+
+    def test_zombie_stock_never_wins_the_low_volatility_decile(self):
+        """The illiquidity illusion: the lowest-variance name is a stock that
+        barely trades, which is exactly what the metric would reward."""
+        strategy = LowVolatilityStrategy(_low_vol_config(top_percentile=0.2, min_universe=5))
+        universe = {
+            f"SYM{i}": _features(
+                close=100.0, realized_vol_60=i * 0.05, **self._liquid()
+            )
+            for i in range(1, 11)
+        }
+        # SYM1 has the lowest variance because nothing trades.
+        universe["SYM1"] = _features(
+            close=100.0, realized_vol_60=0.01,
+            **self._liquid(zero_return_fraction_60=0.8, traded_value_60=10_000.0),
+        )
+        context = StrategyContext(risk=_risk_params())
+
+        signals = strategy.score_batch(universe, context)
+
+        assert signals["SYM1"].signal == "AVOID"
+        assert "illiquid" in signals["SYM1"].rationale
+        assert signals["SYM2"].signal == "BUY"
+
+    def test_filter_can_be_disabled(self):
+        strategy = MomentumStrategy(
+            _momentum_config(top_percentile=0.2, min_universe=5, liquidity_filter=False)
+        )
+        universe = self._universe_with({"circuit_locked_today": 1.0})
+        context = StrategyContext(risk=_risk_params())
+
+        signals = strategy.score_batch(universe, context)
+
+        assert signals["SYM10"].signal == "BUY"
+
+    def test_missing_screening_data_passes_rather_than_rejects(self):
+        """Short caches must not disqualify every name — the screen excludes
+        on positive evidence of untradeability, not on absence of evidence."""
+        strategy = MomentumStrategy(_momentum_config(top_percentile=0.2, min_universe=5))
+        universe = {
+            f"SYM{i}": _features(close=100.0, mom_9m_skip1m=i / 100.0)
+            for i in range(1, 11)
+        }
+        context = StrategyContext(risk=_risk_params())
+
+        signals = strategy.score_batch(universe, context)
+
+        assert signals["SYM10"].signal == "BUY"
+
+    def test_thresholds_are_configurable(self):
+        strategy = MomentumStrategy(
+            _momentum_config(top_percentile=0.2, min_universe=5, min_traded_value_inr=0.0)
+        )
+        universe = self._universe_with({"traded_value_60": 1_000.0})
+        context = StrategyContext(risk=_risk_params())
+
+        signals = strategy.score_batch(universe, context)
+
+        assert signals["SYM10"].signal == "BUY"

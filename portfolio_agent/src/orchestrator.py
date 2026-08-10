@@ -84,7 +84,7 @@ def _prepare_one_ticker(
     try:
         indicator = calculate_indicators(ticker, df)
         daily_returns = df['close'].pct_change().dropna().tolist()
-        mc_result = mc_settings.run(symbol=ticker, daily_returns=daily_returns)
+        mc_result = mc_settings.run(symbol=ticker, daily_returns=daily_returns, ohlcv=df)
         features = build_features(df, required_features)
         return ticker, indicator, mc_result, features
     except Exception:

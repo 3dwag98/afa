@@ -47,6 +47,11 @@ from portfolio_agent.config.schema import StrategyConfig
 
 try:
     from src.risk import calculate_stop_target, net_reward_risk
+    from src.liquidity import (
+        DEFAULT_MAX_CIRCUIT_LOCK_FRACTION,
+        DEFAULT_MAX_ZERO_RETURN_FRACTION,
+        DEFAULT_MIN_TRADED_VALUE_INR,
+    )
     from src.regime import (
         DEFAULT_CRASH_VOL_MULTIPLE,
         DEFAULT_MAX_SCALE,
@@ -62,6 +67,11 @@ try:
     )
 except ImportError:
     from risk import calculate_stop_target, net_reward_risk
+    from liquidity import (
+        DEFAULT_MAX_CIRCUIT_LOCK_FRACTION,
+        DEFAULT_MAX_ZERO_RETURN_FRACTION,
+        DEFAULT_MIN_TRADED_VALUE_INR,
+    )
     from regime import (
         DEFAULT_CRASH_VOL_MULTIPLE,
         DEFAULT_MAX_SCALE,
@@ -80,6 +90,102 @@ except ImportError:
 # names a "top 10%" selection is 1-3 stocks chosen from a sample far too small
 # for the rank to carry information, so the strategy stands aside instead.
 DEFAULT_MIN_UNIVERSE = 30
+
+
+@dataclass
+class TradabilityFilter:
+    """Liquidity / circuit-lock screen applied before ranking.
+
+    Every ranking formula here assumes a printed close is a price you could
+    have transacted at. On NSE/BSE mid- and small-caps that assumption fails
+    in two specific, detectable ways (docs/QUANT_RESEARCH.md section 15):
+
+    - A stock locked at its upper circuit prints the return momentum reads as
+      strength while offering nothing to buy; locked at the lower circuit, it
+      cannot be exited at the modelled stop.
+    - A stock that barely trades prints unchanged closes, which suppresses its
+      realized variance and walks it into the low-volatility buy decile
+      without being remotely low-risk.
+
+    Screened names are reported as AVOID with the failing reason, and are
+    removed from the ranking entirely rather than merely being un-buyable:
+    leaving an untradeable stock in the cross-section would still shift every
+    other name's percentile.
+
+    Tunable through strategy params:
+
+        params:
+          liquidity_filter: true
+          min_traded_value_inr: 5000000
+          max_zero_return_fraction: 0.30
+          max_circuit_lock_fraction: 0.10
+    """
+
+    enabled: bool = True
+    min_traded_value_inr: float = DEFAULT_MIN_TRADED_VALUE_INR
+    max_zero_return_fraction: float = DEFAULT_MAX_ZERO_RETURN_FRACTION
+    max_circuit_lock_fraction: float = DEFAULT_MAX_CIRCUIT_LOCK_FRACTION
+
+    @classmethod
+    def from_params(cls, params: Dict[str, Any]) -> "TradabilityFilter":
+        return cls(
+            enabled=bool(params.get("liquidity_filter", True)),
+            min_traded_value_inr=float(
+                params.get("min_traded_value_inr", DEFAULT_MIN_TRADED_VALUE_INR)
+            ),
+            max_zero_return_fraction=float(
+                params.get("max_zero_return_fraction", DEFAULT_MAX_ZERO_RETURN_FRACTION)
+            ),
+            max_circuit_lock_fraction=float(
+                params.get("max_circuit_lock_fraction", DEFAULT_MAX_CIRCUIT_LOCK_FRACTION)
+            ),
+        )
+
+    def required_features(self) -> List[str]:
+        return [
+            "traded_value_60",
+            "zero_return_fraction_60",
+            "circuit_lock_fraction_60",
+            "circuit_locked_today",
+        ] if self.enabled else []
+
+    def reject_reason(self, latest: pd.Series) -> Optional[str]:
+        """Why this ticker is untradeable today, or None if it is fine.
+
+        A screening statistic that could not be computed (too little history)
+        is treated as passing: the filter's job is to exclude names with
+        positive evidence of being untradeable, not to reject everything with
+        a short cache.
+        """
+        if not self.enabled:
+            return None
+
+        traded_value = _clean(latest.get("traded_value_60"))
+        if traded_value is not None and traded_value < self.min_traded_value_inr:
+            return (
+                f"illiquid: median turnover {traded_value:,.0f} < "
+                f"{self.min_traded_value_inr:,.0f} INR/day"
+            )
+
+        zero_fraction = _clean(latest.get("zero_return_fraction_60"))
+        if zero_fraction is not None and zero_fraction > self.max_zero_return_fraction:
+            return (
+                f"zombie: {zero_fraction:.0%} of sessions closed unchanged "
+                f"(> {self.max_zero_return_fraction:.0%}); low variance reflects "
+                f"illiquidity, not stability"
+            )
+
+        lock_fraction = _clean(latest.get("circuit_lock_fraction_60"))
+        if lock_fraction is not None and lock_fraction > self.max_circuit_lock_fraction:
+            return (
+                f"circuit-driven: {lock_fraction:.0%} of sessions locked at a limit "
+                f"(> {self.max_circuit_lock_fraction:.0%})"
+            )
+
+        if _clean(latest.get("circuit_locked_today")):
+            return "locked at a circuit limit on the decision date; no fill available"
+
+        return None
 
 
 @dataclass
@@ -178,6 +284,7 @@ def _rank_and_select_decile(
     min_universe: int,
     protection: CrashProtection,
     regime: MarketRegime,
+    rejected: Dict[str, str],
 ) -> Dict[str, StrategySignal]:
     """Rank symbols by `metric_by_symbol` and go long the extreme decile.
 
@@ -198,6 +305,8 @@ def _rank_and_select_decile(
             considered reliable; below this, every ticker is AVOID.
         protection: Volatility-targeting / regime settings.
         regime: The assessed market regime (see _assess_regime).
+        rejected: symbol -> reason for symbols the tradability screen removed
+            before ranking; each gets an AVOID signal carrying that reason.
 
     Returns:
         Dictionary of symbol -> StrategySignal. Selected signals carry a
@@ -206,8 +315,21 @@ def _rank_and_select_decile(
     """
     signals: Dict[str, StrategySignal] = {}
 
+    for symbol, reason in rejected.items():
+        latest = latest_by_symbol.get(symbol)
+        close = _clean(latest.get("close")) if latest is not None else None
+        signals[symbol] = StrategySignal(
+            symbol=symbol, signal="AVOID", score=0.0, trigger="None",
+            entry_price=close or 0.0, stop_price=0.0, target_price=0.0,
+            reward_risk=0.0, probability_profit=0.0,
+            component_scores={}, rationale=f"Not tradable — {reason}",
+            extra={"position_scale": 0.0, "tradability_reject_reason": reason},
+        )
+
     if len(metric_by_symbol) < min_universe:
         for symbol, latest in latest_by_symbol.items():
+            if symbol in signals:  # already rejected by the tradability screen
+                continue
             close = _clean(latest.get("close")) or 0.0
             signals[symbol] = StrategySignal(
                 symbol=symbol, signal="AVOID", score=0.0, trigger="None",
@@ -347,6 +469,7 @@ class MomentumStrategy(BaseStrategy):
         self._top_fraction = float(params.get("top_percentile", 0.1))
         self._min_universe = int(params.get("min_universe", DEFAULT_MIN_UNIVERSE))
         self._protection = CrashProtection.from_params(params, regime_filter_default=True)
+        self._tradability = TradabilityFilter.from_params(params)
 
     @property
     def name(self) -> str:
@@ -359,7 +482,9 @@ class MomentumStrategy(BaseStrategy):
     def required_features(self) -> List[str]:
         # realized_vol_60 is not part of the ranking metric; it drives the
         # per-position volatility-targeting scalar.
-        return ["close", "mom_9m_skip1m", "atr_14", "realized_vol_60"]
+        return [
+            "close", "mom_9m_skip1m", "atr_14", "realized_vol_60"
+        ] + self._tradability.required_features()
 
     def entry_rules(self) -> Dict[str, Any]:
         return {
@@ -376,6 +501,11 @@ class MomentumStrategy(BaseStrategy):
                 "crash_vol_multiple": self._protection.crash_vol_multiple,
                 "bear_exposure": self._protection.bear_exposure,
             },
+            "tradability_filter": {
+                "enabled": self._tradability.enabled,
+                "min_traded_value_inr": self._tradability.min_traded_value_inr,
+                "max_circuit_lock_fraction": self._tradability.max_circuit_lock_fraction,
+            },
         }
 
     def score(self, symbol: str, features: pd.DataFrame, context: StrategyContext) -> StrategySignal:
@@ -387,12 +517,20 @@ class MomentumStrategy(BaseStrategy):
         metric_by_symbol: Dict[str, float] = {}
         latest_by_symbol: Dict[str, pd.Series] = {}
 
+        rejected: Dict[str, str] = {}
+
         for symbol, features in features_by_symbol.items():
             if features.empty:
                 continue
             latest = features.iloc[-1]
-            mom = _clean(latest.get("mom_9m_skip1m"))
             latest_by_symbol[symbol] = latest
+
+            reason = self._tradability.reject_reason(latest)
+            if reason is not None:
+                rejected[symbol] = reason
+                continue
+
+            mom = _clean(latest.get("mom_9m_skip1m"))
             if mom is not None:
                 metric_by_symbol[symbol] = mom
 
@@ -409,6 +547,7 @@ class MomentumStrategy(BaseStrategy):
             min_universe=self._min_universe,
             protection=self._protection,
             regime=regime,
+            rejected=rejected,
         )
 
 
@@ -430,6 +569,7 @@ class LowVolatilityStrategy(BaseStrategy):
         self._top_fraction = float(params.get("top_percentile", 0.1))
         self._min_universe = int(params.get("min_universe", DEFAULT_MIN_UNIVERSE))
         self._protection = CrashProtection.from_params(params, regime_filter_default=False)
+        self._tradability = TradabilityFilter.from_params(params)
 
     @property
     def name(self) -> str:
@@ -440,7 +580,7 @@ class LowVolatilityStrategy(BaseStrategy):
         return True
 
     def required_features(self) -> List[str]:
-        return ["close", "realized_vol_60", "atr_14"]
+        return ["close", "realized_vol_60", "atr_14"] + self._tradability.required_features()
 
     def entry_rules(self) -> Dict[str, Any]:
         return {
@@ -454,6 +594,11 @@ class LowVolatilityStrategy(BaseStrategy):
                 "scale_by_volatility": self._protection.scale_by_volatility,
                 "regime_filter": self._protection.regime_filter,
             },
+            "tradability_filter": {
+                "enabled": self._tradability.enabled,
+                "min_traded_value_inr": self._tradability.min_traded_value_inr,
+                "max_zero_return_fraction": self._tradability.max_zero_return_fraction,
+            },
         }
 
     def score(self, symbol: str, features: pd.DataFrame, context: StrategyContext) -> StrategySignal:
@@ -465,12 +610,22 @@ class LowVolatilityStrategy(BaseStrategy):
         metric_by_symbol: Dict[str, float] = {}
         latest_by_symbol: Dict[str, pd.Series] = {}
 
+        rejected: Dict[str, str] = {}
+
         for symbol, features in features_by_symbol.items():
             if features.empty:
                 continue
             latest = features.iloc[-1]
-            vol = _clean(latest.get("realized_vol_60"))
             latest_by_symbol[symbol] = latest
+
+            # This screen matters most here: an illiquid stock's suppressed
+            # variance is precisely what would rank it first.
+            reason = self._tradability.reject_reason(latest)
+            if reason is not None:
+                rejected[symbol] = reason
+                continue
+
+            vol = _clean(latest.get("realized_vol_60"))
             if vol is not None:
                 metric_by_symbol[symbol] = vol
 
@@ -487,4 +642,5 @@ class LowVolatilityStrategy(BaseStrategy):
             min_universe=self._min_universe,
             protection=self._protection,
             regime=regime,
+            rejected=rejected,
         )

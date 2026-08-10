@@ -3,6 +3,7 @@
 import pytest
 from portfolio_agent.config.schema import AppConfig
 from src.risk import (
+    MAX_KELLY_FRACTION,
     calculate_quantity,
     calculate_stop_target,
     calculate_max_loss,
@@ -538,11 +539,30 @@ class TestCalculateKellyQuantity:
             max_single_position_pct=0.5,
             win_probability=0.6,
             reward_risk_ratio=2.0,
-            kelly_fraction=0.5,
+            kelly_fraction=0.25,
         )
-        # f* = 0.4, half-Kelly = 0.2 -> position value ~= 200,000 -> qty ~= 2000
+        # f* = 0.4, quarter-Kelly = 0.1 -> position value ~= 100,000 -> qty ~= 1000
         # (floor of a floating-point division, so off-by-one from binary rounding is fine)
-        assert qty in (1999, 2000)
+        assert qty in (999, 1000)
+
+    def test_kappa_is_hard_capped_at_quarter_kelly(self):
+        """The cap lives in calculate_kelly_quantity(), not in the config, so
+        no YAML, override or test fixture can size above quarter-Kelly."""
+        common = dict(
+            entry_price=100.0,
+            portfolio_value_inr=1_000_000.0,
+            max_single_position_pct=0.9,
+            win_probability=0.6,
+            reward_risk_ratio=2.0,
+        )
+
+        at_cap = calculate_kelly_quantity(kelly_fraction=MAX_KELLY_FRACTION, **common)
+
+        assert MAX_KELLY_FRACTION == 0.25
+        assert calculate_kelly_quantity(kelly_fraction=0.5, **common) == at_cap
+        assert calculate_kelly_quantity(kelly_fraction=1.0, **common) == at_cap
+        # Below the cap still scales normally.
+        assert calculate_kelly_quantity(kelly_fraction=0.1, **common) < at_cap
 
     def test_capped_by_max_single_position_pct(self):
         qty = calculate_kelly_quantity(
@@ -605,22 +625,22 @@ class TestCalculatePositionQuantity:
         config = _make_config(portfolio_value_inr=1_000_000.0, max_single_position_pct=0.5)
         config.risk.use_kelly_sizing = True
         config.risk.kelly_min_trades = 10
-        config.risk.kelly_fraction = 0.5
+        config.risk.kelly_fraction = 0.25
         config.risk.kelly_shrinkage_strength = 0.0  # raw win rate, no shrinkage
         trade_history = [{"outcome": "WIN", "return_pct": 6.0}] * 12 + [{"outcome": "LOSS", "return_pct": -3.0}] * 8
 
         actual = calculate_position_quantity(
             entry_price=100.0, stop_price=95.0, config=config, trade_history=trade_history
         )
-        # p=0.6, b=2.0 -> f*=0.4, half-Kelly=0.2 -> ~200,000 INR / 100 = ~2000 shares
-        assert actual in (1999, 2000)
+        # p=0.6, b=2.0 -> f*=0.4, quarter-Kelly=0.1 -> ~100,000 INR / 100 = ~1000 shares
+        assert actual in (999, 1000)
 
     def test_shrinkage_sizes_more_conservatively_than_raw_win_rate(self):
         """Default shrinkage must never size *larger* than the raw estimate."""
         config = _make_config(portfolio_value_inr=1_000_000.0, max_single_position_pct=0.5)
         config.risk.use_kelly_sizing = True
         config.risk.kelly_min_trades = 10
-        config.risk.kelly_fraction = 0.5
+        config.risk.kelly_fraction = 0.25
         trade_history = [{"outcome": "WIN", "return_pct": 6.0}] * 12 + [{"outcome": "LOSS", "return_pct": -3.0}] * 8
 
         config.risk.kelly_shrinkage_strength = 0.0
@@ -632,8 +652,8 @@ class TestCalculatePositionQuantity:
             entry_price=100.0, stop_price=95.0, config=config, trade_history=trade_history
         )
 
-        # p=0.55, b=2.0 -> f*=0.325, half-Kelly=0.1625 -> ~1625 shares
-        assert shrunk == 1625
+        # p=0.55, b=2.0 -> f*=0.325, quarter-Kelly=0.08125 -> ~812 shares
+        assert shrunk == 812
         assert shrunk < raw
 
 

@@ -205,9 +205,15 @@ class RiskConfig(BaseModel):
         "sizing otherwise. Off by default since it needs real trade history to be meaningful.",
     )
     kelly_fraction: float = Field(
-        default=0.5,
-        description="Fractional-Kelly multiplier kappa in [0, 1] (0.5 = half-Kelly, the common "
-        "practitioner default that captures ~75% of full-Kelly's growth rate at lower drawdown risk).",
+        default=0.25,
+        ge=0.0,
+        le=0.25,
+        description="Fractional-Kelly multiplier kappa. Hard-capped at 0.25 (quarter-Kelly) rather "
+        "than merely defaulted there: Kelly assumes a well-estimated, roughly symmetric payoff "
+        "distribution, and Indian small/mid-caps offer neither — a 'loss' that locks at the lower "
+        "circuit for days realizes far worse than the modelled stop, which inflates the payoff "
+        "ratio b and makes f* an overestimate. Quarter-Kelly captures roughly half of full-Kelly's "
+        "growth rate at a small fraction of its drawdown risk.",
     )
     kelly_min_trades: int = Field(
         default=50,
@@ -297,6 +303,15 @@ class SimulationConfig(BaseModel):
     jump_volatility: float = Field(
         default=0.05,
         description="Standard deviation of jump size in log-return terms for method='jump_diffusion'.",
+    )
+    separate_overnight_gaps: bool = Field(
+        default=True,
+        description="When GARCH volatility is enabled, fit the recursion to intraday session "
+        "returns (close/open) and add overnight gap risk (open/prev_close) as a separate "
+        "component, instead of feeding it close-to-close returns. NSE opens after both the US "
+        "close and the Asian session, so gaps are frequent and large; attributing them to the "
+        "previous session's shock inflates alpha/gamma and destabilizes the persistence estimate. "
+        "Falls back to close-to-close GARCH when open prices or history are unavailable.",
     )
     use_garch_volatility: bool = Field(
         default=False,

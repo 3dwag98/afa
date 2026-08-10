@@ -220,6 +220,15 @@ def estimate_kelly_inputs(
     return win_probability, reward_risk_ratio
 
 
+# Hard ceiling on the fractional-Kelly multiplier kappa. Kelly assumes p and b
+# are known and the payoff distribution is roughly symmetric. Neither holds
+# here: p and b are estimated from a few dozen trades, and a loss that locks at
+# the lower circuit for several sessions realizes far worse than the modelled
+# stop, so the measured b is biased upward and f* with it. Quarter-Kelly keeps
+# roughly half of full-Kelly's growth rate at a small fraction of its drawdown.
+MAX_KELLY_FRACTION = 0.25
+
+
 def calculate_kelly_fraction(win_probability: float, reward_risk_ratio: float) -> float:
     """Full-Kelly capital fraction: f* = p - (1-p)/b.
 
@@ -239,7 +248,7 @@ def calculate_kelly_quantity(
     max_single_position_pct: float,
     win_probability: float,
     reward_risk_ratio: float,
-    kelly_fraction: float = 0.5,
+    kelly_fraction: float = MAX_KELLY_FRACTION,
 ) -> int:
     """Fractional-Kelly position sizing.
 
@@ -251,8 +260,10 @@ def calculate_kelly_quantity(
             the platform's existing fixed-fractional cap.
         win_probability: Realized win rate p (see estimate_kelly_inputs).
         reward_risk_ratio: Realized average win:loss ratio b.
-        kelly_fraction: Fractional-Kelly multiplier kappa in [0, 1] (default
-            0.5 = half-Kelly).
+        kelly_fraction: Fractional-Kelly multiplier kappa, clamped to
+            [0, MAX_KELLY_FRACTION]. The clamp is applied here rather than
+            trusted to the caller, so no config, YAML or test fixture can
+            route around it.
 
     Returns:
         Integer quantity >= 0.
@@ -261,7 +272,8 @@ def calculate_kelly_quantity(
         return 0
 
     f_star = calculate_kelly_fraction(win_probability, reward_risk_ratio)
-    position_fraction = f_star * kelly_fraction
+    kappa = max(0.0, min(MAX_KELLY_FRACTION, kelly_fraction))
+    position_fraction = f_star * kappa
 
     position_value = portfolio_value_inr * position_fraction
     max_position_value = portfolio_value_inr * max_single_position_pct
