@@ -7,9 +7,10 @@ and allowing the Agent's Brain to learn over time.
 
 import copy
 import logging
+import math
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 from pathlib import Path
 
 import pandas as pd
@@ -27,14 +28,20 @@ try:
     from .data_store import load_ticker_data
     from .models import AgentBrain
     from .execution_sim import ExecutionSimulator
-    from .monte_carlo import run_monte_carlo, run_monte_carlo_garch
-    from .risk import calculate_kelly_quantity, estimate_kelly_inputs
+    from .monte_carlo import MonteCarloSettings
+    from .risk import MAX_KELLY_FRACTION, calculate_kelly_quantity, estimate_kelly_inputs
+    from .sectors import (
+        load_sector_map, sector_cap_is_enforceable, sector_capacity_inr, sector_of,
+    )
 except ImportError:
     from data_store import load_ticker_data
     from models import AgentBrain
     from execution_sim import ExecutionSimulator
-    from monte_carlo import run_monte_carlo, run_monte_carlo_garch
-    from risk import calculate_kelly_quantity, estimate_kelly_inputs
+    from monte_carlo import MonteCarloSettings
+    from risk import MAX_KELLY_FRACTION, calculate_kelly_quantity, estimate_kelly_inputs
+    from sectors import (
+        load_sector_map, sector_cap_is_enforceable, sector_capacity_inr, sector_of,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -47,22 +54,16 @@ def _score_one_ticker(
     required_features: List[str],
     risk_params: RiskParams,
     weights: Dict[str, float],
-    mc_params: Tuple[int, int, int, bool],
+    mc_settings: MonteCarloSettings,
 ) -> Optional[StrategySignal]:
     """Score a single ticker: run Monte Carlo + build features + call strategy.score().
 
     Module-level (not a method) so it is picklable for ProcessPoolExecutor dispatch.
     """
     try:
-        horizon_days, simulations, seed, use_garch = mc_params
         daily_returns = hist_data['close'].pct_change().dropna().tolist()
-        mc_fn = run_monte_carlo_garch if use_garch else run_monte_carlo
-        mc_result = mc_fn(
-            symbol=ticker,
-            daily_returns=daily_returns,
-            horizon_days=horizon_days,
-            simulations=simulations,
-            seed=seed,
+        mc_result = mc_settings.run(
+            symbol=ticker, daily_returns=daily_returns, ohlcv=hist_data
         )
         features = build_features(hist_data, required_features)
         context = StrategyContext(risk=risk_params, weights=weights, mc_result=mc_result)
@@ -79,21 +80,21 @@ def _score_one_ticker(
 _WORKER_STRATEGY: Optional[BaseStrategy] = None
 _WORKER_FEATURES: List[str] = []
 _WORKER_RISK: Optional[RiskParams] = None
-_WORKER_MC_PARAMS: Tuple[int, int, int, bool] = (0, 0, 0, False)
+_WORKER_MC_SETTINGS: MonteCarloSettings = MonteCarloSettings()
 
 
 def _init_scoring_worker(
     strategy: BaseStrategy,
     required_features: List[str],
     risk_params: RiskParams,
-    mc_params: Tuple[int, int, int, bool],
+    mc_settings: MonteCarloSettings,
 ) -> None:
     """ProcessPoolExecutor initializer: pin the run-constant scoring inputs."""
-    global _WORKER_STRATEGY, _WORKER_FEATURES, _WORKER_RISK, _WORKER_MC_PARAMS
+    global _WORKER_STRATEGY, _WORKER_FEATURES, _WORKER_RISK, _WORKER_MC_SETTINGS
     _WORKER_STRATEGY = strategy
     _WORKER_FEATURES = required_features
     _WORKER_RISK = risk_params
-    _WORKER_MC_PARAMS = mc_params
+    _WORKER_MC_SETTINGS = mc_settings
 
 
 def _score_one_ticker_in_worker(
@@ -104,7 +105,7 @@ def _score_one_ticker_in_worker(
         raise RuntimeError("Scoring worker was not initialized")
     return _score_one_ticker(
         _WORKER_STRATEGY, ticker, hist_data, _WORKER_FEATURES,
-        _WORKER_RISK, weights, _WORKER_MC_PARAMS,
+        _WORKER_RISK, weights, _WORKER_MC_SETTINGS,
     )
 
 
@@ -131,9 +132,20 @@ class BacktestEngine:
         mc_simulations: int = 1000,
         mc_seed: int = 42,
         use_garch_volatility: bool = False,
+        mc_method: str = "gaussian",
+        mc_block_size_days: int = 5,
+        mc_jump_intensity_per_year: float = 12.0,
+        mc_jump_mean: float = -0.02,
+        mc_jump_volatility: float = 0.05,
         use_kelly_sizing: bool = False,
-        kelly_fraction: float = 0.5,
-        kelly_min_trades: int = 20,
+        kelly_fraction: float = MAX_KELLY_FRACTION,
+        kelly_min_trades: int = 50,
+        kelly_shrinkage_strength: float = 20.0,
+        max_sector_pct: float = 0.0,
+        sector_map_csv: Optional[str] = None,
+        max_portfolio_drawdown_pct: float = 0.0,
+        drawdown_reentry_pct: float = 0.10,
+        benchmark_symbol: Optional[str] = None,
     ):
         """
         Initialize the BacktestEngine.
@@ -156,11 +168,32 @@ class BacktestEngine:
             use_garch_volatility: If True, forecast each ticker's forward
                 volatility with GJR-GARCH(1,1) instead of a flat historical
                 standard deviation (see src/volatility_models.py).
+            mc_method: Monte Carlo shock process — "gaussian", "block_bootstrap"
+                or "jump_diffusion" (see src/monte_carlo.py).
+            mc_block_size_days: Mean block length for the block bootstrap.
+            mc_jump_intensity_per_year: Expected jumps/year for jump diffusion.
+            mc_jump_mean: Mean log jump size for jump diffusion.
+            mc_jump_volatility: Std dev of log jump size for jump diffusion.
             use_kelly_sizing: If True, size positions with fractional-Kelly
                 once enough realized trades exist in this run's trade_log,
                 falling back to fixed-fractional sizing otherwise.
-            kelly_fraction: Fractional-Kelly multiplier kappa (default 0.5 = half-Kelly).
+            kelly_fraction: Fractional-Kelly multiplier kappa, hard-capped at
+                MAX_KELLY_FRACTION (quarter-Kelly) inside calculate_kelly_quantity.
             kelly_min_trades: Minimum realized trades required before Kelly sizing is trusted.
+            kelly_shrinkage_strength: Beta-prior strength shrinking the realized
+                win rate toward 0.5 before it reaches Kelly (see src/risk.py).
+            max_sector_pct: Cap on any one sector's share of portfolio value.
+                0 (the default here) disables the cap; BacktesterAgent passes
+                the configured value through.
+            sector_map_csv: Path to the ticker,sector CSV backing that cap.
+            max_portfolio_drawdown_pct: Circuit breaker — stop opening new
+                positions once drawdown from the equity peak reaches this
+                fraction. 0 disables it.
+            drawdown_reentry_pct: Drawdown level at which buying resumes.
+            benchmark_symbol: Optional market index (e.g. "^NSEI") whose cached
+                history drives the momentum crash filter's trend and
+                volatility tests. Without it the filter falls back to a
+                composite of the traded universe.
         """
         self.start_date = pd.to_datetime(start_date)
         self.end_date = pd.to_datetime(end_date)
@@ -188,9 +221,64 @@ class BacktestEngine:
         self.mc_simulations = mc_simulations
         self.mc_seed = mc_seed
         self.use_garch_volatility = use_garch_volatility
+        self.mc_settings = MonteCarloSettings(
+            horizon_days=mc_horizon_days,
+            simulations=mc_simulations,
+            seed=mc_seed,
+            use_garch_volatility=use_garch_volatility,
+            method=mc_method,
+            block_size_days=mc_block_size_days,
+            jump_intensity_per_year=mc_jump_intensity_per_year,
+            jump_mean=mc_jump_mean,
+            jump_volatility=mc_jump_volatility,
+        )
         self.use_kelly_sizing = use_kelly_sizing
         self.kelly_fraction = kelly_fraction
         self.kelly_min_trades = kelly_min_trades
+        self.kelly_shrinkage_strength = kelly_shrinkage_strength
+
+        # Sector concentration cap, loaded once per run. Without a map the cap
+        # is inactive rather than applied to a single UNKNOWN pool — pooling
+        # would cap total invested capital, not sector concentration.
+        self.max_sector_pct = max_sector_pct
+        self.sector_map = load_sector_map(sector_map_csv) if max_sector_pct > 0 else {}
+        if max_sector_pct > 0 and not sector_cap_is_enforceable(self.sector_map):
+            logger.warning(
+                "risk.max_sector_pct is set to %.0f%% but no sector map was loaded from %s, "
+                "so sector concentration is NOT being limited. Provide a ticker,sector CSV "
+                "to enable it.",
+                max_sector_pct * 100, sector_map_csv or "data/sector_map.csv",
+            )
+
+        # Benchmark index for the momentum crash filter. Loaded once from the
+        # same parquet cache as everything else; None when it was never
+        # cached, in which case the filter uses its composite fallback.
+        self.benchmark_symbol = benchmark_symbol
+        self.benchmark_close: Optional[pd.Series] = None
+        if benchmark_symbol:
+            benchmark_df = load_ticker_data(
+                benchmark_symbol,
+                start_date=None,  # the trend window reaches back before start_date
+                end_date=self.end_date.strftime('%Y-%m-%d'),
+            )
+            if benchmark_df is not None and 'close' in benchmark_df.columns:
+                self.benchmark_close = benchmark_df['close'].sort_index()
+                logger.info(
+                    f"Loaded benchmark {benchmark_symbol} "
+                    f"({len(self.benchmark_close)} bars) for the market-regime filter"
+                )
+            else:
+                logger.info(
+                    f"Benchmark {benchmark_symbol} is not cached; the market-regime filter "
+                    f"will use a composite of the traded universe"
+                )
+
+        # Drawdown circuit breaker state.
+        self.max_portfolio_drawdown_pct = max_portfolio_drawdown_pct
+        self.drawdown_reentry_pct = drawdown_reentry_pct
+        self.equity_peak = initial_capital
+        self.buying_halted = False
+        self.circuit_breaker_log: List[Dict[str, Any]] = []
 
 
         # Track untradeable tickers (delisted or NaN issues) - initialize BEFORE loading data
@@ -671,7 +759,13 @@ class BacktestEngine:
                 ticker: build_features(hist_data, self.strategy.required_features())
                 for ticker, hist_data in eligible.items()
             }
-            context = StrategyContext(risk=self.risk_params, weights=weights)
+            context = StrategyContext(
+                risk=self.risk_params,
+                weights=weights,
+                # Strictly before T, exactly like every other input: the
+                # regime filter must not see the day it is deciding on.
+                benchmark_close=self._benchmark_up_to(current_date),
+            )
             return self.strategy.score_batch(features_by_symbol, context)
 
         if self.parallel and len(eligible) > 1:
@@ -680,20 +774,27 @@ class BacktestEngine:
                 return parallel_signals
 
         required_features = self.strategy.required_features()
-        mc_params = self._mc_params()
 
         signals: Dict[str, StrategySignal] = {}
         for ticker, hist_data in eligible.items():
             result = _score_one_ticker(
-                self.strategy, ticker, hist_data, required_features, self.risk_params, weights, mc_params
+                self.strategy, ticker, hist_data, required_features,
+                self.risk_params, weights, self.mc_settings,
             )
             if result is not None:
                 signals[ticker] = result
         return signals
 
-    def _mc_params(self) -> Tuple[int, int, int, bool]:
-        """Monte Carlo settings bundled for dispatch to scoring workers."""
-        return (self.mc_horizon_days, self.mc_simulations, self.mc_seed, self.use_garch_volatility)
+    def _benchmark_up_to(self, current_date: pd.Timestamp) -> Optional[pd.Series]:
+        """Benchmark closes strictly before `current_date`.
+
+        Same look-ahead rule as every other input: the regime filter must not
+        see the bar for the day it is deciding on.
+        """
+        if self.benchmark_close is None:
+            return None
+        truncated = self.benchmark_close[self.benchmark_close.index < current_date]
+        return truncated if not truncated.empty else None
 
     def _get_scoring_executor(self) -> ProcessPoolExecutor:
         """Return this run's scoring process pool, creating it on first use.
@@ -712,7 +813,7 @@ class BacktestEngine:
                     self.strategy,
                     self.strategy.required_features(),
                     self.risk_params,
-                    self._mc_params(),
+                    self.mc_settings,
                 ),
             )
         return self._scoring_executor
@@ -997,7 +1098,11 @@ class BacktestEngine:
             for t in self.trade_log
             if t.get("exit_date") is not None
         ]
-        kelly_inputs = estimate_kelly_inputs(realized, min_trades=self.kelly_min_trades)
+        kelly_inputs = estimate_kelly_inputs(
+            realized,
+            min_trades=self.kelly_min_trades,
+            shrinkage_strength=self.kelly_shrinkage_strength,
+        )
         if kelly_inputs is None:
             return 0
         win_probability, reward_risk_ratio = kelly_inputs
@@ -1009,6 +1114,69 @@ class BacktestEngine:
             reward_risk_ratio=reward_risk_ratio,
             kelly_fraction=self.kelly_fraction,
         )
+
+    def _update_circuit_breaker(self, current_date: pd.Timestamp) -> None:
+        """Track the equity peak and trip/re-arm the drawdown circuit breaker.
+
+        Once drawdown from the running peak reaches max_portfolio_drawdown_pct,
+        no new positions are opened until it recovers to within
+        drawdown_reentry_pct of the peak. Two distinct thresholds, not one:
+        with a single level the breaker would flip on and off every time equity
+        wobbled across it, churning the book precisely when conditions are
+        worst. Open positions are left alone — their stops and targets are
+        already the exit plan, and force-liquidating a whole book at a
+        drawdown trough is how a bad quarter becomes a permanent loss.
+        """
+        if self.max_portfolio_drawdown_pct <= 0 or self.max_portfolio_drawdown_pct >= 1:
+            return
+
+        self.equity_peak = max(self.equity_peak, self.portfolio_value)
+        if self.equity_peak <= 0:
+            return
+
+        drawdown = (self.equity_peak - self.portfolio_value) / self.equity_peak
+
+        if not self.buying_halted and drawdown >= self.max_portfolio_drawdown_pct:
+            self.buying_halted = True
+            entry = {
+                'date': current_date.strftime('%Y-%m-%d'),
+                'event': 'HALT',
+                'drawdown_pct': round(drawdown * 100, 2),
+                'portfolio_value': round(self.portfolio_value, 2),
+                'peak_value': round(self.equity_peak, 2),
+            }
+            self.circuit_breaker_log.append(entry)
+            logger.warning(
+                f"Drawdown circuit breaker tripped on {entry['date']}: "
+                f"{entry['drawdown_pct']:.2f}% below peak; halting new BUY orders"
+            )
+        elif self.buying_halted and drawdown <= self.drawdown_reentry_pct:
+            self.buying_halted = False
+            entry = {
+                'date': current_date.strftime('%Y-%m-%d'),
+                'event': 'RESUME',
+                'drawdown_pct': round(drawdown * 100, 2),
+                'portfolio_value': round(self.portfolio_value, 2),
+                'peak_value': round(self.equity_peak, 2),
+            }
+            self.circuit_breaker_log.append(entry)
+            logger.info(
+                f"Drawdown circuit breaker re-armed on {entry['date']}: "
+                f"recovered to {entry['drawdown_pct']:.2f}% below peak; buying resumed"
+            )
+
+    def _current_position_values(self, current_date: pd.Timestamp) -> Dict[str, float]:
+        """Mark every open holding to T's close, for sector-exposure accounting."""
+        values: Dict[str, float] = {}
+        for ticker, quantity in self.holdings.items():
+            if quantity <= 0:
+                continue
+            price = self._get_price_at_date(ticker, current_date, 'close')
+            if price is None or pd.isna(price):
+                price = self._get_last_valid_price(ticker, current_date)
+            if price is not None and not pd.isna(price):
+                values[ticker] = float(quantity) * float(price)
+        return values
 
     def _create_pending_orders(self, signals: Dict[str, StrategySignal], current_date: pd.Timestamp) -> None:
         """
@@ -1022,6 +1190,18 @@ class BacktestEngine:
         how the strategy happened to be scored (serial vs. parallel, and which
         worker finished first). Ranking by conviction is both reproducible and
         the behaviour a capital-constrained portfolio actually wants.
+
+        Three risk controls sit between a BUY signal and a queued order:
+
+        1. The drawdown circuit breaker, which suppresses new positions
+           entirely while it is tripped.
+        2. `position_scale` from the signal (volatility targeting / market
+           regime — see src/regime.py), which shrinks the sized quantity.
+        3. The sector concentration cap, which trims or drops an order that
+           would push its sector past risk.max_sector_pct. Because BUYs are
+           processed in conviction order, the highest-scoring name in a sector
+           gets the remaining capacity and later ones are trimmed — the same
+           ordering guarantee the cash constraint already relies on.
 
         Args:
             signals: Dictionary of ticker -> StrategySignal.
@@ -1047,10 +1227,20 @@ class BacktestEngine:
                     'trigger': signals[ticker].trigger or 'SIGNAL'
                 })
 
+        self._update_circuit_breaker(current_date)
+        if self.buying_halted:
+            return
+
         buys = sorted(
             (t for t, s in signals.items() if s.signal == 'BUY' and t not in self.holdings),
             key=lambda t: (-signals[t].score, t),
         )
+
+        # Sector exposure accumulates across this round's queued orders too, not
+        # just already-open positions: five BUYs in one sector each fit under
+        # the cap individually and blow straight through it together.
+        position_values = self._current_position_values(current_date)
+
         for ticker in buys:
             sig = signals[ticker]
             price = sig.entry_price or 100
@@ -1061,7 +1251,11 @@ class BacktestEngine:
                 position_value = self.portfolio_value * 0.10
                 quantity = int(position_value / price)
 
+            quantity = self._apply_position_scale(quantity, sig)
+            quantity = self._apply_sector_cap(ticker, quantity, price, position_values)
+
             if quantity > 0:
+                position_values[ticker] = position_values.get(ticker, 0.0) + quantity * price
                 self.pending_orders.append({
                     'ticker': ticker,
                     'action': 'BUY',
@@ -1069,6 +1263,62 @@ class BacktestEngine:
                     'execution_date': execution_date,
                     'trigger': sig.trigger or 'SIGNAL'
                 })
+
+    @staticmethod
+    def _apply_position_scale(quantity: int, signal: StrategySignal) -> int:
+        """Shrink a sized quantity by the signal's `position_scale`, if any.
+
+        Strategies that measure their own risk environment (cross-sectional
+        momentum's volatility targeting and market-regime filter) publish a
+        multiplier in [0, 1] on the signal. Sizing honours it here rather than
+        inside the strategy so every sizing rule — fixed-fractional, Kelly,
+        or a future one — picks it up automatically. A signal that carries no
+        scale is left untouched.
+        """
+        scale = signal.extra.get("position_scale") if signal.extra else None
+        if scale is None:
+            return quantity
+        try:
+            scale = float(scale)
+        except (TypeError, ValueError):
+            return quantity
+        if scale >= 1.0:
+            return quantity
+        return int(quantity * max(0.0, scale))
+
+    def _apply_sector_cap(
+        self,
+        ticker: str,
+        quantity: int,
+        price: float,
+        position_values: Dict[str, float],
+    ) -> int:
+        """Trim a BUY so its sector stays under risk.max_sector_pct."""
+        if self.max_sector_pct <= 0 or self.max_sector_pct >= 1 or quantity <= 0 or price <= 0:
+            return quantity
+
+        capacity = sector_capacity_inr(
+            ticker=ticker,
+            portfolio_value_inr=self.portfolio_value,
+            position_values=position_values,
+            sector_map=self.sector_map,
+            max_sector_pct=self.max_sector_pct,
+        )
+        if math.isinf(capacity):
+            # The cap does not apply to this ticker (disabled, or unmapped
+            # sector). Return before int(inf / price) raises OverflowError.
+            return quantity
+        max_quantity = int(capacity / price)
+        if max_quantity >= quantity:
+            return quantity
+
+        if max_quantity <= 0:
+            logger.debug(
+                f"Sector cap: skipping BUY {ticker} — sector "
+                f"'{sector_of(ticker, self.sector_map)}' already at "
+                f"{self.max_sector_pct:.0%} of portfolio value"
+            )
+        return max(0, max_quantity)
 
 
     def _evaluate_and_learn(self, learning_rate: float = 0.15, min_trades_for_learning: int = 3) -> None:
@@ -1325,7 +1575,8 @@ class BacktestEngine:
             'daily_equity_curve': self.daily_equity_curve,
             'trade_log': self.trade_log,
             'brain_evolution': self.brain_evolution,
-            'daily_activity_log': self.daily_activity_log
+            'daily_activity_log': self.daily_activity_log,
+            'circuit_breaker_log': self.circuit_breaker_log,
         }
 
     def _position_value(self, ticker: str, current_date: pd.Timestamp) -> Optional[float]:

@@ -36,11 +36,12 @@ A lightweight, CLI-first platform for training and backtesting trading strategie
 Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-# Install dependencies (add --extra gpu for torch/CUDA support)
-uv sync
+# Install dependencies (--extra hf for the HuggingFace data source,
+# --extra gpu for torch/CUDA support)
+uv sync --extra hf
 
-# Download market data for the configured universe
-uv run portfolio-agent download-data --universe-size 50
+# Download 5 years of Indian-market OHLCV from the HuggingFace dataset
+uv run portfolio-agent download-data
 
 # Run the live paper-trading agent (writes an Excel recommendation report)
 uv run portfolio-agent run-agent
@@ -59,10 +60,18 @@ uv run portfolio-agent backtest --strategy lstm --years 1
 All commands are subcommands of `portfolio-agent` (equivalently `uv run python -m portfolio_agent.cli`).
 
 ```
-portfolio-agent download-data [--force] [--universe-size N] [--workers N]
-    Download and cache OHLCV data for the resolved ticker universe.
-    Chunks are fetched concurrently (default 4); use --workers 1 if the
-    data provider rate-limits you.
+portfolio-agent download-data
+    [--source huggingface|yfinance]  Data source (default: config.data.source)
+    [--years N]                      Years of history to keep (default: 5)
+    [--hf-dataset ID]                Hub dataset repo id
+    [--hf-revision REV]              Pin to a branch/tag/commit for reproducibility
+    [--universe-size N]              Cap the number of tickers ingested
+    [--force] [--workers N]          yfinance path only
+    Download and cache OHLCV into data/market_data/*.parquet.
+    huggingface (default) reads vishnun0027/indian-market-historical-ohlcv,
+    one parquet per symbol, and also caches the benchmark index (^NSEI).
+    yfinance fetches per ticker in concurrent chunks; use --workers 1 if
+    the provider rate-limits you.
 
 portfolio-agent train [--device auto|cuda|mps|cpu]
     Train the configured model (default: LSTM) on real cached market data.
@@ -251,20 +260,48 @@ Key sections: `data` (universe/tickers), `strategy`, `training`, `backtest`, `ri
 
 ```yaml
 data:
-  download_workers: 4          # concurrent chunk downloads; set to 1 if rate-limited
+  source: huggingface          # huggingface | yfinance
+  hf_dataset_id: vishnun0027/indian-market-historical-ohlcv
+  hf_revision: null            # pin a branch/tag/commit for a reproducible backtest
+  hf_adjust_prices: true       # back-adjust OHLC by adj_close/close (splits/dividends)
+  benchmark_symbol: "^NSEI"    # index driving the momentum crash filter
+  default_history_years: 5     # history kept, both sources
+  download_workers: 4          # concurrent chunk downloads (yfinance); 1 if rate-limited
   parallel_ticker_prep: true   # prepare tickers across a CPU pool during run-agent
-  ticker_prep_workers: null    # null = CPU count
 compliance:
   paper_trading_mode: true   # must remain true
 risk:
   portfolio_value_inr: 308733
   risk_per_trade_pct: 0.01
-  use_kelly_sizing: false    # true = fractional-Kelly sizing once enough realized trades exist
-  kelly_fraction: 0.5        # kappa in [0, 1]; 0.5 = half-Kelly
-  kelly_min_trades: 20       # minimum realized trades before Kelly is trusted (else fixed-fractional)
+  use_kelly_sizing: false       # true = fractional-Kelly once enough realized trades exist
+  kelly_fraction: 0.25          # kappa; hard-capped at 0.25 (quarter-Kelly) in src/risk.py
+  kelly_min_trades: 50          # realized trades before Kelly is trusted (else fixed-fractional)
+  kelly_shrinkage_strength: 20  # Beta prior pulling the win rate toward 0.5
+compliance:
+  min_reward_risk: 1.2          # applied to reward:risk NET of round-trip costs
+  max_sector_pct: 0.25          # max share of portfolio in any one sector
+  max_portfolio_drawdown_pct: 0.15  # halt new buys past this drawdown
+  drawdown_reentry_pct: 0.10        # resume buying once recovered to here
+  slippage_pct_per_side: 0.0025     # assumed slippage when costing a signal
 simulation:
-  use_garch_volatility: false   # true = GJR-GARCH(1,1) volatility forecast instead of flat historical std
+  method: block_bootstrap       # gaussian | block_bootstrap | jump_diffusion
+  use_garch_volatility: false   # true = GJR-GARCH(1,1) instead of flat historical std
+  separate_overnight_gaps: true # fit GARCH to sessions, add gap risk separately
+training:
+  walk_forward_splits: 5        # expanding-window validation folds; 0 to skip
 ```
+
+### Risk controls
+
+| Control | Config | What it does |
+|---|---|---|
+| Momentum crash filter | `momentum` strategy params | Stands momentum down when the market is below its 200-day average *and* volatility is above 1.5× target — the state momentum crashes in ([§12](docs/QUANT_RESEARCH.md)) |
+| Volatility targeting | `volatility_target` (0.20) | Scales each position by target vol / realized vol; never levers up |
+| Cost-aware signals | `risk.slippage_pct_per_side` | Reward:risk is reported net of round-trip friction (~0.8%), so the `min_reward_risk` gate compares money actually kept |
+| Tradability screen | `liquidity_filter` params | Drops circuit-locked and zombie stocks from the ranking ([§15](docs/QUANT_RESEARCH.md)) |
+| Sector cap | `risk.max_sector_pct` | Trims orders so no sector exceeds 25%. **Requires a `ticker,sector` CSV at `paths.sector_map_csv`** — without one the cap is inactive (and logs a warning), because capping the unmapped pool would limit total invested capital rather than sector concentration |
+| Drawdown breaker | `risk.max_portfolio_drawdown_pct` | Halts new entries past 15% drawdown, re-arms at 10% |
+| Kelly guards | `risk.kelly_*` | 50-trade floor, Beta-shrunk win rate, kappa hard-capped at quarter-Kelly |
 
 ## Scheduling (cron / Task Scheduler)
 
@@ -299,14 +336,17 @@ afa/
 │   ├── features/               # lag-safe technical indicators + pipeline
 │   ├── models/                 # PyTorch model definitions
 │   ├── agents/                 # trainer.py, backtester.py
-│   ├── src/                    # orchestrator, backtest engine, data store, risk.py (incl. Kelly sizing),
-│   │                           # volatility_models.py (GJR-GARCH), monte_carlo.py, compliance, ...
+│   ├── src/                    # orchestrator, backtest engine, data store, hf_dataset.py (HuggingFace
+│   │                           # source), risk.py (Kelly + cost-aware reward:risk), regime.py (momentum
+│   │                           # crash protection), liquidity.py (circuit/zombie screen), sectors.py
+│   │                           # (concentration caps), volatility_models.py (GJR-GARCH), monte_carlo.py, ...
 │   └── tests/
 ├── docs/
 │   ├── ARCHITECTURE.md         # how it all works, with diagrams
 │   ├── STRATEGIES.md           # create / update / delete a strategy
 │   └── QUANT_RESEARCH.md       # research basis for every strategy/risk model
 ├── data/                       # gitignored: market_data/*.parquet cache, agent_brain.json, sqlite db
+│                               # optional: sector_map.csv (ticker,sector) for concentration caps
 ├── output/                     # gitignored: Excel reports
 ├── models/                     # gitignored: trained model checkpoints
 └── logs/                       # gitignored
@@ -328,6 +368,12 @@ docker run --rm -v $(pwd)/data:/app/data -v $(pwd)/output:/app/output afa
 - **No leverage, no short selling** — long positions only, fully funded.
 - **Position size cap** — configurable via `risk.max_single_position_pct`.
 - **Risk per trade cap** — configurable via `risk.risk_per_trade_pct`.
+- **Sector concentration cap** — `risk.max_sector_pct` (25% by default).
+- **Drawdown circuit breaker** — new entries stop past `risk.max_portfolio_drawdown_pct`.
+- **Momentum crash filter** — exposure is cut in the market state where momentum crashes.
 - **Penny stock filter** — `compliance.min_price_inr`.
+- **Tradability screen** — circuit-locked and effectively-untraded stocks are excluded.
+- **Costs charged to the decision, not just the fill** — signals are gated on
+  reward:risk net of the full Indian friction stack.
 
 MIT License — for educational purposes only. This system is not investment advice.

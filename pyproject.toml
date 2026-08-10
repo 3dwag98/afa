@@ -22,6 +22,12 @@ gpu = [
     "torch>=2.0.0",
     "torchvision>=0.15.0",
 ]
+# Historical OHLCV from a versioned HuggingFace Hub dataset
+# (data.source: huggingface). Optional so an offline or yfinance-only install
+# stays lean.
+hf = [
+    "huggingface_hub>=0.20.0",
+]
 
 [project.scripts]
 portfolio-agent = "portfolio_agent.cli:main"

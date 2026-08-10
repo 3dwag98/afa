@@ -26,41 +26,102 @@ def get_config() -> "AppConfig":
 
 def cmd_download_data(args) -> int:
     """Download market data command."""
+    from datetime import timedelta
+
     import pandas as pd
+
+    from portfolio_agent.src.data_store import fetch_and_cache
     from portfolio_agent.src.universe import resolve_backtest_universe
-    from portfolio_agent.src.data_store import batch_download_and_cache
-    
+
     config = get_config()
-    
-    # Resolve universe
+    source = args.source or config.data.source
+
+    end_date = pd.Timestamp.now()
+    years = args.years or config.data.default_history_years
+    start_date = end_date - timedelta(days=years * 365)
+
+    if source == "huggingface":
+        # One columnar download covers the whole universe, so there is no
+        # ticker list to resolve first — the dataset defines the universe, and
+        # an empty local cache is the normal starting state.
+        from portfolio_agent.src.hf_dataset import sync_hf_to_cache
+
+        dataset_id = args.hf_dataset or config.data.hf_dataset_id
+        revision = args.hf_revision or config.data.hf_revision
+        print(
+            f"Loading {dataset_id}/{config.data.hf_asset_dir} "
+            f"(revision={revision or 'main'}) from HuggingFace, keeping {years} years "
+            f"of history ({start_date:%Y-%m-%d} to {end_date:%Y-%m-%d})"
+        )
+        try:
+            written = sync_hf_to_cache(
+                dataset_id=dataset_id,
+                revision=revision,
+                asset_dir=config.data.hf_asset_dir,
+                adjust_prices=config.data.hf_adjust_prices,
+                start_date=start_date.strftime('%Y-%m-%d'),
+                end_date=end_date.strftime('%Y-%m-%d'),
+                max_symbols=args.universe_size,
+                progress=True,
+            )
+        except Exception as e:
+            print(f"Error: HuggingFace ingest failed: {e}")
+            print("Re-run with --source yfinance to use the per-ticker download path instead.")
+            return 1
+
+        if not written:
+            print(f"Error: {dataset_id} yielded no tickers for the requested window")
+            return 1
+
+        print(f"Cached {len(written)} tickers from {dataset_id}/{config.data.hf_asset_dir}")
+
+        # The benchmark index drives the momentum crash filter, so it is worth
+        # one extra small download rather than leaving the filter on its
+        # composite fallback.
+        benchmark = config.data.benchmark_symbol
+        if benchmark:
+            cached = sync_hf_to_cache(
+                dataset_id=dataset_id,
+                revision=revision,
+                asset_dir="indices",
+                adjust_prices=config.data.hf_adjust_prices,
+                tickers=[benchmark],
+                start_date=start_date.strftime('%Y-%m-%d'),
+                end_date=end_date.strftime('%Y-%m-%d'),
+            )
+            if cached:
+                print(f"Cached benchmark index {benchmark}")
+            else:
+                print(
+                    f"Note: benchmark {benchmark} not found in {dataset_id}/indices; "
+                    f"the market-regime filter will use a composite of the traded universe"
+                )
+        return 0
+
     tickers = resolve_backtest_universe(
         force_full_download=args.force,
         max_tickers=args.universe_size or config.data.universe_size
     )
-    
+
     if not tickers:
         print("Error: No tickers found with available data")
         return 1
-    
+
     print(f"Resolved {len(tickers)} tickers")
-    
-    # Calculate date range
-    from datetime import timedelta
-    end_date = pd.Timestamp.now()
-    start_date = end_date - timedelta(days=config.data.default_history_years * 365)
-    
-    # Download and cache
+
     workers = args.workers or config.data.download_workers
     print(f"Downloading with {workers} concurrent chunk request(s)")
-    success = batch_download_and_cache(
+    config = config.model_copy(deep=True)
+    config.data.source = "yfinance"
+    config.data.download_workers = workers
+    success = fetch_and_cache(
+        config,
         tickers=tickers,
         start_date=start_date.strftime('%Y-%m-%d'),
         end_date=end_date.strftime('%Y-%m-%d'),
-        chunk_size=50,
         skip_existing=not args.force,
-        max_workers=workers,
     )
-    
+
     if success:
         print(f"Successfully downloaded data for {len(tickers)} tickers")
         return 0
@@ -303,6 +364,30 @@ def create_parser() -> argparse.ArgumentParser:
         help="Download market data for the configured universe"
     )
     download_parser.add_argument(
+        "--source",
+        choices=("huggingface", "yfinance"),
+        default=None,
+        help="Where to pull history from (default: config.data.source). 'huggingface' reads a "
+             "versioned Hub dataset in one download; 'yfinance' fetches per ticker."
+    )
+    download_parser.add_argument(
+        "--years",
+        type=int,
+        default=None,
+        help="Years of history to keep (default: config.data.default_history_years)"
+    )
+    download_parser.add_argument(
+        "--hf-dataset",
+        default=None,
+        help="HuggingFace dataset repo id (default: config.data.hf_dataset_id)"
+    )
+    download_parser.add_argument(
+        "--hf-revision",
+        default=None,
+        help="Pin the Hub dataset to a git revision (branch, tag or commit) for a "
+             "reproducible backtest"
+    )
+    download_parser.add_argument(
         "--force",
         action="store_true",
         help="Force re-download of all data"
@@ -311,7 +396,8 @@ def create_parser() -> argparse.ArgumentParser:
         "--universe-size",
         type=int,
         default=None,
-        help="Number of tickers to download (default: from config)"
+        help="Cap the number of tickers ingested (default: from config for yfinance, "
+             "the dataset's full symbol list for huggingface)"
     )
     download_parser.add_argument(
         "--workers",

@@ -263,3 +263,308 @@ class TestPerformanceMetrics:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def _signal(ticker, signal="BUY", score=90.0, entry_price=100.0, extra=None):
+    from portfolio_agent.strategies.types import StrategySignal
+
+    return StrategySignal(
+        symbol=ticker, signal=signal, score=score, trigger="Momentum",
+        entry_price=entry_price, stop_price=entry_price * 0.95,
+        target_price=entry_price * 1.10, reward_risk=2.0, probability_profit=0.6,
+        extra=extra or {},
+    )
+
+
+class TestPositionScaling:
+    """Signals that measure their own risk environment publish a
+    position_scale; sizing must honour it wherever the quantity came from."""
+
+    def test_scale_shrinks_the_sized_quantity(self, synthetic_data):
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-03-31",
+            initial_capital=1_000_000.0, universe_tickers=synthetic_data['tickers'],
+        )
+        full = engine._apply_position_scale(1000, _signal("A", extra={"position_scale": 1.0}))
+        half = engine._apply_position_scale(1000, _signal("A", extra={"position_scale": 0.5}))
+        none = engine._apply_position_scale(1000, _signal("A", extra={"position_scale": 0.0}))
+
+        assert full == 1000
+        assert half == 500
+        assert none == 0
+
+    def test_missing_or_unparseable_scale_leaves_quantity_untouched(self, synthetic_data):
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-03-31",
+            initial_capital=1_000_000.0, universe_tickers=synthetic_data['tickers'],
+        )
+
+        assert engine._apply_position_scale(1000, _signal("A")) == 1000
+        assert engine._apply_position_scale(1000, _signal("A", extra={"position_scale": "x"})) == 1000
+
+    def test_scale_above_one_never_levers_up(self, synthetic_data):
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-03-31",
+            initial_capital=1_000_000.0, universe_tickers=synthetic_data['tickers'],
+        )
+
+        assert engine._apply_position_scale(1000, _signal("A", extra={"position_scale": 3.0})) == 1000
+
+    def test_scaled_signal_queues_a_smaller_order(self, synthetic_data):
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-03-31",
+            initial_capital=1_000_000.0, universe_tickers=synthetic_data['tickers'],
+        )
+        date = pd.Timestamp("2023-02-01")
+        ticker = synthetic_data['tickers'][0]
+
+        engine._create_pending_orders({ticker: _signal(ticker)}, date)
+        unscaled = engine.pending_orders[0]['quantity']
+
+        engine.pending_orders.clear()
+        engine._create_pending_orders(
+            {ticker: _signal(ticker, extra={"position_scale": 0.25})}, date
+        )
+        scaled = engine.pending_orders[0]['quantity']
+
+        assert scaled == int(unscaled * 0.25)
+
+
+class TestSectorConcentrationCap:
+    def test_cap_trims_the_second_name_in_a_crowded_sector(self, synthetic_data, tmp_path):
+        tickers = synthetic_data['tickers']
+        sector_csv = tmp_path / "sectors.csv"
+        sector_csv.write_text(
+            "ticker,sector\n" + "".join(f"{t},IT\n" for t in tickers), encoding="utf-8"
+        )
+
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-03-31",
+            initial_capital=1_000_000.0, universe_tickers=tickers,
+            max_sector_pct=0.15, sector_map_csv=str(sector_csv),
+        )
+        date = pd.Timestamp("2023-02-01")
+
+        signals = {t: _signal(t, score=90.0 - i, entry_price=100.0) for i, t in enumerate(tickers)}
+        engine._create_pending_orders(signals, date)
+
+        queued_value = sum(o['quantity'] * 100.0 for o in engine.pending_orders)
+        # Three 10%-of-portfolio positions would be 30% of the book in one
+        # sector; the 15% cap must hold across the whole round, not per order.
+        assert queued_value <= 0.15 * engine.portfolio_value + 100.0
+
+    def test_without_a_sector_map_the_cap_is_inactive(self, synthetic_data, tmp_path):
+        """Pooling unmapped tickers into one UNKNOWN bucket and capping it
+        would turn a 15% *sector* limit into a 15% limit on the whole book,
+        leaving 85% of capital idle. A cap that cannot be computed is reported
+        as unenforceable, not quietly reinterpreted."""
+        tickers = synthetic_data['tickers']
+
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-03-31",
+            initial_capital=1_000_000.0, universe_tickers=tickers,
+            max_sector_pct=0.15, sector_map_csv=str(tmp_path / "absent.csv"),
+        )
+        date = pd.Timestamp("2023-02-01")
+
+        signals = {t: _signal(t, score=90.0 - i, entry_price=100.0) for i, t in enumerate(tickers)}
+        engine._create_pending_orders(signals, date)
+
+        assert engine.sector_map == {}
+        assert len(engine.pending_orders) == len(tickers)
+        queued_value = sum(o['quantity'] * 100.0 for o in engine.pending_orders)
+        assert queued_value > 0.15 * engine.portfolio_value
+
+    def test_mapped_and_unmapped_tickers_do_not_share_an_allowance(
+        self, synthetic_data, tmp_path
+    ):
+        """An unmapped holding must not consume a mapped sector's capacity."""
+        tickers = synthetic_data['tickers']
+        sector_csv = tmp_path / "sectors.csv"
+        # Only the first two names are classified.
+        sector_csv.write_text(
+            "ticker,sector\n" + "".join(f"{t},IT\n" for t in tickers[:2]), encoding="utf-8"
+        )
+
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-03-31",
+            initial_capital=1_000_000.0, universe_tickers=tickers,
+            max_sector_pct=0.15, sector_map_csv=str(sector_csv),
+        )
+        date = pd.Timestamp("2023-02-01")
+
+        signals = {t: _signal(t, score=90.0 - i, entry_price=100.0) for i, t in enumerate(tickers)}
+        engine._create_pending_orders(signals, date)
+
+        queued = {o['ticker']: o['quantity'] * 100.0 for o in engine.pending_orders}
+        it_value = sum(queued.get(t, 0.0) for t in tickers[:2])
+        assert it_value <= 0.15 * engine.portfolio_value + 100.0
+        # The unmapped name keeps its full 10%-of-portfolio sizing.
+        assert queued.get(tickers[2], 0.0) == pytest.approx(100_000.0, rel=0.01)
+
+    def test_disabled_cap_leaves_orders_alone(self, synthetic_data):
+        tickers = synthetic_data['tickers']
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-03-31",
+            initial_capital=1_000_000.0, universe_tickers=tickers, max_sector_pct=0.0,
+        )
+        date = pd.Timestamp("2023-02-01")
+
+        signals = {t: _signal(t, score=90.0 - i, entry_price=100.0) for i, t in enumerate(tickers)}
+        engine._create_pending_orders(signals, date)
+
+        assert len(engine.pending_orders) == len(tickers)
+
+
+class TestDrawdownCircuitBreaker:
+    def _engine(self, tickers, **kwargs):
+        params = dict(
+            start_date="2023-01-02", end_date="2023-03-31",
+            initial_capital=1_000_000.0, universe_tickers=tickers,
+            max_portfolio_drawdown_pct=0.15, drawdown_reentry_pct=0.10,
+        )
+        params.update(kwargs)
+        return BacktestEngine(**params)
+
+    def test_trips_past_the_threshold_and_blocks_new_buys(self, synthetic_data):
+        engine = self._engine(synthetic_data['tickers'])
+        ticker = synthetic_data['tickers'][0]
+        date = pd.Timestamp("2023-02-01")
+
+        engine.portfolio_value = 800_000.0  # 20% below the 1,000,000 peak
+        engine._create_pending_orders({ticker: _signal(ticker)}, date)
+
+        assert engine.buying_halted is True
+        assert engine.pending_orders == []
+        assert engine.circuit_breaker_log[-1]['event'] == 'HALT'
+
+    def test_stays_armed_inside_the_threshold(self, synthetic_data):
+        engine = self._engine(synthetic_data['tickers'])
+        ticker = synthetic_data['tickers'][0]
+
+        engine.portfolio_value = 900_000.0  # 10% drawdown, under the 15% trip
+        engine._create_pending_orders({ticker: _signal(ticker)}, pd.Timestamp("2023-02-01"))
+
+        assert engine.buying_halted is False
+        assert engine.pending_orders
+
+    def test_does_not_re_arm_between_the_two_thresholds(self, synthetic_data):
+        """Separate trip and re-entry levels are what stop the breaker
+        flickering on every wobble across a single line."""
+        engine = self._engine(synthetic_data['tickers'])
+
+        engine.portfolio_value = 800_000.0
+        engine._update_circuit_breaker(pd.Timestamp("2023-02-01"))
+        assert engine.buying_halted is True
+
+        engine.portfolio_value = 870_000.0  # 13% down: past the trip, short of re-entry
+        engine._update_circuit_breaker(pd.Timestamp("2023-02-02"))
+        assert engine.buying_halted is True
+
+    def test_re_arms_once_recovered(self, synthetic_data):
+        engine = self._engine(synthetic_data['tickers'])
+        ticker = synthetic_data['tickers'][0]
+
+        engine.portfolio_value = 800_000.0
+        engine._update_circuit_breaker(pd.Timestamp("2023-02-01"))
+        engine.portfolio_value = 920_000.0  # 8% down, inside the 10% re-entry
+        engine._create_pending_orders({ticker: _signal(ticker)}, pd.Timestamp("2023-02-03"))
+
+        assert engine.buying_halted is False
+        assert engine.pending_orders
+        assert engine.circuit_breaker_log[-1]['event'] == 'RESUME'
+
+    def test_sells_are_still_queued_while_halted(self, synthetic_data):
+        """A halt stops new risk; it must not trap capital in open positions."""
+        engine = self._engine(synthetic_data['tickers'])
+        ticker = synthetic_data['tickers'][0]
+        engine.holdings[ticker] = 100
+        engine.portfolio_value = 800_000.0
+
+        engine._create_pending_orders(
+            {ticker: _signal(ticker, signal="SELL")}, pd.Timestamp("2023-02-01")
+        )
+
+        assert engine.buying_halted is True
+        assert [o['action'] for o in engine.pending_orders] == ['SELL']
+
+    def test_disabled_breaker_never_trips(self, synthetic_data):
+        engine = self._engine(synthetic_data['tickers'], max_portfolio_drawdown_pct=0.0)
+        ticker = synthetic_data['tickers'][0]
+
+        engine.portfolio_value = 100_000.0  # 90% drawdown
+        engine._create_pending_orders({ticker: _signal(ticker)}, pd.Timestamp("2023-02-01"))
+
+        assert engine.buying_halted is False
+        assert engine.pending_orders
+
+    def test_peak_tracks_new_highs(self, synthetic_data):
+        engine = self._engine(synthetic_data['tickers'])
+
+        engine.portfolio_value = 1_500_000.0
+        engine._update_circuit_breaker(pd.Timestamp("2023-02-01"))
+        assert engine.equity_peak == 1_500_000.0
+
+        engine.portfolio_value = 1_300_000.0  # ~13% off the NEW peak, not the old one
+        engine._update_circuit_breaker(pd.Timestamp("2023-02-02"))
+        assert engine.buying_halted is False
+
+
+class TestBenchmarkWiring:
+    """The crash filter's benchmark has to survive the trip from cache to
+    StrategyContext, look-ahead safe."""
+
+    def _engine_with_benchmark(self, monkeypatch, synthetic_data, series):
+        real_loader = __import__("src.backtest_engine", fromlist=["x"]).load_ticker_data
+
+        def loader(ticker, start_date=None, end_date=None):
+            if ticker == "^NSEI":
+                return pd.DataFrame({"close": series.values}, index=series.index)
+            return real_loader(ticker, start_date=start_date, end_date=end_date)
+
+        monkeypatch.setattr("src.backtest_engine.load_ticker_data", loader)
+        return BacktestEngine(
+            start_date="2023-01-02", end_date="2023-03-31",
+            initial_capital=1_000_000.0, universe_tickers=synthetic_data['tickers'],
+            benchmark_symbol="^NSEI",
+        )
+
+    def test_loads_the_benchmark_and_truncates_before_the_decision_date(
+        self, monkeypatch, synthetic_data
+    ):
+        dates = pd.bdate_range("2023-01-02", periods=60)
+        series = pd.Series(np.linspace(100, 160, 60), index=dates)
+
+        engine = self._engine_with_benchmark(monkeypatch, synthetic_data, series)
+
+        assert engine.benchmark_close is not None
+        cutoff = dates[30]
+        truncated = engine._benchmark_up_to(cutoff)
+        assert truncated is not None
+        assert truncated.index.max() < cutoff
+
+    def test_missing_benchmark_degrades_to_none(self, synthetic_data):
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-03-31",
+            initial_capital=1_000_000.0, universe_tickers=synthetic_data['tickers'],
+            benchmark_symbol="^NOSUCH",
+        )
+
+        assert engine.benchmark_close is None
+        assert engine._benchmark_up_to(pd.Timestamp("2023-02-01")) is None
+
+    def test_batch_strategies_score_without_crashing(self, synthetic_data):
+        """Regression: _generate_signals reaches the benchmark helper on the
+        batch path, which no test exercised."""
+        from portfolio_agent.config.schema import StrategyConfig
+        from portfolio_agent.strategies.cross_sectional import MomentumStrategy
+
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-03-31",
+            initial_capital=1_000_000.0, universe_tickers=synthetic_data['tickers'],
+            strategy=MomentumStrategy(StrategyConfig(type="momentum", params={"min_universe": 2})),
+        )
+
+        signals = engine._generate_signals(pd.Timestamp("2023-03-01"))
+
+        assert isinstance(signals, dict)

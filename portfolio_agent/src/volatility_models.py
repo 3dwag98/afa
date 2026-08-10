@@ -40,6 +40,16 @@ class GarchForecast:
     daily_sigma: np.ndarray  # shape (horizon_days,); forecasted daily return std, decimal (not %)
     leverage_gamma: float  # fitted asymmetry coefficient; > 0 confirms the leverage effect
     persistence: float  # alpha + gamma/2 + beta; must be < 1 for a stationary process
+    # Set when the forecast was built from a gap-aware decomposition
+    # (see forecast_volatility_gap_aware): the constant overnight-gap standard
+    # deviation folded into daily_sigma, and the session-only GARCH path.
+    overnight_sigma: Optional[float] = None
+    intraday_sigma: Optional[np.ndarray] = None
+
+    @property
+    def gap_aware(self) -> bool:
+        """Whether overnight gap risk was modelled separately from the session."""
+        return self.overnight_sigma is not None
 
 
 def forecast_volatility(
@@ -95,3 +105,73 @@ def forecast_volatility(
     except Exception:
         logger.debug("GJR-GARCH fit failed; falling back to constant volatility", exc_info=True)
         return None
+
+
+def forecast_volatility_gap_aware(
+    intraday_returns: Sequence[float],
+    overnight_returns: Sequence[float],
+    horizon_days: int,
+) -> Optional[GarchForecast]:
+    """Fit GJR-GARCH to the trading session only, and add gap risk separately.
+
+    Close-to-close returns bundle two processes with different dynamics, and
+    GARCH is a model of only one of them (docs/QUANT_RESEARCH.md section 16):
+
+    - The **overnight gap** (open_t / close_{t-1} - 1) reprices global cues,
+      FII decisions and policy news while the market is shut. It arrives as a
+      single instantaneous jump; there is no within-gap conditional variance
+      process for the recursion to track.
+    - The **intraday session** (close_t / open_t - 1) is the continuous
+      trading that the GARCH recursion actually describes.
+
+    Feeding close-to-close returns to GARCH makes it attribute every gap to
+    yesterday's session shock, which inflates alpha and gamma, drags the
+    persistence estimate toward (and sometimes past) the stationarity bound,
+    and makes the fitted parameters unstable across refits — precisely the
+    failure mode Indian equities provoke, since NSE opens after both the US
+    close and the Asian session.
+
+    Modelling them apart: sigma_intraday follows GJR-GARCH, sigma_gap is
+    estimated as the unconditional standard deviation of the gap series, and
+    the two are combined as independent components of the daily move:
+
+        sigma_daily^2 = sigma_intraday^2 + sigma_gap^2
+
+    Independence is the standard simplification and a conservative one here —
+    a positive correlation between gaps and the sessions that follow them
+    would widen the total, so the combined estimate does not overstate risk.
+
+    Args:
+        intraday_returns: Session returns (close/open - 1).
+        overnight_returns: Gap returns (open/prev_close - 1), same length.
+        horizon_days: Number of trading days ahead to forecast.
+
+    Returns:
+        A GarchForecast whose daily_sigma includes gap risk, or None when the
+        session fit is unavailable — callers should fall back to the
+        close-to-close path (or constant volatility) in that case.
+    """
+    session = forecast_volatility(intraday_returns, horizon_days)
+    if session is None:
+        return None
+
+    gaps = np.asarray(overnight_returns, dtype=float)
+    gaps = gaps[np.isfinite(gaps)]
+    if len(gaps) < MIN_OBSERVATIONS:
+        return None
+
+    gap_sigma = float(np.std(gaps, ddof=1))
+    if not np.isfinite(gap_sigma) or gap_sigma < 0:
+        return None
+
+    combined = np.sqrt(session.daily_sigma ** 2 + gap_sigma ** 2)
+    if not np.all(np.isfinite(combined)) or np.any(combined <= 0):
+        return None
+
+    return GarchForecast(
+        daily_sigma=combined,
+        leverage_gamma=session.leverage_gamma,
+        persistence=session.persistence,
+        overnight_sigma=gap_sigma,
+        intraday_sigma=session.daily_sigma,
+    )

@@ -8,8 +8,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 import numpy as np
 import pytest
 
-from src.volatility_models import forecast_volatility, GarchForecast, MIN_OBSERVATIONS
+from src.volatility_models import (
+    forecast_volatility,
+    forecast_volatility_gap_aware,
+    GarchForecast,
+    MIN_OBSERVATIONS,
+)
 from src.monte_carlo import run_monte_carlo, run_monte_carlo_garch, MonteCarloResult
+
+
+try:  # the gap-aware tests need a real GJR-GARCH fit
+    import arch  # noqa: F401
+    _ARCH_AVAILABLE = True
+except ImportError:
+    _ARCH_AVAILABLE = False
 
 
 def _synthetic_returns(n: int, seed: int = 7) -> list[float]:
@@ -100,3 +112,60 @@ class TestMonteCarloWithVolForecast:
         assert isinstance(result, MonteCarloResult)
         assert result.simulations_count == 500
         assert 0.0 <= result.probability_profit <= 1.0
+
+
+class TestGapAwareForecast:
+    """GARCH is a model of the trading session; overnight gaps are jumps that
+    arrive while the market is shut, and folding them into the recursion
+    distorts the fitted parameters."""
+
+    @staticmethod
+    def _series(n=600, session_vol=0.008, gap_vol=0.03, seed=17):
+        rng = np.random.default_rng(seed)
+        intraday = rng.normal(0.0, session_vol, n)
+        overnight = rng.normal(0.0, gap_vol, n)
+        return list(intraday), list(overnight)
+
+    def test_returns_none_without_enough_gap_history(self):
+        intraday, overnight = self._series(n=600)
+
+        assert forecast_volatility_gap_aware(intraday, overnight[:10], 5) is None
+
+    def test_returns_none_when_the_session_fit_is_unavailable(self):
+        intraday, overnight = self._series(n=50)
+
+        assert forecast_volatility_gap_aware(intraday, overnight, 5) is None
+
+    @pytest.mark.skipif(not _ARCH_AVAILABLE, reason="arch package not installed")
+    def test_total_volatility_exceeds_the_session_alone(self):
+        """Gap risk is added, not substituted: a stock whose sessions are calm
+        but which gaps hard overnight is not a low-volatility stock."""
+        intraday, overnight = self._series()
+
+        session_only = forecast_volatility(intraday, 5)
+        gap_aware = forecast_volatility_gap_aware(intraday, overnight, 5)
+
+        assert session_only is not None and gap_aware is not None
+        assert gap_aware.gap_aware is True
+        assert np.all(gap_aware.daily_sigma > session_only.daily_sigma)
+
+    @pytest.mark.skipif(not _ARCH_AVAILABLE, reason="arch package not installed")
+    def test_components_combine_in_quadrature(self):
+        intraday, overnight = self._series()
+
+        gap_aware = forecast_volatility_gap_aware(intraday, overnight, 5)
+
+        assert gap_aware is not None
+        expected = np.sqrt(gap_aware.intraday_sigma ** 2 + gap_aware.overnight_sigma ** 2)
+        assert np.allclose(gap_aware.daily_sigma, expected)
+
+    @pytest.mark.skipif(not _ARCH_AVAILABLE, reason="arch package not installed")
+    def test_close_to_close_fit_is_not_gap_aware(self):
+        intraday, overnight = self._series()
+        close_to_close = [i + o for i, o in zip(intraday, overnight)]
+
+        forecast = forecast_volatility(close_to_close, 5)
+
+        assert forecast is not None
+        assert forecast.gap_aware is False
+        assert forecast.overnight_sigma is None

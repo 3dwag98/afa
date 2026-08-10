@@ -3,6 +3,7 @@
 import pytest
 from portfolio_agent.config.schema import AppConfig
 from src.risk import (
+    MAX_KELLY_FRACTION,
     calculate_quantity,
     calculate_stop_target,
     calculate_max_loss,
@@ -467,13 +468,42 @@ class TestEstimateKellyInputs:
         assert estimate_kelly_inputs(trades, min_trades=10) is None
 
     def test_computes_win_rate_and_reward_risk(self):
-        # 12 wins @ +6%, 8 losses @ -3% => p=0.6, b=6/3=2.0
+        # 12 wins @ +6%, 8 losses @ -3% => raw p=0.6, b=6/3=2.0
         trades = self._trades(12, 8, win_pct=6.0, loss_pct=-3.0)
-        result = estimate_kelly_inputs(trades, min_trades=10)
+        result = estimate_kelly_inputs(trades, min_trades=10, shrinkage_strength=0.0)
         assert result is not None
         win_probability, reward_risk_ratio = result
         assert win_probability == pytest.approx(0.6)
         assert reward_risk_ratio == pytest.approx(2.0)
+
+    def test_shrinks_win_rate_toward_coin_flip_by_default(self):
+        # Same 12/8 sample, but with the default 20-pseudo-trade Beta(10, 10)
+        # prior: (12 + 10) / (20 + 20) = 0.55, not the raw 0.60. Kelly is far
+        # more punishing of over-betting than under-betting, so a 20-trade
+        # sample must not be read as a 60% edge.
+        trades = self._trades(12, 8, win_pct=6.0, loss_pct=-3.0)
+        result = estimate_kelly_inputs(trades, min_trades=10)
+        assert result is not None
+        win_probability, reward_risk_ratio = result
+        assert win_probability == pytest.approx(0.55)
+        # The payoff ratio is a magnitude average, not a proportion, so it is
+        # reported unshrunk.
+        assert reward_risk_ratio == pytest.approx(2.0)
+
+    def test_shrinkage_fades_as_evidence_accumulates(self):
+        # The same 60% raw win rate over 20 vs 400 trades: the prior dominates
+        # the small sample and barely moves the large one.
+        small = estimate_kelly_inputs(self._trades(12, 8), min_trades=10)
+        large = estimate_kelly_inputs(self._trades(240, 160), min_trades=10)
+        assert small is not None and large is not None
+        assert small[0] == pytest.approx(0.55)
+        assert large[0] == pytest.approx(0.5952, abs=1e-4)
+
+    def test_default_min_trades_rejects_small_samples(self):
+        # 30 realized trades is below the 50-trade floor, so Kelly is not
+        # trusted at all and the caller falls back to fixed-fractional sizing.
+        assert estimate_kelly_inputs(self._trades(18, 12)) is None
+        assert estimate_kelly_inputs(self._trades(30, 25)) is not None
 
     def test_ignores_pending_trades(self):
         trades = self._trades(10, 10) + [{"outcome": "PENDING", "return_pct": 0.0}] * 100
@@ -509,11 +539,30 @@ class TestCalculateKellyQuantity:
             max_single_position_pct=0.5,
             win_probability=0.6,
             reward_risk_ratio=2.0,
-            kelly_fraction=0.5,
+            kelly_fraction=0.25,
         )
-        # f* = 0.4, half-Kelly = 0.2 -> position value ~= 200,000 -> qty ~= 2000
+        # f* = 0.4, quarter-Kelly = 0.1 -> position value ~= 100,000 -> qty ~= 1000
         # (floor of a floating-point division, so off-by-one from binary rounding is fine)
-        assert qty in (1999, 2000)
+        assert qty in (999, 1000)
+
+    def test_kappa_is_hard_capped_at_quarter_kelly(self):
+        """The cap lives in calculate_kelly_quantity(), not in the config, so
+        no YAML, override or test fixture can size above quarter-Kelly."""
+        common = dict(
+            entry_price=100.0,
+            portfolio_value_inr=1_000_000.0,
+            max_single_position_pct=0.9,
+            win_probability=0.6,
+            reward_risk_ratio=2.0,
+        )
+
+        at_cap = calculate_kelly_quantity(kelly_fraction=MAX_KELLY_FRACTION, **common)
+
+        assert MAX_KELLY_FRACTION == 0.25
+        assert calculate_kelly_quantity(kelly_fraction=0.5, **common) == at_cap
+        assert calculate_kelly_quantity(kelly_fraction=1.0, **common) == at_cap
+        # Below the cap still scales normally.
+        assert calculate_kelly_quantity(kelly_fraction=0.1, **common) < at_cap
 
     def test_capped_by_max_single_position_pct(self):
         qty = calculate_kelly_quantity(
@@ -576,14 +625,36 @@ class TestCalculatePositionQuantity:
         config = _make_config(portfolio_value_inr=1_000_000.0, max_single_position_pct=0.5)
         config.risk.use_kelly_sizing = True
         config.risk.kelly_min_trades = 10
-        config.risk.kelly_fraction = 0.5
+        config.risk.kelly_fraction = 0.25
+        config.risk.kelly_shrinkage_strength = 0.0  # raw win rate, no shrinkage
         trade_history = [{"outcome": "WIN", "return_pct": 6.0}] * 12 + [{"outcome": "LOSS", "return_pct": -3.0}] * 8
 
         actual = calculate_position_quantity(
             entry_price=100.0, stop_price=95.0, config=config, trade_history=trade_history
         )
-        # p=0.6, b=2.0 -> f*=0.4, half-Kelly=0.2 -> ~200,000 INR / 100 = ~2000 shares
-        assert actual in (1999, 2000)
+        # p=0.6, b=2.0 -> f*=0.4, quarter-Kelly=0.1 -> ~100,000 INR / 100 = ~1000 shares
+        assert actual in (999, 1000)
+
+    def test_shrinkage_sizes_more_conservatively_than_raw_win_rate(self):
+        """Default shrinkage must never size *larger* than the raw estimate."""
+        config = _make_config(portfolio_value_inr=1_000_000.0, max_single_position_pct=0.5)
+        config.risk.use_kelly_sizing = True
+        config.risk.kelly_min_trades = 10
+        config.risk.kelly_fraction = 0.25
+        trade_history = [{"outcome": "WIN", "return_pct": 6.0}] * 12 + [{"outcome": "LOSS", "return_pct": -3.0}] * 8
+
+        config.risk.kelly_shrinkage_strength = 0.0
+        raw = calculate_position_quantity(
+            entry_price=100.0, stop_price=95.0, config=config, trade_history=trade_history
+        )
+        config.risk.kelly_shrinkage_strength = 20.0
+        shrunk = calculate_position_quantity(
+            entry_price=100.0, stop_price=95.0, config=config, trade_history=trade_history
+        )
+
+        # p=0.55, b=2.0 -> f*=0.325, quarter-Kelly=0.08125 -> ~812 shares
+        assert shrunk == 812
+        assert shrunk < raw
 
 
 if __name__ == "__main__":

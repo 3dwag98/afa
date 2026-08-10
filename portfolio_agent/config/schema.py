@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class DataConfig(BaseModel):
@@ -14,8 +14,46 @@ class DataConfig(BaseModel):
     market_data_dir: str = Field(
         default="data/market_data", description="Directory for market data"
     )
+    source: Literal["huggingface", "yfinance"] = Field(
+        default="huggingface",
+        description="Where historical OHLCV comes from. 'huggingface' pulls a versioned Hub "
+        "dataset (see src/hf_dataset.py) — reproducible when hf_revision is pinned, and one "
+        "columnar download instead of thousands of per-ticker requests. 'yfinance' keeps the "
+        "original per-ticker download path. Either way the bars land in the same parquet cache.",
+    )
+    hf_dataset_id: str = Field(
+        default="vishnun0027/indian-market-historical-ohlcv",
+        description="HuggingFace Hub dataset repo id used when source='huggingface'.",
+    )
+    hf_revision: Optional[str] = Field(
+        default=None,
+        description="Git revision (branch, tag or commit SHA) of the Hub dataset to pin. Leave "
+        "unset to track the default branch; pin it for a reproducible backtest, since an "
+        "unpinned dataset can be updated underneath a running series of experiments.",
+    )
+    hf_asset_dir: str = Field(
+        default="stocks",
+        description="Directory within the Hub dataset to ingest equities from "
+        "(stocks | indices | etfs | commodities | forex). One parquet per symbol.",
+    )
+    hf_adjust_prices: bool = Field(
+        default=True,
+        description="Back-adjust OHLC by adj_close/close on ingest. Leave on: an unadjusted "
+        "1:10 split prints as a -90% daily return, which cross-sectional momentum reads as a "
+        "crash and the circuit-lock detector reads as a limit move. The previous yfinance path "
+        "used auto_adjust=True, so this also keeps the cache internally consistent.",
+    )
+    benchmark_symbol: str = Field(
+        default="^NSEI",
+        description="Index symbol (in the Hub dataset's indices/ directory) used as the market "
+        "benchmark for the momentum crash filter. ^NSEI is the Nifty 50. When its history is "
+        "cached, src/regime.py keys the trend and volatility filters off the real index; "
+        "otherwise it falls back to an equal-weighted composite of the traded universe.",
+    )
     default_history_years: int = Field(
-        default=5, description="Default number of years of historical data to use"
+        default=5,
+        description="Years of historical data to keep. Applied to both sources: the Hub dataset "
+        "is trimmed to this window on ingest rather than cached in full.",
     )
     universe_size: int = Field(
         default=10, description="Number of securities in the trading universe"
@@ -141,6 +179,26 @@ class TrainingConfig(BaseModel):
         "biggest benefit on CUDA). Off by default since compile overhead isn't worth it for very "
         "short runs and isn't supported on every platform.",
     )
+    walk_forward_splits: int = Field(
+        default=5,
+        description="Number of expanding-window walk-forward folds used to validate the model "
+        "(agents/trainer.py::run_walk_forward_validation). A single chronological 70/15/15 split "
+        "measures one regime and one initialization; walk-forward re-trains on an expanding "
+        "history and tests on the next contiguous block, so the reported out-of-sample numbers "
+        "average over several regimes. Set to 0 to skip validation and train on the single split "
+        "only (faster, much weaker evidence).",
+    )
+    walk_forward_epochs: Optional[int] = Field(
+        default=None,
+        description="Epoch budget per walk-forward fold. Folds exist to estimate generalization, "
+        "not to produce the shipped weights, so this defaults to min(20, training.epochs) to keep "
+        "validation affordable; set explicitly to train folds to full length.",
+    )
+    walk_forward_min_train_fraction: float = Field(
+        default=0.4,
+        description="Fraction of the panel used to train the first walk-forward fold. Subsequent "
+        "folds expand into the data the previous fold tested on.",
+    )
 
 
 class BacktestConfig(BaseModel):
@@ -185,15 +243,76 @@ class RiskConfig(BaseModel):
         "sizing otherwise. Off by default since it needs real trade history to be meaningful.",
     )
     kelly_fraction: float = Field(
-        default=0.5,
-        description="Fractional-Kelly multiplier kappa in [0, 1] (0.5 = half-Kelly, the common "
-        "practitioner default that captures ~75% of full-Kelly's growth rate at lower drawdown risk).",
+        default=0.25,
+        ge=0.0,
+        description="Fractional-Kelly multiplier kappa. Values above 0.25 are silently clamped to "
+        "quarter-Kelly by risk.py::calculate_kelly_quantity — the ceiling lives at the point of "
+        "use, so no config, env override or fixture can size above it, and an existing config "
+        "carrying the old 0.5 default still loads. Kelly assumes a well-estimated, roughly "
+        "symmetric payoff distribution and Indian small/mid-caps offer neither: a 'loss' that "
+        "locks at the lower circuit for days realizes far worse than the modelled stop, which "
+        "inflates the payoff ratio b and f* with it. Quarter-Kelly captures roughly half of "
+        "full-Kelly's growth rate at a small fraction of its drawdown risk.",
     )
     kelly_min_trades: int = Field(
-        default=20,
+        default=50,
         description="Minimum realized (WIN/LOSS) trades required before Kelly sizing is trusted; "
-        "below this, sizing falls back to fixed-fractional.",
+        "below this, sizing falls back to fixed-fractional. 50 is a floor, not a target: at "
+        "smaller samples the win-rate standard error is ~5-7 percentage points, and Kelly "
+        "penalizes over-betting off an optimistic estimate far more than under-betting.",
     )
+    kelly_shrinkage_strength: float = Field(
+        default=20.0,
+        description="Beta-prior strength (in pseudo-trades) used to shrink the realized win rate "
+        "toward 0.5 before it is fed to Kelly (see risk.py::shrink_win_probability). 20 means a "
+        "coin-flip prior worth 20 trades of evidence; 0 disables shrinkage and uses the raw rate.",
+    )
+    max_sector_pct: float = Field(
+        default=0.25,
+        description="Maximum share of portfolio value allowed in any single sector "
+        "(see src/sectors.py). Requires a ticker,sector CSV at paths.sector_map_csv; without "
+        "one every holding counts as UNKNOWN and the cap applies to that single pooled bucket. "
+        "Set to 0 (or >= 1) to disable.",
+    )
+    max_portfolio_drawdown_pct: float = Field(
+        default=0.15,
+        description="Circuit breaker: once peak-to-trough portfolio drawdown reaches this "
+        "fraction, no new BUY orders are created until equity recovers to within "
+        "drawdown_reentry_pct of the peak. Existing positions keep their stops and targets. "
+        "Set to 0 (or >= 1) to disable.",
+    )
+    drawdown_reentry_pct: float = Field(
+        default=0.10,
+        description="Drawdown level at which the circuit breaker re-arms and buying resumes. "
+        "Kept below max_portfolio_drawdown_pct so the breaker cannot flicker on and off at "
+        "the trip point.",
+    )
+    slippage_pct_per_side: float = Field(
+        default=0.0025,
+        description="Assumed per-side slippage, as a fraction of turnover, used when charging "
+        "estimated round-trip costs against a strategy's reward:risk before a quantity exists "
+        "(src/execution_sim.py::cost_fraction_per_side). Realized fills price slippage off each "
+        "ticker's own ATR and traded volume instead; this only affects signal gating.",
+    )
+
+    @model_validator(mode="after")
+    def _check_drawdown_thresholds(self) -> "RiskConfig":
+        """The breaker needs distinct trip and re-arm levels to be a breaker.
+
+        With reentry >= max, equity sitting just past the trip point satisfies
+        both conditions, so the breaker halts on one bar and resumes on the
+        next, churning the book at the drawdown trough — the exact behaviour
+        two thresholds exist to prevent.
+        """
+        if self.max_portfolio_drawdown_pct <= 0:
+            return self
+        if self.drawdown_reentry_pct >= self.max_portfolio_drawdown_pct:
+            raise ValueError(
+                f"risk.drawdown_reentry_pct ({self.drawdown_reentry_pct}) must be below "
+                f"risk.max_portfolio_drawdown_pct ({self.max_portfolio_drawdown_pct}); "
+                f"otherwise the circuit breaker trips and re-arms on alternating bars."
+            )
+        return self
 
 
 class LearningConfig(BaseModel):
@@ -213,6 +332,45 @@ class SimulationConfig(BaseModel):
     mc_horizon_days: int = Field(default=20, description="Forward simulation horizon in trading days")
     mc_simulations: int = Field(default=1000, description="Number of Monte Carlo simulation paths")
     random_seed: int = Field(default=42, description="Random seed for reproducible simulations")
+    method: Literal["gaussian", "block_bootstrap", "jump_diffusion"] = Field(
+        default="block_bootstrap",
+        description="Shock-generating process for the forward simulation (src/monte_carlo.py). "
+        "'gaussian' draws i.i.d. normal shocks (thin-tailed, no serial dependence — understates "
+        "tail risk); 'block_bootstrap' resamples contiguous blocks of the ticker's own returns, "
+        "preserving both the empirical fat tails and volatility clustering; 'jump_diffusion' adds "
+        "a compound-Poisson jump component to the Gaussian diffusion for gap/circuit-limit risk. "
+        "Defaults to block_bootstrap as the most faithful to Indian equity return behaviour.",
+    )
+    block_size_days: int = Field(
+        default=5,
+        description="Mean block length for the stationary block bootstrap. Blocks are drawn with "
+        "geometric lengths averaging this many days, so serial dependence within a block survives "
+        "resampling while the resulting series stays stationary.",
+    )
+    jump_intensity_per_year: float = Field(
+        default=12.0,
+        description="Expected number of jumps per year for method='jump_diffusion' (Merton "
+        "lambda). 12 ~ one policy/earnings/flow shock a month.",
+    )
+    jump_mean: float = Field(
+        default=-0.02,
+        description="Mean jump size in log-return terms for method='jump_diffusion'. Negative by "
+        "default: equity jump risk is asymmetric, and downside gaps are what a risk model needs "
+        "to capture.",
+    )
+    jump_volatility: float = Field(
+        default=0.05,
+        description="Standard deviation of jump size in log-return terms for method='jump_diffusion'.",
+    )
+    separate_overnight_gaps: bool = Field(
+        default=True,
+        description="When GARCH volatility is enabled, fit the recursion to intraday session "
+        "returns (close/open) and add overnight gap risk (open/prev_close) as a separate "
+        "component, instead of feeding it close-to-close returns. NSE opens after both the US "
+        "close and the Asian session, so gaps are frequent and large; attributing them to the "
+        "previous session's shock inflates alpha/gamma and destabilizes the persistence estimate. "
+        "Falls back to close-to-close GARCH when open prices or history are unavailable.",
+    )
     use_garch_volatility: bool = Field(
         default=False,
         description="If True, forecast each ticker's forward volatility with GJR-GARCH(1,1) "
@@ -230,7 +388,14 @@ class ComplianceConfig(BaseModel):
     target_prob_profit: float = Field(
         default=0.55, description="Minimum Monte Carlo probability-of-profit required for a BUY signal"
     )
-    min_reward_risk: float = Field(default=1.5, description="Minimum reward:risk ratio required for a BUY signal")
+    min_reward_risk: float = Field(
+        default=1.2,
+        description="Minimum reward:risk ratio required for a BUY signal, measured NET of "
+        "estimated round-trip friction (src/risk.py::net_reward_risk) rather than gross. "
+        "Lowered from 1.5 when costing was introduced: the same trade scores roughly 0.6x its "
+        "gross ratio once ~0.79% of round-trip cost is charged against an ATR-scale move, so "
+        "the old threshold was unreachable for any ATR-derived stop/target.",
+    )
     paper_trading_mode: bool = Field(
         default=True, description="Must remain True; this system never places real trades"
     )
@@ -246,6 +411,12 @@ class PathsConfig(BaseModel):
     )
     backtest_excel_output: str = Field(
         default="output/Backtest_Report.xlsx", description="Path to the backtest Excel report"
+    )
+    sector_map_csv: str = Field(
+        default="data/sector_map.csv",
+        description="CSV mapping tickers to sectors (columns: ticker,sector) used to enforce "
+        "risk.max_sector_pct. Optional — when absent, every holding is pooled into a single "
+        "UNKNOWN sector and the cap applies to that pool.",
     )
     log_file: str = Field(default="logs/agent.log", description="Path to the log file")
     log_dir: str = Field(default="logs", description="Directory for log files")

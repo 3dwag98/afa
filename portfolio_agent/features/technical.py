@@ -10,6 +10,7 @@ import numpy as np
 from typing import Callable
 
 from .registry import register_feature
+from portfolio_agent.src.liquidity import circuit_locked_days, zero_return_days
 
 
 @register_feature('close')
@@ -285,3 +286,79 @@ def realized_vol_60(df: pd.DataFrame) -> pd.Series:
     close_shifted = df['close'].shift(1)
     daily_returns = close_shifted.pct_change()
     return daily_returns.rolling(window=60).std() * np.sqrt(252)
+
+
+@register_feature('traded_value_60')
+def traded_value_60(df: pd.DataFrame) -> pd.Series:
+    """Median daily turnover (close x volume) over the trailing 60 sessions.
+
+    The liquidity screen behind the low-volatility strategy's "illiquidity
+    illusion" guard: a stock whose variance is low because nothing trades is
+    not a low-risk stock (docs/QUANT_RESEARCH.md section 15). Median rather
+    than mean, so one operator print cannot make a dead ticker look liquid.
+    Uses data shifted by 1 to avoid look-ahead bias.
+
+    Args:
+        df: DataFrame with 'close' and 'volume' columns.
+
+    Returns:
+        Series with median rupee turnover (lagged by 1 period).
+    """
+    traded_value = (df['close'] * df['volume']).shift(1)
+    return traded_value.rolling(window=60, min_periods=20).median()
+
+
+@register_feature('zero_return_fraction_60')
+def zero_return_fraction_60(df: pd.DataFrame) -> pd.Series:
+    """Share of the last 60 sessions that closed exactly unchanged.
+
+    An illiquid ticker that did not trade carries yesterday's close forward,
+    printing r = 0 rather than a small return — which mechanically suppresses
+    realized variance and pushes the stock into the low-volatility buy decile
+    for entirely the wrong reason. Uses data shifted by 1 to avoid look-ahead
+    bias.
+
+    Args:
+        df: DataFrame with 'close' column.
+
+    Returns:
+        Series with the unchanged-close fraction in [0, 1] (lagged by 1 period).
+    """
+    flat = zero_return_days(df).astype(float).shift(1)
+    return flat.rolling(window=60, min_periods=20).mean()
+
+
+@register_feature('circuit_lock_fraction_60')
+def circuit_lock_fraction_60(df: pd.DataFrame) -> pd.Series:
+    """Share of the last 60 sessions that locked at a circuit limit.
+
+    A stock pinned at its upper circuit prints a large return the momentum
+    formula reads as strength, while offering no liquidity to buy; the same
+    stock locked at the lower circuit cannot be exited at the modelled stop.
+    Uses data shifted by 1 to avoid look-ahead bias.
+
+    Args:
+        df: DataFrame with 'high', 'low' and 'close' columns.
+
+    Returns:
+        Series with the circuit-locked fraction in [0, 1] (lagged by 1 period).
+    """
+    locked = circuit_locked_days(df).astype(float).shift(1)
+    return locked.rolling(window=60, min_periods=20).mean()
+
+
+@register_feature('circuit_locked_today')
+def circuit_locked_today(df: pd.DataFrame) -> pd.Series:
+    """1.0 when the most recent completed session locked at a circuit limit.
+
+    Distinct from the 60-day fraction above: that measures whether a stock is
+    structurally operator-driven, this answers "can this order actually be
+    filled tomorrow?". Uses data shifted by 1 to avoid look-ahead bias.
+
+    Args:
+        df: DataFrame with 'high', 'low' and 'close' columns.
+
+    Returns:
+        Series of 0.0/1.0 flags (lagged by 1 period).
+    """
+    return circuit_locked_days(df).astype(float).shift(1)

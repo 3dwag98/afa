@@ -157,3 +157,165 @@ class TestMonteCarlo:
         assert check_decimals(result.expected_return_pct)
         assert check_decimals(result.var_95)
         assert check_decimals(result.cvar_95)
+
+
+class TestSimulationMethods:
+    """The shock-generating process materially changes the tail estimates the
+    compliance gate depends on, so each method is pinned separately."""
+
+    @staticmethod
+    def _fat_tailed_returns(n=500, seed=7):
+        """Returns with volatility clustering and occasional crash days —
+        the shape a Gaussian model cannot reproduce."""
+        rng = np.random.default_rng(seed)
+        returns = rng.normal(0.0005, 0.01, n)
+        # A clustered stretch of high volatility, plus two circuit-limit crashes.
+        returns[200:240] = rng.normal(-0.002, 0.05, 40)
+        returns[220] = -0.18
+        returns[221] = -0.12
+        return list(returns)
+
+    @pytest.mark.parametrize("method", ["gaussian", "block_bootstrap", "jump_diffusion"])
+    def test_every_method_is_deterministic_under_a_seed(self, method):
+        returns = self._fat_tailed_returns()
+        kwargs = dict(
+            symbol="TEST", daily_returns=returns, horizon_days=20,
+            simulations=500, seed=42, method=method,
+        )
+
+        first = run_monte_carlo(**kwargs)
+        second = run_monte_carlo(**kwargs)
+
+        assert first == second
+
+    @pytest.mark.parametrize("method", ["gaussian", "block_bootstrap", "jump_diffusion"])
+    def test_every_method_reports_a_usable_result(self, method):
+        result = run_monte_carlo(
+            symbol="TEST", daily_returns=self._fat_tailed_returns(),
+            horizon_days=20, simulations=500, seed=42, method=method,
+        )
+
+        assert 0.0 <= result.probability_profit <= 1.0
+        assert result.cvar_95 <= result.var_95
+        assert result.simulations_count == 500
+        assert result.method == method
+
+    def test_block_bootstrap_produces_a_fatter_left_tail_than_gaussian(self):
+        """The whole point: resampling real return blocks keeps the crash days
+        and the clustering, which i.i.d. normal draws smooth away."""
+        returns = self._fat_tailed_returns()
+        common = dict(symbol="TEST", daily_returns=returns, horizon_days=20,
+                      simulations=4000, seed=42)
+
+        gaussian = run_monte_carlo(method="gaussian", **common)
+        bootstrap = run_monte_carlo(method="block_bootstrap", **common)
+
+        assert bootstrap.cvar_95 < gaussian.cvar_95
+
+    def test_jump_diffusion_produces_a_fatter_left_tail_than_gaussian(self):
+        returns = self._fat_tailed_returns()
+        common = dict(symbol="TEST", daily_returns=returns, horizon_days=20,
+                      simulations=4000, seed=42)
+
+        gaussian = run_monte_carlo(method="gaussian", **common)
+        jumpy = run_monte_carlo(
+            method="jump_diffusion", jump_intensity_per_year=52.0,
+            jump_mean=-0.05, jump_volatility=0.08, **common,
+        )
+
+        assert jumpy.cvar_95 < gaussian.cvar_95
+
+    def test_jump_drift_is_compensated_so_jumps_widen_tails_not_shift_the_mean(self):
+        """Adding jump risk must not quietly turn every expected return
+        negative — otherwise the method choice would double as a return
+        forecast, which it is not."""
+        returns = self._fat_tailed_returns()
+        common = dict(symbol="TEST", daily_returns=returns, horizon_days=20,
+                      simulations=8000, seed=11)
+
+        gaussian = run_monte_carlo(method="gaussian", **common)
+        jumpy = run_monte_carlo(
+            method="jump_diffusion", jump_intensity_per_year=52.0,
+            jump_mean=-0.05, jump_volatility=0.08, **common,
+        )
+
+        assert jumpy.expected_return_pct == pytest.approx(
+            gaussian.expected_return_pct, abs=0.05
+        )
+
+    def test_block_bootstrap_falls_back_on_short_history(self):
+        """A resample of 40 observations just re-prints the same few days, so
+        the method degrades to Gaussian rather than pretending otherwise."""
+        short_returns = list(np.random.default_rng(1).normal(0.0, 0.01, 40))
+
+        result = run_monte_carlo(
+            symbol="TEST", daily_returns=short_returns, horizon_days=10,
+            simulations=200, seed=42, method="block_bootstrap",
+        )
+
+        assert result.method == "gaussian"
+        assert result.simulations_count == 200
+
+    def test_block_bootstrap_preserves_serial_dependence(self):
+        """Contiguous blocks must travel together: a series of strictly
+        alternating returns resampled in blocks keeps alternating, while
+        independent draws would not."""
+        from src.monte_carlo import _block_bootstrap_shocks
+
+        source = np.array([0.01, -0.01] * 50)
+        rng = np.random.default_rng(3)
+
+        shocks = _block_bootstrap_shocks(source, simulations=200, horizon_days=30,
+                                         mean_block_days=10, rng=rng)
+
+        # Within a block, consecutive draws alternate sign, so consecutive
+        # products are negative. With mean block length 10, the large majority
+        # of adjacent pairs sit inside a block.
+        adjacent_products = shocks[:, :-1] * shocks[:, 1:]
+        assert float(np.mean(adjacent_products < 0)) > 0.8
+
+    def test_unseeded_runs_differ(self):
+        returns = self._fat_tailed_returns()
+        kwargs = dict(symbol="TEST", daily_returns=returns, horizon_days=20,
+                      simulations=500, seed=None, method="block_bootstrap")
+
+        assert run_monte_carlo(**kwargs) != run_monte_carlo(**kwargs)
+
+
+class TestMonteCarloSettings:
+    """The settings bundle both worker-dispatch paths ship to their workers."""
+
+    def test_from_simulation_config_round_trips_every_option(self):
+        from portfolio_agent.config.schema import AppConfig
+        from src.monte_carlo import MonteCarloSettings
+
+        config = AppConfig()
+        settings = MonteCarloSettings.from_simulation_config(config.simulation)
+
+        assert settings.horizon_days == config.simulation.mc_horizon_days
+        assert settings.simulations == config.simulation.mc_simulations
+        assert settings.seed == config.simulation.random_seed
+        assert settings.method == config.simulation.method
+        assert settings.block_size_days == config.simulation.block_size_days
+        assert settings.jump_mean == config.simulation.jump_mean
+
+    def test_run_dispatches_to_the_configured_method(self):
+        from src.monte_carlo import MonteCarloSettings
+
+        returns = list(np.random.default_rng(5).normal(0.0005, 0.012, 400))
+        settings = MonteCarloSettings(
+            horizon_days=20, simulations=300, seed=42, method="block_bootstrap"
+        )
+
+        result = settings.run("TEST", returns)
+
+        assert result.method == "block_bootstrap"
+        assert result.simulations_count == 300
+
+    def test_settings_are_picklable_for_worker_dispatch(self):
+        import pickle
+        from src.monte_carlo import MonteCarloSettings
+
+        settings = MonteCarloSettings(method="jump_diffusion", seed=7)
+
+        assert pickle.loads(pickle.dumps(settings)) == settings

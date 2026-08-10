@@ -561,13 +561,20 @@ portfolio_agent/
 └── src/
     ├── orchestrator.py     the live daily loop
     ├── backtest_engine.py  event-driven backtest
-    ├── execution_sim.py    Indian market costs, slippage, STCG/LTCG
-    ├── risk.py             position sizing incl. fractional Kelly
+    ├── execution_sim.py    Indian market costs, slippage, STCG/LTCG,
+    │                       plus the quantity-free round-trip cost estimator
+    ├── risk.py             position sizing incl. fractional Kelly (capped at
+    │                       quarter-Kelly), Beta-shrunk win rate, net-of-cost RR
+    ├── regime.py           market regime + volatility targeting (momentum crash filter)
+    ├── liquidity.py        circuit-lock / illiquidity / zombie screening
+    ├── sectors.py          ticker->sector map and concentration caps
     ├── risk_analytics.py   CAGR/Sharpe/Sortino/drawdown, bootstrap MC
-    ├── monte_carlo.py      per-symbol forward simulation (scoring input)
-    ├── volatility_models.py GJR-GARCH(1,1)
+    ├── monte_carlo.py      per-symbol forward simulation (scoring input):
+    │                       gaussian / block bootstrap / jump diffusion
+    ├── volatility_models.py GJR-GARCH(1,1), incl. the gap-aware fit
     ├── compliance.py       eligibility gates
-    ├── data_store.py       parquet cache + downloads
+    ├── data_store.py       parquet cache + source dispatch (Hub or yfinance)
+    ├── hf_dataset.py       HuggingFace Hub OHLCV ingest + split adjustment
     ├── universe.py         ticker universe resolution
     ├── reporting.py        live-agent Excel report
     └── backtest_reporting.py backtest Excel report

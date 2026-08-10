@@ -148,16 +148,25 @@ def get_cached_tickers(cache_dir: Optional[Path] = None) -> List[str]:
     function; the single canonical implementation used by both DataStore and
     universe.py's discover_available_tickers()).
 
+    Symbols beginning with "^" are excluded. Those are indices (^NSEI, ^BSESN,
+    ...) cached alongside equities so the market-regime filter can read them —
+    they are not instruments this platform trades, and letting one into the
+    universe would rank the Nifty against individual stocks by momentum, queue
+    orders against it, and pollute the equal-weighted composite the regime
+    filter builds from the universe.
+
     Args:
         cache_dir: Directory to scan. Defaults to DATA_DIR (data/market_data,
             resolved relative to the current working directory).
 
     Returns:
-        Sorted list of unique ticker symbols. Empty list if none cached.
+        Sorted list of unique tradeable ticker symbols. Empty if none cached.
     """
     directory = Path(cache_dir) if cache_dir is not None else DATA_DIR
     directory.mkdir(parents=True, exist_ok=True)
-    tickers = {path.stem for path in directory.glob("*.parquet")}
+    tickers = {
+        path.stem for path in directory.glob("*.parquet") if not path.stem.startswith("^")
+    }
     return sorted(tickers)
 
 
@@ -209,6 +218,75 @@ def generate_synthetic_ohlcv(
     return df
 
 
+def fetch_and_cache(
+    config,
+    tickers: List[str],
+    start_date: str,
+    end_date: str,
+    skip_existing: bool = True,
+) -> bool:
+    """Populate the parquet cache from whichever source config.data.source names.
+
+    The single place that decides between the Hub dataset and yfinance, so
+    every caller (the live agent's missing-ticker top-up, the CLI's
+    download-data command) picks the same source without repeating the branch.
+    A failed HuggingFace ingest falls back to yfinance rather than leaving the
+    run with no data at all — the fallback is logged loudly, because silently
+    switching sources mid-experiment is exactly how two "identical" backtests
+    end up disagreeing.
+
+    Args:
+        config: AppConfig instance.
+        tickers: Tickers to fetch.
+        start_date: Start date (YYYY-MM-DD).
+        end_date: End date (YYYY-MM-DD).
+        skip_existing: Skip tickers whose cached data already covers the range
+            (yfinance path only; the Hub path reads one file for everything, so
+            per-ticker skipping saves nothing).
+
+    Returns:
+        True when every requested ticker was cached or skipped.
+    """
+    source = getattr(config.data, "source", "yfinance")
+
+    if source == "huggingface":
+        try:
+            from .hf_dataset import sync_hf_to_cache
+        except ImportError:  # pragma: no cover - script-style import path
+            from hf_dataset import sync_hf_to_cache
+
+        try:
+            written = sync_hf_to_cache(
+                dataset_id=config.data.hf_dataset_id,
+                revision=config.data.hf_revision,
+                asset_dir=config.data.hf_asset_dir,
+                adjust_prices=config.data.hf_adjust_prices,
+                tickers=tickers,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            missing = sorted(set(t.upper() for t in tickers) - set(written))
+            if missing:
+                logger.warning(
+                    "%d of %d requested tickers are absent from %s (e.g. %s)",
+                    len(missing), len(tickers), config.data.hf_dataset_id, missing[:5],
+                )
+            return not missing
+        except Exception:
+            logger.warning(
+                "HuggingFace ingest from %s failed; falling back to yfinance for this fetch",
+                config.data.hf_dataset_id, exc_info=True,
+            )
+
+    return batch_download_and_cache(
+        tickers,
+        start_date=start_date,
+        end_date=end_date,
+        skip_existing=skip_existing,
+        max_workers=getattr(config.data, "download_workers", None),
+    )
+
+
 def load_or_fetch_data(
     config,
     force_refresh: bool = False,
@@ -256,12 +334,12 @@ def load_or_fetch_data(
         end_date = datetime.now()
         start_date = end_date - timedelta(days=config.data.default_history_years * 365)
         logger.info(f"Fetching fresh data for {len(missing)} tickers")
-        batch_download_and_cache(
+        fetch_and_cache(
+            config,
             missing,
             start_date=start_date.strftime('%Y-%m-%d'),
             end_date=end_date.strftime('%Y-%m-%d'),
             skip_existing=False,
-            max_workers=getattr(config.data, 'download_workers', None),
         )
         for ticker in missing:
             df = load_ticker_data(ticker)

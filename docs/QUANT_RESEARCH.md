@@ -15,6 +15,13 @@ This document is the mathematical/research foundation behind the platform's stra
 9. [Quality (QMJ) factor](#9-quality-qmj-factor-not-yet-implemented) — **not implemented** (data gap)
 10. [FII/DII institutional flows](#10-fiidii-institutional-flows-not-yet-implemented) — **not implemented** (data gap)
 11. [Calendar anomalies](#11-calendar-anomalies-deliberately-not-implemented) — deliberately not implemented (weak/inconsistent evidence)
+12. [Momentum crash protection](#12-momentum-crash-protection) — implemented (`src/regime.py`)
+13. [Transaction costs and concentration limits](#13-transaction-costs-and-concentration-limits) — implemented (`src/execution_sim.py`, `src/sectors.py`)
+14. [Fat tails in the forward simulation](#14-fat-tails-in-the-forward-simulation) — implemented (`src/monte_carlo.py`)
+15. [Circuit limits and the illiquidity illusion](#15-circuit-limits-and-the-illiquidity-illusion) — implemented (`src/liquidity.py`)
+16. [Overnight gaps and GARCH stationarity](#16-overnight-gaps-and-garch-stationarity) — implemented (`src/volatility_models.py`)
+17. [The long-only constraint](#17-the-long-only-constraint) — a known, accepted limitation
+18. [Making the walk-forward measurement honest](#18-making-the-walk-forward-measurement-honest) — implemented (`agents/trainer.py`)
 
 ---
 
@@ -204,3 +211,170 @@ Given the above, a reasonable evidence-backed UMA (see `config/strategies/exampl
 | `lstm` | Learned sequence pattern | OHLCV | Daily |
 
 Momentum and low-volatility are close to orthogonal in the literature (momentum profits from continuation, low-vol profits from an entirely different risk-pricing anomaly), making them a good `weighted_blend` pair; `rule_based` and `lstm` add faster-moving, daily-refreshed signals on top.
+
+---
+
+## 12. Momentum crash protection
+
+**The problem.** Momentum is the factor most prone to catastrophic, fat-tailed failure, and its crashes are not random draws from a fat tail — they cluster in an identifiable *panic state*: after a bear market, during the rebound, when the recent losers a momentum book is underweight rally hardest and market volatility is elevated. In Indian equities pure momentum has drawn down roughly 45–55% in 2011, 2018 and the COVID crash, and the Nifty 200 Momentum 30 index's worst drawdown (−70.25%) is materially deeper than the Nifty's (−55.12%). A long-only implementation with no volatility scaling and no regime awareness inherits all of that.
+
+**Three fixes exist in the literature; two need only OHLCV and are implemented.**
+
+**(a) Constant volatility scaling.** Scale exposure by the ratio of a target risk budget to realized volatility, so a position's risk contribution stays roughly constant instead of ballooning exactly when volatility spikes:
+
+$$
+w_i(t) = \min\left(w_{\max},\ \max\left(w_{\min},\ \frac{\sigma_{\text{target}}}{\sigma_i(t)}\right)\right)
+$$
+
+with \(\sigma_{\text{target}} = 20\%\) annualized by default. \(w_{\max} = 1\), so this can only ever *reduce* a position — the platform's existing position caps stay the binding constraint in calm markets, and no configuration turns this into leverage.
+
+**(b) Dynamic scaling / regime filter.** Classify the market state and cut momentum exposure in the panic state:
+
+| State | Condition | Exposure |
+|---|---|---|
+| `crash_risk` | market below its 200-day MA **and** realized vol > 1.5× target | `bear_exposure` (0 by default: no new momentum entries) |
+| `elevated_vol` | exactly one of those holds | volatility-scaled, halved again if the trigger is the downtrend |
+| `risk_on` | neither holds | volatility-scaled only |
+
+Both conditions are required for the hard stand-down because the crash literature puts the danger in the *rebound out of* a bear market, not in the decline itself — a quiet downtrend is a warning, so it dampens rather than halts.
+
+**The market series.** When `data.benchmark_symbol` (default `^NSEI`, the Nifty 50) is cached, the trend and volatility tests key off the real index — "the market is below its 200-day average" is a statement about the index the research studied. Without one, `src/regime.py::build_market_proxy()` falls back to an equal-weighted composite of the traded universe, which needs no extra data but is only a proxy: it reflects whatever is in today's universe, and idiosyncratic noise diversifies out of it in a way real index volatility does not.
+
+The composite averages **daily returns** and cumulates them, rather than averaging rebased price levels. Real universes have ragged start dates and the eligible set changes daily during a backtest; averaging rebased levels makes a newly-listed ticker join at its own base of 1.0 while incumbents sit at 1.4, printing a double-digit synthetic drop on a day every constituent rose — and the filter would read that construction artifact as a trend break and as realized volatility. A return average has no such discontinuity.
+
+Nifty VIX would be a better volatility gauge than realized volatility, but it is not in the OHLCV cache; see §10 for the flow-data equivalent.
+
+**(c) Idiosyncratic momentum** — ranking on residual rather than total returns — is the third documented fix. It needs a factor model to residualize against, which needs §8's data. Not implemented.
+
+**Fail-neutral by design.** With too little history to judge the regime, exposure is left unscaled rather than blocked: there is no evidence of a panic state, and inventing one would silently disable the strategy on a short cache rather than protect it.
+
+**Sources:**
+- Daniel & Moskowitz, ["Momentum Crashes"](https://www.sciencedirect.com/science/article/abs/pii/S0304405X16301490), *Journal of Financial Economics* 122(2), 2016
+- Barroso & Santa-Clara, ["Momentum has its moments"](https://www.sciencedirect.com/science/article/abs/pii/S0304405X14002323), *Journal of Financial Economics* 116(1), 2015
+- Blitz, Huij & Martens, ["Residual momentum"](https://www.sciencedirect.com/science/article/abs/pii/S0927539811000247), *Journal of Empirical Finance* 18(3), 2011
+- Harvey et al., ["The Impact of Volatility Targeting"](https://www.man.com/insights/the-impact-of-volatility-targeting), *Journal of Portfolio Management*, 2018
+
+---
+
+## 13. Transaction costs and concentration limits
+
+### 13.1 The Indian cost stack
+
+`src/execution_sim.py` charges the full delivery (CNC) schedule on every simulated fill:
+
+| Component | Rate | Legs |
+|---|---|---|
+| Brokerage | min(₹20, 0.03% of turnover) | both |
+| STT | 0.1% of turnover | both |
+| Exchange transaction charges | 0.00345% | both |
+| SEBI turnover fees | 0.0001% (₹10/crore) | both |
+| GST | 18% of (brokerage + exchange + SEBI) | both |
+| Stamp duty | 0.015% | buy only |
+| STCG / LTCG | 20% / 12.5% above the ₹1.25L exemption | on realized gains |
+
+STT is 0.1% on *both* legs, not 0.025%: the 0.025% figure is the intraday sell-side rate, and a platform that holds overnight never qualifies for it.
+
+### 13.2 Costs must reach the *signal*, not just the fill
+
+Charging friction at fill time makes the equity curve honest but leaves the decision unchanged — the strategy still selects trades as if they were free. A momentum book rebalancing monthly into a top-decile portfolio gives up roughly 0.5–1.5% per round trip, which is the same order as the premium being harvested.
+
+So reward:risk is now reported **net of estimated round-trip friction** (`src/risk.py::net_reward_risk`):
+
+$$
+\text{RR}_{\text{net}} = \frac{P_{\text{target}}(1-c_{\text{sell}}) - P_{\text{entry}}(1+c_{\text{buy}})}{P_{\text{entry}}(1+c_{\text{buy}}) - P_{\text{stop}}(1-c_{\text{sell}})}
+$$
+
+with \(c\) from `cost_fraction_per_side()` — the statutory rates above plus an assumed 25 bps/side of slippage, ~0.8% per round trip in total. Brokerage enters at its percentage rate rather than min(₹20, 0.03%), because the flat cap only ever *lowers* the effective rate, making the percentage the conservative upper bound.
+
+**A consequence worth stating plainly, and what was done about it.** The old rule-based exit rules (1.5× ATR stop, 2.0× ATR target) give a *gross* reward:risk of 1.33 regardless of ATR. Charging ~0.79% of round-trip friction against an ATR-scale move takes that to 0.72–1.11 depending on how large ATR is relative to price — so against `compliance.min_reward_risk: 1.5` the flagship strategy could not emit a single BUY, and could not before costing either (1.33 < 1.5 gross).
+
+Rather than document a config that cannot fire, the geometry was widened to match the economics: the take-profit multiple is now **3.0× ATR** (2.0 gross, ~1.2–1.7 net across realistic ATR levels) and `min_reward_risk` is **1.2**, a threshold good setups clear and marginal ones fail. Signals carry both `reward_risk` (net) and `extra["gross_reward_risk"]`, so the size of the friction haircut stays visible instead of implicit. `src/compliance.py::check_risk_reward_ratio` measures the same net quantity, so the strategy gate and the compliance gate cannot disagree about what a trade's reward:risk is.
+
+### 13.3 Sector concentration
+
+Ranking on one characteristic and buying the extreme decile has no term in the objective that cares what those stocks *are*. In Indian equities that reliably produces a portfolio which is nominally 10 names and economically one bet — momentum concentrated in IT through 2020-21, then Banking/PSU through 2022-23. The factor exposure is intended; the sector exposure is an accident, and it is what turns a factor drawdown into a portfolio drawdown.
+
+`src/sectors.py` caps any one sector at `risk.max_sector_pct` (25% by default), enforced at *order-creation* time in both the backtest engine and the live orchestrator, and accounting for orders queued in the same round — five BUYs in one sector each fit under the cap individually and blow straight through it together.
+
+The map comes from a `ticker,sector` CSV at `paths.sector_map_csv`. **Without one the cap is inactive, and both engines say so at WARNING level.** Pooling unmapped names into a single `UNKNOWN` bucket and capping *that* looks like the conservative choice and is in fact a completely different constraint: with no map at all, every holding is UNKNOWN, so a 25% "sector" limit silently becomes a 25% limit on total invested capital and leaves three quarters of the portfolio in cash forever. An unmapped ticker is likewise never charged against a mapped sector's allowance. A cap that cannot be computed is reported as unenforceable rather than quietly reinterpreted.
+
+### 13.4 Drawdown circuit breaker
+
+`risk.max_portfolio_drawdown_pct` (15%) halts *new* entries once peak-to-trough drawdown reaches it; buying resumes at `drawdown_reentry_pct` (10%). Two thresholds rather than one, so the breaker cannot flicker on and off as equity wobbles across a single line — and a config validator rejects `drawdown_reentry_pct >= max_portfolio_drawdown_pct`, since that setting re-creates the single-threshold flicker the pair exists to prevent. Open positions keep their stops and targets: force-liquidating a whole book at a drawdown trough is how a bad quarter becomes a permanent loss.
+
+---
+
+## 14. Fat tails in the forward simulation
+
+The original Monte Carlo drew i.i.d. Gaussian shocks around a historical mean and standard deviation. That model assumes stationary parameters, thin tails and independent days — all three fail in an emerging market with circuit limits, retail participation spikes and policy shocks, and the failure is one-directional: it *understates* tail risk, which is exactly the quantity `compliance.target_prob_profit` gates on.
+
+`simulation.method` now selects the shock process:
+
+- **`block_bootstrap`** (default) — the stationary bootstrap of Politis & Romano. At each simulated day, either continue the current block (probability \(1 - 1/L\)) or jump to a fresh random start (probability \(1/L\)), giving geometric block lengths with mean \(L\). Contiguous days travel together, so both the empirical fat tails and the volatility clustering survive resampling; drawing days independently would destroy exactly the serial dependence that makes a drawdown a drawdown. Geometric rather than fixed block lengths avoid imprinting an artificial periodicity on the paths.
+- **`jump_diffusion`** — Merton: Gaussian diffusion plus a compound-Poisson jump component, \(N \sim \text{Poisson}(\lambda/252)\) jumps per day of size \(\sim \mathcal{N}(\mu_J, \sigma_J^2)\) with \(\mu_J < 0\). Diffusion cannot produce a gap; jumps can. The drift is jump-compensated, so adding jump risk widens the tails without also quietly shifting every expected return downward.
+- **`gaussian`** — the original, retained for comparison.
+
+All three compose with the GARCH volatility path (§3, §16): GARCH sets how large tomorrow's shocks should be, `method` sets what shape they take. A method whose preconditions do not hold — a block bootstrap over fewer than 60 observations just re-prints the same few days — degrades to the Gaussian path rather than failing the ticker, since a missing MC result is read downstream as zero probability-of-profit.
+
+**Sources:**
+- Politis & Romano, ["The Stationary Bootstrap"](https://www.tandfonline.com/doi/abs/10.1080/01621459.1994.10476870), *JASA* 89(428), 1994
+- Merton, ["Option pricing when underlying stock returns are discontinuous"](https://www.sciencedirect.com/science/article/abs/pii/0304405X76900222), *Journal of Financial Economics* 3(1-2), 1976
+
+---
+
+## 15. Circuit limits and the illiquidity illusion
+
+Every ranking formula in this platform assumes continuous price discovery and that a printed close is a price you could have transacted at. On the NSE/BSE mid- and small-cap segments neither holds, in two specific ways that are both detectable from OHLCV alone.
+
+**Circuit locks.** Stocks lock at 5%/10%/20% bands. An operator-driven pump locks a stock in the upper circuit for consecutive sessions: \(P(t)/P(t-J)\) registers a huge formation return and momentum screams BUY, while there is no offer to lift. On the way back down the stock locks in the lower circuit and the position cannot be exited at all, so the realized loss blows through the modelled stop — which in turn inflates the payoff ratio \(b\) that Kelly sizes off (§4).
+
+A locked session is identified by a **zero intraday range** (high == low) together with a move from the prior close at or beyond the smallest statutory band. Both conditions are needed: a zero range alone is an untraded day, a large move alone is an ordinary volatile session.
+
+**The illiquidity illusion.** Low realized volatility is supposed to proxy for a stable business. In India it frequently proxies for *nothing trading*: an illiquid stock carries yesterday's close forward, printing \(r = 0\) rather than a small return, which mechanically suppresses \(\sigma_i\) and walks the stock into the low-volatility buy decile. The anomaly the strategy is trying to harvest is not the one it ends up holding — these "quiet" names carry exactly the governance risk that ends in a forensic audit or a SEBI suspension.
+
+`src/liquidity.py` screens on three trailing-60-session statistics — median rupee turnover, the share of unchanged closes, and the share of circuit-locked sessions — plus a "locked on the decision date" check for whether an order could be filled at all. Screened names are **removed from the ranking**, not merely marked un-buyable: leaving an untradeable stock in the cross-section would still shift every other name's percentile. Statistics that cannot be computed (short cache) pass, since the screen's job is to exclude on positive evidence of untradeability, not on absence of evidence.
+
+**A related bias this does not fix.** \(p\) and \(b\) estimated only from currently-listed stocks ignore suspensions and delistings, inflating the apparent win rate. The backtest engine does force-liquidate delisted holdings and books the loss, so a *backtest's* Kelly inputs see them; a universe list built from today's constituents still cannot.
+
+---
+
+## 16. Overnight gaps and GARCH stationarity
+
+GJR-GARCH (§3) is a model of a continuous trading process, and close-to-close returns are not one — they bundle two mechanisms with different dynamics:
+
+- the **overnight gap**, \(\text{open}_t / \text{close}_{t-1} - 1\), which reprices global cues, FII decisions and policy news while the market is shut, arriving as a single instantaneous jump with no within-gap conditional variance to track;
+- the **intraday session**, \(\text{close}_t / \text{open}_t - 1\), which is the continuous trading the recursion actually describes.
+
+Feeding close-to-close returns to the recursion makes it attribute every gap to yesterday's session shock. That inflates \(\alpha\) and \(\gamma\), drags the persistence estimate \(\alpha + \gamma/2 + \beta\) toward (and sometimes past) the stationarity bound, and makes the fitted parameters unstable across refits — a pronounced problem for NSE, which opens after both the US close and the Asian session.
+
+`forecast_volatility_gap_aware()` fits GJR-GARCH to the session leg only and adds gap risk as a separate component:
+
+$$
+\sigma_{\text{daily},t}^2 = \sigma_{\text{intraday},t}^2 + \sigma_{\text{gap}}^2
+$$
+
+with \(\sigma_{\text{gap}}\) the unconditional standard deviation of the gap series. Independence is the standard simplification and a conservative one here: positive correlation between a gap and the session following it would only widen the total. Enabled by `simulation.separate_overnight_gaps`; each fallback is independent, so a failed gap-aware fit drops to close-to-close GARCH rather than all the way to constant volatility.
+
+---
+
+## 17. The long-only constraint
+
+Momentum and the low-volatility anomaly are defined in the literature as **long-short** portfolios. Shorting the loser decile is not incidental — it is what makes the factor market-neutral (\(\beta \approx 0\)) and what isolates the anomaly from the market return. This platform never shorts, so its momentum sleeve carries \(\beta \approx 1\) and will draw down with the Nifty in any broad selloff, whereas the academic long-short construction would earn on the short leg.
+
+This is an accepted limitation, not an oversight, for two reasons. First, India's Securities Lending and Borrowing mechanism is thin outside large caps, so the short leg of a mid-cap momentum book is not reliably borrowable at any price — the academic construction is not merely disallowed here but largely unimplementable. Second, a paper-trading decision-support tool that quietly modelled unborrowable shorts would report returns nobody could have earned.
+
+What the platform does instead is manage the resulting beta directly rather than hedge it away: the §12 regime filter cuts exposure when the market is in the state where a long-only factor book suffers most, and §13.4's circuit breaker caps how far a systemic drawdown can run before new risk stops being added. Index-futures hedging (a Nifty short against the long book) is the natural way to close the remaining gap and would need a futures data path plus an explicit exception to the no-shorting guardrail — a scoping decision, flagged here rather than half-built.
+
+---
+
+## 18. Making the walk-forward measurement honest
+
+Section 12–17's controls are only as good as the evidence that they help, and the LSTM's walk-forward validation (`agents/trainer.py`) is the only place this platform produces a deploy/don't-deploy number. Three properties are what make that number mean anything, and each was a live defect at some point in this work:
+
+**The target must be a forecast.** `config.training.target` defaults to `return_5d`, which is *also* a registered feature (the trailing 5-day return). The original "create the target if it doesn't exist" branch therefore never fired, and the model was trained to reproduce a quantity already determined by the price history it was being shown. Training loss looked excellent and forecast nothing. The target is now always recomputed as a forward return under a namespaced column (`target_return_5d`), so a same-named feature can never silently become the label.
+
+**Folds must split by date, not by row.** The stacked training panel is ordered *[every ticker's train block][every val block][every test block]*, an ordering chosen so `create_dataloaders()`'s single 70/15/15 index split represents every ticker. A row-index split of that same panel is not chronological: fold 1's "future" test rows and its training rows cover the *same calendar dates* for different tickers. Walk-forward therefore works from per-ticker frames (`load_panel_by_ticker()`) and splits each by date, concatenating the blocks afterwards — which keeps each ticker's rows contiguous, as the sequence windows require, while guaranteeing no training row is dated at or after its fold's test period.
+
+**Forward-looking labels need an embargo.** With a 5-day forward target, the last five training rows before a boundary carry labels computed from prices *inside* the test period. Those rows are dropped, or the model is fitted against labels encoding the moves it is about to be scored on.
+
+Reported metrics are directional accuracy plus the annualized Sharpe of a long-only signal-following rule, always against an always-long benchmark on the identical sample. A model that cannot beat always-long is adding turnover, not alpha, and the trainer says so in as many words. The held-out test evaluation reloads the best checkpoint first, so the numbers describe the weights `MLStrategy` will actually load rather than whatever the last epoch of overfitting produced.

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -27,6 +29,8 @@ TRAINING_FEATURE_NAMES = [
     'sma_20', 'sma_50', 'rsi_14', 'macd',
     'bollinger_pct_b', 'atr_14', 'return_1d', 'return_5d'
 ]
+
+TRADING_DAYS_PER_YEAR = 252
 
 
 def _generate_synthetic_ohlcv(n_samples: int = 1000, seed: int = 42) -> pd.DataFrame:
@@ -52,14 +56,13 @@ def _generate_synthetic_ohlcv(n_samples: int = 1000, seed: int = 42) -> pd.DataF
     }, index=dates)
 
 
-def _load_and_split_ticker(
-    ticker: str, config: AppConfig
-) -> Optional[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
-    """Load, featurize, and chronologically split (70/15/15) one ticker.
+def _load_ticker_features(ticker: str, config: AppConfig) -> Optional[pd.DataFrame]:
+    """Load and featurize one ticker, keeping its DatetimeIndex.
 
     Module-level (not a nested closure) so it can be dispatched across a
-    ProcessPoolExecutor for parallel training-panel construction. Returns
-    None if the ticker has insufficient cached history.
+    ProcessPoolExecutor. The index is preserved deliberately: walk-forward
+    validation splits by *date*, which is impossible once rows are stacked and
+    re-indexed. Returns None if the ticker has insufficient cached history.
     """
     df = load_ticker_data(ticker)
     if df is None or len(df) < config.data.min_history_days:
@@ -73,6 +76,16 @@ def _load_and_split_ticker(
         return None
     if len(feature_df) < config.training.sequence_length * 2:
         return None
+    return feature_df
+
+
+def _load_and_split_ticker(
+    ticker: str, config: AppConfig
+) -> Optional[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    """Load, featurize, and chronologically split (70/15/15) one ticker."""
+    feature_df = _load_ticker_features(ticker, config)
+    if feature_df is None:
+        return None
 
     n = len(feature_df)
     train_end = int(n * 0.70)
@@ -84,44 +97,17 @@ def _load_and_split_ticker(
     )
 
 
-def load_data(config: AppConfig) -> pd.DataFrame:
-    """Load and featurize training data.
+def load_panel_by_ticker(config: AppConfig) -> Dict[str, pd.DataFrame]:
+    """Featurized, date-indexed frames keyed by ticker.
 
-    By default, loads real cached multi-ticker OHLCV data — the full 5-year
-    cached universe (via data_store), not a synthetic stand-in — and builds a
-    concatenated training panel: each ticker is featurized and split 70/15/15
-    chronologically *individually*, then all tickers' train portions are
-    concatenated, followed by all val portions, then all test portions. This
-    ordering lets create_dataloaders()'s single top-level 70/15/15 index split
-    land exactly on those boundaries, so validation/test proportionally
-    represent every ticker rather than only the last one in the panel.
-
-    Per-ticker loading + feature computation is CPU-bound (parquet decode +
-    indicator math), so when config.training.parallel_data_loading is set
-    (the default), tickers are dispatched across a ProcessPoolExecutor sized
-    by config.training.data_load_workers (default: CPU count) — this is what
-    makes training on the full ~2,400-ticker cached universe practical. The
-    parallel path reassembles results in resolved-universe order, so it builds
-    exactly the same panel as the serial path (workers completing out of order
-    must not change what the model trains on).
-
-    Sequence windows that straddle two concatenated tickers' boundaries mix
-    data from different instruments; this is a bounded, documented limitation
-    of pooling multiple series through a single-series windowing dataset
-    (TimeSeriesDataset), not a look-ahead bias — it affects at most
-    sequence_length * (n_tickers - 1) windows out of the full panel.
-
-    Falls back to synthetic random-walk data only when
-    config.training.use_synthetic_data is set.
-
-    Args:
-        config: Application configuration.
-
-    Returns:
-        DataFrame with computed features and target column (already featurized).
+    The shared source for both panel constructions: load_data() stacks these
+    into the single training panel, and run_walk_forward_validation() splits
+    each one by date. Keeping them separate is what lets walk-forward respect
+    chronology — see that function for why a row-index split of the stacked
+    panel does not.
     """
     if config.training.use_synthetic_data:
-        return prepare_features(_generate_synthetic_ohlcv(), config)
+        return {"SYNTHETIC": prepare_features(_generate_synthetic_ohlcv(), config, verbose=False)}
 
     tickers = resolve_backtest_universe(max_tickers=config.data.universe_size)
     if not tickers:
@@ -132,17 +118,17 @@ def load_data(config: AppConfig) -> pd.DataFrame:
         )
 
     # Keyed by ticker rather than appended in completion order: workers finish
-    # in a nondeterministic order, and appending in that order would make the
-    # concatenated panel's row order (and therefore training) differ run to
-    # run for identical inputs. Reassembling in `tickers` order below makes the
-    # parallel path produce byte-identical output to the serial path.
-    by_ticker: Dict[str, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = {}
+    # nondeterministically, and appending in that order would make the panel's
+    # row order (and therefore training) differ run to run for identical
+    # inputs. Reassembling in `tickers` order below makes the parallel path
+    # produce byte-identical output to the serial path.
+    by_ticker: Dict[str, pd.DataFrame] = {}
     show_progress = len(tickers) > 20
     failures = 0
 
     if config.training.parallel_data_loading and len(tickers) > 1:
         with ProcessPoolExecutor(max_workers=config.training.data_load_workers) as executor:
-            futures = {executor.submit(_load_and_split_ticker, t, config): t for t in tickers}
+            futures = {executor.submit(_load_ticker_features, t, config): t for t in tickers}
             iterator = as_completed(futures)
             if show_progress:
                 iterator = tqdm(iterator, total=len(futures), desc="Loading training data", unit="ticker")
@@ -161,7 +147,7 @@ def load_data(config: AppConfig) -> pd.DataFrame:
         ticker_iter = tqdm(tickers, desc="Loading training data", unit="ticker") if show_progress else tickers
         for ticker in ticker_iter:
             try:
-                result = _load_and_split_ticker(ticker, config)
+                result = _load_ticker_features(ticker, config)
             except Exception as e:
                 failures += 1
                 print(f"Warning: failed to load training data for {ticker}: {e}")
@@ -169,29 +155,99 @@ def load_data(config: AppConfig) -> pd.DataFrame:
             if result is not None:
                 by_ticker[ticker] = result
 
-    results = [by_ticker[t] for t in tickers if t in by_ticker]
-
     if failures:
         print(f"Warning: {failures}/{len(tickers)} tickers failed to load and were skipped")
 
-    if not results:
+    ordered = {t: by_ticker[t] for t in tickers if t in by_ticker}
+    if not ordered:
         raise RuntimeError(
             "None of the resolved tickers had enough cached history to build a "
             "training panel. Run `portfolio-agent download-data` first, or set "
             "training.use_synthetic_data=true for offline testing."
         )
+    return ordered
 
-    train_parts = [r[0] for r in results]
-    val_parts = [r[1] for r in results]
-    test_parts = [r[2] for r in results]
+
+def load_data(config: AppConfig) -> pd.DataFrame:
+    """Load and featurize training data into a single stacked panel.
+
+    Each ticker is featurized and split 70/15/15 chronologically
+    *individually*, then all tickers' train portions are concatenated,
+    followed by all val portions, then all test portions. That ordering lets
+    create_dataloaders()'s single top-level 70/15/15 index split land exactly
+    on those boundaries, so validation/test proportionally represent every
+    ticker rather than only the last one in the panel.
+
+    Note what this ordering is *not* suitable for: because it groups by split
+    and then by ticker, a row-index split of the result is not chronological
+    across the panel. Walk-forward validation therefore works from
+    load_panel_by_ticker() and splits by date — see
+    run_walk_forward_validation().
+
+    Sequence windows that straddle two concatenated tickers' boundaries mix
+    data from different instruments; this is a bounded, documented limitation
+    of pooling multiple series through a single-series windowing dataset
+    (TimeSeriesDataset), not a look-ahead bias — it affects at most
+    sequence_length * (n_tickers - 1) windows out of the full panel.
+
+    Args:
+        config: Application configuration.
+
+    Returns:
+        DataFrame with computed features and target column (already featurized).
+    """
+    by_ticker = load_panel_by_ticker(config)
+
+    train_parts, val_parts, test_parts = [], [], []
+    for frame in by_ticker.values():
+        n = len(frame)
+        train_end = int(n * 0.70)
+        val_end = int(n * 0.85)
+        train_parts.append(frame.iloc[:train_end])
+        val_parts.append(frame.iloc[train_end:val_end])
+        test_parts.append(frame.iloc[val_end:])
 
     combined = pd.concat(train_parts + val_parts + test_parts, ignore_index=True)
-    print(f"Built training panel from {len(results)}/{len(tickers)} tickers: {len(combined)} total rows")
+    print(f"Built training panel from {len(by_ticker)} tickers: {len(combined)} total rows")
     return combined
 
 
+def target_column_name(target: str) -> str:
+    """Column name for the training target, namespaced away from features.
+
+    The target must never share a name with a registered feature. It used to:
+    config.training.target defaults to "return_5d", which is also in
+    TRAINING_FEATURE_NAMES, so the "create target if it doesn't exist" branch
+    below never fired and the model was trained to reproduce the *trailing*
+    5-day return — a quantity fully determined by the price history it was
+    already being shown. That trains and validates beautifully and forecasts
+    nothing. Prefixing the target guarantees the collision cannot recur.
+    """
+    return f"target_{target}"
+
+
+def build_forward_return(close: pd.Series, target: str) -> pd.Series:
+    """Realized *forward* return over the horizon encoded in `target`.
+
+    For target="return_5d": (close[t+5] - close[t]) / close[t] — what the
+    model is supposed to predict, dated at the decision point t. The value is
+    unknown at t by construction, which is the point; rows near the end of the
+    series are NaN and get dropped.
+    """
+    periods = 1
+    if 'return' in target:
+        digits = "".join(ch for ch in target if ch.isdigit())
+        if digits:
+            periods = max(1, int(digits))
+    return close.shift(-periods).pct_change(periods)
+
+
 def prepare_features(df: pd.DataFrame, config: AppConfig, verbose: bool = True) -> pd.DataFrame:
-    """Build feature matrix from raw OHLCV data.
+    """Build feature matrix and forward-return target from raw OHLCV data.
+
+    The returned frame's last column is always the target; every other column
+    is an input feature. Downstream code (create_dataloaders, the walk-forward
+    splitter, and the metadata written for MLStrategy) relies on that ordering.
 
     Args:
         df: Raw OHLCV DataFrame.
@@ -200,7 +256,7 @@ def prepare_features(df: pd.DataFrame, config: AppConfig, verbose: bool = True) 
             from load_data()'s multi-ticker panel construction).
 
     Returns:
-        DataFrame with computed features and target.
+        DataFrame with computed features and the forward-return target.
     """
     feature_df = build_features(
         df,
@@ -209,18 +265,11 @@ def prepare_features(df: pd.DataFrame, config: AppConfig, verbose: bool = True) 
         normalize_window=config.features.normalize_window
     )
 
-    # Add target (next period return as example)
-    target_name = config.training.target
-    if target_name not in feature_df.columns:
-        # Create target if it doesn't exist
-        if 'return' in target_name:
-            try:
-                periods = int(target_name.replace('return_', ''))
-                feature_df[target_name] = df['close'].shift(-periods).pct_change(periods)
-            except ValueError:
-                feature_df[target_name] = df['close'].shift(-1).pct_change()
-        else:
-            feature_df[target_name] = df['close'].shift(-1).pct_change()
+    # Target is always recomputed as a forward return under a namespaced
+    # column, so a feature of the same name (e.g. the trailing return_5d)
+    # stays an input and never silently becomes the label.
+    target_name = target_column_name(config.training.target)
+    feature_df[target_name] = build_forward_return(df['close'], config.training.target)
 
     # Drop NaN values
     feature_df = feature_df.dropna()
@@ -231,6 +280,478 @@ def prepare_features(df: pd.DataFrame, config: AppConfig, verbose: bool = True) 
         print(f"Target: {feature_df.columns[-1]}")
 
     return feature_df
+
+
+def _target_horizon_days(target_name: str) -> int:
+    """Forecast horizon implied by a target name like 'return_5d'.
+
+    Used only to annualize the walk-forward Sharpe ratios; defaults to 1 day
+    for target names that don't encode a horizon.
+    """
+    digits = "".join(ch for ch in str(target_name) if ch.isdigit())
+    try:
+        return max(1, int(digits))
+    except ValueError:
+        return 1
+
+
+def evaluate_predictions(
+    predictions: np.ndarray,
+    actuals: np.ndarray,
+    horizon_days: int = 5,
+) -> Dict[str, float]:
+    """Score out-of-sample predictions on the terms a trader cares about.
+
+    A regression loss says how close the predicted number is; it does not say
+    whether acting on the prediction makes money. Both are reported, plus the
+    benchmark that any forecasting model has to beat before it earns a place
+    in the stack:
+
+    - ``mse`` — the loss the model was actually trained on.
+    - ``directional_accuracy`` — fraction of predictions whose sign matches
+      the realized return. On noisy daily equity data anything much above 0.5
+      is the whole edge.
+    - ``strategy_sharpe`` — annualized Sharpe of a long-only rule that takes
+      the position when the prediction is positive and sits in cash otherwise
+      (long-only because this platform never shorts). Gross of costs; see
+      src/execution_sim.py for what friction would remove.
+    - ``benchmark_sharpe`` — annualized Sharpe of always being long. A model
+      whose strategy Sharpe does not clear this is adding turnover, not alpha.
+    - ``excess_sharpe`` — strategy minus benchmark, the number to judge on.
+
+    Sharpe is annualized by sqrt(252 / horizon_days). With daily-sampled
+    multi-day targets the observations overlap, which understates the standard
+    error, so these ratios read slightly high in absolute terms — they are
+    meaningful as a comparison between strategy and benchmark, both of which
+    are computed on the identical overlapping sample.
+
+    Args:
+        predictions: Model outputs, shape (n,).
+        actuals: Realized target values, shape (n,).
+        horizon_days: Forecast horizon in trading days, for annualization.
+
+    Returns:
+        Dictionary of metrics; zeros when there is nothing to score.
+    """
+    predictions = np.asarray(predictions, dtype=float).ravel()
+    actuals = np.asarray(actuals, dtype=float).ravel()
+
+    empty = {
+        "n_samples": 0, "mse": 0.0, "directional_accuracy": 0.0,
+        "strategy_sharpe": 0.0, "benchmark_sharpe": 0.0, "excess_sharpe": 0.0,
+    }
+    if predictions.size == 0 or predictions.size != actuals.size:
+        return empty
+
+    finite = np.isfinite(predictions) & np.isfinite(actuals)
+    predictions, actuals = predictions[finite], actuals[finite]
+    if predictions.size == 0:
+        return empty
+
+    mse = float(np.mean((predictions - actuals) ** 2))
+    directional_accuracy = float(np.mean(np.sign(predictions) == np.sign(actuals)))
+
+    annualization = math.sqrt(TRADING_DAYS_PER_YEAR / max(1, horizon_days))
+
+    def _sharpe(returns: np.ndarray) -> float:
+        if returns.size < 2:
+            return 0.0
+        sigma = float(np.std(returns, ddof=1))
+        if sigma <= 0:
+            return 0.0
+        return float(np.mean(returns) / sigma * annualization)
+
+    strategy_returns = np.where(predictions > 0, actuals, 0.0)
+
+    strategy_sharpe = _sharpe(strategy_returns)
+    benchmark_sharpe = _sharpe(actuals)
+
+    return {
+        "n_samples": int(predictions.size),
+        "mse": mse,
+        "directional_accuracy": directional_accuracy,
+        "strategy_sharpe": strategy_sharpe,
+        "benchmark_sharpe": benchmark_sharpe,
+        "excess_sharpe": strategy_sharpe - benchmark_sharpe,
+    }
+
+
+def _make_loader(
+    features: np.ndarray,
+    targets: np.ndarray,
+    config: TrainingConfig,
+    shuffle: bool = False,
+    drop_last: bool = False,
+) -> Optional[DataLoader]:
+    """Wrap a contiguous feature/target slice in a sequence DataLoader.
+
+    Returns None when the slice is shorter than one sequence, so a fold that
+    lands on too little data is skipped rather than raising.
+    """
+    if len(features) <= config.sequence_length:
+        return None
+    dataset = TimeSeriesDataset(features, targets, config.sequence_length)
+    if len(dataset) == 0:
+        return None
+    return DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=shuffle,           # never True here: temporal order is the point
+        num_workers=0,             # folds are short; worker startup dominates
+        drop_last=drop_last,
+    )
+
+
+def _train_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: Optional[DataLoader],
+    device: torch.device,
+    epochs: int,
+    learning_rate: float,
+    use_mixed_precision: bool,
+    patience: int = 10,
+    min_delta: float = 1e-4,
+    progress_label: str = "",
+    on_improve=None,
+) -> Tuple[List[float], List[float], float]:
+    """Train `model` with early stopping on validation loss.
+
+    Shared by the final fit and by every walk-forward fold, so a fold is
+    trained exactly the way the shipped model is — a validation procedure that
+    trains differently from production is measuring the wrong thing.
+
+    Args:
+        model: Model to train in place.
+        train_loader: Training batches.
+        val_loader: Validation batches; without one, early stopping is
+            disabled and the model trains for the full epoch budget.
+        device: Device to train on.
+        epochs: Maximum epochs.
+        learning_rate: AdamW learning rate.
+        use_mixed_precision: Whether to use CUDA autocast + GradScaler.
+        patience: Epochs without improvement before stopping.
+        min_delta: Minimum validation-loss improvement that counts.
+        progress_label: Prefix for the progress bar description.
+        on_improve: Optional callback(epoch, val_loss) invoked whenever
+            validation loss improves — used to checkpoint the best weights.
+
+    Returns:
+        (train_losses, val_losses, best_val_loss).
+    """
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
+    loss_fn = nn.MSELoss()
+    scaler = torch.amp.GradScaler('cuda') if use_mixed_precision else None
+
+    train_losses: List[float] = []
+    val_losses: List[float] = []
+    best_val_loss = float('inf')
+    patience_counter = 0
+
+    for epoch in range(epochs):
+        model.train()
+        epoch_train_loss = 0.0
+        num_train_batches = 0
+
+        pbar = tqdm(
+            train_loader,
+            desc=f"{progress_label}Epoch {epoch + 1}/{epochs} [Train]",
+            leave=False,
+            mininterval=0.5,
+        )
+        for batch_x, batch_y in pbar:
+            batch_x = batch_x.to(device, non_blocking=True)
+            batch_y = batch_y.to(device, non_blocking=True)
+
+            optimizer.zero_grad()
+
+            if use_mixed_precision:
+                with torch.autocast('cuda'):
+                    outputs = model(batch_x)
+                    loss = loss_fn(outputs.squeeze(), batch_y)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(batch_x)
+                loss = loss_fn(outputs.squeeze(), batch_y)
+                loss.backward()
+                optimizer.step()
+
+            epoch_train_loss += loss.item()
+            num_train_batches += 1
+
+        avg_train_loss = epoch_train_loss / max(num_train_batches, 1)
+        train_losses.append(avg_train_loss)
+
+        if val_loader is None:
+            continue
+
+        model.eval()
+        epoch_val_loss = 0.0
+        num_val_batches = 0
+        with torch.no_grad():
+            for batch_x, batch_y in val_loader:
+                batch_x = batch_x.to(device, non_blocking=True)
+                batch_y = batch_y.to(device, non_blocking=True)
+                if use_mixed_precision:
+                    with torch.autocast('cuda'):
+                        outputs = model(batch_x)
+                        loss = loss_fn(outputs.squeeze(), batch_y)
+                else:
+                    outputs = model(batch_x)
+                    loss = loss_fn(outputs.squeeze(), batch_y)
+                epoch_val_loss += loss.item()
+                num_val_batches += 1
+
+        avg_val_loss = epoch_val_loss / max(num_val_batches, 1)
+        val_losses.append(avg_val_loss)
+
+        if avg_val_loss < best_val_loss - min_delta:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            if on_improve is not None:
+                on_improve(epoch + 1, avg_val_loss, optimizer)
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"  Early stopping triggered (patience={patience} exceeded)")
+                break
+
+    return train_losses, val_losses, best_val_loss
+
+
+def _predict(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[np.ndarray, np.ndarray]:
+    """Collect (predictions, actuals) over a loader, in order."""
+    model.eval()
+    predictions: List[np.ndarray] = []
+    actuals: List[np.ndarray] = []
+    with torch.no_grad():
+        for batch_x, batch_y in loader:
+            batch_x = batch_x.to(device, non_blocking=True)
+            outputs = model(batch_x).squeeze(-1)
+            predictions.append(outputs.detach().cpu().numpy().ravel())
+            actuals.append(batch_y.detach().cpu().numpy().ravel())
+    if not predictions:
+        return np.array([]), np.array([])
+    return np.concatenate(predictions), np.concatenate(actuals)
+
+
+def _stack_blocks(blocks: List[pd.DataFrame]) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Concatenate per-ticker blocks into (features, targets) arrays."""
+    usable = [b for b in blocks if b is not None and not b.empty]
+    if not usable:
+        return None
+    panel = pd.concat(usable)
+    return panel.iloc[:, :-1].values, panel.iloc[:, -1].values
+
+
+def run_walk_forward_validation(
+    panel_by_ticker: Dict[str, pd.DataFrame],
+    config: AppConfig,
+    device: torch.device,
+    use_mixed_precision: bool = False,
+) -> Dict[str, Any]:
+    """Expanding-window walk-forward validation, split by calendar date.
+
+    A single chronological 70/15/15 split answers "how did this model do on
+    2023?" — one regime, one initialization, one number. That is not enough
+    evidence to deploy a 5-day return forecaster on a market with this
+    signal-to-noise ratio. Walk-forward re-fits on an expanding history and
+    tests on the *next* contiguous period, repeatedly:
+
+        fold 1: train dates < T1        test dates in [T1, T2)
+        fold 2: train dates < T2        test dates in [T2, T3)
+        ...
+
+    **Splitting by date, not by row index.** The stacked training panel is
+    ordered [every ticker's train block][every val block][every test block],
+    so an index-based split of it would put 2019 rows for ticker B in the
+    "future" test block while 2019 rows for ticker A sit in the training
+    block — an out-of-sample measurement covering the same calendar dates it
+    trained on. Each ticker is therefore split by date individually and the
+    blocks concatenated afterwards, which keeps every ticker's rows contiguous
+    (as the sequence windows require) while guaranteeing no training row is
+    dated at or after its fold's test period.
+
+    **Embargo.** The target is a *forward* return over `horizon_days`, so the
+    last few training rows before a boundary carry labels computed from prices
+    inside the test period. Those rows are dropped, or the model would be
+    fitted against labels that already encode the moves it is about to be
+    scored on.
+
+    Each fold holds back the tail of its own training window for early
+    stopping, so the test period is never seen during fitting. Folds train
+    with a reduced epoch budget (`walk_forward_epochs`, default
+    min(20, epochs)): their job is to estimate generalization, not to produce
+    the shipped weights.
+
+    Args:
+        panel_by_ticker: Featurized, date-indexed frames keyed by ticker (see
+            load_panel_by_ticker); the last column of each is the target.
+        config: Application configuration.
+        device: Device to train on.
+        use_mixed_precision: Whether to use CUDA autocast.
+
+    Returns:
+        Dictionary with per-fold metrics and their averages, or a `skipped`
+        marker when the history is too short to split.
+    """
+    training = config.training
+    n_splits = training.walk_forward_splits
+    if n_splits <= 0:
+        return {"skipped": "walk_forward_splits <= 0"}
+    if not panel_by_ticker:
+        return {"skipped": "no tickers in the training panel"}
+
+    sample = next(iter(panel_by_ticker.values()))
+    feature_cols = sample.columns[:-1].tolist()
+    target_col = sample.columns[-1]
+    horizon_days = _target_horizon_days(target_col)
+
+    # Fold boundaries come from the pooled distribution of dates, so each fold
+    # holds a comparable number of observations even with ragged histories.
+    all_dates = np.sort(np.concatenate([
+        frame.index.values for frame in panel_by_ticker.values() if len(frame)
+    ])) if panel_by_ticker else np.array([])
+    if len(all_dates) == 0:
+        return {"skipped": "training panel has no dated rows"}
+
+    first_fraction = training.walk_forward_min_train_fraction
+    boundaries = [
+        pd.Timestamp(all_dates[min(len(all_dates) - 1, int(len(all_dates) * q))])
+        for q in np.linspace(first_fraction, 1.0, n_splits + 1)
+    ]
+
+    epochs = training.walk_forward_epochs or min(20, training.epochs)
+    model_class = get_model(training.model)
+
+    print("\n" + "=" * 60)
+    print(f"Walk-Forward Validation ({n_splits} expanding-window folds, split by date)")
+    print("=" * 60)
+
+    fold_metrics: List[Dict[str, Any]] = []
+    for fold in range(n_splits):
+        train_end_date = boundaries[fold]
+        test_end_date = boundaries[fold + 1]
+        if test_end_date <= train_end_date:
+            continue
+
+        train_blocks: List[pd.DataFrame] = []
+        val_blocks: List[pd.DataFrame] = []
+        test_blocks: List[pd.DataFrame] = []
+
+        for frame in panel_by_ticker.values():
+            history = frame[frame.index < train_end_date]
+            # Embargo: labels of the final `horizon_days` training rows are
+            # computed from prices inside the test period.
+            if horizon_days > 0:
+                history = history.iloc[:-horizon_days] if len(history) > horizon_days else history.iloc[:0]
+            if len(history) <= training.sequence_length:
+                continue
+
+            inner_val_size = max(training.sequence_length + 1, int(len(history) * 0.15))
+            inner_train_end = len(history) - inner_val_size
+            if inner_train_end <= training.sequence_length:
+                continue
+
+            train_blocks.append(history.iloc[:inner_train_end])
+            val_blocks.append(history.iloc[inner_train_end:])
+
+            test = frame[(frame.index >= train_end_date) & (frame.index < test_end_date)]
+            if len(test) > training.sequence_length:
+                test_blocks.append(test)
+
+        train_data = _stack_blocks(train_blocks)
+        test_data = _stack_blocks(test_blocks)
+        val_data = _stack_blocks(val_blocks)
+        if train_data is None or test_data is None:
+            print(f"Fold {fold + 1}/{n_splits}: skipped (not enough rows)")
+            continue
+
+        train_loader = _make_loader(*train_data, training, drop_last=True)
+        val_loader = _make_loader(*val_data, training) if val_data is not None else None
+        test_loader = _make_loader(*test_data, training)
+        if train_loader is None or test_loader is None:
+            print(f"Fold {fold + 1}/{n_splits}: skipped (not enough rows)")
+            continue
+
+        model = model_class(
+            n_features=len(feature_cols),
+            hidden_size=64,
+            n_layers=2,
+            sequence_length=training.sequence_length,
+            dropout=0.2,
+            n_outputs=1,
+        ).to(device)
+
+        _train_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            device=device,
+            epochs=epochs,
+            learning_rate=training.learning_rate,
+            use_mixed_precision=use_mixed_precision,
+            progress_label=f"[fold {fold + 1}/{n_splits}] ",
+        )
+
+        predictions, actuals = _predict(model, test_loader, device)
+        metrics = evaluate_predictions(predictions, actuals, horizon_days)
+        metrics.update({
+            "fold": fold + 1,
+            "train_end": train_end_date.strftime("%Y-%m-%d"),
+            "test_end": test_end_date.strftime("%Y-%m-%d"),
+            "train_rows": int(len(train_data[0])),
+            "test_rows": int(len(test_data[0])),
+        })
+        fold_metrics.append(metrics)
+
+        print(
+            f"Fold {fold + 1}/{n_splits}: train<{metrics['train_end']} "
+            f"test<{metrics['test_end']} ({metrics['test_rows']} rows) | "
+            f"MSE={metrics['mse']:.6f} | dir_acc={metrics['directional_accuracy']:.3f} | "
+            f"Sharpe={metrics['strategy_sharpe']:.2f} vs benchmark "
+            f"{metrics['benchmark_sharpe']:.2f} (excess {metrics['excess_sharpe']:+.2f})"
+        )
+
+    if not fold_metrics:
+        return {"skipped": "no fold had enough rows to evaluate"}
+
+    def _mean(key: str) -> float:
+        return float(np.mean([m[key] for m in fold_metrics]))
+
+    summary = {
+        "n_folds": len(fold_metrics),
+        "epochs_per_fold": epochs,
+        "horizon_days": horizon_days,
+        "embargo_days": horizon_days,
+        "folds": fold_metrics,
+        "mean_mse": _mean("mse"),
+        "mean_directional_accuracy": _mean("directional_accuracy"),
+        "mean_strategy_sharpe": _mean("strategy_sharpe"),
+        "mean_benchmark_sharpe": _mean("benchmark_sharpe"),
+        "mean_excess_sharpe": _mean("excess_sharpe"),
+        "folds_beating_benchmark": sum(1 for m in fold_metrics if m["excess_sharpe"] > 0),
+    }
+
+    print("-" * 60)
+    print(
+        f"Mean across {summary['n_folds']} folds: "
+        f"dir_acc={summary['mean_directional_accuracy']:.3f} | "
+        f"Sharpe={summary['mean_strategy_sharpe']:.2f} vs benchmark "
+        f"{summary['mean_benchmark_sharpe']:.2f} | "
+        f"excess={summary['mean_excess_sharpe']:+.2f} | "
+        f"beat benchmark in {summary['folds_beating_benchmark']}/{summary['n_folds']} folds"
+    )
+    if summary["mean_excess_sharpe"] <= 0:
+        print(
+            "  WARNING: out-of-sample Sharpe does not beat always-long. The model is "
+            "adding turnover, not alpha — do not trade it without changing something."
+        )
+    print("=" * 60)
+
+    return summary
 
 
 def run_training(config: AppConfig) -> Dict[str, Any]:
@@ -272,35 +793,52 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
 
     if use_mixed_precision:
         print("Mixed Precision: Enabled")
-        scaler = torch.amp.GradScaler('cuda')
     else:
         if config.training.use_mixed_precision and device.type != "cuda":
             print(f"Mixed Precision: Disabled (requires CUDA; running on {device.type})")
         else:
             print("Mixed Precision: Disabled")
-        scaler = None
-    
+
     # =========================================================================
     # 2. Load and featurize training data (real cached tickers by default)
     # =========================================================================
     print("\nLoading and featurizing training data...")
-    feature_df = load_data(config)
-
+    panel_by_ticker = load_panel_by_ticker(config)
 
     # =========================================================================
-    # 3. Create DataLoaders
+    # 3. Walk-forward validation (before the final fit)
+    # =========================================================================
+    # Run first, so the generalization estimate is available even if the final
+    # long fit is interrupted — and so a model that cannot beat always-long is
+    # flagged before anyone reads its training loss as evidence of anything.
+    # Takes the per-ticker frames, not the stacked panel: it splits by date.
+    walk_forward = run_walk_forward_validation(
+        panel_by_ticker, config, device, use_mixed_precision
+    )
+
+    train_parts, val_parts, test_parts = [], [], []
+    for frame in panel_by_ticker.values():
+        n = len(frame)
+        train_parts.append(frame.iloc[:int(n * 0.70)])
+        val_parts.append(frame.iloc[int(n * 0.70):int(n * 0.85)])
+        test_parts.append(frame.iloc[int(n * 0.85):])
+    feature_df = pd.concat(train_parts + val_parts + test_parts, ignore_index=True)
+    print(f"Built training panel from {len(panel_by_ticker)} tickers: {len(feature_df)} total rows")
+
+    # =========================================================================
+    # 4. Create DataLoaders
     # =========================================================================
     print("\nCreating DataLoaders...")
     train_loader, val_loader, test_loader = create_dataloaders(
         feature_df, config.training
     )
-    
+
     # Extract feature and target names for metadata
     feature_names = list(feature_df.columns[:-1])
     target_name = feature_df.columns[-1]
-    
+
     # =========================================================================
-    # 4. Initialize model from registry
+    # 5. Initialize model from registry
     # =========================================================================
     print(f"\nInitializing model: {config.training.model}")
     
@@ -333,137 +871,67 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
             print(f"torch.compile unavailable, continuing uncompiled: {e}")
     
     # =========================================================================
-    # 5. Initialize Optimizer and Loss Function
+    # 6. Train (AdamW + MSE, early stopping on validation loss)
     # =========================================================================
-    optimizer = optim.AdamW(model.parameters(), lr=config.training.learning_rate)
-    
-    # Select loss function based on config or default to MSE
-    loss_fn = nn.MSELoss()
     print(f"Optimizer: AdamW (lr={config.training.learning_rate})")
     print(f"Loss Function: MSE")
-    
-    # =========================================================================
-    # 6. Training Loop Setup
-    # =========================================================================
     print("\n" + "=" * 60)
     print("Starting Training")
     print("=" * 60)
-    
-    # Early stopping parameters
-    patience = 10
-    min_delta = 1e-4
-    best_val_loss = float('inf')
-    patience_counter = 0
-    early_stop = False
-    
-    # Track metrics
-    train_losses: List[float] = []
-    val_losses: List[float] = []
-    
+
     # Create models directory if it doesn't exist
     models_dir = Path("models")
     models_dir.mkdir(exist_ok=True)
-    
-    # =========================================================================
-    # 7. Epoch Loop
-    # =========================================================================
+    model_path = models_dir / f"{config.training.model}_best.pt"
+
     # Enable cudnn benchmarking for faster training on fixed-size inputs
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         print("cuDNN benchmarking: Enabled (optimized for fixed input sizes)")
-    
-    for epoch in range(config.training.epochs):
-        if early_stop:
-            print(f"\nEarly stopping at epoch {epoch + 1}")
-            break
-        
-        # ----- Training Phase -----
-        model.train()
-        epoch_train_loss = 0.0
-        num_train_batches = 0
-        
-        # Use autocast for mixed precision
-        # Set progress bar to update less frequently for speed
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.training.epochs} [Train]", leave=False, mininterval=0.5)
-        for batch_x, batch_y in pbar:
-            batch_x = batch_x.to(device, non_blocking=True)
-            batch_y = batch_y.to(device, non_blocking=True)
-            
-            optimizer.zero_grad()
-            
-            if use_mixed_precision:
-                with torch.autocast('cuda'):
-                    outputs = model(batch_x)
-                    loss = loss_fn(outputs.squeeze(), batch_y)
-                
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                outputs = model(batch_x)
-                loss = loss_fn(outputs.squeeze(), batch_y)
-                loss.backward()
-                optimizer.step()
-            
-            epoch_train_loss += loss.item()
-            num_train_batches += 1
-        
-        avg_train_loss = epoch_train_loss / max(num_train_batches, 1)
-        train_losses.append(avg_train_loss)
-        
-        # ----- Validation Phase -----
-        model.eval()
-        epoch_val_loss = 0.0
-        num_val_batches = 0
-        
-        with torch.no_grad():
-            for batch_x, batch_y in val_loader:
-                batch_x = batch_x.to(device, non_blocking=True)
-                batch_y = batch_y.to(device, non_blocking=True)
-                
-                if use_mixed_precision:
-                    with torch.autocast('cuda'):
-                        outputs = model(batch_x)
-                        loss = loss_fn(outputs.squeeze(), batch_y)
-                else:
-                    outputs = model(batch_x)
-                    loss = loss_fn(outputs.squeeze(), batch_y)
-                
-                epoch_val_loss += loss.item()
-                num_val_batches += 1
-        
-        avg_val_loss = epoch_val_loss / max(num_val_batches, 1)
-        val_losses.append(avg_val_loss)
-        
-        # Print epoch summary
-        print(f"\nEpoch {epoch + 1}/{config.training.epochs}:")
-        print(f"  Train Loss: {avg_train_loss:.6f}")
-        print(f"  Val Loss:   {avg_val_loss:.6f}")
-        
-        # ----- Early Stopping Check -----
-        if avg_val_loss < best_val_loss - min_delta:
-            best_val_loss = avg_val_loss
-            patience_counter = 0
-            
-            # Save best model weights
-            model_path = models_dir / f"{config.training.model_name if hasattr(config.training, 'model_name') else config.training.model}_best.pt"
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': avg_val_loss,
-                'feature_names': feature_names,
-                'target': target_name,
-                'sequence_length': config.training.sequence_length,
-                'device': str(device),
-            }, model_path)
-            print(f"  ✓ Saved best model to {model_path}")
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                early_stop = True
-                print(f"  Early stopping triggered (patience={patience} exceeded)")
-    
+
+    def _checkpoint(epoch: int, val_loss: float, optimizer) -> None:
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'val_loss': val_loss,
+            'feature_names': feature_names,
+            'target': target_name,
+            'sequence_length': config.training.sequence_length,
+            'device': str(device),
+        }, model_path)
+        print(f"  ✓ Saved best model to {model_path}")
+
+    train_losses, val_losses, best_val_loss = _train_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        device=device,
+        epochs=config.training.epochs,
+        learning_rate=config.training.learning_rate,
+        use_mixed_precision=use_mixed_precision,
+        on_improve=_checkpoint,
+    )
+
+    # =========================================================================
+    # 7. Held-out test evaluation
+    # =========================================================================
+    # Score the weights that actually ship, not the last epoch's. Early
+    # stopping leaves `model` up to `patience` epochs past the validation
+    # optimum, so evaluating it in place would report metrics for weights that
+    # exist nowhere — MLStrategy loads the checkpoint.
+    if model_path.exists():
+        checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"  Restored best checkpoint (epoch {checkpoint.get('epoch', '?')}) for test scoring")
+
+    # The 15% test tail was never touched by training or early stopping, so
+    # this is the single-split counterpart to the walk-forward numbers above.
+    test_metrics = evaluate_predictions(
+        *_predict(model, test_loader, device),
+        horizon_days=_target_horizon_days(target_name),
+    )
+
     # =========================================================================
     # 8. Save Metadata
     # =========================================================================
@@ -477,16 +945,18 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
             'val_losses': val_losses,
             'best_val_loss': best_val_loss,
         },
+        'test_metrics': test_metrics,
+        'walk_forward': walk_forward,
         'epochs_trained': len(train_losses),
         'mixed_precision_enabled': use_mixed_precision,
         'model_architecture': config.training.model,
     }
-    
+
     metadata_path = models_dir / "metadata.json"
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
     print(f"\nSaved metadata to {metadata_path}")
-    
+
     # =========================================================================
     # 9. Summary
     # =========================================================================
@@ -495,7 +965,20 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
     print("=" * 60)
     print(f"  Epochs trained: {len(train_losses)}")
     print(f"  Best validation loss: {best_val_loss:.6f}")
-    print(f"  Final train loss: {train_losses[-1]:.6f}")
-    print(f"  Final val loss: {val_losses[-1]:.6f}")
-    
+    if train_losses:
+        print(f"  Final train loss: {train_losses[-1]:.6f}")
+    if val_losses:
+        print(f"  Final val loss: {val_losses[-1]:.6f}")
+    print(
+        f"  Held-out test: dir_acc={test_metrics['directional_accuracy']:.3f} | "
+        f"Sharpe={test_metrics['strategy_sharpe']:.2f} vs always-long "
+        f"{test_metrics['benchmark_sharpe']:.2f}"
+    )
+    if 'mean_excess_sharpe' in walk_forward:
+        print(
+            f"  Walk-forward mean excess Sharpe: "
+            f"{walk_forward['mean_excess_sharpe']:+.2f} over "
+            f"{walk_forward['n_folds']} folds"
+        )
+
     return metadata

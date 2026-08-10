@@ -89,10 +89,28 @@ strictly before the decision date, so you cannot see the future by accident.
 context.risk            # RiskParams: target_prob_profit, min_reward_risk,
                         # min_price_inr, portfolio_value_inr, risk_per_trade_pct,
                         # max_single_position_pct, atr_stop_multiplier,
-                        # atr_target_multiplier
+                        # atr_target_multiplier, buy_cost_pct, sell_cost_pct
 context.weights         # learned component weights, e.g. {"Trend": 25.0, ...}
 context.mc_result       # MonteCarloResult for this ticker, or None in batch paths
+context.benchmark_close # market index close series (e.g. Nifty 50) truncated to
+                        # before the decision date, or None when not cached
 context.run_id          # correlation id for logging
+```
+
+`buy_cost_pct` / `sell_cost_pct` are estimated per-leg friction as a fraction of
+turnover. Report `reward_risk` **net** of them — `src/risk.py::net_reward_risk()`
+does the arithmetic — so the `min_reward_risk` gate compares money actually kept
+rather than a gross ratio that flatters every trade.
+
+Two optional keys in `StrategySignal.extra` are read by the sizing layer, so a
+strategy that measures its own risk environment does not have to reimplement
+position sizing:
+
+```python
+extra={"position_scale": 0.5}   # multiplier in [0, 1] applied to the sized
+                                # quantity by BOTH the backtest engine and the
+                                # live orchestrator; used by cross_sectional.py
+                                # for volatility targeting and the crash filter
 ```
 
 `context.mc_result` is `None` on the batched paths. If your strategy needs a

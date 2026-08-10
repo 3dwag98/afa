@@ -39,6 +39,53 @@ def calculate_stop_target(
     return (round(stop, 2), round(target, 2))
 
 
+def net_reward_risk(
+    entry_price: float,
+    stop_price: float,
+    target_price: float,
+    buy_cost_pct: float,
+    sell_cost_pct: float,
+) -> float:
+    """Reward:risk ratio measured *after* round-trip transaction costs.
+
+    A gross reward:risk of 1.33 (the ATR 1.5x/2.0x default) looks like a
+    perfectly good trade until brokerage, STT, exchange and SEBI charges, GST,
+    stamp duty and slippage are charged against both legs — on a tight stop
+    those costs are a meaningful fraction of the move. This nets them out on
+    both sides so the platform's `min_reward_risk` gate compares like with
+    like (docs/QUANT_RESEARCH.md section 12):
+
+        effective entry cost  = entry  * (1 + buy_cost_pct)
+        net target proceeds   = target * (1 - sell_cost_pct)
+        net stop proceeds     = stop   * (1 - sell_cost_pct)
+
+    Args:
+        entry_price: Entry price per share.
+        stop_price: Stop price per share.
+        target_price: Target price per share.
+        buy_cost_pct: Buy-leg friction as a fraction of turnover.
+        sell_cost_pct: Sell-leg friction as a fraction of turnover.
+
+    Returns:
+        Net reward:risk ratio, or 0.0 when the trade has no net upside or the
+        stop sits at/above the cost-adjusted entry (no measurable risk).
+    """
+    if entry_price <= 0:
+        return 0.0
+
+    effective_entry = entry_price * (1.0 + buy_cost_pct)
+    net_target = target_price * (1.0 - sell_cost_pct)
+    net_stop = stop_price * (1.0 - sell_cost_pct)
+
+    net_reward = net_target - effective_entry
+    net_risk = effective_entry - net_stop
+
+    if net_risk <= 0 or net_reward <= 0:
+        return 0.0
+
+    return net_reward / net_risk
+
+
 def calculate_quantity(
     entry_price: float,
     stop_price: float,
@@ -77,9 +124,51 @@ def calculate_quantity(
     return max(0, quantity)
 
 
+def shrink_win_probability(
+    wins: int,
+    total: int,
+    prior_strength: float = 20.0,
+    prior_win_rate: float = 0.5,
+) -> float:
+    """Beta-Binomial posterior-mean win rate (Bayesian shrinkage).
+
+    The raw win rate wins/total is an unbiased but high-variance estimate at
+    the sample sizes a retail-scale strategy actually accumulates: at 50
+    trades its standard error is already ~7 percentage points. Kelly is
+    asymmetric in that error — over-betting off an optimistic p costs far more
+    long-run growth than under-betting off a pessimistic one — so the estimate
+    is shrunk toward a no-edge prior instead of taken at face value:
+
+        p_hat = (wins + a) / (total + a + b),  a = m*q, b = m*(1-q)
+
+    with prior strength m (in pseudo-trades) and prior win rate q. m = 20 and
+    q = 0.5 means "start from a coin flip worth 20 trades of evidence": with
+    50 real trades a raw 70% win rate is reported as 64%, and the pull fades
+    as real evidence accumulates. See docs/QUANT_RESEARCH.md section 4.
+
+    Args:
+        wins: Number of realized winning trades.
+        total: Number of realized (WIN or LOSS) trades.
+        prior_strength: Prior weight m in pseudo-trades; 0 disables shrinkage.
+        prior_win_rate: Prior win rate q in [0, 1].
+
+    Returns:
+        Shrunk win probability in [0, 1].
+    """
+    if total <= 0:
+        return 0.0
+
+    m = max(0.0, prior_strength)
+    q = min(1.0, max(0.0, prior_win_rate))
+    alpha = m * q
+    beta = m * (1.0 - q)
+    return (wins + alpha) / (total + alpha + beta)
+
+
 def estimate_kelly_inputs(
     trade_history: List[Dict[str, Any]],
-    min_trades: int = 20,
+    min_trades: int = 50,
+    shrinkage_strength: float = 20.0,
 ) -> Optional[Tuple[float, float]]:
     """Estimate (win_probability, reward:risk ratio) from realized trade history.
 
@@ -87,12 +176,23 @@ def estimate_kelly_inputs(
     the average win magnitude divided by the average loss magnitude (in the
     same reward:risk units this platform already reports on StrategySignal).
 
+    Two guards against sizing off noise, both of which matter because Kelly
+    punishes over-betting much harder than under-betting:
+
+    1. A hard sample-size floor (`min_trades`, default 50). Below ~50 realized
+       trades the win-rate standard error is wide enough (±5-7 percentage
+       points) that f* is dominated by estimation error.
+    2. Beta-prior shrinkage of the win rate toward 0.5 (see
+       shrink_win_probability), which keeps a lucky early streak from being
+       read as a large edge even once the floor is cleared.
+
     Args:
         trade_history: Trade dicts with "outcome" ("WIN"/"LOSS"/other) and
             "return_pct" keys (same shape as AgentBrain.trade_history).
         min_trades: Minimum realized (WIN/LOSS) trades required to trust the
-            estimate; matches the sample-size gate already used by
-            strategies/weighting.py::evaluate_and_learn.
+            estimate at all.
+        shrinkage_strength: Beta-prior strength in pseudo-trades; 0 returns
+            the raw win rate.
 
     Returns:
         (win_probability, reward_risk_ratio), or None when there isn't enough
@@ -108,7 +208,9 @@ def estimate_kelly_inputs(
     if not wins or not losses:
         return None
 
-    win_probability = len(wins) / len(realized)
+    win_probability = shrink_win_probability(
+        wins=len(wins), total=len(realized), prior_strength=shrinkage_strength
+    )
     avg_win_pct = float(np.mean([abs(t.get("return_pct", 0.0)) for t in wins]))
     avg_loss_pct = float(np.mean([abs(t.get("return_pct", 0.0)) for t in losses]))
     if avg_loss_pct <= 0:
@@ -116,6 +218,15 @@ def estimate_kelly_inputs(
 
     reward_risk_ratio = avg_win_pct / avg_loss_pct
     return win_probability, reward_risk_ratio
+
+
+# Hard ceiling on the fractional-Kelly multiplier kappa. Kelly assumes p and b
+# are known and the payoff distribution is roughly symmetric. Neither holds
+# here: p and b are estimated from a few dozen trades, and a loss that locks at
+# the lower circuit for several sessions realizes far worse than the modelled
+# stop, so the measured b is biased upward and f* with it. Quarter-Kelly keeps
+# roughly half of full-Kelly's growth rate at a small fraction of its drawdown.
+MAX_KELLY_FRACTION = 0.25
 
 
 def calculate_kelly_fraction(win_probability: float, reward_risk_ratio: float) -> float:
@@ -137,7 +248,7 @@ def calculate_kelly_quantity(
     max_single_position_pct: float,
     win_probability: float,
     reward_risk_ratio: float,
-    kelly_fraction: float = 0.5,
+    kelly_fraction: float = MAX_KELLY_FRACTION,
 ) -> int:
     """Fractional-Kelly position sizing.
 
@@ -149,8 +260,10 @@ def calculate_kelly_quantity(
             the platform's existing fixed-fractional cap.
         win_probability: Realized win rate p (see estimate_kelly_inputs).
         reward_risk_ratio: Realized average win:loss ratio b.
-        kelly_fraction: Fractional-Kelly multiplier kappa in [0, 1] (default
-            0.5 = half-Kelly).
+        kelly_fraction: Fractional-Kelly multiplier kappa, clamped to
+            [0, MAX_KELLY_FRACTION]. The clamp is applied here rather than
+            trusted to the caller, so no config, YAML or test fixture can
+            route around it.
 
     Returns:
         Integer quantity >= 0.
@@ -159,7 +272,8 @@ def calculate_kelly_quantity(
         return 0
 
     f_star = calculate_kelly_fraction(win_probability, reward_risk_ratio)
-    position_fraction = f_star * kelly_fraction
+    kappa = max(0.0, min(MAX_KELLY_FRACTION, kelly_fraction))
+    position_fraction = f_star * kappa
 
     position_value = portfolio_value_inr * position_fraction
     max_position_value = portfolio_value_inr * max_single_position_pct
@@ -190,7 +304,11 @@ def calculate_position_quantity(
         Integer quantity >= 0.
     """
     if config.risk.use_kelly_sizing and trade_history:
-        kelly_inputs = estimate_kelly_inputs(trade_history, min_trades=config.risk.kelly_min_trades)
+        kelly_inputs = estimate_kelly_inputs(
+            trade_history,
+            min_trades=config.risk.kelly_min_trades,
+            shrinkage_strength=config.risk.kelly_shrinkage_strength,
+        )
         if kelly_inputs is not None:
             win_probability, reward_risk_ratio = kelly_inputs
             return calculate_kelly_quantity(
