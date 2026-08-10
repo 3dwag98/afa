@@ -50,7 +50,84 @@ MIN_BOOTSTRAP_OBSERVATIONS = 60
 # not usable as a unit-variance shock.
 MIN_INNOVATION_DF = 2.1
 
+TRADING_DAYS_PER_YEAR = 252
+
+# Cross-sectional dispersion of *true* annual drifts, in log-return terms —
+# the prior standard deviation tau used to shrink each ticker's estimated
+# drift (see shrink_drift). 10% a year is deliberately generous: it says a
+# genuinely exceptional name might compound 20% a year faster than the market
+# and a genuinely poor one 20% slower. Method-of-moments estimates of this
+# quantity on daily equity panels typically come out at or below zero, because
+# the observed spread of sample means is almost entirely estimation noise.
+DEFAULT_PRIOR_ANNUAL_DRIFT_STD = 0.10
+
 SimulationMethod = Literal["gaussian", "block_bootstrap", "jump_diffusion"]
+
+
+def shrink_drift(
+    sample_mean_log_return: float,
+    sample_sigma: float,
+    n_observations: int,
+    prior_annual_drift_std: float = DEFAULT_PRIOR_ANNUAL_DRIFT_STD,
+    prior_mean_log_return: float = 0.0,
+) -> tuple[float, float]:
+    """Bayesian posterior for a ticker's daily drift, and its uncertainty.
+
+    The sample mean of daily returns is the noisiest statistic in finance. Its
+    standard error is sigma/sqrt(T), which for a 2%/day Indian mid-cap over
+    five years is ~0.057%/day — about 14% a year. Propagating that number
+    forward as if it were known is what makes probability-of-profit an
+    expensive random number generator: simulating tickers whose true drift is
+    exactly zero, 8.5% of them clear a 0.55 probability gate on estimation
+    error alone. On a 3,800-name universe that is ~322 zero-edge tickers
+    passing the gate every day.
+
+    Worse, the error is not independent of the rest of the platform. mu_hat is
+    large precisely for stocks that have already risen, so an unshrunk drift
+    makes the Monte Carlo gate a noisy restatement of the momentum signal it
+    is supposed to corroborate.
+
+    Under a Normal(mu_0, tau^2) prior on the true daily drift and a sample mean
+    with variance sigma^2/T, the posterior is Normal with
+
+        mu_post  = (tau^2 * mu_hat + (sigma^2/T) * mu_0) / (tau^2 + sigma^2/T)
+        var_post = (tau^2 * sigma^2/T) / (tau^2 + sigma^2/T)
+
+    An annual drift is 252 daily drifts, so a prior dispersion expressed per
+    year converts to tau = prior_annual_drift_std / 252 per day.
+
+    Args:
+        sample_mean_log_return: mu_hat, the realized mean daily log return.
+        sample_sigma: Sample standard deviation of daily log returns.
+        n_observations: T, the number of returns mu_hat was estimated from.
+        prior_annual_drift_std: tau in annualized terms. 0 shrinks all the way
+            to the prior mean (no ticker is credited with any drift edge);
+            a very large value recovers the raw sample mean.
+        prior_mean_log_return: mu_0, the drift a ticker is assumed to have
+            before seeing its own history. Defaults to 0 rather than the
+            universe mean, which is the conservative choice for a long-only
+            book: it declines to credit any name with an edge it has not
+            demonstrated beyond the noise.
+
+    Returns:
+        (posterior_mean_daily_log_drift, posterior_standard_deviation).
+    """
+    if n_observations <= 0 or sample_sigma <= 0:
+        return prior_mean_log_return, 0.0
+
+    tau = max(0.0, float(prior_annual_drift_std)) / TRADING_DAYS_PER_YEAR
+    tau_squared = tau * tau
+    estimator_variance = (sample_sigma * sample_sigma) / n_observations
+
+    denominator = tau_squared + estimator_variance
+    if denominator <= 0:
+        return prior_mean_log_return, 0.0
+
+    posterior_mean = (
+        tau_squared * sample_mean_log_return + estimator_variance * prior_mean_log_return
+    ) / denominator
+    posterior_variance = (tau_squared * estimator_variance) / denominator
+    return float(posterior_mean), float(math.sqrt(max(0.0, posterior_variance)))
 
 
 @dataclass
@@ -85,6 +162,8 @@ class MonteCarloSettings:
     jump_mean: float = -0.02
     jump_volatility: float = 0.05
     separate_overnight_gaps: bool = True
+    prior_annual_drift_std: float = DEFAULT_PRIOR_ANNUAL_DRIFT_STD
+    propagate_drift_uncertainty: bool = True
 
     @classmethod
     def from_simulation_config(cls, simulation) -> "MonteCarloSettings":
@@ -100,6 +179,8 @@ class MonteCarloSettings:
             jump_mean=simulation.jump_mean,
             jump_volatility=simulation.jump_volatility,
             separate_overnight_gaps=simulation.separate_overnight_gaps,
+            prior_annual_drift_std=simulation.prior_annual_drift_std,
+            propagate_drift_uncertainty=simulation.propagate_drift_uncertainty,
         )
 
     def run(
@@ -130,6 +211,8 @@ class MonteCarloSettings:
                 jump_intensity_per_year=self.jump_intensity_per_year,
                 jump_mean=self.jump_mean,
                 jump_volatility=self.jump_volatility,
+                prior_annual_drift_std=self.prior_annual_drift_std,
+                propagate_drift_uncertainty=self.propagate_drift_uncertainty,
             )
 
         intraday = overnight = None
@@ -155,6 +238,8 @@ class MonteCarloSettings:
             jump_volatility=self.jump_volatility,
             intraday_returns=intraday,
             overnight_returns=overnight,
+            prior_annual_drift_std=self.prior_annual_drift_std,
+            propagate_drift_uncertainty=self.propagate_drift_uncertainty,
         )
 
 
@@ -298,6 +383,8 @@ def run_monte_carlo(
     jump_mean: float = -0.02,
     jump_volatility: float = 0.05,
     innovation_df: Optional[float] = None,
+    prior_annual_drift_std: float = DEFAULT_PRIOR_ANNUAL_DRIFT_STD,
+    propagate_drift_uncertainty: bool = True,
 ) -> MonteCarloResult:
     """Run Monte Carlo simulation on historical returns using log returns.
 
@@ -325,6 +412,17 @@ def run_monte_carlo(
             the "gaussian" method and to jump_diffusion's diffusion leg;
             block_bootstrap already inherits the empirical tail shape by
             construction and ignores it.
+        prior_annual_drift_std: Prior dispersion of true annual drifts used to
+            shrink this ticker's estimated drift toward zero (see
+            shrink_drift). Raising it toward infinity recovers the raw sample
+            mean and, with it, the false-positive rate that motivated the
+            shrinkage.
+        propagate_drift_uncertainty: When True, each simulated path draws its
+            own drift from the posterior rather than sharing the posterior
+            mean, so what the result reports is the *posterior predictive*
+            probability of profit — the probability accounting for the fact
+            that the drift is estimated, not known. This is the quantity the
+            compliance gate should be reading.
 
     Returns:
         MonteCarloResult with simulation statistics.
@@ -353,8 +451,21 @@ def run_monte_carlo(
     # log(1 + r) where r is simple return
     log_returns = np.log1p(returns_arr)
 
-    mu = np.mean(log_returns)
+    sample_mu = float(np.mean(log_returns))
     sigma = float(np.std(log_returns, ddof=0))  # Population std
+
+    # The drift is estimated, and badly. Shrink it toward zero in proportion to
+    # how much of its spread is estimation noise, and carry the residual
+    # uncertainty forward instead of discarding it. `mu` from here on is the
+    # posterior mean, not the sample mean.
+    mu, drift_posterior_sd = shrink_drift(
+        sample_mean_log_return=sample_mu,
+        sample_sigma=sigma,
+        n_observations=len(log_returns),
+        prior_annual_drift_std=prior_annual_drift_std,
+    )
+    if not propagate_drift_uncertainty:
+        drift_posterior_sd = 0.0
 
     if daily_vol_forecast is not None:
         sigma_path = np.asarray(daily_vol_forecast, dtype=float)
@@ -375,13 +486,15 @@ def run_monte_carlo(
     if effective_method == "block_bootstrap":
         # Bootstrap the *shape* of the return distribution and re-apply drift
         # explicitly, so the resampled shocks are centred and the drift term
-        # stays the same Ito-corrected one every method uses.
-        demeaned = log_returns - mu
+        # stays the same Ito-corrected one every method uses. Centring uses the
+        # *sample* mean — the shocks are the realized deviations from what
+        # actually happened — while the drift re-applied below is the shrunk
+        # posterior mean.
+        demeaned = log_returns - sample_mu
         shocks = _block_bootstrap_shocks(
             demeaned, simulations, horizon_days, block_size_days, rng
         )
         daily_drift_path = mu - 0.5 * sigma_path ** 2
-        cumulative_returns = (daily_drift_path[None, :] + shocks).sum(axis=1)
     elif effective_method == "jump_diffusion":
         shocks = _jump_diffusion_shocks(
             sigma_path, simulations, horizon_days,
@@ -394,16 +507,25 @@ def run_monte_carlo(
         # shifting every expected return downward.
         jump_compensator = (max(0.0, jump_intensity_per_year) / 252.0) * jump_mean
         daily_drift_path = mu - 0.5 * sigma_path ** 2 - jump_compensator
-        cumulative_returns = (daily_drift_path[None, :] + shocks).sum(axis=1)
     elif sigma == 0 and daily_vol_forecast is None:
         # No volatility, deterministic path
-        cumulative_returns = np.full(simulations, mu * horizon_days)
+        shocks = np.zeros((simulations, horizon_days), dtype=float)
+        daily_drift_path = np.full(horizon_days, mu, dtype=float)
     else:
-        daily_drift_path = mu - 0.5 * sigma_path ** 2
-        random_shocks = _standardized_shocks(
+        shocks = _standardized_shocks(
             rng, (simulations, horizon_days), innovation_df
         ) * sigma_path[None, :]
-        cumulative_returns = (daily_drift_path[None, :] + random_shocks).sum(axis=1)
+        daily_drift_path = mu - 0.5 * sigma_path ** 2
+
+    cumulative_returns = (daily_drift_path[None, :] + shocks).sum(axis=1)
+
+    # Posterior predictive, not plug-in: every path gets its own draw of the
+    # drift from the posterior, so the reported probability of profit accounts
+    # for the drift being estimated rather than known. Without this the
+    # simulation is confident about the one number it has least right.
+    if drift_posterior_sd > 0:
+        path_drift = rng.normal(0.0, drift_posterior_sd, size=simulations)
+        cumulative_returns = cumulative_returns + path_drift * horizon_days
 
     # Probability profit = mean(cumulative_returns > 0)
     probability_profit = float(np.mean(cumulative_returns > 0))
@@ -445,6 +567,8 @@ def run_monte_carlo_garch(
     jump_volatility: float = 0.05,
     intraday_returns: Optional[list[float]] = None,
     overnight_returns: Optional[list[float]] = None,
+    prior_annual_drift_std: float = DEFAULT_PRIOR_ANNUAL_DRIFT_STD,
+    propagate_drift_uncertainty: bool = True,
 ) -> MonteCarloResult:
     """Like run_monte_carlo(), but forecasts volatility with GJR-GARCH(1,1)
     (see volatility_models.py) instead of assuming a flat historical
@@ -500,4 +624,6 @@ def run_monte_carlo_garch(
         jump_mean=jump_mean,
         jump_volatility=jump_volatility,
         innovation_df=innovation_df,
+        prior_annual_drift_std=prior_annual_drift_std,
+        propagate_drift_uncertainty=propagate_drift_uncertainty,
     )

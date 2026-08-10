@@ -632,7 +632,9 @@ class TestKellyUsesNetReturns:
         gross_quantity = calculate_kelly_quantity(
             entry_price=100.0, portfolio_value_inr=engine.portfolio_value,
             max_single_position_pct=0.9,
-            win_probability=gross_inputs[0], reward_risk_ratio=gross_inputs[1],
+            win_probability=gross_inputs.win_probability,
+            avg_win_pct=gross_inputs.avg_win_pct,
+            avg_loss_pct=gross_inputs.avg_loss_pct,
             kelly_fraction=engine.kelly_fraction,
         )
 

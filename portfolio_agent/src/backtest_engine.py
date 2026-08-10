@@ -1258,12 +1258,18 @@ class BacktestEngine:
             return 0.0
         return float(trade.get("net_pnl", 0.0)) / cost_basis * 100.0
 
-    def _kelly_quantity(self, entry_price: float) -> int:
+    def _kelly_quantity(self, entry_price: float, stop_price: Optional[float] = None) -> int:
         """Fractional-Kelly position size from this run's realized trade_log so far.
 
         Returns 0 (triggering the caller's fixed-fractional fallback) when
         there aren't yet enough realized trades to estimate Kelly inputs
         reliably (see risk.py::estimate_kelly_inputs).
+
+        Args:
+            entry_price: Entry price per share.
+            stop_price: This signal's stop, used to cap the Kelly size at the
+                per-trade risk budget. Omitted (None) leaves only the
+                concentration cap in force.
         """
         # Only *closed* round trips are realized outcomes. Open BUY legs carry
         # net_pnl = -transaction_costs, so counting them here classified every
@@ -1290,15 +1296,31 @@ class BacktestEngine:
         )
         if kelly_inputs is None:
             return 0
-        win_probability, reward_risk_ratio = kelly_inputs
-        return calculate_kelly_quantity(
+        kelly_quantity = calculate_kelly_quantity(
             entry_price=entry_price,
             portfolio_value_inr=self.portfolio_value,
             max_single_position_pct=self.risk_params.max_single_position_pct,
-            win_probability=win_probability,
-            reward_risk_ratio=reward_risk_ratio,
+            win_probability=kelly_inputs.win_probability,
+            avg_win_pct=kelly_inputs.avg_win_pct,
+            avg_loss_pct=kelly_inputs.avg_loss_pct,
             kelly_fraction=self.kelly_fraction,
         )
+
+        # Kelly is a ceiling, not a licence — the same contract as
+        # risk.py::calculate_position_quantity. With the allocation units
+        # corrected, f* is scaled up by 1/l (~17x at a 6% stop), so without the
+        # per-trade risk budget alongside it the fix would land as an
+        # across-the-board increase in position size. The budget is priced off
+        # this signal's own stop distance, which is known exactly, rather than
+        # Kelly's historical average loss.
+        if stop_price is not None and stop_price > 0:
+            risk_per_share = entry_price - stop_price
+            if risk_per_share <= 0:
+                return 0
+            risk_budget = self.portfolio_value * self.risk_params.risk_per_trade_pct
+            kelly_quantity = min(kelly_quantity, math.floor(risk_budget / risk_per_share))
+
+        return max(0, kelly_quantity)
 
     def _update_circuit_breaker(self, current_date: pd.Timestamp) -> None:
         """Track the equity peak and trip/re-arm the drawdown circuit breaker.
@@ -1562,7 +1584,9 @@ class BacktestEngine:
         for ticker in buys:
             sig = signals[ticker]
             price = sig.entry_price or 100
-            quantity = self._kelly_quantity(price) if self.use_kelly_sizing else 0
+            quantity = (
+                self._kelly_quantity(price, sig.stop_price) if self.use_kelly_sizing else 0
+            )
 
             if quantity <= 0:
                 # Default / Kelly-unavailable fallback: 10% of portfolio per position.

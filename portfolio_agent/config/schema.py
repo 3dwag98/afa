@@ -466,6 +466,26 @@ class SimulationConfig(BaseModel):
         "GARCH reliably. Off by default since per-ticker GARCH fitting is much slower than the "
         "closed-form flat-vol path.",
     )
+    prior_annual_drift_std: float = Field(
+        default=0.10,
+        ge=0.0,
+        description="Prior standard deviation (annualized, in log-return terms) of the "
+        "cross-sectional spread of *true* drifts, used to shrink each ticker's estimated drift "
+        "toward zero before simulating (src/monte_carlo.py::shrink_drift). The sample mean of "
+        "daily returns has a standard error of sigma/sqrt(T) — roughly 14% a year for a 2%/day "
+        "name over five years — so an unshrunk drift makes probability-of-profit mostly "
+        "estimation noise: 8.5% of tickers with exactly zero true drift clear a 0.55 gate on "
+        "noise alone. Raise this toward infinity to recover the raw sample mean; set it to 0 to "
+        "credit no ticker with any drift edge at all.",
+    )
+    propagate_drift_uncertainty: bool = Field(
+        default=True,
+        description="If True, each simulated path draws its own drift from the posterior instead "
+        "of sharing the posterior mean, so probability_profit is the posterior *predictive* "
+        "probability — the one that accounts for the drift being estimated rather than known. "
+        "Set False to reproduce the older plug-in behaviour, which reports a confident number "
+        "about the least reliable input in the simulation.",
+    )
 
 
 class ComplianceConfig(BaseModel):
