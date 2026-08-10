@@ -191,3 +191,124 @@ class TestExampleUmaYaml:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestTriggerMethodUMA:
+    """`method: trigger` routes members through the arbitration engine instead
+    of averaging them, so conflict blocks rather than blends."""
+
+    @staticmethod
+    def _members(*specs):
+        return [
+            {"type": "fixed_test", "weight": 1.0, "params": dict(name=name, signal=signal, score=score)}
+            for name, signal, score in specs
+        ]
+
+    def _uma(self, tmp_path, members, trigger=None, regimes=None):
+        import yaml
+        spec = {"name": "Trigger UMA", "method": "trigger", "members": members}
+        if trigger is not None:
+            spec["trigger"] = trigger
+        if regimes is not None:
+            spec["regimes"] = regimes
+        path = tmp_path / "trigger_uma.yaml"
+        with open(path, "w") as f:
+            yaml.safe_dump(spec, f)
+        return EnsembleStrategy(StrategyConfig(type="ensemble", config_path=str(path)))
+
+    def test_conflicting_strong_members_block_instead_of_averaging(self, tmp_path):
+        """The DoD: BUY(0.90) against SELL(0.85) is a BLOCK. A weighted blend
+        of the same two members reports a positive strength."""
+        members = self._members(("A", "BUY", 90.0), ("B", "SELL", 15.0))
+        strategy = self._uma(tmp_path, members)
+
+        signal = strategy.score("ACME", pd.DataFrame(), StrategyContext(risk=_risk_params()))
+
+        assert signal.signal == "AVOID"
+        assert signal.trigger == "Trigger:BLOCK"
+        assert signal.extra["position_scale"] == 0.0
+        assert "conflict" in signal.rationale
+
+    def test_agreeing_members_fire_and_carry_a_size_multiplier(self, tmp_path):
+        members = self._members(("A", "BUY", 85.0), ("B", "BUY", 80.0))
+        strategy = self._uma(tmp_path, members)
+
+        signal = strategy.score("ACME", pd.DataFrame(), StrategyContext(risk=_risk_params()))
+
+        assert signal.signal == "BUY"
+        assert signal.trigger.startswith("Trigger:")
+        assert 0.5 <= signal.extra["position_scale"] <= 1.0
+
+    def test_the_levels_come_from_a_contributing_member_not_an_average(self, tmp_path):
+        """Averaging a wide stop with a tight one produces a stop that belongs
+        to neither thesis."""
+        members = self._members(("A", "BUY", 90.0), ("B", "AVOID", 10.0))
+        strategy = self._uma(tmp_path, members)
+
+        signal = strategy.score("ACME", pd.DataFrame(), StrategyContext(risk=_risk_params()))
+
+        assert signal.signal == "BUY"
+        assert signal.stop_price == 95.0
+        assert signal.target_price == 110.0
+
+    def test_thresholds_are_configurable_from_the_yaml(self, tmp_path):
+        members = self._members(("A", "BUY", 60.0))
+        blocked = self._uma(tmp_path, members, trigger={"mode": "strong_single", "strong_confidence": 0.9})
+        context = StrategyContext(risk=_risk_params())
+
+        assert blocked.score("ACME", pd.DataFrame(), context).signal == "AVOID"
+
+        allowed = self._uma(tmp_path, members, trigger={"mode": "strong_single", "strong_confidence": 0.5})
+        assert allowed.score("ACME", pd.DataFrame(), context).signal == "BUY"
+
+    def test_the_regime_map_mutes_members_out_of_season(self, tmp_path):
+        members = self._members(("momentum", "BUY", 95.0), ("low_vol", "BUY", 20.0))
+        strategy = self._uma(
+            tmp_path, members,
+            trigger={"mode": "strong_single", "strong_confidence": 0.7},
+            regimes={"BULL_RISK_ON": ["momentum"], "BEAR_CRASH_RISK": ["low_vol"]},
+        )
+
+        bull = strategy.score(
+            "ACME", pd.DataFrame(),
+            StrategyContext(risk=_risk_params(), regime_label="BULL_RISK_ON"),
+        )
+        bear = strategy.score(
+            "ACME", pd.DataFrame(),
+            StrategyContext(risk=_risk_params(), regime_label="BEAR_CRASH_RISK"),
+        )
+
+        assert bull.signal == "BUY"
+        assert bear.signal == "AVOID"
+        assert "momentum" in bear.extra["trigger_muted_models"]
+
+    def test_an_unknown_regime_permits_every_member(self, tmp_path):
+        """Not knowing the regime is not evidence that every model is wrong;
+        standing the whole book down on a lookup miss is the worse failure."""
+        members = self._members(("momentum", "BUY", 95.0))
+        strategy = self._uma(
+            tmp_path, members,
+            trigger={"mode": "strong_single", "strong_confidence": 0.7},
+            regimes={"BULL_RISK_ON": ["momentum"]},
+        )
+
+        signal = strategy.score(
+            "ACME", pd.DataFrame(),
+            StrategyContext(risk=_risk_params(), regime_label="SOMETHING_ELSE"),
+        )
+
+        assert signal.signal == "BUY"
+
+    def test_weighted_blend_would_have_produced_a_buy_from_the_same_conflict(self, tmp_path):
+        """Pins the contrast the trigger method exists to fix."""
+        import yaml
+        members = self._members(("A", "BUY", 90.0), ("B", "SELL", 15.0))
+        path = tmp_path / "blend.yaml"
+        with open(path, "w") as f:
+            yaml.safe_dump({"name": "Blend", "method": "weighted_blend", "members": members}, f)
+        blended = EnsembleStrategy(StrategyConfig(type="ensemble", config_path=str(path)))
+
+        signal = blended.score("ACME", pd.DataFrame(), StrategyContext(risk=_risk_params()))
+
+        assert signal.signal != "AVOID"
+        assert signal.score > 0

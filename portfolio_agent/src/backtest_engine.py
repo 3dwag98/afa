@@ -26,6 +26,7 @@ from portfolio_agent.strategies.weighting import evaluate_and_learn
 # Import from src module
 try:
     from .data_store import load_ticker_data
+    from .liquidity import lower_circuit_locked_days
     from .models import AgentBrain
     from .execution_sim import ExecutionSimulator
     from .monte_carlo import MonteCarloSettings
@@ -35,6 +36,7 @@ try:
     )
 except ImportError:
     from data_store import load_ticker_data
+    from liquidity import lower_circuit_locked_days
     from models import AgentBrain
     from execution_sim import ExecutionSimulator
     from monte_carlo import MonteCarloSettings
@@ -147,6 +149,8 @@ class BacktestEngine:
         max_portfolio_drawdown_pct: float = 0.0,
         drawdown_reentry_pct: float = 0.10,
         benchmark_symbol: Optional[str] = None,
+        exit_on_lower_circuit_lock: bool = True,
+        liquidate_on_drawdown_halt: bool = False,
     ):
         """
         Initialize the BacktestEngine.
@@ -197,6 +201,20 @@ class BacktestEngine:
                 history drives the momentum crash filter's trend and
                 volatility tests. Without it the filter falls back to a
                 composite of the traded universe.
+            exit_on_lower_circuit_lock: Queue an immediate exit when a holding
+                closes pinned at its lower circuit. A locked-down stock cannot
+                be sold at the modelled stop, so waiting for that stop is
+                waiting for a fill that will not come at that price; the exit
+                is queued for the next session, which is the earliest a real
+                order could work. On by default — this is a correction to how
+                the modelled stop behaves, not a strategy opinion.
+            liquidate_on_drawdown_halt: Also sell every open position when the
+                drawdown circuit breaker trips, rather than only suppressing
+                new BUYs. Off by default and deliberately so: force-liquidating
+                a whole book at a drawdown trough converts a bad quarter into a
+                permanent loss, and existing positions already carry stops.
+                Turn it on for mandates where a hard equity floor outranks
+                recovery potential.
         """
         self.start_date = pd.to_datetime(start_date)
         self.end_date = pd.to_datetime(end_date)
@@ -283,6 +301,11 @@ class BacktestEngine:
         self.equity_peak = initial_capital
         self.buying_halted = False
         self.circuit_breaker_log: List[Dict[str, Any]] = []
+
+        # Forced-exit triggers (see the constructor docstring).
+        self.exit_on_lower_circuit_lock = exit_on_lower_circuit_lock
+        self.liquidate_on_drawdown_halt = liquidate_on_drawdown_halt
+        self.exit_trigger_log: List[Dict[str, Any]] = []
 
 
         # Track untradeable tickers (delisted or NaN issues) - initialize BEFORE loading data
@@ -1195,6 +1218,64 @@ class BacktestEngine:
                 f"recovered to {entry['drawdown_pct']:.2f}% below peak; buying resumed"
             )
 
+    def _is_locked_down(self, ticker: str, current_date: pd.Timestamp) -> bool:
+        """Whether `ticker` closed pinned at its lower circuit on `current_date`.
+
+        Read from the raw bar rather than a feature column, because this runs
+        against the holdings book — which contains positions in names that may
+        have dropped out of the scored universe entirely.
+        """
+        df = self.ticker_data.get(ticker)
+        if df is None or current_date not in df.index:
+            return False
+
+        position = df.index.get_loc(current_date)
+        if not isinstance(position, int) or position < 1:
+            return False
+
+        # Two bars are the minimum: the lock is defined against the prior close.
+        window = df.iloc[position - 1:position + 1]
+        window = window.rename(columns={c: c.lower() for c in window.columns})
+        try:
+            return bool(lower_circuit_locked_days(window).iloc[-1])
+        except Exception:
+            return False
+
+    def _exit_trigger_reasons(self, current_date: pd.Timestamp) -> Dict[str, str]:
+        """Holdings that must be exited regardless of what the strategy says.
+
+        Two conditions, both of which invalidate the exit plan a position was
+        opened with rather than merely arguing against holding it:
+
+        - **Locked at the lower circuit.** The modelled stop assumes a fill is
+          available somewhere near it. On a lock there is no bid, so the stop is
+          not a stop — it is a hope. Every further locked session realizes a
+          loss the sizing never priced, which is precisely the asymmetry that
+          biases the measured payoff ratio Kelly reads. Exiting is queued for
+          the next session, the earliest a real order could work.
+        - **The drawdown breaker has tripped** and this run is configured to
+          liquidate on it (off by default; see the constructor docstring).
+
+        Returns:
+            ticker -> reason, for holdings with a live position.
+        """
+        reasons: Dict[str, str] = {}
+        if not self.holdings:
+            return reasons
+
+        if self.liquidate_on_drawdown_halt and self.buying_halted:
+            for ticker, quantity in self.holdings.items():
+                if quantity > 0:
+                    reasons[ticker] = "portfolio drawdown circuit breaker tripped"
+            return reasons
+
+        if self.exit_on_lower_circuit_lock:
+            for ticker, quantity in self.holdings.items():
+                if quantity > 0 and self._is_locked_down(ticker, current_date):
+                    reasons[ticker] = "locked at the lower circuit; modelled stop is unfillable"
+
+        return reasons
+
     def _current_position_values(self, current_date: pd.Timestamp) -> Dict[str, float]:
         """Mark every open holding to T's close, for sector-exposure accounting."""
         values: Dict[str, float] = {}
@@ -1243,21 +1324,44 @@ class BacktestEngine:
         while execution_date.weekday() >= 5:
             execution_date += pd.Timedelta(days=1)
 
-        sells = sorted(
-            (t for t, s in signals.items() if s.signal == 'SELL' and t in self.holdings)
-        )
-        for ticker in sells:
-            quantity = self.holdings[ticker]
-            if quantity > 0:
-                self.pending_orders.append({
-                    'ticker': ticker,
-                    'action': 'SELL',
-                    'quantity': quantity,
-                    'execution_date': execution_date,
-                    'trigger': signals[ticker].trigger or 'SIGNAL'
-                })
-
+        # Forced exits are evaluated first and win any tie with a strategy
+        # signal: they exist because the position's exit plan has stopped being
+        # valid, which no amount of conviction in holding can restore. The
+        # breaker is updated before this so a trip on today's equity can fire
+        # today's liquidation rather than tomorrow's.
         self._update_circuit_breaker(current_date)
+        forced_exits = self._exit_trigger_reasons(current_date)
+
+        signal_sells = {
+            t for t, s in signals.items() if s.signal == 'SELL' and t in self.holdings
+        }
+        for ticker in sorted(forced_exits.keys() | signal_sells):
+            quantity = self.holdings.get(ticker, 0)
+            if quantity <= 0:
+                continue
+            reason = forced_exits.get(ticker)
+            if reason is not None:
+                trigger = 'EXIT_TRIGGER'
+                self.exit_trigger_log.append({
+                    'date': current_date.strftime('%Y-%m-%d'),
+                    'ticker': ticker,
+                    'quantity': quantity,
+                    'reason': reason,
+                })
+                logger.info(
+                    f"Exit trigger on {current_date.strftime('%Y-%m-%d')} for {ticker}: {reason}"
+                )
+            else:
+                trigger = signals[ticker].trigger or 'SIGNAL'
+
+            self.pending_orders.append({
+                'ticker': ticker,
+                'action': 'SELL',
+                'quantity': quantity,
+                'execution_date': execution_date,
+                'trigger': trigger,
+            })
+
         if self.buying_halted:
             return
 
@@ -1608,6 +1712,7 @@ class BacktestEngine:
             'brain_evolution': self.brain_evolution,
             'daily_activity_log': self.daily_activity_log,
             'circuit_breaker_log': self.circuit_breaker_log,
+            'exit_trigger_log': self.exit_trigger_log,
         }
 
     def _position_value(self, ticker: str, current_date: pd.Timestamp) -> Optional[float]:

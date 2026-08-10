@@ -647,3 +647,122 @@ class TestKellyUsesNetReturns:
         ] * 50
 
         assert engine._kelly_quantity(entry_price=100.0) == 0
+
+
+class TestExitTriggers:
+    """A modelled stop assumes a fill is available near it. Two conditions
+    invalidate that assumption rather than merely arguing against the position."""
+
+    @staticmethod
+    def _engine(synthetic_data, **kwargs):
+        return BacktestEngine(
+            start_date="2023-01-02",
+            end_date="2023-06-30",
+            initial_capital=1_000_000.0,
+            universe_tickers=synthetic_data['tickers'],
+            **kwargs,
+        )
+
+    def test_a_lower_circuit_lock_queues_an_immediate_exit(self, synthetic_data):
+        ticker = synthetic_data['tickers'][0]
+        engine = self._engine(synthetic_data)
+        engine.holdings[ticker] = 100
+
+        # Rewrite the last two bars into a 5% lower-circuit close.
+        df = engine.ticker_data[ticker]
+        lock_date = df.index[-1]
+        prev_close = 100.0
+        df.loc[df.index[-2], ['open', 'high', 'low', 'close']] = prev_close
+        df.loc[lock_date, ['open', 'high', 'low', 'close']] = [98.0, 98.0, 95.0, 95.0]
+
+        engine._create_pending_orders({}, lock_date)
+
+        sells = [o for o in engine.pending_orders if o['action'] == 'SELL']
+        assert [o['ticker'] for o in sells] == [ticker]
+        assert sells[0]['trigger'] == 'EXIT_TRIGGER'
+        assert 'lower circuit' in engine.exit_trigger_log[0]['reason']
+
+    def test_the_lock_exit_can_be_switched_off(self, synthetic_data):
+        ticker = synthetic_data['tickers'][0]
+        engine = self._engine(synthetic_data, exit_on_lower_circuit_lock=False)
+        engine.holdings[ticker] = 100
+
+        df = engine.ticker_data[ticker]
+        lock_date = df.index[-1]
+        df.loc[df.index[-2], ['open', 'high', 'low', 'close']] = 100.0
+        df.loc[lock_date, ['open', 'high', 'low', 'close']] = [98.0, 98.0, 95.0, 95.0]
+
+        engine._create_pending_orders({}, lock_date)
+
+        assert engine.pending_orders == []
+
+    def test_an_ordinary_fall_is_not_an_exit_trigger(self, synthetic_data):
+        """Band matching, not a floor: 3.5% is not a statutory limit."""
+        ticker = synthetic_data['tickers'][0]
+        engine = self._engine(synthetic_data)
+        engine.holdings[ticker] = 100
+
+        df = engine.ticker_data[ticker]
+        fall_date = df.index[-1]
+        df.loc[df.index[-2], ['open', 'high', 'low', 'close']] = 100.0
+        df.loc[fall_date, ['open', 'high', 'low', 'close']] = [99.0, 99.0, 96.5, 96.5]
+
+        engine._create_pending_orders({}, fall_date)
+
+        assert engine.pending_orders == []
+
+    def test_drawdown_liquidation_is_opt_in(self, synthetic_data):
+        tickers = synthetic_data['tickers']
+        date = pd.Timestamp("2023-06-01")
+
+        holding_engine = self._engine(
+            synthetic_data, max_portfolio_drawdown_pct=0.15, drawdown_reentry_pct=0.10,
+        )
+        holding_engine.holdings = {t: 10 for t in tickers}
+        holding_engine.portfolio_value = 700_000.0
+        holding_engine._create_pending_orders({}, date)
+
+        assert holding_engine.buying_halted is True
+        assert holding_engine.pending_orders == []
+
+    def test_drawdown_liquidation_sells_the_whole_book_when_enabled(self, synthetic_data):
+        tickers = synthetic_data['tickers']
+        engine = self._engine(
+            synthetic_data,
+            max_portfolio_drawdown_pct=0.15,
+            drawdown_reentry_pct=0.10,
+            liquidate_on_drawdown_halt=True,
+        )
+        engine.holdings = {t: 10 for t in tickers}
+        engine.portfolio_value = 700_000.0
+
+        engine._create_pending_orders({}, pd.Timestamp("2023-06-01"))
+
+        sells = [o for o in engine.pending_orders if o['action'] == 'SELL']
+        assert sorted(o['ticker'] for o in sells) == sorted(tickers)
+        assert all(o['trigger'] == 'EXIT_TRIGGER' for o in sells)
+
+    def test_a_forced_exit_does_not_duplicate_a_signal_sell(self, synthetic_data):
+        """Both paths want the same position gone; queueing it twice would sell
+        a quantity the book does not hold."""
+        from portfolio_agent.strategies.types import StrategySignal
+
+        ticker = synthetic_data['tickers'][0]
+        engine = self._engine(synthetic_data)
+        engine.holdings[ticker] = 100
+
+        df = engine.ticker_data[ticker]
+        lock_date = df.index[-1]
+        df.loc[df.index[-2], ['open', 'high', 'low', 'close']] = 100.0
+        df.loc[lock_date, ['open', 'high', 'low', 'close']] = [98.0, 98.0, 95.0, 95.0]
+
+        signals = {ticker: StrategySignal(
+            symbol=ticker, signal="SELL", score=10.0, trigger="Model",
+            entry_price=95.0, stop_price=0.0, target_price=0.0,
+            reward_risk=0.0, probability_profit=0.0,
+        )}
+        engine._create_pending_orders(signals, lock_date)
+
+        sells = [o for o in engine.pending_orders if o['action'] == 'SELL']
+        assert len(sells) == 1
+        assert sells[0]['trigger'] == 'EXIT_TRIGGER'

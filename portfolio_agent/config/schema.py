@@ -296,6 +296,23 @@ class RiskConfig(BaseModel):
         "Kept below max_portfolio_drawdown_pct so the breaker cannot flicker on and off at "
         "the trip point.",
     )
+    exit_on_lower_circuit_lock: bool = Field(
+        default=True,
+        description="Queue an immediate exit when a holding closes pinned at its lower circuit. "
+        "The modelled stop assumes a fill is available near it; on a lock there is no bid, so "
+        "waiting for the stop means holding through however many further locked sessions it takes "
+        "to find one. Every one of those realizes a loss the position sizing never priced — the "
+        "same asymmetry that biases the payoff ratio Kelly estimates from. The exit is queued for "
+        "the next session, the earliest a real order could work.",
+    )
+    liquidate_on_drawdown_halt: bool = Field(
+        default=False,
+        description="Also sell every open position when the drawdown circuit breaker trips, "
+        "instead of only suppressing new BUYs. Off by default: open positions already carry stops "
+        "and targets, and force-liquidating an entire book at a drawdown trough is how a bad "
+        "quarter becomes a permanent loss. Turn it on for mandates where a hard equity floor "
+        "outranks recovery potential.",
+    )
     slippage_pct_per_side: float = Field(
         default=0.0025,
         description="Assumed per-side slippage, as a fraction of turnover, used when charging "

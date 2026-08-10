@@ -7,30 +7,45 @@ combination method, mirroring how config/strategies/trend_breakout.yaml
 configures the plain rule-based strategy. See
 config/strategies/example_uma.yaml for the file shape.
 
-Two combination methods are supported, selected per UMA via the YAML's
+Three combination methods are supported, selected per UMA via the YAML's
 `method` field:
 
-- weighted_blend (default): each member's signal is mapped to a -1..1
-  strength (BUY=1, WATCH=0.3, HOLD=0, AVOID=-0.3, SELL=-1) and blended by
-  weight; score/entry/stop/target/probability are likewise weighted averages.
-  Works well for any mix of rule-based and ML members.
+- trigger: members are converted to ModelVerdicts and arbitrated by
+  src/trigger_engine.py. This is the method to use for anything that trades
+  real money. The other two both average, and averaging a strong BUY against
+  a strong SELL produces a weak BUY — a trade neither member would take
+  alone, entered precisely when the models disagree most. The trigger engine
+  discounts conviction by the opposing conviction, applies hard vetoes for
+  tradability, regime and expected value, and emits a position-size
+  multiplier rather than a direction alone.
+- weighted_blend (default, retained for compatibility): each member's signal
+  is mapped to a -1..1 strength (BUY=1, WATCH=0.3, HOLD=0, AVOID=-0.3,
+  SELL=-1) and blended by weight; score/entry/stop/target/probability are
+  likewise weighted averages. Cheap and smooth, and wrong in the specific way
+  described above whenever members conflict.
 - vote: each member casts a BUY/SELL/HOLD-bucketed vote; `vote.mode:
   majority` (>50% agreement) or `vote.mode: unanimous` (all members agree)
-  decides the combined signal. More conservative — fewer, higher-conviction
-  signals.
+  decides the combined signal. More conservative than blending — it cannot
+  manufacture a signal out of disagreement — but it throws away conviction
+  magnitude, position sizing and the expected-value hurdle.
+
+`weighted_blend` stays the default only so existing UMA files keep behaving
+as they did. New configurations should set `method: trigger`; see
+config/strategies/uma_meta_orchestrator.yaml.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import yaml
 
 from .base import BaseStrategy
-from .types import StrategyContext, StrategySignal
+from .types import ModelVerdict, StrategyContext, StrategySignal
 from portfolio_agent.config.schema import StrategyConfig
+from portfolio_agent.src.trigger_engine import TriggerConfig, TriggerEngine
 
 _SIGNAL_STRENGTH = {
     "BUY": 1.0,
@@ -103,6 +118,15 @@ class EnsembleStrategy(BaseStrategy):
             self._members.append(member)
             self._weights.append(float(member_spec.get("weight", 1.0)))
 
+        self._trigger_engine = TriggerEngine(TriggerConfig.from_params(self._spec.get("trigger")))
+        # Which members the current regime lets buy. Read from the YAML's
+        # `regimes` block by the meta-orchestrator (Phase 4); absent means every
+        # member is always permitted, which is how a plain UMA behaves.
+        self._regime_map: Dict[str, List[str]] = {
+            str(label): [str(name) for name in names]
+            for label, names in (self._spec.get("regimes") or {}).items()
+        }
+
     def _load_spec(self) -> Dict[str, Any]:
         yaml_path = Path(self._yaml_path)
         if not yaml_path.is_absolute():
@@ -150,16 +174,128 @@ class EnsembleStrategy(BaseStrategy):
         return names
 
     def entry_rules(self) -> Dict[str, Any]:
-        return {"uma_method": self.method, "members": [m.name for m in self._members], "weights": self._weights}
+        rules: Dict[str, Any] = {
+            "uma_method": self.method,
+            "members": [m.name for m in self._members],
+            "weights": self._weights,
+        }
+        if self.method == "trigger":
+            rules["trigger"] = {
+                "mode": self._trigger_engine.config.mode,
+                "strong_confidence": self._trigger_engine.config.strong_confidence,
+                "consensus_confidence": self._trigger_engine.config.consensus_confidence,
+                "min_consensus_models": self._trigger_engine.config.min_consensus_models,
+                "min_net_ev_pct": self._trigger_engine.config.min_net_ev_pct,
+            }
+        if self._regime_map:
+            rules["regimes"] = self._regime_map
+        return rules
 
     def exit_rules(self) -> Dict[str, Any]:
         return {}
 
+    def permitted_members(self, regime_label: Optional[str]) -> Optional[List[str]]:
+        """Member names the given regime allows to buy, or None for "all".
+
+        An unrecognized or missing regime label returns None rather than an
+        empty list: not knowing the regime is not evidence that every model
+        should be silenced, and standing the whole book down on a lookup miss
+        is a far worse failure than trading one sleeve out of season.
+        """
+        if not self._regime_map or regime_label is None:
+            return None
+        return self._regime_map.get(regime_label)
+
     def score(self, symbol: str, features: pd.DataFrame, context: StrategyContext) -> StrategySignal:
         member_signals = [member.score(symbol, features, context) for member in self._members]
+        if self.method == "trigger":
+            return self._combine_trigger(symbol, member_signals, context)
         if self.method == "vote":
             return self._combine_vote(symbol, member_signals)
         return self._combine_weighted_blend(symbol, member_signals)
+
+    def _combine_trigger(
+        self, symbol: str, signals: List[StrategySignal], context: StrategyContext
+    ) -> StrategySignal:
+        """Arbitrate the members through the trigger engine.
+
+        The emitted signal is either a BUY carrying the engine's size
+        multiplier in `extra["position_scale"]` — the same channel the
+        cross-sectional strategies already use for volatility targeting, so the
+        backtest engine and live orchestrator pick it up with no extra wiring —
+        or an AVOID carrying the block reason. There is deliberately no
+        in-between: a "weak buy" is the artifact this method exists to remove.
+
+        Entry, stop and target come from the highest-conviction *contributing*
+        member rather than from an average of every member's levels. Averaging
+        a momentum model's wide ATR stop with a mean-reversion model's tight
+        one produces a stop that belongs to neither thesis.
+        """
+        permitted = self.permitted_members(context.regime_label)
+        verdicts = [
+            ModelVerdict.from_signal(
+                signal,
+                model_name=member.name,
+                regime_compatible=permitted is None or member.name in permitted,
+            )
+            for member, signal in zip(self._members, signals)
+        ]
+
+        decision = self._trigger_engine.evaluate(verdicts)
+
+        by_name = {member.name: signal for member, signal in zip(self._members, signals)}
+        contributing = [by_name[name] for name in decision.contributing_models if name in by_name]
+        anchor = (
+            max(contributing, key=lambda s: s.score)
+            if contributing
+            else max(signals, key=lambda s: s.score)
+        )
+
+        rationale = "; ".join(
+            [decision.reason]
+            + [f"{m.name}={s.signal}/{s.score:.1f}" for m, s in zip(self._members, signals)]
+        )
+
+        if not decision.allowed:
+            return StrategySignal(
+                symbol=symbol, signal="AVOID", score=0.0, trigger="Trigger:BLOCK",
+                entry_price=anchor.entry_price, stop_price=0.0, target_price=0.0,
+                reward_risk=0.0, probability_profit=0.0,
+                component_scores={m.name: s.score for m, s in zip(self._members, signals)},
+                rationale=rationale,
+                extra={
+                    "position_scale": 0.0,
+                    "trigger_decision": decision.action,
+                    "trigger_vetoes": decision.vetoes,
+                    "trigger_muted_models": decision.muted_models,
+                    "member_signals": {m.name: s.signal for m, s in zip(self._members, signals)},
+                },
+            )
+
+        return StrategySignal(
+            symbol=symbol,
+            signal="BUY",
+            score=round(decision.effective_confidence * 100, 2),
+            trigger=f"Trigger:{decision.fired_rule}",
+            entry_price=anchor.entry_price,
+            stop_price=anchor.stop_price,
+            target_price=anchor.target_price,
+            reward_risk=anchor.reward_risk,
+            probability_profit=anchor.probability_profit,
+            component_scores={m.name: s.score for m, s in zip(self._members, signals)},
+            rationale=rationale,
+            extra={
+                "position_scale": decision.size_multiplier,
+                "trigger_decision": decision.action,
+                "trigger_rule": decision.fired_rule,
+                "trigger_effective_confidence": decision.effective_confidence,
+                "trigger_expected_net_ev_pct": decision.expected_net_ev_pct,
+                "trigger_contributing_models": decision.contributing_models,
+                "trigger_opposing_models": decision.opposing_models,
+                "trigger_muted_models": decision.muted_models,
+                "member_signals": {m.name: s.signal for m, s in zip(self._members, signals)},
+            },
+        )
 
     def _combine_weighted_blend(self, symbol: str, signals: List[StrategySignal]) -> StrategySignal:
         weights = self._weights
