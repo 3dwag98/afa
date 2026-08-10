@@ -49,6 +49,7 @@ try:
     from src.risk import calculate_stop_target, net_reward_risk
     from src.liquidity import (
         DEFAULT_MAX_CIRCUIT_LOCK_FRACTION,
+        DEFAULT_MAX_OPERATOR_TRAP_FRACTION,
         DEFAULT_MAX_ZERO_RETURN_FRACTION,
         DEFAULT_MIN_TRADED_VALUE_INR,
     )
@@ -69,6 +70,7 @@ except ImportError:
     from risk import calculate_stop_target, net_reward_risk
     from liquidity import (
         DEFAULT_MAX_CIRCUIT_LOCK_FRACTION,
+        DEFAULT_MAX_OPERATOR_TRAP_FRACTION,
         DEFAULT_MAX_ZERO_RETURN_FRACTION,
         DEFAULT_MIN_TRADED_VALUE_INR,
     )
@@ -102,7 +104,10 @@ class TradabilityFilter:
 
     - A stock locked at its upper circuit prints the return momentum reads as
       strength while offering nothing to buy; locked at the lower circuit, it
-      cannot be exited at the modelled stop.
+      cannot be exited at the modelled stop. Both the zero-range lock and the
+      weaker "ran up and closed pinned at the limit" operator footprint are
+      screened, since only the first has no intraday range and the second is
+      the more common of the two.
     - A stock that barely trades prints unchanged closes, which suppresses its
       realized variance and walks it into the low-volatility buy decile
       without being remotely low-risk.
@@ -119,12 +124,14 @@ class TradabilityFilter:
           min_traded_value_inr: 5000000
           max_zero_return_fraction: 0.30
           max_circuit_lock_fraction: 0.10
+          max_operator_trap_fraction: 0.05
     """
 
     enabled: bool = True
     min_traded_value_inr: float = DEFAULT_MIN_TRADED_VALUE_INR
     max_zero_return_fraction: float = DEFAULT_MAX_ZERO_RETURN_FRACTION
     max_circuit_lock_fraction: float = DEFAULT_MAX_CIRCUIT_LOCK_FRACTION
+    max_operator_trap_fraction: float = DEFAULT_MAX_OPERATOR_TRAP_FRACTION
 
     @classmethod
     def from_params(cls, params: Dict[str, Any]) -> "TradabilityFilter":
@@ -139,6 +146,9 @@ class TradabilityFilter:
             max_circuit_lock_fraction=float(
                 params.get("max_circuit_lock_fraction", DEFAULT_MAX_CIRCUIT_LOCK_FRACTION)
             ),
+            max_operator_trap_fraction=float(
+                params.get("max_operator_trap_fraction", DEFAULT_MAX_OPERATOR_TRAP_FRACTION)
+            ),
         )
 
     def required_features(self) -> List[str]:
@@ -147,6 +157,8 @@ class TradabilityFilter:
             "zero_return_fraction_60",
             "circuit_lock_fraction_60",
             "circuit_locked_today",
+            "operator_trap_fraction_60",
+            "operator_trap_today",
         ] if self.enabled else []
 
     def reject_reason(self, latest: pd.Series) -> Optional[str]:
@@ -182,8 +194,25 @@ class TradabilityFilter:
                 f"(> {self.max_circuit_lock_fraction:.0%})"
             )
 
+        trap_fraction = _clean(latest.get("operator_trap_fraction_60"))
+        if trap_fraction is not None and trap_fraction > self.max_operator_trap_fraction:
+            return (
+                f"operator footprint: {trap_fraction:.0%} of sessions closed pinned at "
+                f"an upper circuit (> {self.max_operator_trap_fraction:.0%})"
+            )
+
         if _clean(latest.get("circuit_locked_today")):
             return "locked at a circuit limit on the decision date; no fill available"
+
+        # The weaker single-day footprint, checked last so the more specific
+        # reasons above win the message: the stock traded a real range and then
+        # shut at its upper limit, so the printed close is not a price anything
+        # could have been bought at.
+        if _clean(latest.get("operator_trap_today")):
+            return (
+                "closed pinned at an upper circuit on the decision date; "
+                "no offer available at the printed close"
+            )
 
         return None
 
@@ -522,6 +551,7 @@ class MomentumStrategy(BaseStrategy):
                 "enabled": self._tradability.enabled,
                 "min_traded_value_inr": self._tradability.min_traded_value_inr,
                 "max_circuit_lock_fraction": self._tradability.max_circuit_lock_fraction,
+                "max_operator_trap_fraction": self._tradability.max_operator_trap_fraction,
             },
         }
 

@@ -659,3 +659,91 @@ class TestCalculatePositionQuantity:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestNetRealizedReturn:
+    """Kelly's two inputs both have to be measured after friction. On an Indian
+    delivery round trip that is ~0.8% of turnover — enough to shrink b and to
+    flip marginal winners into losers."""
+
+    def test_costs_are_charged_to_both_legs(self):
+        from src.risk import net_realized_return_pct
+
+        gross = net_realized_return_pct(100.0, 110.0, buy_cost_pct=0.0, sell_cost_pct=0.0)
+        net = net_realized_return_pct(100.0, 110.0, buy_cost_pct=0.004, sell_cost_pct=0.004)
+
+        assert gross == pytest.approx(10.0)
+        # basis 100.4, proceeds 109.56 -> 9.12%
+        assert net == pytest.approx(9.12, abs=0.01)
+        assert net < gross
+
+    def test_an_unusable_entry_price_returns_zero(self):
+        from src.risk import net_realized_return_pct
+
+        assert net_realized_return_pct(0.0, 110.0, 0.004, 0.004) == 0.0
+
+    def test_a_marginal_gross_win_is_reclassified_as_a_net_loss(self):
+        """The bias that matters: counting this as a WIN adds a phantom win to
+        p *and* drags the average win magnitude down, inflating f* twice."""
+        from src.risk import to_net_realized_trades
+
+        restated = to_net_realized_trades(
+            [{"entry_price": 100.0, "exit_price": 100.3, "outcome": "WIN", "return_pct": 0.3}],
+            buy_cost_pct=0.004,
+            sell_cost_pct=0.004,
+        )
+
+        assert restated[0]["outcome"] == "LOSS"
+        assert restated[0]["return_pct"] < 0
+
+    def test_other_keys_survive_the_restatement(self):
+        from src.risk import to_net_realized_trades
+
+        restated = to_net_realized_trades(
+            [{"entry_price": 100.0, "exit_price": 120.0, "signal_trigger": "Trend",
+              "symbol": "ACME", "outcome": "WIN", "return_pct": 20.0}],
+            buy_cost_pct=0.004, sell_cost_pct=0.004,
+        )
+
+        assert restated[0]["signal_trigger"] == "Trend"
+        assert restated[0]["symbol"] == "ACME"
+        assert restated[0]["outcome"] == "WIN"
+
+    def test_open_and_unpriced_trades_are_dropped_not_guessed_at(self):
+        from src.risk import to_net_realized_trades
+
+        restated = to_net_realized_trades(
+            [
+                {"entry_price": 100.0, "exit_price": None, "outcome": "PENDING"},
+                {"entry_price": None, "exit_price": 120.0, "outcome": "WIN"},
+                {"entry_price": 100.0, "exit_price": "n/a", "outcome": "WIN"},
+            ],
+            buy_cost_pct=0.004, sell_cost_pct=0.004,
+        )
+
+        assert restated == []
+
+    def test_kelly_sizes_smaller_off_net_history_than_gross(self):
+        """The DoD for the calibration task: identical trades, costed, produce
+        a smaller position."""
+        from src.risk import calculate_kelly_quantity, estimate_kelly_inputs, to_net_realized_trades
+
+        gross_history = [
+            {
+                "entry_price": 100.0,
+                "exit_price": 106.0 if i % 5 else 96.0,
+                "outcome": "WIN" if i % 5 else "LOSS",
+                "return_pct": 6.0 if i % 5 else -4.0,
+            }
+            for i in range(60)
+        ]
+        net_history = to_net_realized_trades(gross_history, buy_cost_pct=0.004, sell_cost_pct=0.004)
+
+        def _quantity(history):
+            p, b = estimate_kelly_inputs(history, min_trades=50)
+            return calculate_kelly_quantity(
+                entry_price=100.0, portfolio_value_inr=1_000_000.0,
+                max_single_position_pct=1.0, win_probability=p, reward_risk_ratio=b,
+            )
+
+        assert _quantity(net_history) < _quantity(gross_history)

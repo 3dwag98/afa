@@ -86,6 +86,95 @@ def net_reward_risk(
     return net_reward / net_risk
 
 
+def net_realized_return_pct(
+    entry_price: float,
+    exit_price: float,
+    buy_cost_pct: float,
+    sell_cost_pct: float,
+) -> float:
+    """A completed round trip's return in percent, net of both legs' friction.
+
+    Same convention as net_reward_risk(), applied after the fact instead of
+    before: the buy leg's cost is capitalized into the basis and the sell leg's
+    is deducted from the proceeds, so the result is the return the portfolio
+    actually kept.
+
+        net_pct = (exit * (1 - sell_cost) - entry * (1 + buy_cost))
+                  / (entry * (1 + buy_cost)) * 100
+
+    Args:
+        entry_price: Fill price per share on the buy leg.
+        exit_price: Fill price per share on the sell leg.
+        buy_cost_pct: Buy-leg friction as a fraction of turnover.
+        sell_cost_pct: Sell-leg friction as a fraction of turnover.
+
+    Returns:
+        Net return in percent; 0.0 when the entry price is unusable.
+    """
+    if entry_price <= 0:
+        return 0.0
+    cost_basis = entry_price * (1.0 + buy_cost_pct)
+    proceeds = exit_price * (1.0 - sell_cost_pct)
+    return (proceeds - cost_basis) / cost_basis * 100.0
+
+
+def to_net_realized_trades(
+    trade_history: List[Dict[str, Any]],
+    buy_cost_pct: float,
+    sell_cost_pct: float,
+) -> List[Dict[str, Any]]:
+    """Restate a gross trade history in net-of-friction terms.
+
+    The stored trade log is deliberately gross: `return_pct` there is the price
+    move, which is what a report should show. Kelly is not a report. Both of
+    its inputs have to be measured after friction, and the failure mode is
+    asymmetric in the dangerous direction (docs/QUANT_RESEARCH.md section 4):
+
+    - **b, the payoff ratio.** With ~0.8% of round-trip friction on an
+      Indian delivery trade, a gross 2.0 reward:risk realizes nearer 1.8. A
+      gross b therefore overstates the edge, and f* = p - (1-p)/b is more
+      sensitive to b than to anything except p.
+    - **p, the win probability.** A trade that gained 0.3% gross *lost* money.
+      Classifying it as a WIN inflates p and b simultaneously — it adds a
+      phantom win and drags the average win magnitude down by less than the
+      loss it actually was.
+
+    Every record is therefore re-priced and re-classified from the entry and
+    exit prices, so an outcome label computed gross upstream cannot leak into
+    the sizing decision. Records without a usable entry/exit pair (still open,
+    or missing prices) are dropped rather than guessed at.
+
+    Args:
+        trade_history: Trade dicts carrying "entry_price" and "exit_price"
+            (the shape AgentBrain.trade_history and storage.get_trade_history
+            produce).
+        buy_cost_pct: Buy-leg friction as a fraction of turnover.
+        sell_cost_pct: Sell-leg friction as a fraction of turnover.
+
+    Returns:
+        New trade dicts with net "return_pct" and a net-consistent "outcome",
+        every other key preserved.
+    """
+    restated: List[Dict[str, Any]] = []
+    for trade in trade_history:
+        entry_price = trade.get("entry_price")
+        exit_price = trade.get("exit_price")
+        if not entry_price or not exit_price:
+            continue
+        try:
+            net_pct = net_realized_return_pct(
+                float(entry_price), float(exit_price), buy_cost_pct, sell_cost_pct
+            )
+        except (TypeError, ValueError):
+            continue
+        restated.append({
+            **trade,
+            "return_pct": net_pct,
+            "outcome": "WIN" if net_pct > 0 else "LOSS",
+        })
+    return restated
+
+
 def calculate_quantity(
     entry_price: float,
     stop_price: float,
@@ -175,6 +264,16 @@ def estimate_kelly_inputs(
     Per docs/QUANT_RESEARCH.md section 4: p is the realized win rate and b is
     the average win magnitude divided by the average loss magnitude (in the
     same reward:risk units this platform already reports on StrategySignal).
+
+    **The input contract is net, not gross.** Both "outcome" and "return_pct"
+    must already have round-trip friction — brokerage, STT, exchange and SEBI
+    charges, GST, stamp duty, slippage and (where modelled) capital gains tax —
+    deducted. This function cannot verify that, so the two call sites do it
+    explicitly and identically: the backtest engine divides `net_pnl` by the
+    cost basis (backtest_engine.py::_net_return_pct), and the live orchestrator
+    restates its stored gross history through to_net_realized_trades(). Feeding
+    gross figures here inflates b by roughly the friction stack and mislabels
+    marginally-positive trades as wins, and f* over-bets on both.
 
     Two guards against sizing off noise, both of which matter because Kelly
     punishes over-betting much harder than under-betting:

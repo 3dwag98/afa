@@ -10,7 +10,12 @@ import numpy as np
 from typing import Callable
 
 from .registry import register_feature
-from portfolio_agent.src.liquidity import circuit_locked_days, zero_return_days
+from portfolio_agent.src.liquidity import (
+    circuit_locked_days,
+    lower_circuit_locked_days,
+    operator_trap_days,
+    zero_return_days,
+)
 
 
 @register_feature('close')
@@ -362,3 +367,59 @@ def circuit_locked_today(df: pd.DataFrame) -> pd.Series:
         Series of 0.0/1.0 flags (lagged by 1 period).
     """
     return circuit_locked_days(df).astype(float).shift(1)
+
+
+@register_feature('operator_trap_today')
+def operator_trap_today(df: pd.DataFrame) -> pd.Series:
+    """1.0 when the most recent completed session closed at an upper circuit.
+
+    Weaker and broader than `circuit_locked_today`, which requires a zero
+    intraday range: this fires whenever the close equals the session high on a
+    band-sized advance, which is what an operator-driven run-up-then-lock
+    actually prints (src/liquidity.py::operator_trap_days). Momentum reads the
+    move as strength; there is no offer left to lift at that close. Uses data
+    shifted by 1 to avoid look-ahead bias.
+
+    Args:
+        df: DataFrame with 'high' and 'close' columns.
+
+    Returns:
+        Series of 0.0/1.0 flags (lagged by 1 period).
+    """
+    return operator_trap_days(df).astype(float).shift(1)
+
+
+@register_feature('operator_trap_fraction_60')
+def operator_trap_fraction_60(df: pd.DataFrame) -> pd.Series:
+    """Share of the last 60 sessions that closed at an upper circuit.
+
+    The structural counterpart to the single-day flag: one lock is a news day,
+    a sustained pattern is a stock whose price is being walked. Uses data
+    shifted by 1 to avoid look-ahead bias.
+
+    Args:
+        df: DataFrame with 'high' and 'close' columns.
+
+    Returns:
+        Series with the upper-circuit-close fraction in [0, 1] (lagged by 1).
+    """
+    trapped = operator_trap_days(df).astype(float).shift(1)
+    return trapped.rolling(window=60, min_periods=20).mean()
+
+
+@register_feature('lower_circuit_locked_today')
+def lower_circuit_locked_today(df: pd.DataFrame) -> pd.Series:
+    """1.0 when the most recent completed session closed at a lower circuit.
+
+    The exit-side hazard: a holding locked down cannot be sold at the modelled
+    stop, so the backtest engine fires an immediate exit trigger on this rather
+    than waiting for a stop that will never fill at its modelled price. Uses
+    data shifted by 1 to avoid look-ahead bias.
+
+    Args:
+        df: DataFrame with 'low' and 'close' columns.
+
+    Returns:
+        Series of 0.0/1.0 flags (lagged by 1 period).
+    """
+    return lower_circuit_locked_days(df).astype(float).shift(1)

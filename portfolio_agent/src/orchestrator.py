@@ -25,7 +25,8 @@ try:
     from .data_store import load_or_fetch_data, load_ticker_data
     from .indicators import calculate_indicators
     from .monte_carlo import MonteCarloResult, MonteCarloSettings
-    from .risk import calculate_position_quantity
+    from .risk import calculate_position_quantity, to_net_realized_trades
+    from .execution_sim import cost_fraction_per_side
     from .compliance import run_compliance_checks
     from .learning import evaluate_and_learn
     from .reporting import export_excel_report
@@ -44,7 +45,8 @@ except ImportError:
     from data_store import load_or_fetch_data, load_ticker_data
     from indicators import calculate_indicators
     from monte_carlo import MonteCarloResult, MonteCarloSettings
-    from risk import calculate_position_quantity
+    from risk import calculate_position_quantity, to_net_realized_trades
+    from execution_sim import cost_fraction_per_side
     from compliance import run_compliance_checks
     from learning import evaluate_and_learn
     from reporting import export_excel_report
@@ -298,9 +300,18 @@ def run_orchestrator(
         logger.info(f"Loaded brain from {config.paths.brain_file}")
 
         # Step 4: Load trade outcomes from SQLite into brain.trade_history
+        #
+        # Restated net of round-trip friction on the way in. The stored
+        # outcomes carry a gross price move, which is the right thing for a
+        # report but the wrong thing for every consumer of brain.trade_history:
+        # Kelly sizes off the payoff ratio b (risk.py::estimate_kelly_inputs)
+        # and the weight learner off the per-trigger win rate, and a ~0.8%
+        # round-trip cost both shrinks b and turns marginally-positive trades
+        # into losses. Netting once here keeps a single definition of "did this
+        # trade make money" across both.
         trade_outcomes = get_trade_history(config.paths.sqlite_path)
-        for outcome in trade_outcomes:
-            brain.trade_history.append({
+        gross_history = [
+            {
                 "trade_id": outcome.trade_id,
                 "symbol": outcome.symbol,
                 "signal_trigger": outcome.signal_trigger,
@@ -310,8 +321,17 @@ def run_orchestrator(
                 "exit_price": outcome.exit_price,
                 "outcome": outcome.outcome,
                 "return_pct": outcome.return_pct,
-                "outcome_source": outcome.outcome_source
-            })
+                "outcome_source": outcome.outcome_source,
+            }
+            for outcome in trade_outcomes
+        ]
+        brain.trade_history.extend(
+            to_net_realized_trades(
+                gross_history,
+                buy_cost_pct=cost_fraction_per_side("BUY", config.risk.slippage_pct_per_side),
+                sell_cost_pct=cost_fraction_per_side("SELL", config.risk.slippage_pct_per_side),
+            )
+        )
         logger.info(f"Loaded {len(trade_outcomes)} trade outcomes from SQLite")
 
         # Step 5: Run evaluate_and_learn()
@@ -486,19 +506,25 @@ def run_orchestrator(
             simulated = simulate_outcome_fn(top_rec)
             save_trade_outcome(config.paths.sqlite_path, simulated)
 
-            # Also add to brain's trade_history
-            brain.trade_history.append({
-                "trade_id": simulated.trade_id,
-                "symbol": simulated.symbol,
-                "signal_trigger": simulated.signal_trigger,
-                "entry_date": simulated.entry_date,
-                "entry_price": simulated.entry_price,
-                "exit_date": simulated.exit_date,
-                "exit_price": simulated.exit_price,
-                "outcome": simulated.outcome,
-                "return_pct": simulated.return_pct,
-                "outcome_source": simulated.outcome_source
-            })
+            # Also add to brain's trade_history — netted the same way the
+            # stored history was on load, so one appended trade cannot be the
+            # single gross record in an otherwise net series.
+            brain.trade_history.extend(to_net_realized_trades(
+                [{
+                    "trade_id": simulated.trade_id,
+                    "symbol": simulated.symbol,
+                    "signal_trigger": simulated.signal_trigger,
+                    "entry_date": simulated.entry_date,
+                    "entry_price": simulated.entry_price,
+                    "exit_date": simulated.exit_date,
+                    "exit_price": simulated.exit_price,
+                    "outcome": simulated.outcome,
+                    "return_pct": simulated.return_pct,
+                    "outcome_source": simulated.outcome_source,
+                }],
+                buy_cost_pct=cost_fraction_per_side("BUY", config.risk.slippage_pct_per_side),
+                sell_cost_pct=cost_fraction_per_side("SELL", config.risk.slippage_pct_per_side),
+            ))
             logger.info(f"Added simulated outcome for {top_rec.symbol}: {simulated.outcome}")
 
         # Step 11: Optionally update outcomes from market data
