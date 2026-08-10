@@ -35,6 +35,7 @@ class BacktesterAgent:
         inference_device: str = "cpu",
         parallel: bool = False,
         max_workers: Optional[int] = None,
+        show_progress: bool = True,
     ):
         """Initialize the backtester agent.
 
@@ -48,8 +49,13 @@ class BacktesterAgent:
             inference_device: Device for ML strategy inference ("cpu", "cuda", "mps").
             parallel: Whether to parallelize rule-based signal generation across CPU workers.
             max_workers: Max worker processes when parallel=True.
+            show_progress: Draw progress bars for data loading and the day-by-day
+                replay. On by default: this is the interactive entry point, and a
+                multi-year backtest over a few thousand tickers otherwise prints
+                nothing at all between "Running backtest..." and the report.
         """
         self.config = config
+        self.show_progress = show_progress
         self.strategy_config = config.strategy.model_copy(deep=True)
         if strategy_type:
             self.strategy_config.type = strategy_type
@@ -123,10 +129,22 @@ class BacktesterAgent:
             benchmark_symbol=self.config.data.benchmark_symbol,
             exit_on_lower_circuit_lock=self.config.risk.exit_on_lower_circuit_lock,
             liquidate_on_drawdown_halt=self.config.risk.liquidate_on_drawdown_halt,
+            show_progress=self.show_progress,
         )
 
         logger.info(f"Running backtest from {start_date} to {end_date} with strategy '{strategy.name}'")
+        if self.show_progress:
+            print(
+                f"Replaying {start_date} to {end_date} with strategy '{strategy.name}' "
+                f"over {len(engine.master_date_index)} trading days"
+            )
         engine.run_backtest()
+
+        # The two post-loop phases are slow enough (a Monte Carlo ruin
+        # simulation and a multi-sheet Excel write) that a terminal which went
+        # quiet right after the progress bar filled looks like a hang.
+        if self.show_progress:
+            print("Computing risk analytics...")
 
         analyzer = RiskAnalyzer(
             daily_equity_curve=engine.daily_equity_curve,
@@ -165,6 +183,9 @@ class BacktesterAgent:
             'model_used': strategy.name != 'rule_based',
             'model_name': strategy.name,
         }
+
+        if self.show_progress:
+            print(f"Writing report to {output_file}...")
 
         export_backtest_excel(
             analytics=analytics_for_export,
@@ -211,6 +232,7 @@ def run_backtest_cli(
     max_workers: Optional[int] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    show_progress: bool = True,
 ) -> Dict[str, Any]:
     """Run backtest from CLI with configuration.
 
@@ -224,6 +246,8 @@ def run_backtest_cli(
         max_workers: Max worker processes when parallel=True.
         start_date: Optional explicit start date (YYYY-MM-DD), overrides config.backtest.start_years_ago.
         end_date: Optional explicit end date (YYYY-MM-DD), defaults to today.
+        show_progress: Draw progress bars during the run (pass False for
+            unattended/scripted runs).
 
     Returns:
         Dictionary with backtest results.
@@ -253,6 +277,7 @@ def run_backtest_cli(
         inference_device=device,
         parallel=parallel,
         max_workers=max_workers,
+        show_progress=show_progress,
     )
 
     return agent.run_backtest(
