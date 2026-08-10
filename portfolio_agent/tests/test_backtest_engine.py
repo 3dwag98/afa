@@ -766,3 +766,86 @@ class TestExitTriggers:
         sells = [o for o in engine.pending_orders if o['action'] == 'SELL']
         assert len(sells) == 1
         assert sells[0]['trigger'] == 'EXIT_TRIGGER'
+
+
+class TestTriggerUMAThroughTheEngine:
+    """End to end: a regime-gated trigger UMA containing a cross-sectional
+    member has to survive the engine's full-batch dispatch, and its size
+    multiplier has to reach the sized quantity."""
+
+    @staticmethod
+    def _uma_yaml(tmp_path, regimes=None):
+        import yaml
+        spec = {
+            "name": "Engine Trigger UMA",
+            "method": "trigger",
+            "trigger": {
+                "mode": "strong_or_consensus",
+                "strong_confidence": 0.6,
+                "min_net_ev_pct": -100.0,   # the hurdle is exercised elsewhere
+            },
+            "members": [
+                {"type": "momentum",
+                 "params": {"name": "mom", "min_universe": 2, "top_percentile": 0.5,
+                            "regime_filter": False}},
+                {"type": "rule_based", "name": "rules",
+                 "config_path": "config/strategies/trend_breakout.yaml"},
+            ],
+        }
+        if regimes is not None:
+            spec["regimes"] = regimes
+        path = tmp_path / "engine_uma.yaml"
+        with open(path, "w") as f:
+            yaml.safe_dump(spec, f)
+        return str(path)
+
+    def _engine(self, synthetic_data, tmp_path, **kwargs):
+        strategy = load_strategy(StrategyConfig(
+            type="ensemble", config_path=self._uma_yaml(tmp_path, **kwargs)
+        ))
+        return BacktestEngine(
+            start_date="2023-01-02",
+            end_date="2023-12-29",
+            initial_capital=1_000_000.0,
+            universe_tickers=synthetic_data['tickers'],
+            strategy=strategy,
+        )
+
+    def test_a_full_batch_uma_runs_to_completion(self, synthetic_data, tmp_path):
+        engine = self._engine(synthetic_data, tmp_path)
+
+        assert engine.strategy.requires_full_batch is True
+
+        results = engine.run_backtest()
+
+        assert len(results['daily_equity_curve']) > 0
+        assert 'exit_trigger_log' in results
+
+    def test_the_engine_classifies_a_regime_for_the_round(self, synthetic_data, tmp_path):
+        """Without this the regime map is inert and every member always speaks."""
+        engine = self._engine(synthetic_data, tmp_path)
+        engine.benchmark_close = None
+
+        # No benchmark cached -> None, which the UMA reads as "permit all".
+        assert engine._classify_regime(None, None) is None
+
+        prices = pd.Series(
+            [100.0 * (1.0003 ** i) for i in range(400)],
+            index=pd.bdate_range("2021-01-04", periods=400),
+        )
+        assert engine._classify_regime(prices, None) == "BULL_RISK_ON"
+
+    def test_the_trigger_size_multiplier_reaches_the_sized_quantity(self, synthetic_data, tmp_path):
+        """The multiplier travels on extra['position_scale'], the same channel
+        volatility targeting uses, so sizing picks it up with no extra wiring."""
+        from portfolio_agent.strategies.types import StrategySignal
+
+        engine = self._engine(synthetic_data, tmp_path)
+        half = StrategySignal(
+            symbol="X", signal="BUY", score=80.0, trigger="Trigger:strong_single",
+            entry_price=100.0, stop_price=95.0, target_price=110.0,
+            reward_risk=2.0, probability_profit=0.6,
+            extra={"position_scale": 0.5},
+        )
+
+        assert engine._apply_position_scale(100, half) == 50

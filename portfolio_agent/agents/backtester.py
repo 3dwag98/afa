@@ -182,6 +182,13 @@ class BacktesterAgent:
                 f"see 'circuit_breaker_log' in the returned results"
             )
 
+        if engine.exit_trigger_log:
+            logger.info(
+                f"Forced exits fired {len(engine.exit_trigger_log)} time(s) during this run "
+                f"(lower-circuit locks and/or drawdown liquidation); see 'exit_trigger_log' "
+                f"in the returned results"
+            )
+
         return {
             'status': 'success',
             'output_file': output_file,
@@ -189,6 +196,7 @@ class BacktesterAgent:
             'trade_count': len(engine.trade_log),
             'strategy': strategy.name,
             'circuit_breaker_log': engine.circuit_breaker_log,
+            'exit_trigger_log': engine.exit_trigger_log,
         }
 
 

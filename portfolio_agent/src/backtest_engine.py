@@ -59,10 +59,15 @@ def _score_one_ticker(
     risk_params: RiskParams,
     weights: Dict[str, float],
     mc_settings: MonteCarloSettings,
+    regime_label: Optional[str] = None,
 ) -> Optional[StrategySignal]:
     """Score a single ticker: run Monte Carlo + build features + call strategy.score().
 
     Module-level (not a method) so it is picklable for ProcessPoolExecutor dispatch.
+
+    `regime_label` is classified once per day by the caller and passed down,
+    not re-derived per ticker: the benchmark is the same for everyone, and a
+    UMA whose members are regime-gated must see one classification per round.
     """
     try:
         daily_returns = hist_data['close'].pct_change().dropna().tolist()
@@ -70,7 +75,10 @@ def _score_one_ticker(
             symbol=ticker, daily_returns=daily_returns, ohlcv=hist_data
         )
         features = build_features(hist_data, required_features)
-        context = StrategyContext(risk=risk_params, weights=weights, mc_result=mc_result)
+        context = StrategyContext(
+            risk=risk_params, weights=weights, mc_result=mc_result,
+            regime_label=regime_label,
+        )
         return strategy.score(ticker, features, context)
     except Exception:
         logger.debug(f"Signal generation failed for {ticker}", exc_info=True)
@@ -102,14 +110,17 @@ def _init_scoring_worker(
 
 
 def _score_one_ticker_in_worker(
-    ticker: str, hist_data: pd.DataFrame, weights: Dict[str, float]
+    ticker: str,
+    hist_data: pd.DataFrame,
+    weights: Dict[str, float],
+    regime_label: Optional[str] = None,
 ) -> Optional[StrategySignal]:
     """Worker-side entry point: only the per-day varying arguments travel."""
     if _WORKER_STRATEGY is None or _WORKER_RISK is None:
         raise RuntimeError("Scoring worker was not initialized")
     return _score_one_ticker(
         _WORKER_STRATEGY, ticker, hist_data, _WORKER_FEATURES,
-        _WORKER_RISK, weights, _WORKER_MC_SETTINGS,
+        _WORKER_RISK, weights, _WORKER_MC_SETTINGS, regime_label,
     )
 
 
@@ -807,8 +818,14 @@ class BacktestEngine:
             )
             return self.strategy.score_batch(features_by_symbol, context)
 
+        # Classified once for the whole round, so the per-ticker path gates
+        # models on the same market state the batched path does.
+        regime_label = self._classify_regime(
+            self._benchmark_up_to(current_date), self._benchmark_ohlcv_up_to(current_date)
+        )
+
         if self.parallel and len(eligible) > 1:
-            parallel_signals = self._score_tickers_parallel(eligible, weights)
+            parallel_signals = self._score_tickers_parallel(eligible, weights, regime_label)
             if parallel_signals is not None:
                 return parallel_signals
 
@@ -818,7 +835,7 @@ class BacktestEngine:
         for ticker, hist_data in eligible.items():
             result = _score_one_ticker(
                 self.strategy, ticker, hist_data, required_features,
-                self.risk_params, weights, self.mc_settings,
+                self.risk_params, weights, self.mc_settings, regime_label,
             )
             if result is not None:
                 signals[ticker] = result
@@ -892,7 +909,10 @@ class BacktestEngine:
             self._scoring_executor = None
 
     def _score_tickers_parallel(
-        self, eligible: Dict[str, pd.DataFrame], weights: Dict[str, float]
+        self,
+        eligible: Dict[str, pd.DataFrame],
+        weights: Dict[str, float],
+        regime_label: Optional[str] = None,
     ) -> Optional[Dict[str, StrategySignal]]:
         """Score every eligible ticker across the run's CPU process pool.
 
@@ -910,7 +930,9 @@ class BacktestEngine:
         try:
             executor = self._get_scoring_executor()
             futures = {
-                ticker: executor.submit(_score_one_ticker_in_worker, ticker, hist_data, weights)
+                ticker: executor.submit(
+                    _score_one_ticker_in_worker, ticker, hist_data, weights, regime_label
+                )
                 for ticker, hist_data in eligible.items()
             }
         except Exception:
