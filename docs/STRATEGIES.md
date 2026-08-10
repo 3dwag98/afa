@@ -94,6 +94,12 @@ context.weights         # learned component weights, e.g. {"Trend": 25.0, ...}
 context.mc_result       # MonteCarloResult for this ticker, or None in batch paths
 context.benchmark_close # market index close series (e.g. Nifty 50) truncated to
                         # before the decision date, or None when not cached
+context.benchmark_ohlcv # the same index as an OHLC frame, when cached. Only ADX
+                        # needs the daily range; None falls back to a close-only proxy
+context.regime_label    # BULL_RISK_ON | BEAR_CRASH_RISK | SIDEWAYS_CHOP |
+                        # NEUTRAL | UNKNOWN, classified once per scoring round
+                        # so every strategy sees the same market state. None
+                        # means "not assessed" — treat that as permissive
 context.run_id          # correlation id for logging
 ```
 
@@ -101,6 +107,19 @@ context.run_id          # correlation id for logging
 turnover. Report `reward_risk` **net** of them — `src/risk.py::net_reward_risk()`
 does the arithmetic — so the `min_reward_risk` gate compares money actually kept
 rather than a gross ratio that flatters every trade.
+
+> **Your `stop_price` and `target_price` are binding, not decorative.** The
+> backtest engine sizes a filled position's exit levels from the signal that
+> produced it (as distances re-applied to the fill price). Two consequences for
+> anyone writing a strategy:
+>
+> - **Match the exit horizon to your signal's horizon.** A stop tight enough to
+>   trigger in a couple of sessions turns a multi-month thesis into
+>   day-trading, and pays ~0.8% of round-trip friction each time it does. The
+>   built-in momentum sleeve lost 2.0% gross at a 1.5× ATR stop and made 4.4%
+>   gross at 6.0× over the same data, purely from that.
+> - **A stop at or above entry is discarded**, and the engine falls back to a
+>   documented default rather than inverting your exit.
 
 Two optional keys in `StrategySignal.extra` are read by the sizing layer, so a
 strategy that measures its own risk environment does not have to reimplement
@@ -340,7 +359,7 @@ exit:
     multiplier: 2.5
 ```
 
-Load it in `__init__` (see `rule_based.py::_load_rules` for the path
+Load it in `__init__` (see `strategies/rule_based.py::_load_rules` for the path
 resolution used by the built-ins, which tries the working directory, then the
 package root, then the workspace root).
 
@@ -512,8 +531,11 @@ Every symbol you were handed must appear in the returned dict. See
 `strategies/cross_sectional.py` for the built-in momentum and low-volatility
 versions, including the shared decile-ranking helper.
 
-Cross-sectional strategies **cannot** be UMA members, because a UMA scores
-members one ticker at a time.
+Cross-sectional strategies can be UMA members, but only under
+`method: trigger`, which scores every member across the whole eligible universe
+before arbitrating. The averaging methods combine through per-ticker `score()`,
+where ranking degenerates to a universe of one, so they reject such members at
+construction rather than silently ranking each stock against itself.
 
 ### C. Model-backed strategy
 
@@ -767,9 +789,14 @@ from .registry import register_model
 @register_model("gru")
 class GRUForecaster(nn.Module):
     def __init__(self, n_features, hidden_size=64, n_layers=2,
-                 sequence_length=60, dropout=0.2, n_outputs=1):
+                 sequence_length=60, dropout=0.2, n_outputs=3):
         # The trainer and ModelLoader both construct models with exactly these
         # keyword arguments — keep the signature.
+        #
+        # n_outputs is one node per quantile (3 by default). It is passed in,
+        # never assumed: the trainer derives it from training.loss/quantiles
+        # and records it in metadata.json so inference rebuilds the same head
+        # before loading the state dict.
         super().__init__()
         self.gru = nn.GRU(n_features, hidden_size, n_layers,
                           batch_first=True, dropout=dropout)
@@ -780,14 +807,24 @@ class GRUForecaster(nn.Module):
         return self.head(out[:, -1])  # (batch, n_outputs)
 ```
 
+Your `forward()` returns raw numbers; the loss decides what they mean. Under
+the default `training.loss: quantile` those are the 10th/50th/90th percentiles
+of the forward return, fitted with pinball loss — do **not** apply a softmax,
+sigmoid or sort inside the model. Sorting happens at inference
+(`sorted_quantiles`), and squashing would break the loss.
+
 ```bash
 AFA_TRAINING__MODEL=gru portfolio-agent train --device auto
 # writes models/gru_best.pt + models/metadata.json
 portfolio-agent backtest --strategy lstm --strategy-config ...   # params.model_name: gru
 ```
 
-Checkpoints are named `models/<model_name>_best.pt`, and `metadata.json`
-records the feature list, target and sequence length that inference reuses.
+Checkpoints are named `models/<model_name>_best.pt`. `metadata.json` records
+the feature list, target and sequence length that inference reuses, plus the
+head shape (`n_outputs`, `quantiles`) and the fitted confidence calibration.
+Metadata written before quantile training existed carries none of the latter,
+and everything defaults to the old single-output shape, so older checkpoints
+keep loading unchanged.
 
 ## Reference
 
@@ -845,6 +882,8 @@ AFA_STRATEGY__TYPE=mean_reversion portfolio-agent run-agent
 - [ ] `requires_full_batch` set if the signal is cross-sectional
 - [ ] `supports_gpu_batch` set only if `score_batch()` really batches on GPU
 - [ ] `score_batch()` returns an entry for **every** symbol it was given
+- [ ] `stop_price` sits below `entry_price`, at a distance matching the
+      signal's horizon — the engine trades the levels you emit
 - [ ] `rationale` explains the decision in plain terms
 - [ ] `register_strategy("name", Class)` added
 - [ ] Tests added and passing
@@ -864,7 +903,7 @@ AFA_STRATEGY__TYPE=mean_reversion portfolio-agent run-agent
 - [ ] `grep` clean across `*.py`, `*.yaml`, `*.md`
 - [ ] Registration line and import removed
 - [ ] Strategy file, YAML and tests deleted
-- [ ] Removed from UMA member lists
+- [ ] Removed from UMA member lists **and any `regimes:` map that names it**
 - [ ] `config.yaml` repointed if it was the default
 - [ ] Suite passes; `list-strategies` looks right
 
@@ -882,3 +921,8 @@ AFA_STRATEGY__TYPE=mean_reversion portfolio-agent run-agent
 | Parallel and serial results differ | Your `score()` depends on hidden mutable state or is nondeterministic | Make `score()` a pure function of `(features, context)` |
 | `mc_result` is `None` in `score()` | You are on a batched dispatch path | Leave both batch flags `False` if you need per-ticker Monte Carlo |
 | Backtest looks impossibly good | Look-ahead in a custom feature | Ban `shift(-n)` and centred windows; use backward-looking windows only |
+| A `method: trigger` UMA blocks every trade | Members conflict, or the EV hurdle is unreachable | Read the rationale — it names the veto. Check `min_net_ev_pct` and `conflict_veto_confidence` |
+| A `regimes:` map appears to do nothing | Its names do not match the members' | Names come from `name:` on the member (or `params.name`). `list-strategies --name ensemble` prints both lists |
+| Every regime resolves to `UNKNOWN` | Not enough history to judge the market state | Needs `trend_window + 1` bars (201 by default) of index or composite history |
+| Positions exit after a couple of sessions | The stop is tighter than the signal's horizon | Raise `risk.atr_stop_multiplier`; see [QUANT_RESEARCH.md §13.6](QUANT_RESEARCH.md#136-the-exit-plan-has-to-reach-the-fill) |
+| Equity curve goes flat partway through | The drawdown breaker halted buying | Expected below `max_portfolio_drawdown_pct`; it re-arms on recovery or after `drawdown_halt_max_days` |

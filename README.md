@@ -301,7 +301,7 @@ Every hot path uses the executor that matches the work, and **all of them are sp
 portfolio-agent backtest --strategy rule_based --years 2 --parallel --workers 4
 ```
 
-Determinism is guaranteed by construction, not by luck: parallel results are reassembled in universe order (never completion order), orders are queued SELL-first then BUYs by descending score so that finite cash is allocated reproducibly, and both Monte Carlo simulations are seeded from `simulation.random_seed`. `tests/test_parallel_determinism.py` enforces this by running the same backtest both ways and comparing the exported workbook sheet by sheet. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#determinism-guarantees).
+Determinism is guaranteed by construction, not by luck: parallel results are reassembled in universe order (never completion order), orders are queued SELL-first then BUYs by descending score so that finite cash is allocated reproducibly, and both Monte Carlo simulations are seeded from `simulation.random_seed`. `portfolio_agent/tests/test_parallel_determinism.py` enforces this by running the same backtest both ways and comparing the exported workbook sheet by sheet. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#determinism-guarantees).
 
 `--parallel` is not free: for small universes, process startup can cost more than it saves. It pays off from a few dozen tickers upward.
 
@@ -477,16 +477,22 @@ afa/
 ├── config.yaml                 # single nested config (see Configuration)
 ├── portfolio_agent/            # the package
 │   ├── cli.py                  # single CLI entry point
-│   ├── config/                 # schema.py, loader.py, strategies/*.yaml (incl. example_uma.yaml)
-│   ├── strategies/             # base.py, types.py, rule_based.py, cross_sectional.py, ml_strategy.py, ensemble.py, weighting.py, registry.py
+│   ├── config/                 # schema.py, loader.py, strategies/*.yaml (incl.
+│   │                           # uma_meta_orchestrator.yaml, the multi-regime UMA)
+│   ├── strategies/             # base.py, types.py (incl. ModelVerdict), rule_based.py,
+│   │                           # cross_sectional.py, ml_strategy.py, ensemble.py,
+│   │                           # weighting.py, registry.py
 │   ├── features/               # lag-safe technical indicators + pipeline
-│   ├── models/                 # PyTorch model definitions
+│   ├── models/                 # LSTM + PatchTST, pinball loss, model registry
 │   ├── agents/                 # trainer.py, backtester.py
-│   ├── src/                    # orchestrator, backtest engine, data store, hf_dataset.py (HuggingFace
-│   │                           # source), risk.py (Kelly + cost-aware reward:risk), regime.py (momentum
-│   │                           # crash protection), liquidity.py (circuit/zombie screen), sectors.py
-│   │                           # (concentration caps), volatility_models.py (GJR-GARCH), monte_carlo.py, ...
-│   └── tests/
+│   ├── src/                    # orchestrator, backtest engine, data store, hf_dataset.py
+│   │                           # (HuggingFace source), risk.py (Kelly + cost-aware
+│   │                           # reward:risk), trigger_engine.py (signal arbitration),
+│   │                           # regime.py (classification + crash protection),
+│   │                           # calibration.py (isotonic), liquidity.py (circuit/zombie
+│   │                           # screen), sectors.py (concentration caps),
+│   │                           # volatility_models.py (GJR-GARCH), monte_carlo.py, ...
+│   └── tests/                  # 772 tests
 ├── docs/
 │   ├── ARCHITECTURE.md         # how it all works, with diagrams
 │   ├── STRATEGIES.md           # create / update / delete a strategy
@@ -515,11 +521,19 @@ docker run --rm -v $(pwd)/data:/app/data -v $(pwd)/output:/app/output afa
 - **Position size cap** — configurable via `risk.max_single_position_pct`.
 - **Risk per trade cap** — configurable via `risk.risk_per_trade_pct`.
 - **Sector concentration cap** — `risk.max_sector_pct` (25% by default).
-- **Drawdown circuit breaker** — new entries stop past `risk.max_portfolio_drawdown_pct`.
+- **Drawdown circuit breaker** — new entries stop past `risk.max_portfolio_drawdown_pct`,
+  resuming on recovery or after `risk.drawdown_halt_max_days`.
 - **Momentum crash filter** — exposure is cut in the market state where momentum crashes.
+- **Regime gating** — a UMA's `regimes:` map decides which sleeves may buy at all.
+- **Signal arbitration** — conflicting models block the trade instead of averaging
+  into one neither would take.
 - **Penny stock filter** — `compliance.min_price_inr`.
-- **Tradability screen** — circuit-locked and effectively-untraded stocks are excluded.
+- **Tradability screen** — circuit-locked (1/2/5/10/20% bands), operator-trapped and
+  effectively-untraded stocks are excluded.
+- **Lower-circuit exit** — a holding locked down is exited at the next session rather
+  than waiting for a stop no bid will fill.
 - **Costs charged to the decision, not just the fill** — signals are gated on
-  reward:risk net of the full Indian friction stack.
+  reward:risk net of the full Indian friction stack, and Kelly's inputs are
+  measured net of it on both the live and backtested paths.
 
 MIT License — for educational purposes only. This system is not investment advice.

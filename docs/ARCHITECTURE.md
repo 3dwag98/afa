@@ -35,18 +35,21 @@ Companion documents:
 Cached OHLCV parquet files are turned into feature matrices by a **feature
 registry**, scored by a **strategy** looked up from a **strategy registry**,
 sized and gated by **risk and compliance** rules, and written out as Excel
-reports. The same strategy object is used by the live agent and the backtest
-engine, so a strategy cannot behave one way in a backtest and another way
-live. Everything expensive — data loading, per-ticker Monte Carlo, model
-training, model inference — is parallelized, but always in a way that leaves
-results identical to the serial path.
+reports. When several strategies are combined, a **trigger engine** arbitrates
+their verdicts rather than averaging them, and a **market regime** decides
+which of them may speak at all. The same strategy object is used by the live
+agent and the backtest engine, so a strategy cannot behave one way in a
+backtest and another way live. Everything expensive — data loading, per-ticker
+Monte Carlo, model training, model inference — is parallelized, but always in a
+way that leaves results identical to the serial path.
 
 ## System overview
 
 ```mermaid
 flowchart TB
     subgraph ingest["Data layer"]
-        YF["yfinance"] -->|"batch_download_and_cache()<br/>thread pool"| CACHE[("data/market_data/<br/>*.parquet")]
+        HF["HuggingFace Hub dataset<br/>(data.source: huggingface, default)"] --> CACHE[("data/market_data/<br/>*.parquet")]
+        YF["yfinance<br/>(data.source: yfinance)"] -->|"thread pool"| CACHE
         CACHE --> LOAD["load_ticker_data()"]
     end
 
@@ -118,8 +121,9 @@ classDiagram
         +load()
     }
     class EnsembleStrategy {
-        members with weights
-        weighted_blend or vote
+        trigger, weighted_blend or vote
+        requires_full_batch propagates
+        from its members
     }
 
     BaseStrategy <|-- RuleBasedStrategy
@@ -140,7 +144,7 @@ Inputs and outputs are fixed shapes (`strategies/types.py`):
 flowchart LR
     subgraph in["Inputs to score()"]
         F["features: DataFrame<br/>one row per bar,<br/>one column per required feature"]
-        C["StrategyContext<br/>• risk: RiskParams<br/>• weights: learned component weights<br/>• mc_result: MonteCarloResult | None<br/>• run_id"]
+        C["StrategyContext<br/>• risk: RiskParams<br/>• weights: learned component weights<br/>• mc_result: MonteCarloResult | None<br/>• benchmark_close / benchmark_ohlcv<br/>• regime_label<br/>• run_id"]
     end
     subgraph out["Output"]
         S["StrategySignal<br/>• signal: BUY/SELL/HOLD/WATCH/AVOID<br/>• score: 0-100<br/>• trigger, entry/stop/target<br/>• reward_risk, probability_profit<br/>• component_scores, rationale, extra"]
@@ -182,7 +186,7 @@ The two flags mean different things and should not be confused:
 | Property | Means | Set by | Consequence of getting it wrong |
 |---|---|---|---|
 | `supports_gpu_batch` | "`score_batch()` is a genuine batched forward pass" | `MLStrategy` | Performance only — you lose GPU batching |
-| `requires_full_batch` | "my signal depends on ranking against the whole universe" | `MomentumStrategy`, `LowVolatilityStrategy` | **Correctness** — ranking against a universe of one is meaningless |
+| `requires_full_batch` | "my signal depends on ranking against the whole universe" | `MomentumStrategy`, `LowVolatilityStrategy`, and any `EnsembleStrategy` containing one | **Correctness** — ranking against a universe of one is meaningless |
 
 A cross-sectional strategy scored one ticker at a time is not slow, it is
 wrong: the top decile of a single stock is always that stock.
@@ -347,8 +351,11 @@ flowchart LR
         T5 --> T6["train loop<br/>AMP on CUDA, early stopping"]
     end
 
-    T6 --> CKPT[("models/lstm_best.pt")]
-    T6 --> META[("models/metadata.json<br/>feature_names, target,<br/>sequence_length")]
+    T5 --> WF["walk-forward folds<br/>(out-of-sample predictions)"]
+    WF --> CAL["isotonic calibration<br/>src/calibration.py"]
+    T6 --> CKPT[("models/&lt;model&gt;_best.pt")]
+    T6 --> META[("models/metadata.json<br/>feature_names, target, sequence_length,<br/>quantiles, n_outputs,<br/>confidence_calibration")]
+    CAL --> META
 
     subgraph infer["backtest / run-agent with --strategy lstm"]
         direction TB
@@ -356,16 +363,38 @@ flowchart LR
         RF --> BF["build_features per ticker"]
         BF --> STACK["stack last sequence_length rows<br/>for every eligible ticker"]
         STACK --> FWD["ONE forward pass<br/>(n_tickers, seq_len, n_features)"]
-        FWD --> P["prediction -> probability -> signal"]
+        FWD --> Q["sort quantiles<br/>q10 / q50 / q90"]
+        Q --> P["calibrated probability -> signal;<br/>stop and target from q10 / q90"]
     end
 
     CKPT --> L
     META --> L
 ```
 
-`metadata.json` is the contract between the two halves: the feature list the
+`metadata.json` is the contract between the two halves. The feature list the
 model was trained on becomes the feature list the strategy requests at
-inference time, so the two can never silently disagree.
+inference time, so the two can never silently disagree — and the head shape
+(`n_outputs`, `quantiles`) travels the same way, so inference rebuilds the
+same architecture before loading the state dict. Metadata written before
+quantile training existed carries neither key, and both default to the old
+single-output shape, so old checkpoints keep loading.
+
+The model predicts **three quantiles of the 5-day forward return, not one
+number**. Squared error is minimized by the conditional mean, the conditional
+mean of a 5-day return is nearly constant, and a network trained on it
+converges to a near-constant output that validates beautifully and forecasts
+nothing. Pinball loss over the 10th/50th/90th percentiles cannot be satisfied
+by a constant, and the outer pair is a confidence interval that comes out of
+the fit rather than being bolted on — `MLStrategy` derives its stop and target
+from those percentiles instead of fixed cuts. See
+[QUANT_RESEARCH.md §20](QUANT_RESEARCH.md#20-forecasting-a-distribution-instead-of-a-point).
+
+The probability the strategy publishes is **calibrated**, not raw. Isotonic
+regression fitted on the walk-forward test folds — the only genuinely
+out-of-sample scores a run produces — maps score to realized win rate,
+preserving the model's ranking while discarding its scale. That number feeds
+Kelly sizing and the trigger engine's expected-value hurdle, both far more
+sensitive to an optimistic probability than a pessimistic one.
 
 Panel construction detail worth knowing: each ticker is split 70/15/15
 *individually* and then all train parts are concatenated, followed by all
@@ -405,14 +434,16 @@ sequenceDiagram
     D->>E: A. fill orders queued on T-1, at T's OPEN
     E->>X: costs, slippage, market impact, capital gains tax
     X-->>E: adjusted price + friction
+    Note over E: a filled BUY takes its stop/target from<br/>the SIGNAL that produced it
     D->>E: B. check stops/targets against T's HIGH/LOW
     D->>E: C. liquidate anything that stopped trading
     D->>E: D. mark to market at T's CLOSE
     Note over E: this is the day's equity point —<br/>it includes everything above
     D->>S: E. score universe using data strictly BEFORE T
     S-->>E: signals
-    E->>E: F. queue T+1 orders (SELLs first, then BUYs by score)
-    E->>E: G. every 20 days, evaluate_and_learn()
+    E->>E: F. update the drawdown breaker
+    E->>E: G. queue T+1 orders:<br/>forced exits, then SELLs, then BUYs by score
+    E->>E: H. every 20 days, evaluate_and_learn()
 ```
 
 Look-ahead prevention is structural, not incidental:
@@ -431,6 +462,41 @@ Position accounting is tracked explicitly in `open_positions` (cost basis,
 first entry date, quantity), which is what makes realized P&L, holding period
 and STCG/LTCG classification correct in the trade log.
 
+### The exit plan belongs to the signal
+
+A filled BUY's stop and target come from the `StrategySignal` that produced
+it, carried on the order and re-applied by `_exit_levels()`. This used to be a
+hardcoded 5% / 10% pair, and the consequences reached well past the exit:
+`min_reward_risk` screened signals on a net-of-cost reward:risk computed from
+ATR levels the engine then discarded, so the platform gated on one exit plan
+and traded another.
+
+**Distances, not levels.** The signal's levels are computed off T−1's close;
+the fill lands at T+1's open plus slippage. Copying absolute levels across
+would put a gapped-up entry immediately through its own target, so the
+fractional distances are preserved and re-applied to the price actually paid.
+A strategy supplying no usable stop still gets a documented fallback.
+
+### Forced exits and the drawdown breaker
+
+Two conditions invalidate a position's exit plan rather than merely arguing
+against holding it, so they queue an exit outside the normal signal path:
+
+| Trigger | Config | Why it overrides the stop |
+|---|---|---|
+| Holding closed at its **lower circuit** | `risk.exit_on_lower_circuit_lock` (on) | There is no bid, so the modelled stop is not a stop. Queued for the next session — the earliest a real order could work. |
+| **Drawdown breaker** tripped | `risk.liquidate_on_drawdown_halt` (off) | Only when explicitly enabled; open positions otherwise keep their own stops. |
+
+The breaker halts new BUYs at `max_portfolio_drawdown_pct` and re-arms on
+recovery to `drawdown_reentry_pct` — **or** after `drawdown_halt_max_days`,
+whichever comes first. The cooldown is not a nicety: halting buys does not
+freeze the book, so open positions keep exiting through their stops until only
+cash is left, and cash cannot appreciate back toward the peak it is measured
+against. Recovery-only re-arming therefore deadlocks, silently, presenting as
+a flat equity curve rather than an error. The cooldown resets the equity peak
+on its way out, because leaving the old peak in place puts the next bar
+straight back over the trip threshold.
+
 ## The live agent
 
 ```mermaid
@@ -441,7 +507,8 @@ flowchart TD
     D --> E["load_strategy(config.strategy)"]
     E --> F["load_or_fetch_data()"]
     F --> G["per-ticker prep: indicators + Monte Carlo + features<br/>PROCESS POOL (order-stable)"]
-    G --> H{"requires_full_batch<br/>or supports_gpu_batch?"}
+    G --> RG["classify market regime<br/>(cached index, else universe composite)"]
+    RG --> H{"requires_full_batch<br/>or supports_gpu_batch?"}
     H -->|yes| I["score_batch(all tickers)"]
     H -->|no| J["score() per ticker with its own mc_result"]
     I --> K["position sizing (fixed-fractional or fractional Kelly)"]
@@ -566,7 +633,7 @@ Two contracts govern the numbers that reach Excel:
 
 - **Units.** Every percentage metric crosses the boundary in *percent* units
   (`18.5` means 18.5%), declared per metric in
-  `backtest_reporting.py::SUMMARY_METRICS`. The exporter divides by 100 once,
+  `src/backtest_reporting.py::SUMMARY_METRICS`. The exporter divides by 100 once,
   because Excel percent formats multiply by 100 on display. Ratios (Sharpe,
   Sortino, profit factor) are written as plain numbers.
 - **Columns.** `EXPECTED_COLUMNS` (16) and `EXPECTED_DAILY_COLUMNS` (11) are
@@ -605,9 +672,9 @@ flowchart TD
    and the bootstrap draws from a local generator so it neither disturbs nor
    depends on global NumPy state.
 
-This is enforced by tests, not just convention: `tests/test_parallel_determinism.py`
-runs the same backtest serially and in parallel and compares the exported
-workbook sheet by sheet.
+This is enforced by tests, not just convention:
+`portfolio_agent/tests/test_parallel_determinism.py` runs the same backtest
+serially and in parallel and compares the exported workbook sheet by sheet.
 
 ## Module map
 
@@ -619,15 +686,15 @@ portfolio_agent/
 │   ├── schema.py           pydantic AppConfig (the full settings surface)
 │   ├── loader.py           config.yaml + AFA_* env overrides
 │   └── strategies/*.yaml   per-strategy rule files, incl. example_uma.yaml
-│                           and uma_meta_orchestrator.yaml (multi-regime)
+│                            and uma_meta_orchestrator.yaml (multi-regime)
 ├── features/
 │   ├── registry.py         @register_feature name -> function
 │   ├── technical.py        the lag-safe indicators themselves
 │   └── pipeline.py         build_features(df, names) -> DataFrame
 ├── strategies/
 │   ├── base.py             BaseStrategy — the interface you implement
-│   ├── types.py            RiskParams, StrategyContext, StrategySignal,
-│                           ModelVerdict (the trigger engine's input contract)
+│   ├── types.py            RiskParams, StrategyContext, StrategySignal, and
+│   │                       ModelVerdict (the trigger engine's input contract)
 │   ├── registry.py         register_strategy / load_strategy
 │   ├── rule_based.py       trend + breakout + volume + Monte Carlo
 │   ├── cross_sectional.py  momentum, low_volatility (requires_full_batch)
@@ -642,9 +709,11 @@ portfolio_agent/
 │   └── backtester.py       wires strategy -> engine -> analytics -> Excel
 ├── data/dataset.py         TimeSeriesDataset + DataLoader construction
 ├── utils/device.py         device resolution and GPU diagnostics
+├── tests/                  the whole suite (pytest portfolio_agent/tests)
 └── src/
     ├── orchestrator.py     the live daily loop
-    ├── backtest_engine.py  event-driven backtest
+    ├── backtest_engine.py  event-driven backtest, incl. the exit plan a
+    │                       filled order inherits from its signal
     ├── execution_sim.py    Indian market costs, slippage, STCG/LTCG,
     │                       plus the quantity-free round-trip cost estimator
     ├── risk.py             position sizing incl. fractional Kelly (capped at
@@ -661,6 +730,10 @@ portfolio_agent/
     │                       gaussian / block bootstrap / jump diffusion
     ├── volatility_models.py GJR-GARCH(1,1), incl. the gap-aware fit
     ├── compliance.py       eligibility gates
+    ├── indicators.py       ATR/RSI/MACD/ADX and the IndicatorSnapshot the
+    │                       live report reads
+    ├── outcomes.py         trade-outcome marking that feeds the weight learner
+    ├── storage.py          SQLite: recommendations, outcomes, brain, run log
     ├── data_store.py       parquet cache + source dispatch (Hub or yfinance)
     ├── hf_dataset.py       HuggingFace Hub OHLCV ingest + split adjustment
     ├── universe.py         ticker universe resolution
