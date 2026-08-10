@@ -20,7 +20,9 @@ from tqdm import tqdm
 from portfolio_agent.config.schema import AppConfig, TrainingConfig
 from portfolio_agent.data.dataset import TimeSeriesDataset, create_dataloaders
 from portfolio_agent.features.pipeline import build_features
+from portfolio_agent.models.pytorch_models import PointLoss, QuantileLoss, sorted_quantiles
 from portfolio_agent.models.registry import get_model
+from portfolio_agent.src.calibration import IsotonicCalibrator, calibration_error
 from portfolio_agent.src.data_store import load_ticker_data
 from portfolio_agent.src.universe import resolve_backtest_universe
 from portfolio_agent.utils.device import get_device
@@ -31,6 +33,44 @@ TRAINING_FEATURE_NAMES = [
 ]
 
 TRADING_DAYS_PER_YEAR = 252
+
+
+def head_width(training: TrainingConfig) -> int:
+    """How many numbers the model's output layer emits.
+
+    One for a point forecast; one per quantile when fitting pinball loss.
+    Single-sourced here because the checkpoint, the walk-forward folds and the
+    inference-time reconstruction in MLStrategy must all agree, and a mismatch
+    surfaces as an inscrutable state-dict shape error.
+    """
+    if training.loss == "quantile":
+        return max(1, len(training.quantiles))
+    return 1
+
+
+def median_output_index(training: TrainingConfig) -> Optional[int]:
+    """Index of the median quantile in the model's output, or None for a point head.
+
+    The median is the point forecast every scalar metric is computed against —
+    directional accuracy, MSE, the strategy Sharpe. Picking the closest level
+    to 0.5 rather than assuming the middle position keeps an asymmetric
+    quantile set (say [0.05, 0.5, 0.7]) from being scored on the wrong column.
+    """
+    if training.loss != "quantile" or not training.quantiles:
+        return None
+    return min(range(len(training.quantiles)), key=lambda i: abs(training.quantiles[i] - 0.5))
+
+
+def build_loss(training: TrainingConfig) -> nn.Module:
+    """The training objective for this configuration.
+
+    See models/pytorch_models.py for why quantile loss is the default: squared
+    error on a 5-day equity return is minimized by a near-constant prediction,
+    which validates well and forecasts nothing.
+    """
+    if training.loss == "quantile":
+        return QuantileLoss(training.quantiles)
+    return PointLoss()
 
 
 def _generate_synthetic_ohlcv(n_samples: int = 1000, seed: int = 42) -> pd.DataFrame:
@@ -414,6 +454,7 @@ def _train_model(
     min_delta: float = 1e-4,
     progress_label: str = "",
     on_improve=None,
+    loss_fn: Optional[nn.Module] = None,
 ) -> Tuple[List[float], List[float], float]:
     """Train `model` with early stopping on validation loss.
 
@@ -435,12 +476,16 @@ def _train_model(
         progress_label: Prefix for the progress bar description.
         on_improve: Optional callback(epoch, val_loss) invoked whenever
             validation loss improves — used to checkpoint the best weights.
+        loss_fn: Training objective. Defaults to squared error only so a bare
+            call still works; real runs pass build_loss(config.training), and
+            folds must be given the *same* objective as the final fit or the
+            generalization estimate describes a different model.
 
     Returns:
         (train_losses, val_losses, best_val_loss).
     """
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
-    loss_fn = nn.MSELoss()
+    loss_fn = (loss_fn or PointLoss()).to(device)
     scaler = torch.amp.GradScaler('cuda') if use_mixed_precision else None
 
     train_losses: List[float] = []
@@ -468,13 +513,13 @@ def _train_model(
             if use_mixed_precision:
                 with torch.autocast('cuda'):
                     outputs = model(batch_x)
-                    loss = loss_fn(outputs.squeeze(), batch_y)
+                    loss = loss_fn(outputs, batch_y)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 outputs = model(batch_x)
-                loss = loss_fn(outputs.squeeze(), batch_y)
+                loss = loss_fn(outputs, batch_y)
                 loss.backward()
                 optimizer.step()
 
@@ -497,10 +542,10 @@ def _train_model(
                 if use_mixed_precision:
                     with torch.autocast('cuda'):
                         outputs = model(batch_x)
-                        loss = loss_fn(outputs.squeeze(), batch_y)
+                        loss = loss_fn(outputs, batch_y)
                 else:
                     outputs = model(batch_x)
-                    loss = loss_fn(outputs.squeeze(), batch_y)
+                    loss = loss_fn(outputs, batch_y)
                 epoch_val_loss += loss.item()
                 num_val_batches += 1
 
@@ -521,15 +566,39 @@ def _train_model(
     return train_losses, val_losses, best_val_loss
 
 
-def _predict(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[np.ndarray, np.ndarray]:
-    """Collect (predictions, actuals) over a loader, in order."""
+def _predict(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    median_index: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Collect (point predictions, actuals) over a loader, in order.
+
+    With a quantile head the point prediction is the median column, taken after
+    sorting so a crossed set of quantiles cannot put the 90th percentile where
+    the median belongs.
+
+    Args:
+        model: Model to run.
+        loader: Batches to predict over.
+        device: Device to run on.
+        median_index: Column holding the median quantile, or None for a
+            single-output point head.
+
+    Returns:
+        (predictions, actuals), both shape (n,).
+    """
     model.eval()
     predictions: List[np.ndarray] = []
     actuals: List[np.ndarray] = []
     with torch.no_grad():
         for batch_x, batch_y in loader:
             batch_x = batch_x.to(device, non_blocking=True)
-            outputs = model(batch_x).squeeze(-1)
+            outputs = model(batch_x)
+            if median_index is not None and outputs.dim() > 1 and outputs.shape[-1] > 1:
+                outputs = sorted_quantiles(outputs)[..., median_index]
+            else:
+                outputs = outputs.squeeze(-1)
             predictions.append(outputs.detach().cpu().numpy().ravel())
             actuals.append(batch_y.detach().cpu().numpy().ravel())
     if not predictions:
@@ -544,6 +613,52 @@ def _stack_blocks(blocks: List[pd.DataFrame]) -> Optional[Tuple[np.ndarray, np.n
         return None
     panel = pd.concat(usable)
     return panel.iloc[:, :-1].values, panel.iloc[:, -1].values
+
+
+def _fit_confidence_calibration(
+    predictions: np.ndarray,
+    actuals: np.ndarray,
+) -> Dict[str, Any]:
+    """Fit and score an isotonic map from model score to realized win rate.
+
+    The outcome being calibrated against is "did the forward return come out
+    positive" — the question a long-only platform actually acts on, and the p
+    that Kelly sizing and the trigger engine's expected-value hurdle both
+    consume. Reporting the expected calibration error before and after makes
+    the correction auditable instead of a black box: if the raw model was
+    already calibrated, the improvement is zero and the map is close to the
+    identity.
+
+    Args:
+        predictions: Pooled out-of-sample point forecasts.
+        actuals: Realized forward returns aligned to them.
+
+    Returns:
+        A JSON-serializable dict with the fitted map and its scores, or a
+        `skipped` marker when there is too little evidence to fit one.
+    """
+    wins = (np.asarray(actuals, dtype=float) > 0).astype(float)
+    calibrator = IsotonicCalibrator.fit(predictions, wins)
+    if calibrator is None:
+        return {"skipped": "not enough out-of-sample folds to calibrate confidence"}
+
+    # A raw regression output is not a probability, so the "before" baseline is
+    # the same squashing MLStrategy applies when no calibrator is available.
+    raw_probabilities = np.clip(0.5 + np.asarray(predictions, dtype=float), 0.0, 1.0)
+    calibrated = calibrator.predict(predictions)
+
+    result = calibrator.to_dict()
+    result.update({
+        "expected_calibration_error_raw": calibration_error(raw_probabilities, wins),
+        "expected_calibration_error_calibrated": calibration_error(calibrated, wins),
+    })
+    print(
+        f"Confidence calibration: ECE {result['expected_calibration_error_raw']:.3f} -> "
+        f"{result['expected_calibration_error_calibrated']:.3f} "
+        f"over {calibrator.n_samples} out-of-sample predictions "
+        f"(base rate {calibrator.base_rate:.1%})"
+    )
+    return result
 
 
 def run_walk_forward_validation(
@@ -625,6 +740,17 @@ def run_walk_forward_validation(
 
     epochs = training.walk_forward_epochs or min(20, training.epochs)
     model_class = get_model(training.model)
+    n_outputs = head_width(training)
+    median_index = median_output_index(training)
+    loss_fn = build_loss(training)
+
+    # Every fold's test-period predictions, pooled. These are the only
+    # genuinely out-of-sample scores the run produces, which makes them the
+    # only defensible sample to calibrate confidence on: fitting the map on
+    # training predictions would measure memorization and hand back a mapping
+    # that makes an overfitted model look perfectly calibrated.
+    oos_predictions: List[np.ndarray] = []
+    oos_actuals: List[np.ndarray] = []
 
     print("\n" + "=" * 60)
     print(f"Walk-Forward Validation ({n_splits} expanding-window folds, split by date)")
@@ -682,7 +808,7 @@ def run_walk_forward_validation(
             n_layers=2,
             sequence_length=training.sequence_length,
             dropout=0.2,
-            n_outputs=1,
+            n_outputs=n_outputs,
         ).to(device)
 
         _train_model(
@@ -694,9 +820,12 @@ def run_walk_forward_validation(
             learning_rate=training.learning_rate,
             use_mixed_precision=use_mixed_precision,
             progress_label=f"[fold {fold + 1}/{n_splits}] ",
+            loss_fn=loss_fn,
         )
 
-        predictions, actuals = _predict(model, test_loader, device)
+        predictions, actuals = _predict(model, test_loader, device, median_index)
+        oos_predictions.append(predictions)
+        oos_actuals.append(actuals)
         metrics = evaluate_predictions(predictions, actuals, horizon_days)
         metrics.update({
             "fold": fold + 1,
@@ -734,6 +863,11 @@ def run_walk_forward_validation(
         "mean_excess_sharpe": _mean("excess_sharpe"),
         "folds_beating_benchmark": sum(1 for m in fold_metrics if m["excess_sharpe"] > 0),
     }
+
+    if training.calibrate_confidence and oos_predictions:
+        summary["calibration"] = _fit_confidence_calibration(
+            np.concatenate(oos_predictions), np.concatenate(oos_actuals)
+        )
 
     print("-" * 60)
     print(
@@ -848,14 +982,20 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
     # Determine number of features from dataloader
     n_features = len(feature_names)
     
-    # Create model instance
+    # Create model instance. The head is one node per quantile when fitting
+    # pinball loss, so the checkpoint's shape is a function of the config —
+    # which is why both are written into the metadata below.
+    n_outputs = head_width(config.training)
+    median_index = median_output_index(config.training)
+    loss_fn = build_loss(config.training)
+
     model = model_class(
         n_features=n_features,
         hidden_size=64,
         n_layers=2,
         sequence_length=config.training.sequence_length,
         dropout=0.2,
-        n_outputs=1,
+        n_outputs=n_outputs,
     )
     
     # Move model to device
@@ -874,7 +1014,10 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
     # 6. Train (AdamW + MSE, early stopping on validation loss)
     # =========================================================================
     print(f"Optimizer: AdamW (lr={config.training.learning_rate})")
-    print(f"Loss Function: MSE")
+    if config.training.loss == "quantile":
+        print(f"Loss Function: pinball over quantiles {config.training.quantiles}")
+    else:
+        print("Loss Function: MSE")
     print("\n" + "=" * 60)
     print("Starting Training")
     print("=" * 60)
@@ -899,6 +1042,8 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
             'target': target_name,
             'sequence_length': config.training.sequence_length,
             'device': str(device),
+            'quantiles': list(config.training.quantiles) if n_outputs > 1 else None,
+            'n_outputs': n_outputs,
         }, model_path)
         print(f"  ✓ Saved best model to {model_path}")
 
@@ -911,6 +1056,7 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
         learning_rate=config.training.learning_rate,
         use_mixed_precision=use_mixed_precision,
         on_improve=_checkpoint,
+        loss_fn=loss_fn,
     )
 
     # =========================================================================
@@ -928,7 +1074,7 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
     # The 15% test tail was never touched by training or early stopping, so
     # this is the single-split counterpart to the walk-forward numbers above.
     test_metrics = evaluate_predictions(
-        *_predict(model, test_loader, device),
+        *_predict(model, test_loader, device, median_index),
         horizon_days=_target_horizon_days(target_name),
     )
 
@@ -940,6 +1086,18 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
         'target': target_name,
         'sequence_length': config.training.sequence_length,
         'device': str(device),
+        # Inference has to rebuild the same head before loading the state dict,
+        # and has to know which column is the median. None means a scalar head.
+        'quantiles': list(config.training.quantiles) if n_outputs > 1 else None,
+        'n_outputs': n_outputs,
+        'median_quantile_index': median_index,
+        'loss': config.training.loss,
+        # The fitted score -> probability map, produced from the walk-forward
+        # test folds. MLStrategy applies it so the confidence it publishes is a
+        # frequency that held up out of sample, not a raw network output.
+        'confidence_calibration': (
+            walk_forward.get('calibration') if isinstance(walk_forward, dict) else None
+        ),
         'metrics': {
             'train_losses': train_losses,
             'val_losses': val_losses,

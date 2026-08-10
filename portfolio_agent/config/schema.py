@@ -194,6 +194,33 @@ class TrainingConfig(BaseModel):
         "not to produce the shipped weights, so this defaults to min(20, training.epochs) to keep "
         "validation affordable; set explicitly to train folds to full length.",
     )
+    loss: Literal["quantile", "mse"] = Field(
+        default="quantile",
+        description="Training objective. 'quantile' fits pinball loss over `quantiles`, so the "
+        "model predicts a distribution of the forward return rather than a point. This is the "
+        "default because squared error is minimized by the conditional mean, the conditional mean "
+        "of a 5-day equity return is nearly constant, and a network trained on MSE therefore "
+        "collapses to a near-constant output that validates beautifully and forecasts nothing. "
+        "Quantile outputs also give the trigger engine a native confidence interval instead of a "
+        "bare number. 'mse' restores the single-output point forecast.",
+    )
+    quantiles: List[float] = Field(
+        default_factory=lambda: [0.1, 0.5, 0.9],
+        description="Quantile levels predicted when loss='quantile', in ascending order. The "
+        "median is the point forecast; the outer pair is the confidence interval. Levels must lie "
+        "strictly inside (0, 1) — the 0th and 100th percentiles of a return distribution are not "
+        "estimable from a few years of daily bars.",
+    )
+    calibrate_confidence: bool = Field(
+        default=True,
+        description="Fit an isotonic map from raw model score to realized win rate on the "
+        "walk-forward test folds (src/calibration.py) and ship it beside the checkpoint. Networks "
+        "on noisy financial data are systematically overconfident, and the score feeds Kelly "
+        "sizing and the trigger engine's expected-value hurdle — both far more sensitive to an "
+        "optimistic probability than to a pessimistic one. Calibration preserves the model's "
+        "ranking (which walk-forward actually measured) and discards its scale (which nothing "
+        "measured).",
+    )
     walk_forward_min_train_fraction: float = Field(
         default=0.4,
         description="Fraction of the panel used to train the first walk-forward fold. Subsequent "
