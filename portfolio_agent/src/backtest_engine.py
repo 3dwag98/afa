@@ -28,7 +28,7 @@ try:
     from .data_store import load_ticker_data
     from .liquidity import lower_circuit_locked_days
     from .models import AgentBrain
-    from .regime import assess_market_regime
+    from .regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
     from .execution_sim import ExecutionSimulator
     from .monte_carlo import MonteCarloSettings
     from .risk import MAX_KELLY_FRACTION, calculate_kelly_quantity, estimate_kelly_inputs
@@ -39,7 +39,7 @@ except ImportError:
     from data_store import load_ticker_data
     from liquidity import lower_circuit_locked_days
     from models import AgentBrain
-    from regime import assess_market_regime
+    from regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
     from execution_sim import ExecutionSimulator
     from monte_carlo import MonteCarloSettings
     from risk import MAX_KELLY_FRACTION, calculate_kelly_quantity, estimate_kelly_inputs
@@ -822,14 +822,18 @@ class BacktestEngine:
                 benchmark_ohlcv=benchmark_ohlcv,
                 # Classified once per round and shared, so every model in the
                 # round is arbitrated against the same market state.
-                regime_label=self._classify_regime(benchmark_close, benchmark_ohlcv),
+                regime_label=self._classify_regime(
+                    benchmark_close, benchmark_ohlcv, eligible
+                ),
             )
             return self.strategy.score_batch(features_by_symbol, context)
 
         # Classified once for the whole round, so the per-ticker path gates
         # models on the same market state the batched path does.
         regime_label = self._classify_regime(
-            self._benchmark_up_to(current_date), self._benchmark_ohlcv_up_to(current_date)
+            self._benchmark_up_to(current_date),
+            self._benchmark_ohlcv_up_to(current_date),
+            eligible,
         )
 
         if self.parallel and len(eligible) > 1:
@@ -871,6 +875,7 @@ class BacktestEngine:
         self,
         benchmark_close: Optional[pd.Series],
         benchmark_ohlcv: Optional[pd.DataFrame],
+        eligible: Optional[Dict[str, pd.DataFrame]] = None,
     ) -> Optional[str]:
         """Name the market state for this scoring round.
 
@@ -879,14 +884,44 @@ class BacktestEngine:
         assess their own regime could otherwise be muted against one
         classification while sizing against another.
 
-        Returns None when there is no benchmark to classify from, which the
-        meta-orchestrator reads as "permit every model" rather than as a reason
-        to stand the book down.
+        **The composite fallback is what keeps the regime map from going
+        silently inert.** A cached index is the better gauge and is used
+        whenever it exists, but requiring one means that on any installation
+        without `^NSEI` in the cache — which is every installation until
+        somebody runs `download-data` against an index directory — the
+        classification is UNKNOWN, every model is permitted in every state, and
+        the meta-orchestrator's whole point quietly evaporates with nothing in
+        the logs to say so. src/regime.py is built to derive the market state
+        from the traded universe itself for exactly this reason, so the same
+        equal-weighted composite the cross-sectional strategies already fall
+        back to is used here too.
+
+        Returns None only when neither an index nor a usable composite is
+        available, which the meta-orchestrator reads as "permit every model"
+        rather than as a reason to stand the book down.
         """
-        if benchmark_close is None:
+        if benchmark_close is not None:
+            return assess_market_regime(
+                benchmark_close, market_ohlcv=benchmark_ohlcv
+            ).classification
+
+        if not eligible:
             return None
-        regime = assess_market_regime(benchmark_close, market_ohlcv=benchmark_ohlcv)
-        return regime.classification
+
+        # Only the trailing trend window can affect either test, and this runs
+        # once per trading day over the full universe.
+        proxy = build_market_proxy(
+            {
+                ticker: history['close']
+                for ticker, history in eligible.items()
+                if 'close' in history.columns and not history.empty
+            },
+            lookback=DEFAULT_TREND_WINDOW + 1,
+        )
+        if proxy is None:
+            return None
+        # No high/low on a composite, so ADX uses its close-only proxy.
+        return assess_market_regime(proxy).classification
 
     def _get_scoring_executor(self) -> ProcessPoolExecutor:
         """Return this run's scoring process pool, creating it on first use.

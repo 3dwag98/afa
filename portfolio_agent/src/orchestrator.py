@@ -29,7 +29,7 @@ try:
     from .execution_sim import cost_fraction_per_side
     from .compliance import run_compliance_checks
     from .learning import evaluate_and_learn
-    from .regime import assess_market_regime
+    from .regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
     from .reporting import export_excel_report
     from .models import Recommendation
     from .outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
@@ -50,7 +50,7 @@ except ImportError:
     from execution_sim import cost_fraction_per_side
     from compliance import run_compliance_checks
     from learning import evaluate_and_learn
-    from regime import assess_market_regime
+    from regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
     from reporting import export_excel_report
     from models import Recommendation
     from outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
@@ -179,6 +179,46 @@ def _load_benchmark_frame(config: AppConfig, logger) -> Optional[pd.DataFrame]:
 
     logger.info(f"Loaded benchmark {symbol} ({len(df)} bars) for the market-regime filter")
     return df.sort_index()
+
+
+def _classify_market_regime(
+    benchmark_frame: Optional[pd.DataFrame],
+    data: Dict[str, pd.DataFrame],
+) -> Optional[str]:
+    """Name today's market state, from the index if cached and the book if not.
+
+    Mirrors BacktestEngine._classify_regime so live and backtested runs gate
+    models on the same definition. The composite fallback is what keeps the
+    meta-orchestrator's regime map from going silently inert on an install that
+    never downloaded an index: without it the label is UNKNOWN, every model is
+    permitted in every state, and nothing in the logs says the gating stopped
+    working.
+
+    Args:
+        benchmark_frame: Cached OHLC for the configured index, or None.
+        data: Per-ticker OHLCV for the traded universe.
+
+    Returns:
+        A regime classification, or None when neither an index nor a usable
+        composite exists — read downstream as "permit every model".
+    """
+    if benchmark_frame is not None and 'close' in benchmark_frame.columns:
+        return assess_market_regime(
+            benchmark_frame['close'], market_ohlcv=benchmark_frame
+        ).classification
+
+    proxy = build_market_proxy(
+        {
+            ticker: df['close']
+            for ticker, df in data.items()
+            if df is not None and 'close' in df.columns and not df.empty
+        },
+        lookback=DEFAULT_TREND_WINDOW + 1,
+    )
+    if proxy is None:
+        return None
+    # A composite has no meaningful high/low, so ADX uses its close-only proxy.
+    return assess_market_regime(proxy).classification
 
 
 def _scaled_quantity(quantity: int, signal: StrategySignal) -> int:
@@ -385,12 +425,8 @@ def run_orchestrator(
         # traded universe, so a missing index is a downgrade, not a failure.
         benchmark_frame = _load_benchmark_frame(config, logger)
         benchmark_close = benchmark_frame['close'] if benchmark_frame is not None else None
-        regime_label = None
-        if benchmark_close is not None:
-            regime_label = assess_market_regime(
-                benchmark_close, market_ohlcv=benchmark_frame
-            ).classification
-            logger.info(f"Market regime classified as {regime_label}")
+        regime_label = _classify_market_regime(benchmark_frame, data)
+        logger.info(f"Market regime classified as {regime_label or 'UNKNOWN (no usable market series)'}")
 
         signals: Dict[str, StrategySignal] = {}
         if strategy.requires_full_batch or strategy.supports_gpu_batch:

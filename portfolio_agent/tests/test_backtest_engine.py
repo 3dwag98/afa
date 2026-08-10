@@ -826,7 +826,7 @@ class TestTriggerUMAThroughTheEngine:
         engine = self._engine(synthetic_data, tmp_path)
         engine.benchmark_close = None
 
-        # No benchmark cached -> None, which the UMA reads as "permit all".
+        # Nothing to classify from at all -> None, read as "permit all".
         assert engine._classify_regime(None, None) is None
 
         prices = pd.Series(
@@ -834,6 +834,33 @@ class TestTriggerUMAThroughTheEngine:
             index=pd.bdate_range("2021-01-04", periods=400),
         )
         assert engine._classify_regime(prices, None) == "BULL_RISK_ON"
+
+    def test_it_falls_back_to_a_universe_composite_without_an_index(
+        self, synthetic_data, tmp_path
+    ):
+        """Requiring a cached index would leave the regime map inert on every
+        installation that never downloaded one — with nothing in the logs to
+        say the gating had stopped working."""
+        engine = self._engine(synthetic_data, tmp_path)
+        index = pd.bdate_range("2021-01-04", periods=400)
+        eligible = {
+            f"SYN{i}": pd.DataFrame(
+                {"close": [100.0 * (1.0004 ** d) for d in range(400)]}, index=index
+            )
+            for i in range(3)
+        }
+
+        assert engine._classify_regime(None, None, eligible) == "BULL_RISK_ON"
+
+    def test_a_composite_too_short_to_judge_returns_none(self, synthetic_data, tmp_path):
+        engine = self._engine(synthetic_data, tmp_path)
+        eligible = {
+            "SYN0": pd.DataFrame(
+                {"close": [100.0] * 20}, index=pd.bdate_range("2023-01-02", periods=20)
+            )
+        }
+
+        assert engine._classify_regime(None, None, eligible) == "UNKNOWN"
 
     def test_the_trigger_size_multiplier_reaches_the_sized_quantity(self, synthetic_data, tmp_path):
         """The multiplier travels on extra['position_scale'], the same channel
