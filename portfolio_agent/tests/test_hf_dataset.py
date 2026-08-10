@@ -444,3 +444,48 @@ class TestDefaults:
         assert data.hf_adjust_prices is True
         assert data.default_history_years == 5
         assert data.benchmark_symbol == "^NSEI"
+
+
+class TestBenchmarkCacheRoundTrip:
+    """The benchmark is only useful if the name it is written under is the
+    name every reader asks for."""
+
+    def test_index_is_cached_under_the_symbol_readers_use(self, monkeypatch, tmp_path):
+        hub_dir = tmp_path / "hub"
+        hub_dir.mkdir()
+        cache_dir = tmp_path / "cache"
+        _install_fake_hub(monkeypatch, hub_dir, {
+            "indices/^NSEI.parquet": _hub_rows(n=8, symbol="^NSEI"),
+        })
+
+        written = sync_hf_to_cache(
+            cache_dir=cache_dir, tickers=["^NSEI"], asset_dir="indices"
+        )
+
+        # Not "^NSEI.NS": config.data.benchmark_symbol is read verbatim, so a
+        # suffixed file would be written and then never found.
+        assert written == ["^NSEI"]
+
+        import src.data_store as data_store
+
+        monkeypatch.setattr(data_store, "DATA_DIR", cache_dir)
+        assert data_store.load_ticker_data("^NSEI") is not None
+
+    def test_the_index_does_not_become_a_tradeable_ticker(self, monkeypatch, tmp_path):
+        """Indices share the equity cache so the regime filter can read them.
+        Letting one into the universe would rank the Nifty against individual
+        stocks by momentum and queue orders against it."""
+        hub_dir = tmp_path / "hub"
+        hub_dir.mkdir()
+        cache_dir = tmp_path / "cache"
+        _install_fake_hub(monkeypatch, hub_dir, {
+            "stocks/TCS.parquet": _hub_rows(n=8, symbol="TCS"),
+            "indices/^NSEI.parquet": _hub_rows(n=8, symbol="^NSEI"),
+        })
+
+        sync_hf_to_cache(cache_dir=cache_dir, tickers=["TCS"], asset_dir="stocks")
+        sync_hf_to_cache(cache_dir=cache_dir, tickers=["^NSEI"], asset_dir="indices")
+
+        import src.data_store as data_store
+
+        assert data_store.get_cached_tickers(cache_dir) == ["TCS.NS"]

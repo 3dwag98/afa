@@ -40,8 +40,13 @@ exit:
     description: "Stop loss at 1.5x ATR below entry"
   take_profit:
     type: "atr_multiple"
-    multiplier: 2.0
-    description: "Take profit at 2.0x ATR above entry"
+    multiplier: 3.0
+    # Widened from 2.0x once reward:risk started being measured net of
+    # round-trip friction (~0.79% of turnover). A 1.5x/2.0x structure is 1.33
+    # gross but only 0.72-1.11 net depending on how large ATR is relative to
+    # price — i.e. the trade cannot clear any sensible gate after costs.
+    # 1.5x/3.0x is 2.0 gross and ~1.2-1.7 net over the same ATR range.
+    description: "Take profit at 3.0x ATR above entry (2:1 gross, ~1.4:1 net of costs)"
 
 # Scoring weights (should sum to 100)
 scoring:

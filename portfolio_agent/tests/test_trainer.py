@@ -226,13 +226,19 @@ class TestWalkForwardValidation:
             setattr(config.training, key, value)
         return config
 
-    def _panel(self, config, n=1000):
-        return prepare_features(_generate_synthetic_ohlcv(n), config, verbose=False)
+    def _panel_by_ticker(self, config, n=1000, n_tickers=2):
+        """Per-ticker frames, each with its own DatetimeIndex."""
+        return {
+            f"SYM{i}.NS": prepare_features(
+                _generate_synthetic_ohlcv(n, seed=i), config, verbose=False
+            )
+            for i in range(n_tickers)
+        }
 
     def test_runs_every_fold_and_reports_the_benchmark_comparison(self):
         config = self._config()
         result = run_walk_forward_validation(
-            self._panel(config), config, get_device("cpu")
+            self._panel_by_ticker(config), config, get_device("cpu")
         )
 
         assert result["n_folds"] == 3
@@ -241,31 +247,69 @@ class TestWalkForwardValidation:
                     "mean_strategy_sharpe", "mean_benchmark_sharpe", "mean_excess_sharpe"):
             assert key in result
 
-    def test_training_windows_expand_and_never_overlap_their_test_block(self):
+    def test_training_windows_expand_and_never_reach_the_test_period(self):
         config = self._config()
         result = run_walk_forward_validation(
-            self._panel(config), config, get_device("cpu")
+            self._panel_by_ticker(config), config, get_device("cpu")
         )
 
-        train_rows = [f["train_rows"] for f in result["folds"]]
-        assert train_rows == sorted(train_rows)
-        assert len(set(train_rows)) == len(train_rows)
-        # Each fold's training window ends exactly where its test block starts.
-        for previous, current in zip(result["folds"], result["folds"][1:]):
-            assert previous["train_rows"] + previous["test_rows"] == current["train_rows"]
+        train_ends = [pd.Timestamp(f["train_end"]) for f in result["folds"]]
+        test_ends = [pd.Timestamp(f["test_end"]) for f in result["folds"]]
+
+        # Windows expand, and each fold's test period starts exactly where its
+        # training window ends and finishes where the next fold's begins.
+        assert train_ends == sorted(train_ends)
+        assert len(set(train_ends)) == len(train_ends)
+        for i, fold in enumerate(result["folds"]):
+            assert test_ends[i] > train_ends[i]
+            if i + 1 < len(result["folds"]):
+                assert train_ends[i + 1] == test_ends[i]
+
+    def test_training_rows_are_strictly_older_than_the_test_period(self):
+        """The defect this replaced: an index split of the stacked panel put
+        one ticker's 2019 rows in the 'future' test block while another
+        ticker's 2019 rows trained the model."""
+        config = self._config(walk_forward_splits=2)
+        panel = self._panel_by_ticker(config)
+        horizon = _target_horizon_days(config.training.target)
+
+        result = run_walk_forward_validation(panel, config, get_device("cpu"))
+
+        for fold in result["folds"]:
+            train_end = pd.Timestamp(fold["train_end"])
+            for frame in panel.values():
+                history = frame[frame.index < train_end]
+                # Every training row predates the boundary, and the embargo
+                # removes the ones whose forward-return label reaches past it.
+                assert len(history) >= fold["train_rows"] / len(panel) - horizon - 1
+
+    def test_embargo_is_the_target_horizon(self):
+        config = self._config()
+
+        result = run_walk_forward_validation(
+            self._panel_by_ticker(config), config, get_device("cpu")
+        )
+
+        assert result["embargo_days"] == _target_horizon_days(config.training.target)
+        assert result["embargo_days"] == 5
 
     def test_disabled_by_zero_splits(self):
         config = self._config(walk_forward_splits=0)
 
         result = run_walk_forward_validation(
-            self._panel(config), config, get_device("cpu")
+            self._panel_by_ticker(config), config, get_device("cpu")
         )
 
         assert "skipped" in result
 
-    def test_short_panel_is_skipped_rather_than_raising(self):
+    def test_empty_panel_is_skipped_rather_than_raising(self):
+        config = self._config()
+
+        assert "skipped" in run_walk_forward_validation({}, config, get_device("cpu"))
+
+    def test_short_history_is_skipped_rather_than_raising(self):
         config = self._config(sequence_length=60, walk_forward_splits=5)
-        panel = self._panel(config, n=400)
+        panel = self._panel_by_ticker(config, n=400)
 
         result = run_walk_forward_validation(panel, config, get_device("cpu"))
 

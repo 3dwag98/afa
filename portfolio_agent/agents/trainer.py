@@ -56,14 +56,13 @@ def _generate_synthetic_ohlcv(n_samples: int = 1000, seed: int = 42) -> pd.DataF
     }, index=dates)
 
 
-def _load_and_split_ticker(
-    ticker: str, config: AppConfig
-) -> Optional[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
-    """Load, featurize, and chronologically split (70/15/15) one ticker.
+def _load_ticker_features(ticker: str, config: AppConfig) -> Optional[pd.DataFrame]:
+    """Load and featurize one ticker, keeping its DatetimeIndex.
 
     Module-level (not a nested closure) so it can be dispatched across a
-    ProcessPoolExecutor for parallel training-panel construction. Returns
-    None if the ticker has insufficient cached history.
+    ProcessPoolExecutor. The index is preserved deliberately: walk-forward
+    validation splits by *date*, which is impossible once rows are stacked and
+    re-indexed. Returns None if the ticker has insufficient cached history.
     """
     df = load_ticker_data(ticker)
     if df is None or len(df) < config.data.min_history_days:
@@ -77,6 +76,16 @@ def _load_and_split_ticker(
         return None
     if len(feature_df) < config.training.sequence_length * 2:
         return None
+    return feature_df
+
+
+def _load_and_split_ticker(
+    ticker: str, config: AppConfig
+) -> Optional[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    """Load, featurize, and chronologically split (70/15/15) one ticker."""
+    feature_df = _load_ticker_features(ticker, config)
+    if feature_df is None:
+        return None
 
     n = len(feature_df)
     train_end = int(n * 0.70)
@@ -88,44 +97,17 @@ def _load_and_split_ticker(
     )
 
 
-def load_data(config: AppConfig) -> pd.DataFrame:
-    """Load and featurize training data.
+def load_panel_by_ticker(config: AppConfig) -> Dict[str, pd.DataFrame]:
+    """Featurized, date-indexed frames keyed by ticker.
 
-    By default, loads real cached multi-ticker OHLCV data — the full 5-year
-    cached universe (via data_store), not a synthetic stand-in — and builds a
-    concatenated training panel: each ticker is featurized and split 70/15/15
-    chronologically *individually*, then all tickers' train portions are
-    concatenated, followed by all val portions, then all test portions. This
-    ordering lets create_dataloaders()'s single top-level 70/15/15 index split
-    land exactly on those boundaries, so validation/test proportionally
-    represent every ticker rather than only the last one in the panel.
-
-    Per-ticker loading + feature computation is CPU-bound (parquet decode +
-    indicator math), so when config.training.parallel_data_loading is set
-    (the default), tickers are dispatched across a ProcessPoolExecutor sized
-    by config.training.data_load_workers (default: CPU count) — this is what
-    makes training on the full ~2,400-ticker cached universe practical. The
-    parallel path reassembles results in resolved-universe order, so it builds
-    exactly the same panel as the serial path (workers completing out of order
-    must not change what the model trains on).
-
-    Sequence windows that straddle two concatenated tickers' boundaries mix
-    data from different instruments; this is a bounded, documented limitation
-    of pooling multiple series through a single-series windowing dataset
-    (TimeSeriesDataset), not a look-ahead bias — it affects at most
-    sequence_length * (n_tickers - 1) windows out of the full panel.
-
-    Falls back to synthetic random-walk data only when
-    config.training.use_synthetic_data is set.
-
-    Args:
-        config: Application configuration.
-
-    Returns:
-        DataFrame with computed features and target column (already featurized).
+    The shared source for both panel constructions: load_data() stacks these
+    into the single training panel, and run_walk_forward_validation() splits
+    each one by date. Keeping them separate is what lets walk-forward respect
+    chronology — see that function for why a row-index split of the stacked
+    panel does not.
     """
     if config.training.use_synthetic_data:
-        return prepare_features(_generate_synthetic_ohlcv(), config)
+        return {"SYNTHETIC": prepare_features(_generate_synthetic_ohlcv(), config, verbose=False)}
 
     tickers = resolve_backtest_universe(max_tickers=config.data.universe_size)
     if not tickers:
@@ -136,17 +118,17 @@ def load_data(config: AppConfig) -> pd.DataFrame:
         )
 
     # Keyed by ticker rather than appended in completion order: workers finish
-    # in a nondeterministic order, and appending in that order would make the
-    # concatenated panel's row order (and therefore training) differ run to
-    # run for identical inputs. Reassembling in `tickers` order below makes the
-    # parallel path produce byte-identical output to the serial path.
-    by_ticker: Dict[str, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = {}
+    # nondeterministically, and appending in that order would make the panel's
+    # row order (and therefore training) differ run to run for identical
+    # inputs. Reassembling in `tickers` order below makes the parallel path
+    # produce byte-identical output to the serial path.
+    by_ticker: Dict[str, pd.DataFrame] = {}
     show_progress = len(tickers) > 20
     failures = 0
 
     if config.training.parallel_data_loading and len(tickers) > 1:
         with ProcessPoolExecutor(max_workers=config.training.data_load_workers) as executor:
-            futures = {executor.submit(_load_and_split_ticker, t, config): t for t in tickers}
+            futures = {executor.submit(_load_ticker_features, t, config): t for t in tickers}
             iterator = as_completed(futures)
             if show_progress:
                 iterator = tqdm(iterator, total=len(futures), desc="Loading training data", unit="ticker")
@@ -165,7 +147,7 @@ def load_data(config: AppConfig) -> pd.DataFrame:
         ticker_iter = tqdm(tickers, desc="Loading training data", unit="ticker") if show_progress else tickers
         for ticker in ticker_iter:
             try:
-                result = _load_and_split_ticker(ticker, config)
+                result = _load_ticker_features(ticker, config)
             except Exception as e:
                 failures += 1
                 print(f"Warning: failed to load training data for {ticker}: {e}")
@@ -173,24 +155,60 @@ def load_data(config: AppConfig) -> pd.DataFrame:
             if result is not None:
                 by_ticker[ticker] = result
 
-    results = [by_ticker[t] for t in tickers if t in by_ticker]
-
     if failures:
         print(f"Warning: {failures}/{len(tickers)} tickers failed to load and were skipped")
 
-    if not results:
+    ordered = {t: by_ticker[t] for t in tickers if t in by_ticker}
+    if not ordered:
         raise RuntimeError(
             "None of the resolved tickers had enough cached history to build a "
             "training panel. Run `portfolio-agent download-data` first, or set "
             "training.use_synthetic_data=true for offline testing."
         )
+    return ordered
 
-    train_parts = [r[0] for r in results]
-    val_parts = [r[1] for r in results]
-    test_parts = [r[2] for r in results]
+
+def load_data(config: AppConfig) -> pd.DataFrame:
+    """Load and featurize training data into a single stacked panel.
+
+    Each ticker is featurized and split 70/15/15 chronologically
+    *individually*, then all tickers' train portions are concatenated,
+    followed by all val portions, then all test portions. That ordering lets
+    create_dataloaders()'s single top-level 70/15/15 index split land exactly
+    on those boundaries, so validation/test proportionally represent every
+    ticker rather than only the last one in the panel.
+
+    Note what this ordering is *not* suitable for: because it groups by split
+    and then by ticker, a row-index split of the result is not chronological
+    across the panel. Walk-forward validation therefore works from
+    load_panel_by_ticker() and splits by date — see
+    run_walk_forward_validation().
+
+    Sequence windows that straddle two concatenated tickers' boundaries mix
+    data from different instruments; this is a bounded, documented limitation
+    of pooling multiple series through a single-series windowing dataset
+    (TimeSeriesDataset), not a look-ahead bias — it affects at most
+    sequence_length * (n_tickers - 1) windows out of the full panel.
+
+    Args:
+        config: Application configuration.
+
+    Returns:
+        DataFrame with computed features and target column (already featurized).
+    """
+    by_ticker = load_panel_by_ticker(config)
+
+    train_parts, val_parts, test_parts = [], [], []
+    for frame in by_ticker.values():
+        n = len(frame)
+        train_end = int(n * 0.70)
+        val_end = int(n * 0.85)
+        train_parts.append(frame.iloc[:train_end])
+        val_parts.append(frame.iloc[train_end:val_end])
+        test_parts.append(frame.iloc[val_end:])
 
     combined = pd.concat(train_parts + val_parts + test_parts, ignore_index=True)
-    print(f"Built training panel from {len(results)}/{len(tickers)} tickers: {len(combined)} total rows")
+    print(f"Built training panel from {len(by_ticker)} tickers: {len(combined)} total rows")
     return combined
 
 
@@ -519,94 +537,141 @@ def _predict(model: nn.Module, loader: DataLoader, device: torch.device) -> Tupl
     return np.concatenate(predictions), np.concatenate(actuals)
 
 
+def _stack_blocks(blocks: List[pd.DataFrame]) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Concatenate per-ticker blocks into (features, targets) arrays."""
+    usable = [b for b in blocks if b is not None and not b.empty]
+    if not usable:
+        return None
+    panel = pd.concat(usable)
+    return panel.iloc[:, :-1].values, panel.iloc[:, -1].values
+
+
 def run_walk_forward_validation(
-    feature_df: pd.DataFrame,
+    panel_by_ticker: Dict[str, pd.DataFrame],
     config: AppConfig,
     device: torch.device,
     use_mixed_precision: bool = False,
 ) -> Dict[str, Any]:
-    """Expanding-window walk-forward validation.
+    """Expanding-window walk-forward validation, split by calendar date.
 
     A single chronological 70/15/15 split answers "how did this model do on
     2023?" — one regime, one initialization, one number. That is not enough
     evidence to deploy a 5-day return forecaster on a market with this
-    signal-to-noise ratio. Walk-forward re-fits the model on an expanding
-    history and tests it on the *next* contiguous block, repeatedly:
+    signal-to-noise ratio. Walk-forward re-fits on an expanding history and
+    tests on the *next* contiguous period, repeatedly:
 
-        fold 1: train [0, 40%)  test [40%, 52%)
-        fold 2: train [0, 52%)  test [52%, 64%)
+        fold 1: train dates < T1        test dates in [T1, T2)
+        fold 2: train dates < T2        test dates in [T2, T3)
         ...
 
-    Training data never includes anything at or after the test block, so each
-    fold is a genuine out-of-sample measurement, and averaging across folds
-    spans several market regimes instead of whichever one happened to land at
-    the end of the panel. Each fold holds back the tail of its own training
-    window for early stopping, so the test block is never seen during fitting.
+    **Splitting by date, not by row index.** The stacked training panel is
+    ordered [every ticker's train block][every val block][every test block],
+    so an index-based split of it would put 2019 rows for ticker B in the
+    "future" test block while 2019 rows for ticker A sit in the training
+    block — an out-of-sample measurement covering the same calendar dates it
+    trained on. Each ticker is therefore split by date individually and the
+    blocks concatenated afterwards, which keeps every ticker's rows contiguous
+    (as the sequence windows require) while guaranteeing no training row is
+    dated at or after its fold's test period.
 
-    Folds are trained with a reduced epoch budget (walk_forward_epochs,
-    default min(20, epochs)): their job is to estimate generalization, not to
-    produce the shipped weights.
+    **Embargo.** The target is a *forward* return over `horizon_days`, so the
+    last few training rows before a boundary carry labels computed from prices
+    inside the test period. Those rows are dropped, or the model would be
+    fitted against labels that already encode the moves it is about to be
+    scored on.
+
+    Each fold holds back the tail of its own training window for early
+    stopping, so the test period is never seen during fitting. Folds train
+    with a reduced epoch budget (`walk_forward_epochs`, default
+    min(20, epochs)): their job is to estimate generalization, not to produce
+    the shipped weights.
 
     Args:
-        feature_df: Featurized panel; last column is the target.
+        panel_by_ticker: Featurized, date-indexed frames keyed by ticker (see
+            load_panel_by_ticker); the last column of each is the target.
         config: Application configuration.
         device: Device to train on.
         use_mixed_precision: Whether to use CUDA autocast.
 
     Returns:
         Dictionary with per-fold metrics and their averages, or a `skipped`
-        marker when the panel is too short to split.
+        marker when the history is too short to split.
     """
     training = config.training
     n_splits = training.walk_forward_splits
     if n_splits <= 0:
         return {"skipped": "walk_forward_splits <= 0"}
+    if not panel_by_ticker:
+        return {"skipped": "no tickers in the training panel"}
 
-    feature_cols = feature_df.columns[:-1].tolist()
-    target_col = feature_df.columns[-1]
-    features = feature_df[feature_cols].values
-    targets = feature_df[target_col].values
-    n_samples = len(feature_df)
+    sample = next(iter(panel_by_ticker.values()))
+    feature_cols = sample.columns[:-1].tolist()
+    target_col = sample.columns[-1]
+    horizon_days = _target_horizon_days(target_col)
 
-    initial_train_end = int(n_samples * training.walk_forward_min_train_fraction)
-    test_size = (n_samples - initial_train_end) // n_splits
+    # Fold boundaries come from the pooled distribution of dates, so each fold
+    # holds a comparable number of observations even with ragged histories.
+    all_dates = np.sort(np.concatenate([
+        frame.index.values for frame in panel_by_ticker.values() if len(frame)
+    ])) if panel_by_ticker else np.array([])
+    if len(all_dates) == 0:
+        return {"skipped": "training panel has no dated rows"}
 
-    # Every fold needs at least one full sequence on each side of the split.
-    if test_size <= training.sequence_length or initial_train_end <= training.sequence_length * 2:
-        return {
-            "skipped": (
-                f"panel of {n_samples} rows is too short for {n_splits} folds at "
-                f"sequence_length={training.sequence_length}"
-            )
-        }
+    first_fraction = training.walk_forward_min_train_fraction
+    boundaries = [
+        pd.Timestamp(all_dates[min(len(all_dates) - 1, int(len(all_dates) * q))])
+        for q in np.linspace(first_fraction, 1.0, n_splits + 1)
+    ]
 
     epochs = training.walk_forward_epochs or min(20, training.epochs)
-    horizon_days = _target_horizon_days(target_col)
     model_class = get_model(training.model)
 
     print("\n" + "=" * 60)
-    print(f"Walk-Forward Validation ({n_splits} expanding-window folds)")
+    print(f"Walk-Forward Validation ({n_splits} expanding-window folds, split by date)")
     print("=" * 60)
 
     fold_metrics: List[Dict[str, Any]] = []
     for fold in range(n_splits):
-        train_end = initial_train_end + fold * test_size
-        test_end = train_end + test_size if fold < n_splits - 1 else n_samples
+        train_end_date = boundaries[fold]
+        test_end_date = boundaries[fold + 1]
+        if test_end_date <= train_end_date:
+            continue
 
-        # Hold back the tail of the training window for early stopping, so the
-        # test block stays untouched during fitting.
-        inner_val_size = max(training.sequence_length + 1, int(train_end * 0.15))
-        inner_train_end = train_end - inner_val_size
+        train_blocks: List[pd.DataFrame] = []
+        val_blocks: List[pd.DataFrame] = []
+        test_blocks: List[pd.DataFrame] = []
 
-        train_loader = _make_loader(
-            features[:inner_train_end], targets[:inner_train_end], training, drop_last=True
-        )
-        val_loader = _make_loader(
-            features[inner_train_end:train_end], targets[inner_train_end:train_end], training
-        )
-        test_loader = _make_loader(
-            features[train_end:test_end], targets[train_end:test_end], training
-        )
+        for frame in panel_by_ticker.values():
+            history = frame[frame.index < train_end_date]
+            # Embargo: labels of the final `horizon_days` training rows are
+            # computed from prices inside the test period.
+            if horizon_days > 0:
+                history = history.iloc[:-horizon_days] if len(history) > horizon_days else history.iloc[:0]
+            if len(history) <= training.sequence_length:
+                continue
+
+            inner_val_size = max(training.sequence_length + 1, int(len(history) * 0.15))
+            inner_train_end = len(history) - inner_val_size
+            if inner_train_end <= training.sequence_length:
+                continue
+
+            train_blocks.append(history.iloc[:inner_train_end])
+            val_blocks.append(history.iloc[inner_train_end:])
+
+            test = frame[(frame.index >= train_end_date) & (frame.index < test_end_date)]
+            if len(test) > training.sequence_length:
+                test_blocks.append(test)
+
+        train_data = _stack_blocks(train_blocks)
+        test_data = _stack_blocks(test_blocks)
+        val_data = _stack_blocks(val_blocks)
+        if train_data is None or test_data is None:
+            print(f"Fold {fold + 1}/{n_splits}: skipped (not enough rows)")
+            continue
+
+        train_loader = _make_loader(*train_data, training, drop_last=True)
+        val_loader = _make_loader(*val_data, training) if val_data is not None else None
+        test_loader = _make_loader(*test_data, training)
         if train_loader is None or test_loader is None:
             print(f"Fold {fold + 1}/{n_splits}: skipped (not enough rows)")
             continue
@@ -635,13 +700,16 @@ def run_walk_forward_validation(
         metrics = evaluate_predictions(predictions, actuals, horizon_days)
         metrics.update({
             "fold": fold + 1,
-            "train_rows": int(train_end),
-            "test_rows": int(test_end - train_end),
+            "train_end": train_end_date.strftime("%Y-%m-%d"),
+            "test_end": test_end_date.strftime("%Y-%m-%d"),
+            "train_rows": int(len(train_data[0])),
+            "test_rows": int(len(test_data[0])),
         })
         fold_metrics.append(metrics)
 
         print(
-            f"Fold {fold + 1}/{n_splits}: train={train_end} test={test_end - train_end} | "
+            f"Fold {fold + 1}/{n_splits}: train<{metrics['train_end']} "
+            f"test<{metrics['test_end']} ({metrics['test_rows']} rows) | "
             f"MSE={metrics['mse']:.6f} | dir_acc={metrics['directional_accuracy']:.3f} | "
             f"Sharpe={metrics['strategy_sharpe']:.2f} vs benchmark "
             f"{metrics['benchmark_sharpe']:.2f} (excess {metrics['excess_sharpe']:+.2f})"
@@ -657,6 +725,7 @@ def run_walk_forward_validation(
         "n_folds": len(fold_metrics),
         "epochs_per_fold": epochs,
         "horizon_days": horizon_days,
+        "embargo_days": horizon_days,
         "folds": fold_metrics,
         "mean_mse": _mean("mse"),
         "mean_directional_accuracy": _mean("directional_accuracy"),
@@ -734,7 +803,7 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
     # 2. Load and featurize training data (real cached tickers by default)
     # =========================================================================
     print("\nLoading and featurizing training data...")
-    feature_df = load_data(config)
+    panel_by_ticker = load_panel_by_ticker(config)
 
     # =========================================================================
     # 3. Walk-forward validation (before the final fit)
@@ -742,9 +811,19 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
     # Run first, so the generalization estimate is available even if the final
     # long fit is interrupted — and so a model that cannot beat always-long is
     # flagged before anyone reads its training loss as evidence of anything.
+    # Takes the per-ticker frames, not the stacked panel: it splits by date.
     walk_forward = run_walk_forward_validation(
-        feature_df, config, device, use_mixed_precision
+        panel_by_ticker, config, device, use_mixed_precision
     )
+
+    train_parts, val_parts, test_parts = [], [], []
+    for frame in panel_by_ticker.values():
+        n = len(frame)
+        train_parts.append(frame.iloc[:int(n * 0.70)])
+        val_parts.append(frame.iloc[int(n * 0.70):int(n * 0.85)])
+        test_parts.append(frame.iloc[int(n * 0.85):])
+    feature_df = pd.concat(train_parts + val_parts + test_parts, ignore_index=True)
+    print(f"Built training panel from {len(panel_by_ticker)} tickers: {len(feature_df)} total rows")
 
     # =========================================================================
     # 4. Create DataLoaders
@@ -837,6 +916,15 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
     # =========================================================================
     # 7. Held-out test evaluation
     # =========================================================================
+    # Score the weights that actually ship, not the last epoch's. Early
+    # stopping leaves `model` up to `patience` epochs past the validation
+    # optimum, so evaluating it in place would report metrics for weights that
+    # exist nowhere — MLStrategy loads the checkpoint.
+    if model_path.exists():
+        checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"  Restored best checkpoint (epoch {checkpoint.get('epoch', '?')}) for test scoring")
+
     # The 15% test tail was never touched by training or early stopping, so
     # this is the single-split counterpart to the walk-forward numbers above.
     test_metrics = evaluate_predictions(

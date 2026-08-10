@@ -7,6 +7,7 @@ and allowing the Agent's Brain to learn over time.
 
 import copy
 import logging
+import math
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
@@ -29,14 +30,18 @@ try:
     from .execution_sim import ExecutionSimulator
     from .monte_carlo import MonteCarloSettings
     from .risk import MAX_KELLY_FRACTION, calculate_kelly_quantity, estimate_kelly_inputs
-    from .sectors import load_sector_map, sector_capacity_inr, sector_of
+    from .sectors import (
+        load_sector_map, sector_cap_is_enforceable, sector_capacity_inr, sector_of,
+    )
 except ImportError:
     from data_store import load_ticker_data
     from models import AgentBrain
     from execution_sim import ExecutionSimulator
     from monte_carlo import MonteCarloSettings
     from risk import MAX_KELLY_FRACTION, calculate_kelly_quantity, estimate_kelly_inputs
-    from sectors import load_sector_map, sector_capacity_inr, sector_of
+    from sectors import (
+        load_sector_map, sector_cap_is_enforceable, sector_capacity_inr, sector_of,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -232,11 +237,18 @@ class BacktestEngine:
         self.kelly_min_trades = kelly_min_trades
         self.kelly_shrinkage_strength = kelly_shrinkage_strength
 
-        # Sector concentration cap. The map is loaded once per run; an absent
-        # file pools every ticker into UNKNOWN, which caps the whole book at
-        # max_sector_pct — conservative, and loud in the logs.
+        # Sector concentration cap, loaded once per run. Without a map the cap
+        # is inactive rather than applied to a single UNKNOWN pool — pooling
+        # would cap total invested capital, not sector concentration.
         self.max_sector_pct = max_sector_pct
         self.sector_map = load_sector_map(sector_map_csv) if max_sector_pct > 0 else {}
+        if max_sector_pct > 0 and not sector_cap_is_enforceable(self.sector_map):
+            logger.warning(
+                "risk.max_sector_pct is set to %.0f%% but no sector map was loaded from %s, "
+                "so sector concentration is NOT being limited. Provide a ticker,sector CSV "
+                "to enable it.",
+                max_sector_pct * 100, sector_map_csv or "data/sector_map.csv",
+            )
 
         # Benchmark index for the momentum crash filter. Loaded once from the
         # same parquet cache as everything else; None when it was never
@@ -773,6 +785,17 @@ class BacktestEngine:
                 signals[ticker] = result
         return signals
 
+    def _benchmark_up_to(self, current_date: pd.Timestamp) -> Optional[pd.Series]:
+        """Benchmark closes strictly before `current_date`.
+
+        Same look-ahead rule as every other input: the regime filter must not
+        see the bar for the day it is deciding on.
+        """
+        if self.benchmark_close is None:
+            return None
+        truncated = self.benchmark_close[self.benchmark_close.index < current_date]
+        return truncated if not truncated.empty else None
+
     def _get_scoring_executor(self) -> ProcessPoolExecutor:
         """Return this run's scoring process pool, creating it on first use.
 
@@ -1281,6 +1304,10 @@ class BacktestEngine:
             sector_map=self.sector_map,
             max_sector_pct=self.max_sector_pct,
         )
+        if math.isinf(capacity):
+            # The cap does not apply to this ticker (disabled, or unmapped
+            # sector). Return before int(inf / price) raises OverflowError.
+            return quantity
         max_quantity = int(capacity / price)
         if max_quantity >= quantity:
             return quantity

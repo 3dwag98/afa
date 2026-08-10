@@ -148,16 +148,25 @@ def get_cached_tickers(cache_dir: Optional[Path] = None) -> List[str]:
     function; the single canonical implementation used by both DataStore and
     universe.py's discover_available_tickers()).
 
+    Symbols beginning with "^" are excluded. Those are indices (^NSEI, ^BSESN,
+    ...) cached alongside equities so the market-regime filter can read them —
+    they are not instruments this platform trades, and letting one into the
+    universe would rank the Nifty against individual stocks by momentum, queue
+    orders against it, and pollute the equal-weighted composite the regime
+    filter builds from the universe.
+
     Args:
         cache_dir: Directory to scan. Defaults to DATA_DIR (data/market_data,
             resolved relative to the current working directory).
 
     Returns:
-        Sorted list of unique ticker symbols. Empty list if none cached.
+        Sorted list of unique tradeable ticker symbols. Empty if none cached.
     """
     directory = Path(cache_dir) if cache_dir is not None else DATA_DIR
     directory.mkdir(parents=True, exist_ok=True)
-    tickers = {path.stem for path in directory.glob("*.parquet")}
+    tickers = {
+        path.stem for path in directory.glob("*.parquet") if not path.stem.startswith("^")
+    }
     return sorted(tickers)
 
 

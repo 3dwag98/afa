@@ -89,7 +89,10 @@ class TestRuleBasedStrategyMetadata:
         strategy = RuleBasedStrategy(_strategy_config())
         exit_rules = strategy.exit_rules()
         assert exit_rules["stop_loss"]["multiplier"] == 1.5
-        assert exit_rules["take_profit"]["multiplier"] == 2.0
+        # 3.0x, not 2.0x: a 1.5/2.0 structure is 1.33 gross but under 1.0 net
+        # of round-trip friction on a typical ATR, i.e. unclearable by any
+        # sensible gate.
+        assert exit_rules["take_profit"]["multiplier"] == 3.0
 
 
 class TestRuleBasedStrategyScoring:
@@ -99,13 +102,13 @@ class TestRuleBasedStrategyScoring:
 
     def test_perfect_bullish_gives_buy_with_breakout_trigger(self):
         strategy = RuleBasedStrategy(_strategy_config())
-        # The YAML's default ATR multipliers (1.5 stop / 2.0 target) yield a fixed
-        # *gross* reward:risk of 2.0/1.5 ~= 1.33 regardless of ATR magnitude. The
-        # strategy now reports reward:risk NET of round-trip friction, which on a
-        # 2%-of-price ATR costs roughly a third of that ratio (~0.83), so
-        # min_reward_risk has to be below the net figure to be satisfiable at all.
+        # The YAML's ATR multipliers (1.5 stop / 3.0 target) give a fixed
+        # *gross* reward:risk of 2.0 regardless of ATR magnitude. The strategy
+        # reports reward:risk NET of round-trip friction, which on a
+        # 2%-of-price ATR takes it to ~1.37 — hence the shipped
+        # compliance.min_reward_risk of 1.2.
         context = StrategyContext(
-            risk=_risk_params(min_reward_risk=0.8),
+            risk=_risk_params(min_reward_risk=1.2),
             weights={"Trend": 25.0, "Breakout": 25.0, "Volume": 20.0, "MC_Prob": 30.0},
             mc_result=_mc_result(0.70),
         )
@@ -123,7 +126,7 @@ class TestRuleBasedStrategyScoring:
         than gross — otherwise the min_reward_risk gate flatters every trade."""
         strategy = RuleBasedStrategy(_strategy_config())
         context = StrategyContext(
-            risk=_risk_params(min_reward_risk=0.8),
+            risk=_risk_params(min_reward_risk=1.2),
             weights={"Trend": 25.0, "Breakout": 25.0, "Volume": 20.0, "MC_Prob": 30.0},
             mc_result=_mc_result(0.70),
         )
@@ -131,8 +134,8 @@ class TestRuleBasedStrategyScoring:
 
         sig = strategy.score("TEST", features, context)
 
-        # 2.0x ATR target over 1.5x ATR stop = 1.333 gross, always.
-        assert sig.extra["gross_reward_risk"] == pytest.approx(1.3333, abs=1e-3)
+        # 3.0x ATR target over 1.5x ATR stop = 2.0 gross, for any ATR.
+        assert sig.extra["gross_reward_risk"] == pytest.approx(2.0, abs=1e-3)
         assert sig.reward_risk < sig.extra["gross_reward_risk"]
         assert sig.extra["round_trip_cost_pct"] > 0
 
@@ -142,10 +145,10 @@ class TestRuleBasedStrategyScoring:
         features = _features(close=150.0, sma_50=140.0, sma_200=120.0,
                              donchian_upper_20=145.0, volume_ratio_20=2.0, atr_14=3.0)
 
-        cheap = _risk_params(min_reward_risk=0.8)
+        cheap = _risk_params(min_reward_risk=1.2)
         cheap.buy_cost_pct = 0.0
         cheap.sell_cost_pct = 0.0
-        expensive = _risk_params(min_reward_risk=0.8)
+        expensive = _risk_params(min_reward_risk=1.2)
         expensive.buy_cost_pct = 0.02
         expensive.sell_cost_pct = 0.02
 

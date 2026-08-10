@@ -30,12 +30,18 @@ Both are detectable from OHLCV alone:
 The screen is deliberately expressed as *fractions of a window* rather than
 single-day flags, so one quiet session never disqualifies a stock and a
 sustained pattern always does.
+
+These are primitives, not the screen itself. They are wrapped as lag-safe
+features (`features/technical.py`), and the thresholds live in
+`strategies/cross_sectional.py::TradabilityFilter`, which reads those features
+during ranking. Keeping the rules in exactly one place is deliberate: a second
+copy operating on raw frames would drift from the feature path the moment
+either window or threshold changed.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -52,18 +58,6 @@ DEFAULT_LIQUIDITY_WINDOW = 60
 DEFAULT_MIN_TRADED_VALUE_INR = 5_000_000.0  # ₹50 lakh median daily turnover
 DEFAULT_MAX_ZERO_RETURN_FRACTION = 0.30
 DEFAULT_MAX_CIRCUIT_LOCK_FRACTION = 0.10
-
-
-@dataclass
-class TradabilityReport:
-    """Whether a ticker can actually be traded, and why not if it cannot."""
-
-    tradable: bool
-    median_traded_value: float
-    zero_return_fraction: float
-    circuit_lock_fraction: float
-    locked_today: bool
-    reasons: List[str] = field(default_factory=list)
 
 
 def circuit_locked_days(df: pd.DataFrame, min_move: float = MIN_CIRCUIT_MOVE) -> pd.Series:
@@ -109,97 +103,6 @@ def zero_return_days(df: pd.DataFrame) -> pd.Series:
     close = pd.to_numeric(df["close"], errors="coerce")
     changed = close.diff()
     return pd.Series(np.isclose(changed, 0.0, rtol=0.0, atol=1e-12), index=df.index).fillna(False)
-
-
-def median_traded_value(df: pd.DataFrame, window: int = DEFAULT_LIQUIDITY_WINDOW) -> float:
-    """Median daily turnover in rupees over the trailing window.
-
-    Median rather than mean: a single delivery-heavy day (or one operator
-    print) should not make an otherwise dead ticker look liquid.
-    """
-    if not {"close", "volume"}.issubset(df.columns) or df.empty:
-        return 0.0
-
-    close = pd.to_numeric(df["close"], errors="coerce")
-    volume = pd.to_numeric(df["volume"], errors="coerce")
-    traded_value = (close * volume).dropna()
-    if traded_value.empty:
-        return 0.0
-    return float(traded_value.iloc[-window:].median())
-
-
-def assess_tradability(
-    df: pd.DataFrame,
-    window: int = DEFAULT_LIQUIDITY_WINDOW,
-    min_traded_value_inr: float = DEFAULT_MIN_TRADED_VALUE_INR,
-    max_zero_return_fraction: float = DEFAULT_MAX_ZERO_RETURN_FRACTION,
-    max_circuit_lock_fraction: float = DEFAULT_MAX_CIRCUIT_LOCK_FRACTION,
-) -> TradabilityReport:
-    """Decide whether a ticker is realistically tradable, and say why not.
-
-    Args:
-        df: OHLCV frame for one ticker, oldest row first.
-        window: Trailing sessions to screen over.
-        min_traded_value_inr: Minimum median daily turnover.
-        max_zero_return_fraction: Maximum share of unchanged closes before the
-            ticker is treated as a zombie.
-        max_circuit_lock_fraction: Maximum share of circuit-locked sessions
-            before the ticker is treated as operator-driven / unexecutable.
-
-    Returns:
-        A TradabilityReport. An empty or too-short frame is reported as
-        untradable — there is no evidence it *can* be traded, and this gate
-        exists to keep uninvestable names out of a ranked portfolio.
-    """
-    if df is None or df.empty:
-        return TradabilityReport(
-            tradable=False, median_traded_value=0.0, zero_return_fraction=1.0,
-            circuit_lock_fraction=0.0, locked_today=False,
-            reasons=["no price history"],
-        )
-
-    recent = df.iloc[-window:] if len(df) > window else df
-
-    locks = circuit_locked_days(df).iloc[-len(recent):]
-    zeros = zero_return_days(df).iloc[-len(recent):]
-
-    # The first row of any window has no prior close, so it can never be
-    # classified; exclude it from both denominators rather than counting it
-    # as a clean session.
-    measurable = max(1, len(recent) - 1)
-    circuit_lock_fraction = float(locks.sum()) / measurable
-    zero_return_fraction = float(zeros.sum()) / measurable
-    traded_value = median_traded_value(df, window)
-    locked_today = bool(locks.iloc[-1]) if len(locks) else False
-
-    reasons: List[str] = []
-    if traded_value < min_traded_value_inr:
-        reasons.append(
-            f"illiquid: median turnover {traded_value:,.0f} < "
-            f"{min_traded_value_inr:,.0f} INR/day"
-        )
-    if zero_return_fraction > max_zero_return_fraction:
-        reasons.append(
-            f"zombie: {zero_return_fraction:.0%} of sessions closed unchanged "
-            f"(> {max_zero_return_fraction:.0%}): variance is suppressed by illiquidity, "
-            f"not by stability"
-        )
-    if circuit_lock_fraction > max_circuit_lock_fraction:
-        reasons.append(
-            f"circuit-driven: {circuit_lock_fraction:.0%} of sessions locked at a "
-            f"circuit limit (> {max_circuit_lock_fraction:.0%})"
-        )
-    if locked_today:
-        reasons.append("locked at a circuit limit on the decision date; no fill available")
-
-    return TradabilityReport(
-        tradable=not reasons,
-        median_traded_value=traded_value,
-        zero_return_fraction=zero_return_fraction,
-        circuit_lock_fraction=circuit_lock_fraction,
-        locked_today=locked_today,
-        reasons=reasons,
-    )
 
 
 def split_intraday_and_overnight(df: pd.DataFrame) -> Optional[tuple]:

@@ -22,9 +22,13 @@ The cap is deliberately enforced at *order-creation* time rather than by
 rejecting a filled position after the fact — a cap you can only discover
 you've broken is not a cap.
 
-Unmapped tickers are pooled under a single "UNKNOWN" sector and capped
-together. That is the conservative reading: an unknown sector could be any
-sector, including the one already at its limit.
+Unmapped tickers are pooled under a single "UNKNOWN" sector, but the cap is
+**not** applied to that bucket, and `sector_cap_is_enforceable()` reports why.
+Capping UNKNOWN looks conservative and is actually a different constraint
+entirely: with no sector map at all, every holding is UNKNOWN, so a 25%
+"sector" cap silently becomes a 25% cap on *total invested capital* and leaves
+three quarters of the portfolio permanently in cash. A cap that cannot be
+computed is reported as unenforceable, not quietly reinterpreted.
 """
 
 from __future__ import annotations
@@ -123,7 +127,9 @@ def sector_exposure_inr(
         sector_map: ticker -> sector mapping (see load_sector_map).
 
     Returns:
-        sector -> total exposure in INR.
+        sector -> total exposure in INR. Unmapped tickers are reported under
+        UNKNOWN_SECTOR for visibility, but sector_capacity_inr() never charges
+        that bucket against a cap.
     """
     by_sector: Dict[str, float] = {}
     for ticker, value in position_values.items():
@@ -132,6 +138,16 @@ def sector_exposure_inr(
         sector = sector_of(ticker, sector_map)
         by_sector[sector] = by_sector.get(sector, 0.0) + float(value)
     return by_sector
+
+
+def sector_cap_is_enforceable(sector_map: Mapping[str, str]) -> bool:
+    """Whether a sector cap can meaningfully be applied at all.
+
+    False when the map is empty. Callers should log that the cap is inactive
+    rather than fall back to capping the UNKNOWN pool, which would constrain
+    total invested capital instead of sector concentration.
+    """
+    return bool(sector_map)
 
 
 def sector_capacity_inr(
@@ -153,12 +169,19 @@ def sector_capacity_inr(
 
     Returns:
         Remaining INR capacity for the sector; 0.0 when it is already at or
-        over the cap, and math.inf when the cap is disabled.
+        over the cap, and math.inf when the cap does not apply — because it is
+        disabled, or because the ticker's sector is unknown. An unmapped
+        ticker is left uncapped deliberately: pooling unmapped names into one
+        UNKNOWN bucket and capping that turns a 25% sector limit into a 25%
+        limit on the entire book.
     """
     if max_sector_pct <= 0 or max_sector_pct >= 1 or portfolio_value_inr <= 0:
         return float("inf")
 
     sector = sector_of(ticker, sector_map)
+    if sector == UNKNOWN_SECTOR:
+        return float("inf")
+
     current = sector_exposure_inr(position_values, sector_map).get(sector, 0.0)
     allowance = portfolio_value_inr * max_sector_pct
     return max(0.0, allowance - current)

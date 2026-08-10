@@ -87,9 +87,18 @@ def _pick(columns: Iterable[str], aliases: Sequence[str]) -> Optional[str]:
 
 
 def normalize_ticker(ticker: str) -> str:
-    """Canonical NSE form used by the parquet cache (UPPER + .NS)."""
+    """Canonical cache key for a symbol.
+
+    Equities get the platform's `.NS` suffix. Index symbols (`^NSEI`,
+    `^BSESN`, ...) are left exactly as written: they are looked up by the
+    literal string in `data.benchmark_symbol`, and appending `.NS` to them
+    produced a cache file (`^NSEI.NS.parquet`) that no reader ever asked for,
+    silently disabling the benchmark-driven regime filter.
+    """
     t = str(ticker).strip().upper()
-    return t if not t or t.endswith(".NS") else f"{t}.NS"
+    if not t or t.startswith("^"):
+        return t
+    return t if t.endswith(".NS") else f"{t}.NS"
 
 
 def hub_symbol(ticker: str) -> str:

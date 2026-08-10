@@ -143,7 +143,12 @@ simulation:
 compliance:
   min_price_inr: 20.0
   target_prob_profit: 0.55
-  min_reward_risk: 1.5
+  # Applied to reward:risk measured NET of round-trip friction (~0.79% of
+  # turnover), which is a materially harder test than the gross ratio this
+  # threshold used to compare against. With the 1.5x/3.0x ATR exits above,
+  # net RR runs ~1.2-1.7 across realistic ATR levels, so 1.2 is a gate the
+  # strategy can actually clear on good setups and fail on marginal ones.
+  min_reward_risk: 1.2
   paper_trading_mode: true
 
 # File/directory locations

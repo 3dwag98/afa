@@ -32,26 +32,49 @@ def _ramp_with_noise(start, end, n=400, noise=0.005, seed=1):
 
 
 class TestBuildMarketProxy:
-    def test_rebases_so_expensive_stocks_do_not_dominate(self):
-        # Both series double. An equal-weighted composite of rebased series
-        # must also double, regardless of the wildly different price levels.
-        cheap = _series([10.0, 20.0])
-        expensive = _series([5000.0, 10000.0])
+    def test_expensive_stocks_do_not_dominate(self):
+        # Both series double. Averaging returns makes the composite double
+        # too, regardless of the wildly different price levels.
+        cheap = _series([10.0, 20.0, 40.0])
+        expensive = _series([5000.0, 10000.0, 20000.0])
 
         proxy = build_market_proxy({"CHEAP": cheap, "PRICEY": expensive})
 
         assert proxy is not None
-        assert proxy.iloc[0] == pytest.approx(1.0)
-        assert proxy.iloc[-1] == pytest.approx(2.0)
+        assert proxy.iloc[-1] / proxy.iloc[0] == pytest.approx(2.0)
+        assert len(proxy) == 2  # one point per return
+
+    def test_a_late_arrival_does_not_dent_the_composite(self):
+        """Averaging rebased *levels* would drop the composite ~11% on the day
+        a shorter-history ticker enters at its own base of 1.0, while both
+        constituents rose — and assess_market_regime would read that
+        construction artifact as a trend break and as realized volatility."""
+        rising = _series(np.linspace(100.0, 190.0, 10))
+        latecomer = pd.Series([50.0, 52.5, 55.0, 57.5, 60.0], index=rising.index[-5:])
+
+        proxy = build_market_proxy({"OLD": rising, "NEW": latecomer})
+
+        assert proxy is not None
+        assert (proxy.pct_change().dropna() > 0).all()
 
     def test_handles_ragged_histories(self):
-        long_series = _series([100.0] * 10)
+        long_series = _series(np.linspace(100.0, 110.0, 10))
         short_series = pd.Series([50.0, 55.0], index=long_series.index[-2:])
 
         proxy = build_market_proxy({"LONG": long_series, "SHORT": short_series})
 
         assert proxy is not None
-        assert len(proxy) == 10
+        assert len(proxy) == 9  # one return per date after the first
+
+    def test_lookback_truncates_the_inputs(self):
+        """Only the trailing trend_window + 1 points can affect either test,
+        and this runs once per scoring round over the whole universe."""
+        series = _series(np.linspace(100.0, 200.0, 500))
+
+        proxy = build_market_proxy({"A": series}, lookback=100)
+
+        assert proxy is not None
+        assert len(proxy) == 100
 
     def test_returns_none_without_usable_series(self):
         assert build_market_proxy({}) is None

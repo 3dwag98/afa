@@ -270,7 +270,13 @@ def _assess_regime(
             for symbol, features in features_by_symbol.items()
             if not features.empty and "close" in features.columns
         }
-        market_close = build_market_proxy(close_by_symbol)
+        # Only the trailing trend_window + 1 observations can affect either
+        # test, and this runs once per scoring round — on a 4,000-name
+        # universe over a 5-year backtest, combining full histories instead
+        # would be the run's dominant cost for a single float comparison.
+        market_close = build_market_proxy(
+            close_by_symbol, lookback=protection.trend_window + 1
+        )
 
     return assess_market_regime(
         market_close,

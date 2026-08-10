@@ -353,7 +353,11 @@ class TestSectorConcentrationCap:
         # sector; the 15% cap must hold across the whole round, not per order.
         assert queued_value <= 0.15 * engine.portfolio_value + 100.0
 
-    def test_unmapped_tickers_are_capped_as_one_pooled_sector(self, synthetic_data, tmp_path):
+    def test_without_a_sector_map_the_cap_is_inactive(self, synthetic_data, tmp_path):
+        """Pooling unmapped tickers into one UNKNOWN bucket and capping it
+        would turn a 15% *sector* limit into a 15% limit on the whole book,
+        leaving 85% of capital idle. A cap that cannot be computed is reported
+        as unenforceable, not quietly reinterpreted."""
         tickers = synthetic_data['tickers']
 
         engine = BacktestEngine(
@@ -366,8 +370,37 @@ class TestSectorConcentrationCap:
         signals = {t: _signal(t, score=90.0 - i, entry_price=100.0) for i, t in enumerate(tickers)}
         engine._create_pending_orders(signals, date)
 
+        assert engine.sector_map == {}
+        assert len(engine.pending_orders) == len(tickers)
         queued_value = sum(o['quantity'] * 100.0 for o in engine.pending_orders)
-        assert queued_value <= 0.15 * engine.portfolio_value + 100.0
+        assert queued_value > 0.15 * engine.portfolio_value
+
+    def test_mapped_and_unmapped_tickers_do_not_share_an_allowance(
+        self, synthetic_data, tmp_path
+    ):
+        """An unmapped holding must not consume a mapped sector's capacity."""
+        tickers = synthetic_data['tickers']
+        sector_csv = tmp_path / "sectors.csv"
+        # Only the first two names are classified.
+        sector_csv.write_text(
+            "ticker,sector\n" + "".join(f"{t},IT\n" for t in tickers[:2]), encoding="utf-8"
+        )
+
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-03-31",
+            initial_capital=1_000_000.0, universe_tickers=tickers,
+            max_sector_pct=0.15, sector_map_csv=str(sector_csv),
+        )
+        date = pd.Timestamp("2023-02-01")
+
+        signals = {t: _signal(t, score=90.0 - i, entry_price=100.0) for i, t in enumerate(tickers)}
+        engine._create_pending_orders(signals, date)
+
+        queued = {o['ticker']: o['quantity'] * 100.0 for o in engine.pending_orders}
+        it_value = sum(queued.get(t, 0.0) for t in tickers[:2])
+        assert it_value <= 0.15 * engine.portfolio_value + 100.0
+        # The unmapped name keeps its full 10%-of-portfolio sizing.
+        assert queued.get(tickers[2], 0.0) == pytest.approx(100_000.0, rel=0.01)
 
     def test_disabled_cap_leaves_orders_alone(self, synthetic_data):
         tickers = synthetic_data['tickers']
@@ -475,3 +508,63 @@ class TestDrawdownCircuitBreaker:
         engine.portfolio_value = 1_300_000.0  # ~13% off the NEW peak, not the old one
         engine._update_circuit_breaker(pd.Timestamp("2023-02-02"))
         assert engine.buying_halted is False
+
+
+class TestBenchmarkWiring:
+    """The crash filter's benchmark has to survive the trip from cache to
+    StrategyContext, look-ahead safe."""
+
+    def _engine_with_benchmark(self, monkeypatch, synthetic_data, series):
+        real_loader = __import__("src.backtest_engine", fromlist=["x"]).load_ticker_data
+
+        def loader(ticker, start_date=None, end_date=None):
+            if ticker == "^NSEI":
+                return pd.DataFrame({"close": series.values}, index=series.index)
+            return real_loader(ticker, start_date=start_date, end_date=end_date)
+
+        monkeypatch.setattr("src.backtest_engine.load_ticker_data", loader)
+        return BacktestEngine(
+            start_date="2023-01-02", end_date="2023-03-31",
+            initial_capital=1_000_000.0, universe_tickers=synthetic_data['tickers'],
+            benchmark_symbol="^NSEI",
+        )
+
+    def test_loads_the_benchmark_and_truncates_before_the_decision_date(
+        self, monkeypatch, synthetic_data
+    ):
+        dates = pd.bdate_range("2023-01-02", periods=60)
+        series = pd.Series(np.linspace(100, 160, 60), index=dates)
+
+        engine = self._engine_with_benchmark(monkeypatch, synthetic_data, series)
+
+        assert engine.benchmark_close is not None
+        cutoff = dates[30]
+        truncated = engine._benchmark_up_to(cutoff)
+        assert truncated is not None
+        assert truncated.index.max() < cutoff
+
+    def test_missing_benchmark_degrades_to_none(self, synthetic_data):
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-03-31",
+            initial_capital=1_000_000.0, universe_tickers=synthetic_data['tickers'],
+            benchmark_symbol="^NOSUCH",
+        )
+
+        assert engine.benchmark_close is None
+        assert engine._benchmark_up_to(pd.Timestamp("2023-02-01")) is None
+
+    def test_batch_strategies_score_without_crashing(self, synthetic_data):
+        """Regression: _generate_signals reaches the benchmark helper on the
+        batch path, which no test exercised."""
+        from portfolio_agent.config.schema import StrategyConfig
+        from portfolio_agent.strategies.cross_sectional import MomentumStrategy
+
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-03-31",
+            initial_capital=1_000_000.0, universe_tickers=synthetic_data['tickers'],
+            strategy=MomentumStrategy(StrategyConfig(type="momentum", params={"min_universe": 2})),
+        )
+
+        signals = engine._generate_signals(pd.Timestamp("2023-03-01"))
+
+        assert isinstance(signals, dict)

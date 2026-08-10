@@ -1,6 +1,7 @@
 """Main orchestrator module for portfolio agent."""
 
 import logging
+import math
 import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -30,7 +31,9 @@ try:
     from .reporting import export_excel_report
     from .models import Recommendation
     from .outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
-    from .sectors import load_sector_map, sector_capacity_inr, sector_of
+    from .sectors import (
+        load_sector_map, sector_cap_is_enforceable, sector_capacity_inr, sector_of,
+    )
     from .logging_utils import get_logger, ContextualLogger
 except ImportError:
     from storage import (
@@ -47,7 +50,9 @@ except ImportError:
     from reporting import export_excel_report
     from models import Recommendation
     from outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
-    from sectors import load_sector_map, sector_capacity_inr, sector_of
+    from sectors import (
+        load_sector_map, sector_cap_is_enforceable, sector_capacity_inr, sector_of,
+    )
     from logging_utils import get_logger, ContextualLogger
 
 
@@ -206,6 +211,13 @@ def _sector_capped_quantity(
     positions, so a set of recommendations that each fit under the cap alone
     cannot collectively breach it — the failure mode a per-position check
     would miss entirely.
+
+    Scope, stated precisely: this caps *today's recommendation set*, not the
+    live book. The orchestrator is a recommender and holds no positions state,
+    so unlike BacktestEngine — which seeds the same accounting with its open
+    holdings marked to market — it cannot see exposure carried in from
+    previous runs. A reader acting on these recommendations on top of an
+    existing portfolio has to apply the cap against their real holdings.
     """
     if config.risk.max_sector_pct <= 0 or config.risk.max_sector_pct >= 1 or price <= 0:
         return quantity
@@ -217,6 +229,9 @@ def _sector_capped_quantity(
         sector_map=sector_map,
         max_sector_pct=config.risk.max_sector_pct,
     )
+    if math.isinf(capacity):
+        # The cap does not apply to this ticker (disabled, or unmapped sector).
+        return quantity
     max_quantity = int(capacity / price)
     if max_quantity >= quantity:
         return quantity
@@ -376,6 +391,12 @@ def run_orchestrator(
         # position_scale (volatility targeting / market regime), then the
         # sector concentration cap.
         sector_map = load_sector_map(config.paths.sector_map_csv) if config.risk.max_sector_pct > 0 else {}
+        if config.risk.max_sector_pct > 0 and not sector_cap_is_enforceable(sector_map):
+            logger.warning(
+                f"risk.max_sector_pct is set to {config.risk.max_sector_pct:.0%} but no sector "
+                f"map was loaded from {config.paths.sector_map_csv}, so sector concentration "
+                f"is NOT being limited. Provide a ticker,sector CSV to enable it."
+            )
         planned_sector_values: Dict[str, float] = {}
 
         ordered_tickers = sorted(

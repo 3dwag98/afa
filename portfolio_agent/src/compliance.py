@@ -130,28 +130,52 @@ def validate_ticker(ticker: str, allowed_tickers: List[str]) -> bool:
 
 
 def check_risk_reward_ratio(entry_price: float, target_price: float,
-                            stop_loss_price: float, min_ratio: float) -> bool:
-    """Check if trade meets minimum risk-reward ratio.
+                            stop_loss_price: float, min_ratio: float,
+                            buy_cost_pct: Optional[float] = None,
+                            sell_cost_pct: Optional[float] = None) -> bool:
+    """Check if trade meets the minimum risk-reward ratio, net of costs.
+
+    The strategy layer reports `reward_risk` net of estimated round-trip
+    friction (src/risk.py::net_reward_risk). Compliance must measure the same
+    quantity against the same `min_reward_risk` threshold, or the two gates
+    disagree: a trade the strategy graded cost-negative at 0.84 would be
+    recomputed here at a gross 1.33 and wave through, while the exported
+    report shows the net figure compliance never actually tested.
 
     Args:
         entry_price: Entry price.
         target_price: Target price.
         stop_loss_price: Stop loss price.
         min_ratio: Minimum required reward/risk ratio.
+        buy_cost_pct: Buy-leg friction as a fraction of turnover. Defaults to
+            the platform's standard estimate.
+        sell_cost_pct: Sell-leg friction as a fraction of turnover.
 
     Returns:
-        True if ratio is acceptable.
+        True if the net ratio is acceptable.
     """
     if stop_loss_price >= entry_price:
         return False
 
-    risk = entry_price - stop_loss_price
-    reward = target_price - entry_price
+    try:
+        from .execution_sim import cost_fraction_per_side
+        from .risk import net_reward_risk
+    except ImportError:  # pragma: no cover - script-style import path
+        from execution_sim import cost_fraction_per_side
+        from risk import net_reward_risk
 
-    if risk <= 0:
-        return False
+    if buy_cost_pct is None:
+        buy_cost_pct = cost_fraction_per_side('BUY')
+    if sell_cost_pct is None:
+        sell_cost_pct = cost_fraction_per_side('SELL')
 
-    ratio = reward / risk
+    ratio = net_reward_risk(
+        entry_price=entry_price,
+        stop_price=stop_loss_price,
+        target_price=target_price,
+        buy_cost_pct=buy_cost_pct,
+        sell_cost_pct=sell_cost_pct,
+    )
     return ratio >= min_ratio
 
 

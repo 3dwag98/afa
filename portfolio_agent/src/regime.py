@@ -86,38 +86,57 @@ def neutral_regime(reason: str = "insufficient history to assess market regime")
     )
 
 
-def build_market_proxy(close_by_symbol: Dict[str, pd.Series]) -> Optional[pd.Series]:
+def build_market_proxy(
+    close_by_symbol: Dict[str, pd.Series],
+    lookback: Optional[int] = None,
+) -> Optional[pd.Series]:
     """Build an equal-weighted composite price index from the traded universe.
 
-    Each ticker's close series is rebased to 1.0 at its first observation and
-    the rebased series are averaged, so a ₹5,000 stock does not dominate a ₹50
-    one. Symbols are aligned on their shared index and any date is averaged
-    over whichever symbols have data there, which keeps the composite usable
-    when tickers have ragged histories.
+    Averages **daily returns** across symbols and cumulates the result, rather
+    than averaging rebased price levels. The distinction is not cosmetic: real
+    universes have ragged start dates, and the eligible set changes daily
+    during a backtest. Averaging rebased levels makes a newly-listed ticker
+    enter the average at its own base of 1.0 while incumbents sit at 1.4, which
+    prints a double-digit synthetic drop in the composite on a day every
+    constituent rose — and `assess_market_regime` would read that construction
+    artifact as a trend break and as realized volatility, which is exactly what
+    drives the crash filter. A return average has no such discontinuity: a
+    symbol simply contributes nothing on days it has no return.
 
     Args:
         close_by_symbol: Per-symbol close price series, indexed by date.
+        lookback: Keep only this many trailing observations per symbol before
+            combining. The regime tests need at most `trend_window + 1` points,
+            and the composite is otherwise rebuilt from every symbol's full
+            history on every scoring round.
 
     Returns:
-        The composite index series, or None if no usable series were supplied.
+        The composite index series (starting at 1.0), or None if no usable
+        series were supplied.
     """
-    rebased = []
+    returns = []
     for series in close_by_symbol.values():
         if series is None or len(series) < 2:
             continue
         clean = pd.to_numeric(series, errors="coerce").dropna()
+        if lookback is not None and len(clean) > lookback + 1:
+            clean = clean.iloc[-(lookback + 1):]
         if len(clean) < 2:
             continue
-        base = clean.iloc[0]
-        if not np.isfinite(base) or base <= 0:
+        clean = clean[clean > 0]
+        if len(clean) < 2:
             continue
-        rebased.append(clean / base)
+        returns.append(clean.pct_change())
 
-    if not rebased:
+    if not returns:
         return None
 
-    composite = pd.concat(rebased, axis=1).mean(axis=1, skipna=True)
-    composite = composite.dropna().sort_index()
+    mean_returns = pd.concat(returns, axis=1).mean(axis=1, skipna=True)
+    mean_returns = mean_returns.replace([np.inf, -np.inf], np.nan).dropna().sort_index()
+    if len(mean_returns) < 2:
+        return None
+
+    composite = (1.0 + mean_returns).cumprod()
     return composite if len(composite) >= 2 else None
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class DataConfig(BaseModel):
@@ -245,13 +245,14 @@ class RiskConfig(BaseModel):
     kelly_fraction: float = Field(
         default=0.25,
         ge=0.0,
-        le=0.25,
-        description="Fractional-Kelly multiplier kappa. Hard-capped at 0.25 (quarter-Kelly) rather "
-        "than merely defaulted there: Kelly assumes a well-estimated, roughly symmetric payoff "
-        "distribution, and Indian small/mid-caps offer neither — a 'loss' that locks at the lower "
-        "circuit for days realizes far worse than the modelled stop, which inflates the payoff "
-        "ratio b and makes f* an overestimate. Quarter-Kelly captures roughly half of full-Kelly's "
-        "growth rate at a small fraction of its drawdown risk.",
+        description="Fractional-Kelly multiplier kappa. Values above 0.25 are silently clamped to "
+        "quarter-Kelly by risk.py::calculate_kelly_quantity — the ceiling lives at the point of "
+        "use, so no config, env override or fixture can size above it, and an existing config "
+        "carrying the old 0.5 default still loads. Kelly assumes a well-estimated, roughly "
+        "symmetric payoff distribution and Indian small/mid-caps offer neither: a 'loss' that "
+        "locks at the lower circuit for days realizes far worse than the modelled stop, which "
+        "inflates the payoff ratio b and f* with it. Quarter-Kelly captures roughly half of "
+        "full-Kelly's growth rate at a small fraction of its drawdown risk.",
     )
     kelly_min_trades: int = Field(
         default=50,
@@ -293,6 +294,25 @@ class RiskConfig(BaseModel):
         "(src/execution_sim.py::cost_fraction_per_side). Realized fills price slippage off each "
         "ticker's own ATR and traded volume instead; this only affects signal gating.",
     )
+
+    @model_validator(mode="after")
+    def _check_drawdown_thresholds(self) -> "RiskConfig":
+        """The breaker needs distinct trip and re-arm levels to be a breaker.
+
+        With reentry >= max, equity sitting just past the trip point satisfies
+        both conditions, so the breaker halts on one bar and resumes on the
+        next, churning the book at the drawdown trough — the exact behaviour
+        two thresholds exist to prevent.
+        """
+        if self.max_portfolio_drawdown_pct <= 0:
+            return self
+        if self.drawdown_reentry_pct >= self.max_portfolio_drawdown_pct:
+            raise ValueError(
+                f"risk.drawdown_reentry_pct ({self.drawdown_reentry_pct}) must be below "
+                f"risk.max_portfolio_drawdown_pct ({self.max_portfolio_drawdown_pct}); "
+                f"otherwise the circuit breaker trips and re-arms on alternating bars."
+            )
+        return self
 
 
 class LearningConfig(BaseModel):
@@ -368,7 +388,14 @@ class ComplianceConfig(BaseModel):
     target_prob_profit: float = Field(
         default=0.55, description="Minimum Monte Carlo probability-of-profit required for a BUY signal"
     )
-    min_reward_risk: float = Field(default=1.5, description="Minimum reward:risk ratio required for a BUY signal")
+    min_reward_risk: float = Field(
+        default=1.2,
+        description="Minimum reward:risk ratio required for a BUY signal, measured NET of "
+        "estimated round-trip friction (src/risk.py::net_reward_risk) rather than gross. "
+        "Lowered from 1.5 when costing was introduced: the same trade scores roughly 0.6x its "
+        "gross ratio once ~0.79% of round-trip cost is charged against an ATR-scale move, so "
+        "the old threshold was unreachable for any ATR-derived stop/target.",
+    )
     paper_trading_mode: bool = Field(
         default=True, description="Must remain True; this system never places real trades"
     )
