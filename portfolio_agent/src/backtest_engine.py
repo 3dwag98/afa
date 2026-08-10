@@ -140,6 +140,7 @@ class BacktestEngine:
         sector_map_csv: Optional[str] = None,
         max_portfolio_drawdown_pct: float = 0.0,
         drawdown_reentry_pct: float = 0.10,
+        benchmark_symbol: Optional[str] = None,
     ):
         """
         Initialize the BacktestEngine.
@@ -184,6 +185,10 @@ class BacktestEngine:
                 positions once drawdown from the equity peak reaches this
                 fraction. 0 disables it.
             drawdown_reentry_pct: Drawdown level at which buying resumes.
+            benchmark_symbol: Optional market index (e.g. "^NSEI") whose cached
+                history drives the momentum crash filter's trend and
+                volatility tests. Without it the filter falls back to a
+                composite of the traded universe.
         """
         self.start_date = pd.to_datetime(start_date)
         self.end_date = pd.to_datetime(end_date)
@@ -232,6 +237,29 @@ class BacktestEngine:
         # max_sector_pct — conservative, and loud in the logs.
         self.max_sector_pct = max_sector_pct
         self.sector_map = load_sector_map(sector_map_csv) if max_sector_pct > 0 else {}
+
+        # Benchmark index for the momentum crash filter. Loaded once from the
+        # same parquet cache as everything else; None when it was never
+        # cached, in which case the filter uses its composite fallback.
+        self.benchmark_symbol = benchmark_symbol
+        self.benchmark_close: Optional[pd.Series] = None
+        if benchmark_symbol:
+            benchmark_df = load_ticker_data(
+                benchmark_symbol,
+                start_date=None,  # the trend window reaches back before start_date
+                end_date=self.end_date.strftime('%Y-%m-%d'),
+            )
+            if benchmark_df is not None and 'close' in benchmark_df.columns:
+                self.benchmark_close = benchmark_df['close'].sort_index()
+                logger.info(
+                    f"Loaded benchmark {benchmark_symbol} "
+                    f"({len(self.benchmark_close)} bars) for the market-regime filter"
+                )
+            else:
+                logger.info(
+                    f"Benchmark {benchmark_symbol} is not cached; the market-regime filter "
+                    f"will use a composite of the traded universe"
+                )
 
         # Drawdown circuit breaker state.
         self.max_portfolio_drawdown_pct = max_portfolio_drawdown_pct
@@ -719,7 +747,13 @@ class BacktestEngine:
                 ticker: build_features(hist_data, self.strategy.required_features())
                 for ticker, hist_data in eligible.items()
             }
-            context = StrategyContext(risk=self.risk_params, weights=weights)
+            context = StrategyContext(
+                risk=self.risk_params,
+                weights=weights,
+                # Strictly before T, exactly like every other input: the
+                # regime filter must not see the day it is deciding on.
+                benchmark_close=self._benchmark_up_to(current_date),
+            )
             return self.strategy.score_batch(features_by_symbol, context)
 
         if self.parallel and len(eligible) > 1:

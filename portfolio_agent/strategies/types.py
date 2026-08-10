@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
+    import pandas as pd
+
     from portfolio_agent.config.schema import AppConfig
     from src.monte_carlo import MonteCarloResult
 
@@ -79,6 +81,13 @@ class StrategyContext:
     weights: Dict[str, float] = field(default_factory=dict)
     mc_result: Optional["MonteCarloResult"] = None
     run_id: Optional[str] = None
+    # Benchmark index close series (e.g. the Nifty 50), truncated to the
+    # decision date by the caller. The momentum crash filter prefers this over
+    # its equal-weighted composite of the traded universe: "the market is below
+    # its 200-day average" is a statement about the index the research actually
+    # studied, and a composite of whatever happens to be in today's universe is
+    # only a proxy for it. None when no benchmark is cached.
+    benchmark_close: Optional["pd.Series"] = None
 
 
 @dataclass

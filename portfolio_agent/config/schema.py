@@ -14,8 +14,46 @@ class DataConfig(BaseModel):
     market_data_dir: str = Field(
         default="data/market_data", description="Directory for market data"
     )
+    source: Literal["huggingface", "yfinance"] = Field(
+        default="huggingface",
+        description="Where historical OHLCV comes from. 'huggingface' pulls a versioned Hub "
+        "dataset (see src/hf_dataset.py) — reproducible when hf_revision is pinned, and one "
+        "columnar download instead of thousands of per-ticker requests. 'yfinance' keeps the "
+        "original per-ticker download path. Either way the bars land in the same parquet cache.",
+    )
+    hf_dataset_id: str = Field(
+        default="vishnun0027/indian-market-historical-ohlcv",
+        description="HuggingFace Hub dataset repo id used when source='huggingface'.",
+    )
+    hf_revision: Optional[str] = Field(
+        default=None,
+        description="Git revision (branch, tag or commit SHA) of the Hub dataset to pin. Leave "
+        "unset to track the default branch; pin it for a reproducible backtest, since an "
+        "unpinned dataset can be updated underneath a running series of experiments.",
+    )
+    hf_asset_dir: str = Field(
+        default="stocks",
+        description="Directory within the Hub dataset to ingest equities from "
+        "(stocks | indices | etfs | commodities | forex). One parquet per symbol.",
+    )
+    hf_adjust_prices: bool = Field(
+        default=True,
+        description="Back-adjust OHLC by adj_close/close on ingest. Leave on: an unadjusted "
+        "1:10 split prints as a -90% daily return, which cross-sectional momentum reads as a "
+        "crash and the circuit-lock detector reads as a limit move. The previous yfinance path "
+        "used auto_adjust=True, so this also keeps the cache internally consistent.",
+    )
+    benchmark_symbol: str = Field(
+        default="^NSEI",
+        description="Index symbol (in the Hub dataset's indices/ directory) used as the market "
+        "benchmark for the momentum crash filter. ^NSEI is the Nifty 50. When its history is "
+        "cached, src/regime.py keys the trend and volatility filters off the real index; "
+        "otherwise it falls back to an equal-weighted composite of the traded universe.",
+    )
     default_history_years: int = Field(
-        default=5, description="Default number of years of historical data to use"
+        default=5,
+        description="Years of historical data to keep. Applied to both sources: the Hub dataset "
+        "is trimmed to this window on ingest rather than cached in full.",
     )
     universe_size: int = Field(
         default=10, description="Number of securities in the trading universe"

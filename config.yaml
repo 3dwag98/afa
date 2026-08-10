@@ -6,6 +6,21 @@
 data:
   data_dir: data
   market_data_dir: data/market_data
+  # huggingface | yfinance. The Hub dataset downloads once as a columnar file
+  # and is reproducible when hf_revision is pinned; yfinance fetches per ticker
+  # and returns whatever it has today. Both land in the same parquet cache.
+  source: huggingface
+  hf_dataset_id: vishnun0027/indian-market-historical-ohlcv
+  hf_revision: null      # pin a branch/tag/commit for a reproducible backtest
+  hf_asset_dir: stocks   # one parquet per symbol under this directory
+  # Back-adjust OHLC by adj_close/close. Leave on: an unadjusted 1:10 split
+  # prints as a -90% day, which momentum reads as a crash.
+  hf_adjust_prices: true
+  # Index used by the momentum crash filter (indices/ directory). ^NSEI is the
+  # Nifty 50; when cached, the regime filter keys off it instead of a
+  # composite of the traded universe.
+  benchmark_symbol: "^NSEI"
+  # Years of history kept, applied to both sources.
   default_history_years: 5
   universe_size: 4000
   tickers: []

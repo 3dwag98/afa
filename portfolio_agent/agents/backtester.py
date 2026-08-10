@@ -118,6 +118,7 @@ class BacktesterAgent:
             sector_map_csv=self.config.paths.sector_map_csv,
             max_portfolio_drawdown_pct=self.config.risk.max_portfolio_drawdown_pct,
             drawdown_reentry_pct=self.config.risk.drawdown_reentry_pct,
+            benchmark_symbol=self.config.data.benchmark_symbol,
         )
 
         logger.info(f"Running backtest from {start_date} to {end_date} with strategy '{strategy.name}'")

@@ -21,7 +21,7 @@ try:
         save_trade_outcome, log_run, get_trade_history,
         load_brain, save_brain
     )
-    from .data_store import load_or_fetch_data
+    from .data_store import load_or_fetch_data, load_ticker_data
     from .indicators import calculate_indicators
     from .monte_carlo import MonteCarloResult, MonteCarloSettings
     from .risk import calculate_position_quantity
@@ -38,7 +38,7 @@ except ImportError:
         save_trade_outcome, log_run, get_trade_history,
         load_brain, save_brain
     )
-    from data_store import load_or_fetch_data
+    from data_store import load_or_fetch_data, load_ticker_data
     from indicators import calculate_indicators
     from monte_carlo import MonteCarloResult, MonteCarloSettings
     from risk import calculate_position_quantity
@@ -144,6 +144,30 @@ def _prepare_all_tickers(
         return results
 
     return [by_ticker[t] for t in data if t in by_ticker]
+
+
+def _load_benchmark_close(config: AppConfig, logger) -> Optional[pd.Series]:
+    """Cached close series for the configured market benchmark, if any.
+
+    Read from the ordinary per-ticker parquet cache, so `download-data`
+    populating it is the only setup step. Returns None when the symbol was
+    never cached — src/regime.py then falls back to an equal-weighted
+    composite of the traded universe.
+    """
+    symbol = getattr(config.data, "benchmark_symbol", "")
+    if not symbol:
+        return None
+
+    df = load_ticker_data(symbol)
+    if df is None or 'close' not in df.columns or df.empty:
+        logger.info(
+            f"Benchmark {symbol} is not cached; the market-regime filter will use a "
+            f"composite of the traded universe"
+        )
+        return None
+
+    logger.info(f"Loaded benchmark {symbol} ({len(df)} bars) for the market-regime filter")
+    return df['close'].sort_index()
 
 
 def _scaled_quantity(quantity: int, signal: StrategySignal) -> int:
@@ -315,9 +339,20 @@ def run_orchestrator(
         # that need the full universe at once (cross-sectional momentum/
         # low-volatility ranking) are scored in a single score_batch() call;
         # everything else is scored per-ticker with its own Monte Carlo result.
+        # The market benchmark (Nifty 50 by default) drives the momentum crash
+        # filter. It comes from the same parquet cache as everything else; when
+        # it was never cached the filter falls back to a composite of the
+        # traded universe, so a missing index is a downgrade, not a failure.
+        benchmark_close = _load_benchmark_close(config, logger)
+
         signals: Dict[str, StrategySignal] = {}
         if strategy.requires_full_batch or strategy.supports_gpu_batch:
-            batch_context = StrategyContext(risk=risk_params, weights=dict(brain.weights), run_id=run_id)
+            batch_context = StrategyContext(
+                risk=risk_params,
+                weights=dict(brain.weights),
+                run_id=run_id,
+                benchmark_close=benchmark_close,
+            )
             signals = strategy.score_batch(features_by_ticker, batch_context)
         else:
             for ticker, features in features_by_ticker.items():

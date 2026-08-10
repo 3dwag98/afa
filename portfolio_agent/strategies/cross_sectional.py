@@ -242,24 +242,35 @@ def _clean(value: Any) -> Optional[float]:
 
 
 def _assess_regime(
-    features_by_symbol: Dict[str, pd.DataFrame], protection: CrashProtection
+    features_by_symbol: Dict[str, pd.DataFrame],
+    protection: CrashProtection,
+    benchmark_close: Optional[pd.Series] = None,
 ) -> MarketRegime:
-    """Derive the market regime from the traded universe's own close prices.
+    """Derive the market regime, preferring a real index over a composite.
 
-    Uses an equal-weighted composite of the eligible tickers rather than an
-    index feed, so crash protection needs no data the platform doesn't already
-    have. Returns a neutral (unscaled) regime when the filter is switched off
-    or there isn't enough history to judge.
+    When the caller supplies a benchmark series (the Nifty 50, cached from the
+    dataset's indices/ directory), the trend and volatility filters key off it
+    — "the market is below its 200-day average" is a statement about the index
+    the research actually studied. Without one, the filter falls back to an
+    equal-weighted composite of the eligible tickers, which needs no data the
+    platform doesn't already have but is only a proxy: it reflects whatever
+    happens to be in today's universe, and idiosyncratic noise diversifies out
+    of it in a way real index volatility does not.
+
+    Returns a neutral (unscaled) regime when the filter is switched off or
+    there isn't enough history to judge.
     """
     if not protection.regime_filter:
         return neutral_regime("regime filter disabled")
 
-    close_by_symbol = {
-        symbol: features["close"]
-        for symbol, features in features_by_symbol.items()
-        if not features.empty and "close" in features.columns
-    }
-    market_close = build_market_proxy(close_by_symbol)
+    market_close = benchmark_close
+    if market_close is None or len(market_close) < protection.trend_window + 1:
+        close_by_symbol = {
+            symbol: features["close"]
+            for symbol, features in features_by_symbol.items()
+            if not features.empty and "close" in features.columns
+        }
+        market_close = build_market_proxy(close_by_symbol)
 
     return assess_market_regime(
         market_close,
@@ -534,7 +545,7 @@ class MomentumStrategy(BaseStrategy):
             if mom is not None:
                 metric_by_symbol[symbol] = mom
 
-        regime = _assess_regime(features_by_symbol, self._protection)
+        regime = _assess_regime(features_by_symbol, self._protection, context.benchmark_close)
 
         return _rank_and_select_decile(
             metric_by_symbol=metric_by_symbol,
@@ -629,7 +640,7 @@ class LowVolatilityStrategy(BaseStrategy):
             if vol is not None:
                 metric_by_symbol[symbol] = vol
 
-        regime = _assess_regime(features_by_symbol, self._protection)
+        regime = _assess_regime(features_by_symbol, self._protection, context.benchmark_close)
 
         return _rank_and_select_decile(
             metric_by_symbol=metric_by_symbol,

@@ -460,3 +460,66 @@ class TestTradabilityScreen:
         signals = strategy.score_batch(universe, context)
 
         assert signals["SYM10"].signal == "BUY"
+
+
+class TestBenchmarkDrivenRegime:
+    """Given a real index (the Nifty, cached from the dataset's indices/), the
+    crash filter keys off it instead of a composite of today's universe."""
+
+    @staticmethod
+    def _index_series(start, end, n=400, noise=0.004, seed=2):
+        import numpy as np
+
+        rng = np.random.default_rng(seed)
+        ramp = np.linspace(start, end, n)
+        return pd.Series(
+            ramp * (1.0 + rng.normal(0.0, noise, n)),
+            index=pd.bdate_range("2020-01-01", periods=n),
+        )
+
+    def test_falling_benchmark_stands_momentum_down_despite_a_rising_universe(self):
+        """The universe here is climbing; only the index says the market is in
+        a volatile downtrend. A composite would miss that entirely."""
+        strategy = MomentumStrategy(_momentum_config(top_percentile=0.1))
+        rising_universe = _universe(n_symbols=40, n=400, start=100, end=200, noise=0.004)
+        crashing_index = self._index_series(200, 100, noise=0.05)
+        context = StrategyContext(risk=_risk_params(), benchmark_close=crashing_index)
+
+        signals = strategy.score_batch(rising_universe, context)
+
+        assert signals["SYM40"].extra["regime"] == "crash_risk"
+        assert signals["SYM40"].signal == "WATCH"
+
+    def test_rising_benchmark_keeps_momentum_invested(self):
+        strategy = MomentumStrategy(_momentum_config(top_percentile=0.1))
+        universe = _universe(n_symbols=40, n=400, start=100, end=200, noise=0.004)
+        context = StrategyContext(
+            risk=_risk_params(), benchmark_close=self._index_series(100, 200)
+        )
+
+        signals = strategy.score_batch(universe, context)
+
+        assert signals["SYM40"].extra["regime"] == "risk_on"
+        assert signals["SYM40"].signal == "BUY"
+
+    def test_short_benchmark_history_falls_back_to_the_composite(self):
+        """A benchmark too short for the 200-day trend test is not usable, and
+        must not disable the filter — the composite still is."""
+        strategy = MomentumStrategy(_momentum_config(top_percentile=0.1))
+        crashing_universe = _universe(n_symbols=40, n=400, start=200, end=100, noise=0.05)
+        context = StrategyContext(
+            risk=_risk_params(),
+            benchmark_close=self._index_series(100, 200, n=50),
+        )
+
+        signals = strategy.score_batch(crashing_universe, context)
+
+        assert signals["SYM40"].extra["regime"] == "crash_risk"
+
+    def test_no_benchmark_uses_the_composite(self):
+        strategy = MomentumStrategy(_momentum_config(top_percentile=0.1))
+        crashing_universe = _universe(n_symbols=40, n=400, start=200, end=100, noise=0.05)
+
+        signals = strategy.score_batch(crashing_universe, StrategyContext(risk=_risk_params()))
+
+        assert signals["SYM40"].extra["regime"] == "crash_risk"
