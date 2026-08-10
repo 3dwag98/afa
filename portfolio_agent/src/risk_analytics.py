@@ -11,7 +11,22 @@ strategy *scoring* decisions during a run — not a backtest report metric.
 
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Sequence, Tuple
+
+try:
+    from .performance_stats import (
+        TRADING_DAYS_PER_YEAR,
+        evaluate_sharpe,
+        excess_returns,
+        sharpe_ratio as arithmetic_sharpe_ratio,
+    )
+except ImportError:  # running from inside src/ as a flat package
+    from performance_stats import (
+        TRADING_DAYS_PER_YEAR,
+        evaluate_sharpe,
+        excess_returns,
+        sharpe_ratio as arithmetic_sharpe_ratio,
+    )
 
 # Keys that may carry a trade's realized profit, most specific first.
 # BacktestEngine writes 'net_pnl' (P&L after costs and taxes); older/simpler
@@ -70,7 +85,7 @@ class RiskAnalyzer:
         self,
         daily_equity_curve: pd.Series,
         trade_log: List[Dict[str, Any]],
-        risk_free_rate: float = 0.065,
+        risk_free_rate: float | pd.Series = 0.065,
         random_seed: Optional[int] = 42,
     ):
         """
@@ -79,7 +94,11 @@ class RiskAnalyzer:
         Args:
             daily_equity_curve: Time series of daily portfolio values.
             trade_log: List of trade records with 'net_pnl' (or 'pnl') fields.
-            risk_free_rate: Annual risk-free rate (default 6.5% for India).
+            risk_free_rate: Annual risk-free rate (default 6.5% for India), or
+                a date-indexed Series of annualized rates — e.g. the 91-day
+                T-bill yield. A constant is a guess about the entire window,
+                and India's policy rate moved materially over 2021-2025; the
+                Series form is the correct input once that data is cached.
             random_seed: Seed for the bootstrap Monte Carlo. Defaults to a
                 fixed seed so re-running the same backtest reproduces the same
                 risk-of-ruin and terminal-wealth percentiles — unseeded, those
@@ -98,9 +117,41 @@ class RiskAnalyzer:
         
         # Calculate daily returns once
         self.daily_returns = self.daily_equity_curve.pct_change().dropna()
-        
+
         # Cache for computed metrics
         self._metrics_cache: Optional[Dict[str, Any]] = None
+
+    @property
+    def risk_free_rate(self) -> float | np.ndarray:
+        """The risk-free input, as the metric functions want to consume it.
+
+        A scalar passes through as an annual rate. A Series is aligned to the
+        return index, forward-filled across non-trading days and converted from
+        annualized to per-period, so a rate series sampled weekly or monthly
+        can be handed in directly.
+        """
+        if not isinstance(self._risk_free_rate, pd.Series):
+            return self._risk_free_rate
+
+        annualized = self._risk_free_rate.reindex(
+            self.daily_returns.index, method="ffill"
+        ).bfill()
+        return ((1.0 + annualized.to_numpy()) ** (1.0 / TRADING_DAYS_PER_YEAR)) - 1.0
+
+    @risk_free_rate.setter
+    def risk_free_rate(self, value: float | pd.Series) -> None:
+        self._risk_free_rate = value
+
+    @property
+    def mean_annual_risk_free_rate(self) -> float:
+        """A single annualized rate, for the report cell and the ratios that
+        genuinely need a scalar. Averaged over the window when a series was
+        supplied, so the reported figure describes the period it covers."""
+        if not isinstance(self._risk_free_rate, pd.Series):
+            return float(self._risk_free_rate)
+        if self._risk_free_rate.empty:
+            return 0.0
+        return float(self._risk_free_rate.mean())
     
     def calculate_cagr(self) -> float:
         """
@@ -149,53 +200,119 @@ class RiskAnalyzer:
     
     def calculate_sharpe_ratio(self) -> float:
         """
-        Calculate Sharpe Ratio.
-        
-        Sharpe = (CAGR - Risk Free Rate) / Annualized Volatility
-        
-        Uses India risk-free rate of 6.5% by default.
-        
+        Calculate Sharpe Ratio: mean daily excess return / its standard
+        deviation, annualized by sqrt(252).
+
+        **Both terms are arithmetic.** This used to divide CAGR — a geometric
+        mean — by an arithmetic annualized standard deviation. Because
+        CAGR ~= mu - sigma^2/2, that hybrid returns approximately
+
+            (mu - rf)/sigma - sigma/2
+
+        so it was biased low by sigma/2: a flat -0.10 of Sharpe at 20%
+        annualized volatility, and worse for more volatile strategies, which
+        means it charged volatility twice and was not comparable to the
+        conventional 1.2 target the platform is aiming at.
+
+        The risk-free rate is subtracted per period rather than once from the
+        annualized return, and compounded rather than divided by 252 (see
+        performance_stats.to_daily_risk_free).
+
         Returns:
-            Sharpe ratio (dimensionless).
+            Annualized Sharpe ratio (dimensionless).
         """
-        cagr = self.calculate_cagr()
+        return arithmetic_sharpe_ratio(
+            self.daily_returns.to_numpy(),
+            risk_free_rate=self.risk_free_rate,
+            periods_per_year=TRADING_DAYS_PER_YEAR,
+        )
+
+    def calculate_geometric_sharpe_ratio(self) -> float:
+        """The old (CAGR - rf) / sigma figure, kept for continuity.
+
+        Reported alongside the Sharpe rather than as it, so the gap between the
+        two is visible in any report that carries both. It is a legitimate
+        quantity — growth rate per unit of volatility — but it is not the
+        Sharpe ratio and should not be compared to a Sharpe threshold.
+        """
         volatility = self.calculate_annualized_volatility()
-        
         if volatility == 0:
             return 0.0
-        
-        sharpe = (cagr - self.risk_free_rate) / volatility
-        return sharpe
-    
+        return (self.calculate_cagr() - self.mean_annual_risk_free_rate) / volatility
+
+    def calculate_sharpe_statistics(
+        self,
+        n_trials: int = 1,
+        sharpe_variance: Optional[float] = None,
+        benchmark_sharpe: float = 0.0,
+    ) -> Dict[str, float]:
+        """Sharpe with its selection-bias adjustments (PSR and DSR).
+
+        A Sharpe ratio reported without the number of configurations tried is
+        the maximum of an unrecorded number of draws. See
+        src/performance_stats.py for the statistics; `n_trials` should come
+        from the trial log, not from memory.
+
+        Args:
+            n_trials: Configurations tried to arrive at this result.
+            sharpe_variance: Variance of Sharpe across those trials; estimated
+                from this sample when omitted.
+            benchmark_sharpe: SR* for the undeflated PSR.
+
+        Returns:
+            Dict of sharpe_ratio, psr, dsr, deflation_threshold_sharpe and the
+            return moments behind them.
+        """
+        return evaluate_sharpe(
+            self.daily_returns.to_numpy(),
+            risk_free_rate=self.risk_free_rate,
+            n_trials=n_trials,
+            sharpe_variance=sharpe_variance,
+            periods_per_year=TRADING_DAYS_PER_YEAR,
+            benchmark_sharpe=benchmark_sharpe,
+        )
+
+
     def calculate_sortino_ratio(self) -> float:
         """
         Calculate Sortino Ratio using Downside Deviation.
-        
-        Sortino = (CAGR - Risk Free Rate) / Downside Deviation
-        
-        Downside Deviation only considers negative returns (penalizes downside volatility).
-        Handles zero downside deviation gracefully.
-        
+
+        Sortino = annualized mean excess return / annualized downside deviation
+
+        Downside deviation only considers returns below the target (here, the
+        risk-free rate), penalizing downside volatility while leaving upside
+        volatility uncharged.
+
+        Both terms are arithmetic and measured on the same excess-return
+        series, for the same reason as calculate_sharpe_ratio: dividing a
+        geometric numerator by an arithmetic denominator biases the ratio low
+        by roughly sigma/2 and does so more for volatile strategies.
+
         Returns:
             Sortino ratio (dimensionless).
         """
-        cagr = self.calculate_cagr()
-        
-        # Calculate downside returns (only negative returns)
-        downside_returns = self.daily_returns[self.daily_returns < 0]
-        
-        if len(downside_returns) == 0:
-            # No negative returns - infinite sortino, but return large finite value
-            return float('inf') if cagr > self.risk_free_rate else 0.0
-        
-        # Calculate downside deviation (annualized)
-        downside_deviation = np.sqrt((downside_returns ** 2).mean()) * np.sqrt(252)
-        
+        excess = excess_returns(
+            self.daily_returns.to_numpy(),
+            risk_free_rate=self.risk_free_rate,
+            periods_per_year=TRADING_DAYS_PER_YEAR,
+        )
+        if excess.size < 2:
+            return 0.0
+
+        annualized_excess = float(np.mean(excess)) * TRADING_DAYS_PER_YEAR
+        downside = excess[excess < 0]
+
+        if downside.size == 0:
+            # No period underperformed the risk-free rate.
+            return float('inf') if annualized_excess > 0 else 0.0
+
+        downside_deviation = float(
+            np.sqrt(np.mean(downside**2)) * np.sqrt(TRADING_DAYS_PER_YEAR)
+        )
         if downside_deviation == 0:
-            return float('inf') if cagr > self.risk_free_rate else 0.0
-        
-        sortino = (cagr - self.risk_free_rate) / downside_deviation
-        return sortino
+            return float('inf') if annualized_excess > 0 else 0.0
+
+        return annualized_excess / downside_deviation
     
     def calculate_max_drawdown(self) -> float:
         """
@@ -498,16 +615,31 @@ class RiskAnalyzer:
             'simulations_run': n_simulations
         }
     
-    def generate_analytics_report(self) -> Dict[str, Any]:
+    def generate_analytics_report(
+        self,
+        n_trials: int = 1,
+        sharpe_variance: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """
         Generate comprehensive risk analytics report.
-        
+
+        Args:
+            n_trials: Number of configurations tried to arrive at this result,
+                used to deflate the Sharpe ratio. Defaults to 1, which applies
+                no deflation — honest only for a single pre-registered run.
+                Pass the count from the trial log for anything exploratory.
+            sharpe_variance: Variance of Sharpe across those trials; estimated
+                from this sample when omitted.
+
         Returns:
             Structured dictionary containing all metrics for Excel reporting.
         """
         # Run Monte Carlo simulation
         mc_results = self.run_monte_carlo_simulation()
-        
+        sharpe_stats = self.calculate_sharpe_statistics(
+            n_trials=n_trials, sharpe_variance=sharpe_variance
+        )
+
         # Compile all metrics
         report = {
             # Core Metrics
@@ -516,6 +648,18 @@ class RiskAnalyzer:
             'annualized_volatility': self.calculate_annualized_volatility(),
             'annualized_volatility_pct': self.calculate_annualized_volatility() * 100,
             'sharpe_ratio': self.calculate_sharpe_ratio(),
+
+            # Selection-bias-aware statistics. A Sharpe reported without the
+            # number of trials behind it is the maximum of an unrecorded number
+            # of draws; DSR below 0.95 means it is not distinguishable from
+            # what the search alone would have produced.
+            'geometric_sharpe_ratio': self.calculate_geometric_sharpe_ratio(),
+            'probabilistic_sharpe_ratio': sharpe_stats['psr'],
+            'deflated_sharpe_ratio': sharpe_stats['dsr'],
+            'deflation_threshold_sharpe': sharpe_stats['deflation_threshold_sharpe'],
+            'return_skewness': sharpe_stats['skewness'],
+            'return_kurtosis': sharpe_stats['kurtosis'],
+            'n_trials': sharpe_stats['n_trials'],
             'sortino_ratio': self.calculate_sortino_ratio(),
             'calmar_ratio': self.calculate_calmar_ratio(),
             'profit_factor': self.calculate_profit_factor(),
@@ -545,7 +689,7 @@ class RiskAnalyzer:
             'final_capital': self.daily_equity_curve.iloc[-1] if len(self.daily_equity_curve) > 0 else 0,
             'total_return': (self.daily_equity_curve.iloc[-1] / self.daily_equity_curve.iloc[0] - 1) if len(self.daily_equity_curve) > 1 else 0,
             'total_return_pct': (self.daily_equity_curve.iloc[-1] / self.daily_equity_curve.iloc[0] - 1) * 100 if len(self.daily_equity_curve) > 1 else 0,
-            'risk_free_rate': self.risk_free_rate,
+            'risk_free_rate': self.mean_annual_risk_free_rate,
             'analysis_period_days': len(self.daily_equity_curve),
         }
         
