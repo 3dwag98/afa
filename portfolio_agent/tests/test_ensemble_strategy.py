@@ -312,3 +312,158 @@ class TestTriggerMethodUMA:
 
         assert signal.signal != "AVOID"
         assert signal.score > 0
+
+
+class TestMetaOrchestratorConfig:
+    """The shipped multi-regime configuration must actually load and describe
+    a coherent set of members — a regime map naming a member that does not
+    exist mutes nothing and fails silently."""
+
+    CONFIG = "portfolio_agent/config/strategies/uma_meta_orchestrator.yaml"
+
+    def _spec(self):
+        import yaml
+        from pathlib import Path
+        return yaml.safe_load(Path(self.CONFIG).read_text())
+
+    def test_every_regime_maps_only_to_declared_members(self):
+        spec = self._spec()
+        declared = {
+            m.get("name") or (m.get("params") or {}).get("name")
+            for m in spec["members"]
+        }
+
+        for regime, members in spec["regimes"].items():
+            unknown = set(members) - declared
+            assert not unknown, f"{regime} names members that do not exist: {sorted(unknown)}"
+
+    def test_every_member_is_reachable_in_some_regime(self):
+        spec = self._spec()
+        declared = {
+            m.get("name") or (m.get("params") or {}).get("name")
+            for m in spec["members"]
+        }
+        mapped = {name for members in spec["regimes"].values() for name in members}
+
+        assert declared == mapped
+
+    def test_momentum_is_muted_in_the_crash_regime(self):
+        """The whole point of the map: momentum's catastrophic drawdowns are
+        concentrated in exactly this state."""
+        spec = self._spec()
+
+        assert "quality_momentum" not in spec["regimes"]["BEAR_CRASH_RISK"]
+        assert "defensive_low_vol" in spec["regimes"]["BEAR_CRASH_RISK"]
+
+    def test_the_defensive_sleeve_is_muted_in_the_bull_regime(self):
+        spec = self._spec()
+
+        assert "defensive_low_vol" not in spec["regimes"]["BULL_RISK_ON"]
+        assert "quality_momentum" in spec["regimes"]["BULL_RISK_ON"]
+
+    def test_trend_following_is_muted_in_chop(self):
+        spec = self._spec()
+
+        assert "quality_momentum" not in spec["regimes"]["SIDEWAYS_CHOP"]
+
+    def test_it_uses_the_trigger_method(self):
+        assert self._spec()["method"] == "trigger"
+
+
+class TestCrossSectionalMembers:
+    """Cross-sectional rankers are legal UMA members under `method: trigger`,
+    which scores every member across the whole universe before arbitrating."""
+
+    @staticmethod
+    def _universe(n=40):
+        rows = {}
+        for i in range(1, n + 1):
+            rows[f"SYM{i}"] = pd.DataFrame([{
+                "close": 100.0,
+                "atr_14": 2.0,
+                "mom_9m_skip1m": i / 100.0,
+                # Rises with the momentum metric, so the low-volatility ranker
+                # favours exactly the names momentum ranks last.
+                "realized_vol_60": 0.10 + i / 200.0,
+                "traded_value_60": 50_000_000.0,
+                "zero_return_fraction_60": 0.0,
+                "circuit_lock_fraction_60": 0.0,
+                "circuit_locked_today": 0.0,
+                "operator_trap_fraction_60": 0.0,
+                "operator_trap_today": 0.0,
+            }])
+        return rows
+
+    def _uma(self, tmp_path, method="trigger", regimes=None):
+        import yaml
+        spec = {
+            "name": "Cross-sectional UMA",
+            "method": method,
+            "trigger": {"mode": "strong_or_consensus", "strong_confidence": 0.75},
+            "members": [
+                {"type": "momentum", "params": {"name": "mom", "min_universe": 10}},
+                {"type": "low_volatility", "params": {"name": "lowvol", "min_universe": 10}},
+            ],
+        }
+        if regimes is not None:
+            spec["regimes"] = regimes
+        path = tmp_path / "cs_uma.yaml"
+        with open(path, "w") as f:
+            yaml.safe_dump(spec, f)
+        return EnsembleStrategy(StrategyConfig(type="ensemble", config_path=str(path)))
+
+    def test_a_cross_sectional_uma_propagates_full_batch(self, tmp_path):
+        strategy = self._uma(tmp_path)
+
+        assert strategy.requires_full_batch is True
+
+    def test_it_ranks_across_the_universe_not_per_ticker(self, tmp_path):
+        strategy = self._uma(tmp_path)
+        universe = self._universe()
+
+        signals = strategy.score_batch(universe, StrategyContext(risk=_risk_params()))
+
+        assert len(signals) == len(universe)
+        # A universe-of-one would make every name the top of its own ranking.
+        assert sum(1 for s in signals.values() if s.signal == "BUY") < len(universe)
+
+    def test_the_regime_map_selects_which_ranker_speaks(self, tmp_path):
+        strategy = self._uma(
+            tmp_path, regimes={"BULL_RISK_ON": ["mom"], "BEAR_CRASH_RISK": ["lowvol"]}
+        )
+        universe = self._universe()
+
+        bull = strategy.score_batch(
+            universe, StrategyContext(risk=_risk_params(), regime_label="BULL_RISK_ON")
+        )
+        bear = strategy.score_batch(
+            universe, StrategyContext(risk=_risk_params(), regime_label="BEAR_CRASH_RISK")
+        )
+
+        bull_buys = {s for s, sig in bull.items() if sig.signal == "BUY"}
+        bear_buys = {s for s, sig in bear.items() if sig.signal == "BUY"}
+
+        # The two rankers order the universe oppositely, so the regimes must
+        # not pick the same names.
+        assert bull_buys and bear_buys
+        assert bull_buys != bear_buys
+
+    def test_averaging_methods_still_reject_cross_sectional_members(self, tmp_path):
+        with pytest.raises(ValueError, match="method: trigger"):
+            self._uma(tmp_path, method="weighted_blend")
+
+    def test_duplicate_member_names_are_rejected(self, tmp_path):
+        import yaml
+        spec = {
+            "name": "Dupes", "method": "trigger",
+            "members": [
+                {"type": "fixed_test", "params": {"name": "A", "signal": "BUY", "score": 90.0}},
+                {"type": "fixed_test", "params": {"name": "A", "signal": "BUY", "score": 90.0}},
+            ],
+        }
+        path = tmp_path / "dupes.yaml"
+        with open(path, "w") as f:
+            yaml.safe_dump(spec, f)
+
+        with pytest.raises(ValueError, match="unique"):
+            EnsembleStrategy(StrategyConfig(type="ensemble", config_path=str(path)))

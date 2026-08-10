@@ -29,6 +29,7 @@ try:
     from .execution_sim import cost_fraction_per_side
     from .compliance import run_compliance_checks
     from .learning import evaluate_and_learn
+    from .regime import assess_market_regime
     from .reporting import export_excel_report
     from .models import Recommendation
     from .outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
@@ -49,6 +50,7 @@ except ImportError:
     from execution_sim import cost_fraction_per_side
     from compliance import run_compliance_checks
     from learning import evaluate_and_learn
+    from regime import assess_market_regime
     from reporting import export_excel_report
     from models import Recommendation
     from outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
@@ -153,13 +155,15 @@ def _prepare_all_tickers(
     return [by_ticker[t] for t in data if t in by_ticker]
 
 
-def _load_benchmark_close(config: AppConfig, logger) -> Optional[pd.Series]:
-    """Cached close series for the configured market benchmark, if any.
+def _load_benchmark_frame(config: AppConfig, logger) -> Optional[pd.DataFrame]:
+    """Cached OHLC frame for the configured market benchmark, if any.
 
     Read from the ordinary per-ticker parquet cache, so `download-data`
-    populating it is the only setup step. Returns None when the symbol was
-    never cached — src/regime.py then falls back to an equal-weighted
-    composite of the traded universe.
+    populating it is the only setup step. The whole frame is returned rather
+    than just the closes because ADX — and therefore the SIDEWAYS_CHOP
+    classification — needs the daily range. Returns None when the symbol was
+    never cached; src/regime.py then falls back to an equal-weighted composite
+    of the traded universe.
     """
     symbol = getattr(config.data, "benchmark_symbol", "")
     if not symbol:
@@ -174,7 +178,7 @@ def _load_benchmark_close(config: AppConfig, logger) -> Optional[pd.Series]:
         return None
 
     logger.info(f"Loaded benchmark {symbol} ({len(df)} bars) for the market-regime filter")
-    return df['close'].sort_index()
+    return df.sort_index()
 
 
 def _scaled_quantity(quantity: int, signal: StrategySignal) -> int:
@@ -379,7 +383,14 @@ def run_orchestrator(
         # filter. It comes from the same parquet cache as everything else; when
         # it was never cached the filter falls back to a composite of the
         # traded universe, so a missing index is a downgrade, not a failure.
-        benchmark_close = _load_benchmark_close(config, logger)
+        benchmark_frame = _load_benchmark_frame(config, logger)
+        benchmark_close = benchmark_frame['close'] if benchmark_frame is not None else None
+        regime_label = None
+        if benchmark_close is not None:
+            regime_label = assess_market_regime(
+                benchmark_close, market_ohlcv=benchmark_frame
+            ).classification
+            logger.info(f"Market regime classified as {regime_label}")
 
         signals: Dict[str, StrategySignal] = {}
         if strategy.requires_full_batch or strategy.supports_gpu_batch:
@@ -388,6 +399,8 @@ def run_orchestrator(
                 weights=dict(brain.weights),
                 run_id=run_id,
                 benchmark_close=benchmark_close,
+                benchmark_ohlcv=benchmark_frame,
+                regime_label=regime_label,
             )
             signals = strategy.score_batch(features_by_ticker, batch_context)
         else:
@@ -397,6 +410,9 @@ def run_orchestrator(
                     weights=dict(brain.weights),
                     mc_result=mc_by_ticker.get(ticker),
                     run_id=run_id,
+                    benchmark_close=benchmark_close,
+                    benchmark_ohlcv=benchmark_frame,
+                    regime_label=regime_label,
                 )
                 try:
                     signals[ticker] = strategy.score(ticker, features, context)

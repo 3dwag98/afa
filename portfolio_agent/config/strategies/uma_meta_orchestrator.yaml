@@ -1,0 +1,139 @@
+# Multi-regime meta-orchestrator.
+#
+# Four sleeves, each good at a different market, arbitrated by the trigger
+# engine rather than averaged:
+#
+#   portfolio-agent backtest \
+#     --strategy ensemble \
+#     --strategy-config config/strategies/uma_meta_orchestrator.yaml
+#
+# Two things distinguish this from config/strategies/example_uma.yaml.
+#
+# `method: trigger` routes members through src/trigger_engine.py instead of
+# blending them. A weighted blend of a strong BUY and a strong SELL is a weak
+# BUY — a trade neither member would take, entered exactly when the models
+# disagree most. The trigger engine discounts conviction by the opposing
+# conviction, applies hard vetoes, and emits a position-size multiplier.
+#
+# The `regimes` block maps each market state (src/regime.py::classify_regime)
+# to the members allowed to generate BUY signals in it. Members outside the
+# list are *muted*, not vetoed: one sleeve being out of season must not stop
+# the sleeve that is in it. A regime the map does not mention — including
+# UNKNOWN, when no benchmark is cached — permits every member, because not
+# knowing the regime is not evidence that every model is wrong.
+
+name: "Multi-Regime Meta-Orchestrator"
+description: >
+  Quality momentum, defensive low-volatility, a rule-based trend/breakout
+  sleeve and a quantile neural forecaster, gated by Nifty 50 regime and
+  arbitrated by the trigger engine.
+
+method: trigger
+
+trigger:
+  # Either one convinced model or two agreeing ones may fire.
+  mode: strong_or_consensus
+
+  # 0.75 is a high bar on purpose: this is the branch that lets a single model
+  # act with no corroboration.
+  strong_confidence: 0.75
+
+  # A model must clear this to count as one of the agreeing voices, and the
+  # agreeing group's mean must clear it too.
+  consensus_confidence: 0.55
+  min_consensus_models: 2
+
+  # An opposing conviction at or above this blocks outright, so the decision's
+  # stated reason is "models disagree" rather than a low number.
+  conflict_veto_confidence: 0.5
+
+  # Expected value, in percent of entry price and net of the ~0.8% round-trip
+  # Indian friction stack, that a trade must clear to be worth taking. 0.5%
+  # leaves room for the sizing and slippage the estimate cannot see.
+  min_net_ev_pct: 0.5
+
+  # Muted members are silenced rather than allowed to veto. Set to "veto" for
+  # the stricter reading, where any regime-incompatible model blocks the trade.
+  regime_policy: mute
+
+  # A trade that only just clears its threshold is taken at half size.
+  min_size_multiplier: 0.5
+  max_size_multiplier: 1.0
+
+# Which members may buy in which regime.
+#
+# BULL_RISK_ON    Nifty above its 200-day average, realized vol below target.
+#                 Trend-following works; the defensive sleeve only drags.
+# BEAR_CRASH_RISK Nifty below its 200-day average, or realized vol above 1.5x
+#                 target. Momentum's crashes live here — it is muted outright,
+#                 and only the low-volatility sleeve is allowed to buy.
+# SIDEWAYS_CHOP   Nifty within 2% of its 200-day average with ADX below 20.
+#                 No persistent direction: trend sleeves whipsaw, so the
+#                 mean-reverting rule-based sleeve and the neural forecaster
+#                 carry the book.
+# NEUTRAL         Above the average but with volatility between target and the
+#                 crash multiple. Not risk-on, not a crash; the sleeves that
+#                 do not depend on a clean trend stay on.
+regimes:
+  BULL_RISK_ON:
+    - quality_momentum
+    - trend_rules
+    - neural_quantile
+  BEAR_CRASH_RISK:
+    - defensive_low_vol
+  SIDEWAYS_CHOP:
+    - trend_rules
+    - neural_quantile
+    - defensive_low_vol
+  NEUTRAL:
+    - defensive_low_vol
+    - trend_rules
+    - neural_quantile
+
+members:
+  # Cross-sectional momentum, top decile by 9-month (skip 1-month) formation
+  # return. Its own crash protection stays on underneath the regime map: the
+  # map decides whether it may speak, volatility targeting decides how loudly.
+  - type: momentum
+    weight: 1.0
+    params:
+      name: quality_momentum
+      top_percentile: 0.1
+      min_universe: 30
+      regime_filter: true
+      volatility_target: 0.20
+      liquidity_filter: true
+      max_operator_trap_fraction: 0.05
+
+  # The low-volatility anomaly, bottom decile by 60-day realized volatility.
+  # The zombie screen matters most here: an illiquid stock's suppressed
+  # variance is exactly what would rank it first.
+  - type: low_volatility
+    weight: 1.0
+    params:
+      name: defensive_low_vol
+      top_percentile: 0.1
+      min_universe: 30
+      regime_filter: false
+      liquidity_filter: true
+      max_zero_return_fraction: 0.30
+
+  # Per-ticker trend/breakout/volume rules with a Monte Carlo probability
+  # component. Note the trade-off documented in strategies/ensemble.py: inside
+  # a batched UMA this member receives no per-ticker Monte Carlo result, so its
+  # MC_Prob component scores zero and it votes on the technical rules alone.
+  - type: rule_based
+    weight: 1.0
+    config_path: config/strategies/trend_breakout.yaml
+    params:
+      name: trend_rules
+
+  # The quantile forecaster. Its confidence is the isotonic-calibrated
+  # probability shipped with the checkpoint, and its stop and target come from
+  # the predicted 10th/90th percentiles rather than fixed cuts.
+  - type: lstm
+    weight: 1.0
+    params:
+      name: neural_quantile
+      model_name: patchtst
+      models_dir: models

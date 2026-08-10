@@ -28,6 +28,7 @@ try:
     from .data_store import load_ticker_data
     from .liquidity import lower_circuit_locked_days
     from .models import AgentBrain
+    from .regime import assess_market_regime
     from .execution_sim import ExecutionSimulator
     from .monte_carlo import MonteCarloSettings
     from .risk import MAX_KELLY_FRACTION, calculate_kelly_quantity, estimate_kelly_inputs
@@ -38,6 +39,7 @@ except ImportError:
     from data_store import load_ticker_data
     from liquidity import lower_circuit_locked_days
     from models import AgentBrain
+    from regime import assess_market_regime
     from execution_sim import ExecutionSimulator
     from monte_carlo import MonteCarloSettings
     from risk import MAX_KELLY_FRACTION, calculate_kelly_quantity, estimate_kelly_inputs
@@ -277,6 +279,9 @@ class BacktestEngine:
         # cached, in which case the filter uses its composite fallback.
         self.benchmark_symbol = benchmark_symbol
         self.benchmark_close: Optional[pd.Series] = None
+        # The full OHLC frame, kept alongside the closes because ADX — and so
+        # the SIDEWAYS_CHOP classification — needs the daily range.
+        self.benchmark_ohlcv: Optional[pd.DataFrame] = None
         if benchmark_symbol:
             benchmark_df = load_ticker_data(
                 benchmark_symbol,
@@ -285,6 +290,7 @@ class BacktestEngine:
             )
             if benchmark_df is not None and 'close' in benchmark_df.columns:
                 self.benchmark_close = benchmark_df['close'].sort_index()
+                self.benchmark_ohlcv = benchmark_df.sort_index()
                 logger.info(
                     f"Loaded benchmark {benchmark_symbol} "
                     f"({len(self.benchmark_close)} bars) for the market-regime filter"
@@ -786,12 +792,18 @@ class BacktestEngine:
                 ticker: build_features(hist_data, self.strategy.required_features())
                 for ticker, hist_data in eligible.items()
             }
+            benchmark_close = self._benchmark_up_to(current_date)
+            benchmark_ohlcv = self._benchmark_ohlcv_up_to(current_date)
             context = StrategyContext(
                 risk=self.risk_params,
                 weights=weights,
                 # Strictly before T, exactly like every other input: the
                 # regime filter must not see the day it is deciding on.
-                benchmark_close=self._benchmark_up_to(current_date),
+                benchmark_close=benchmark_close,
+                benchmark_ohlcv=benchmark_ohlcv,
+                # Classified once per round and shared, so every model in the
+                # round is arbitrated against the same market state.
+                regime_label=self._classify_regime(benchmark_close, benchmark_ohlcv),
             )
             return self.strategy.score_batch(features_by_symbol, context)
 
@@ -822,6 +834,34 @@ class BacktestEngine:
             return None
         truncated = self.benchmark_close[self.benchmark_close.index < current_date]
         return truncated if not truncated.empty else None
+
+    def _benchmark_ohlcv_up_to(self, current_date: pd.Timestamp) -> Optional[pd.DataFrame]:
+        """Benchmark OHLC bars strictly before `current_date`."""
+        if self.benchmark_ohlcv is None:
+            return None
+        truncated = self.benchmark_ohlcv[self.benchmark_ohlcv.index < current_date]
+        return truncated if not truncated.empty else None
+
+    def _classify_regime(
+        self,
+        benchmark_close: Optional[pd.Series],
+        benchmark_ohlcv: Optional[pd.DataFrame],
+    ) -> Optional[str]:
+        """Name the market state for this scoring round.
+
+        Derived here, once, rather than inside each strategy: a UMA whose
+        members are gated by regime and whose cross-sectional members each
+        assess their own regime could otherwise be muted against one
+        classification while sizing against another.
+
+        Returns None when there is no benchmark to classify from, which the
+        meta-orchestrator reads as "permit every model" rather than as a reason
+        to stand the book down.
+        """
+        if benchmark_close is None:
+            return None
+        regime = assess_market_regime(benchmark_close, market_ohlcv=benchmark_ohlcv)
+        return regime.classification
 
     def _get_scoring_executor(self) -> ProcessPoolExecutor:
         """Return this run's scoring process pool, creating it on first use.

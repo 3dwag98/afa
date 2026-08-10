@@ -126,6 +126,76 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return atr
 
 
+def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Wilder's Average Directional Index — trend *strength*, ignoring direction.
+
+    ADX is what separates a market grinding sideways from one trending, at the
+    same distance from its moving average. Below ~20 the directional movement
+    is not persistent enough to call a trend, which is precisely the state that
+    punishes momentum (whipsaw entries, no follow-through) and rewards mean
+    reversion.
+
+    The construction, per Wilder:
+
+        +DM = up_move   if up_move > down_move and up_move > 0   else 0
+        -DM = down_move if down_move > up_move and down_move > 0 else 0
+        +DI = 100 * smoothed(+DM) / ATR,   -DI = 100 * smoothed(-DM) / ATR
+        DX  = 100 * |+DI - -DI| / (+DI + -DI)
+        ADX = smoothed(DX)
+
+    where up_move = high_t - high_{t-1} and down_move = low_{t-1} - low_t.
+
+    **Close-only degradation.** When the frame carries no high/low — an index
+    series cached as closes alone — high and low both fall back to the close.
+    The formulas stay well defined: true range collapses to |close_t -
+    close_{t-1}|, and each day contributes its whole move to +DM or -DM
+    according to sign. The result is a genuine directional index computed on a
+    coarser measure of range, so it reads somewhat higher than the OHLC version
+    on the same market. It is a proxy, and callers that can supply high/low
+    should.
+
+    Args:
+        df: Frame with 'close', and ideally 'high' and 'low'.
+        period: Wilder smoothing period.
+
+    Returns:
+        Series of ADX values in [0, 100]; NaN until the smoothing warms up.
+    """
+    if 'close' not in df.columns or len(df) < 2:
+        return pd.Series(np.nan, index=df.index, dtype=float)
+
+    close = pd.to_numeric(df['close'], errors='coerce')
+    high = pd.to_numeric(df['high'], errors='coerce') if 'high' in df.columns else close
+    low = pd.to_numeric(df['low'], errors='coerce') if 'low' in df.columns else close
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    true_range = pd.concat(
+        [high - low, (high - close.shift()).abs(), (low - close.shift()).abs()],
+        axis=1,
+    ).max(axis=1)
+
+    # Wilder's smoothing is an EMA with alpha = 1/period.
+    def _smooth(series: pd.Series) -> pd.Series:
+        return series.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+
+    atr = _smooth(true_range)
+    # A dead-flat stretch has zero range and no directional information; NaN
+    # says "unmeasurable" where 0/0 would otherwise say "no trend, confidently".
+    atr = atr.replace(0.0, np.nan)
+
+    plus_di = 100.0 * _smooth(plus_dm) / atr
+    minus_di = 100.0 * _smooth(minus_dm) / atr
+
+    di_sum = (plus_di + minus_di).replace(0.0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / di_sum
+    return _smooth(dx)
+
+
 def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Add all technical indicators to a DataFrame.
 

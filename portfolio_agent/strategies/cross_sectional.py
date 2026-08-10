@@ -274,6 +274,7 @@ def _assess_regime(
     features_by_symbol: Dict[str, pd.DataFrame],
     protection: CrashProtection,
     benchmark_close: Optional[pd.Series] = None,
+    benchmark_ohlcv: Optional[pd.DataFrame] = None,
 ) -> MarketRegime:
     """Derive the market regime, preferring a real index over a composite.
 
@@ -293,7 +294,12 @@ def _assess_regime(
         return neutral_regime("regime filter disabled")
 
     market_close = benchmark_close
+    market_ohlcv = benchmark_ohlcv
     if market_close is None or len(market_close) < protection.trend_window + 1:
+        # A composite of the traded universe has no meaningful high/low, so the
+        # ADX-based chop test falls back to its close-only proxy rather than
+        # being fed a range that does not exist.
+        market_ohlcv = None
         close_by_symbol = {
             symbol: features["close"]
             for symbol, features in features_by_symbol.items()
@@ -316,6 +322,7 @@ def _assess_regime(
         bear_exposure=protection.bear_exposure,
         min_scale=protection.min_scale,
         max_scale=protection.max_scale,
+        market_ohlcv=market_ohlcv,
     )
 
 
@@ -581,7 +588,10 @@ class MomentumStrategy(BaseStrategy):
             if mom is not None:
                 metric_by_symbol[symbol] = mom
 
-        regime = _assess_regime(features_by_symbol, self._protection, context.benchmark_close)
+        regime = _assess_regime(
+            features_by_symbol, self._protection,
+            context.benchmark_close, context.benchmark_ohlcv,
+        )
 
         return _rank_and_select_decile(
             metric_by_symbol=metric_by_symbol,
@@ -676,7 +686,10 @@ class LowVolatilityStrategy(BaseStrategy):
             if vol is not None:
                 metric_by_symbol[symbol] = vol
 
-        regime = _assess_regime(features_by_symbol, self._protection, context.benchmark_close)
+        regime = _assess_regime(
+            features_by_symbol, self._protection,
+            context.benchmark_close, context.benchmark_ohlcv,
+        )
 
         return _rank_and_select_decile(
             metric_by_symbol=metric_by_symbol,
