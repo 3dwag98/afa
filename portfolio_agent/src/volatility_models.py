@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 # GJR-GARCH MLE needs a reasonably long history for stable convergence.
 MIN_OBSERVATIONS = 250
 
+# Student-t variance nu/(nu-2) diverges as nu -> 2, so a fitted nu at or below
+# this is not usable for generating standardized shocks.
+MIN_STUDENT_T_DF = 2.1
+
 
 @dataclass
 class GarchForecast:
@@ -40,6 +44,12 @@ class GarchForecast:
     daily_sigma: np.ndarray  # shape (horizon_days,); forecasted daily return std, decimal (not %)
     leverage_gamma: float  # fitted asymmetry coefficient; > 0 confirms the leverage effect
     persistence: float  # alpha + gamma/2 + beta; must be < 1 for a stationary process
+    # Fitted Student-t degrees of freedom (nu). This is the *whole point* of
+    # dist="t" and has to reach the simulation: fitting fat-tailed innovations
+    # and then drawing Gaussian shocks throws the tail estimate away and leaves
+    # VaR/CVaR quietly optimistic. Lower nu = fatter tails; None when the fit
+    # did not produce a usable value.
+    distribution_df: Optional[float] = None
     # Set when the forecast was built from a gap-aware decomposition
     # (see forecast_volatility_gap_aware): the constant overnight-gap standard
     # deviation folded into daily_sigma, and the session-only GARCH path.
@@ -98,10 +108,22 @@ def forecast_volatility(
         beta = float(params.get("beta[1]", 0.0))
         persistence = alpha + gamma / 2.0 + beta
 
+        # Student-t variance is nu/(nu-2), which is only finite for nu > 2.
+        # A fit that lands at or below that is unusable as a shock
+        # distribution, so it is reported as None and the caller draws
+        # Gaussian shocks rather than something with undefined variance.
+        nu = params.get("nu")
+        distribution_df = float(nu) if nu is not None and float(nu) > MIN_STUDENT_T_DF else None
+
         if not np.all(np.isfinite(daily_sigma)) or np.any(daily_sigma <= 0):
             return None
 
-        return GarchForecast(daily_sigma=daily_sigma, leverage_gamma=gamma, persistence=persistence)
+        return GarchForecast(
+            daily_sigma=daily_sigma,
+            leverage_gamma=gamma,
+            persistence=persistence,
+            distribution_df=distribution_df,
+        )
     except Exception:
         logger.debug("GJR-GARCH fit failed; falling back to constant volatility", exc_info=True)
         return None
@@ -172,6 +194,7 @@ def forecast_volatility_gap_aware(
         daily_sigma=combined,
         leverage_gamma=session.leverage_gamma,
         persistence=session.persistence,
+        distribution_df=session.distribution_df,
         overnight_sigma=gap_sigma,
         intraday_sigma=session.daily_sigma,
     )

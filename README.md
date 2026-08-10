@@ -280,6 +280,7 @@ risk:
 compliance:
   min_reward_risk: 1.2          # applied to reward:risk NET of round-trip costs
   max_sector_pct: 0.25          # max share of portfolio in any one sector
+  max_unknown_sector_pct: 0.30  # aggregate budget for tickers missing from the map
   max_portfolio_drawdown_pct: 0.15  # halt new buys past this drawdown
   drawdown_reentry_pct: 0.10        # resume buying once recovered to here
   slippage_pct_per_side: 0.0025     # assumed slippage when costing a signal
@@ -299,7 +300,7 @@ training:
 | Volatility targeting | `volatility_target` (0.20) | Scales each position by target vol / realized vol; never levers up |
 | Cost-aware signals | `risk.slippage_pct_per_side` | Reward:risk is reported net of round-trip friction (~0.8%), so the `min_reward_risk` gate compares money actually kept |
 | Tradability screen | `liquidity_filter` params | Drops circuit-locked and zombie stocks from the ranking ([§15](docs/QUANT_RESEARCH.md)) |
-| Sector cap | `risk.max_sector_pct` | Trims orders so no sector exceeds 25%. **Requires a `ticker,sector` CSV at `paths.sector_map_csv`** — without one the cap is inactive (and logs a warning), because capping the unmapped pool would limit total invested capital rather than sector concentration |
+| Sector cap | `risk.max_sector_pct`, `risk.max_unknown_sector_pct` | Trims orders so no sector exceeds 25%, with unmapped tickers sharing a wider 30% budget so an incomplete map isn't a bypass. **Requires a `ticker,sector` CSV at `paths.sector_map_csv`** — with no map at all the cap is inactive (and logs a warning), since capping the unmapped pool would limit total invested capital rather than sector concentration |
 | Drawdown breaker | `risk.max_portfolio_drawdown_pct` | Halts new entries past 15% drawdown, re-arms at 10% |
 | Kelly guards | `risk.kelly_*` | 50-trade floor, Beta-shrunk win rate, kappa hard-capped at quarter-Kelly |
 

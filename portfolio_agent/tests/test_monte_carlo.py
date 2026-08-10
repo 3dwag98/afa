@@ -319,3 +319,93 @@ class TestMonteCarloSettings:
         settings = MonteCarloSettings(method="jump_diffusion", seed=7)
 
         assert pickle.loads(pickle.dumps(settings)) == settings
+
+
+class TestStudentTInnovations:
+    """GJR-GARCH is fitted with dist='t' precisely because Indian returns are
+    fat-tailed. Simulating Gaussian shocks off that fit throws the estimate
+    away and leaves VaR/CVaR optimistic exactly where the gate reads them."""
+
+    @staticmethod
+    def _returns(n=800, df=4, seed=5):
+        return list(np.random.default_rng(seed).standard_t(df=df, size=n) * 0.01)
+
+    def test_shocks_keep_unit_variance_after_rescaling(self):
+        """Student-t variance is nu/(nu-2); without dividing it out, switching
+        to t-innovations would inflate volatility as well as widening tails,
+        and the two effects would be indistinguishable."""
+        from src.monte_carlo import _standardized_shocks
+
+        rng = np.random.default_rng(0)
+        for df in (3.0, 5.0, 30.0):
+            shocks = _standardized_shocks(rng, (200_000,), df)
+            assert shocks.std() == pytest.approx(1.0, abs=0.05)
+
+    def test_lower_degrees_of_freedom_means_fatter_tails(self):
+        from src.monte_carlo import _standardized_shocks
+
+        rng = np.random.default_rng(1)
+        fat = _standardized_shocks(rng, (200_000,), 3.0)
+        thin = _standardized_shocks(rng, (200_000,), 50.0)
+
+        def _kurtosis(x):
+            return float(((x - x.mean()) ** 4).mean() / x.std() ** 4)
+
+        assert _kurtosis(fat) > _kurtosis(thin)
+
+    def test_none_degrees_of_freedom_draws_gaussian(self):
+        from src.monte_carlo import _standardized_shocks
+
+        rng = np.random.default_rng(2)
+        shocks = _standardized_shocks(rng, (200_000,), None)
+
+        excess = float(((shocks - shocks.mean()) ** 4).mean() / shocks.std() ** 4 - 3.0)
+        assert abs(excess) < 0.2
+
+    def test_degenerate_degrees_of_freedom_falls_back_to_gaussian(self):
+        """Below nu = 2 the variance is infinite, so the draw is unusable."""
+        from src.monte_carlo import _standardized_shocks
+
+        rng = np.random.default_rng(3)
+        shocks = _standardized_shocks(rng, (50_000,), 1.5)
+
+        assert np.isfinite(shocks).all()
+        assert shocks.std() == pytest.approx(1.0, abs=0.05)
+
+    def test_t_innovations_widen_the_simulated_tail(self):
+        returns = self._returns()
+        common = dict(symbol="T", daily_returns=returns, horizon_days=5,
+                      simulations=40_000, seed=11, method="gaussian")
+
+        gaussian = run_monte_carlo(**common)
+        student_t = run_monte_carlo(innovation_df=4.0, **common)
+
+        assert student_t.cvar_95 < gaussian.cvar_95
+
+    def test_garch_wrapper_passes_its_fitted_nu_to_the_simulation(self, monkeypatch):
+        """The regression: the fit produced nu, the dataclass dropped it, and
+        the simulation drew normals regardless."""
+        from src.volatility_models import GarchForecast
+        import src.monte_carlo as mc
+
+        seen = {}
+        real_run = mc.run_monte_carlo
+
+        def spy(**kwargs):
+            seen["innovation_df"] = kwargs.get("innovation_df")
+            return real_run(**kwargs)
+
+        monkeypatch.setattr(mc, "run_monte_carlo", spy)
+        monkeypatch.setattr(
+            "src.volatility_models.forecast_volatility",
+            lambda returns, horizon: GarchForecast(
+                daily_sigma=np.full(5, 0.02), leverage_gamma=0.1,
+                persistence=0.9, distribution_df=4.2,
+            ),
+        )
+
+        mc.run_monte_carlo_garch(
+            symbol="T", daily_returns=self._returns(), horizon_days=5, simulations=100, seed=1
+        )
+
+        assert seen["innovation_df"] == pytest.approx(4.2)

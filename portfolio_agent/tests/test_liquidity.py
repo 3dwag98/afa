@@ -110,3 +110,45 @@ class TestSplitIntradayAndOvernight:
 
 
         assert split_intraday_and_overnight(df) is None
+
+
+class TestDynamicCircuitBands:
+    """Exchanges impose ad-hoc 2% bands on volatile or operator-suspected
+    scrips, not just the 5/10/20% defaults."""
+
+    @pytest.mark.parametrize("band", [0.02, 0.05, 0.10, 0.20])
+    def test_every_statutory_band_is_detected_in_both_directions(self, band):
+        up = _ohlcv([100.0, 100.0 * (1 + band)], ranges=[1.0, 0.0])
+        down = _ohlcv([100.0, 100.0 * (1 - band)], ranges=[1.0, 0.0])
+
+        assert list(circuit_locked_days(up)) == [False, True]
+        assert list(circuit_locked_days(down)) == [False, True]
+
+    def test_a_two_percent_lock_is_no_longer_missed(self):
+        """The regression: a 4.5% floor waved 2% locks straight through to the
+        momentum ranking, so the strategy would BUY a stock with no offer."""
+        df = _ohlcv([100.0, 102.0], ranges=[1.0, 0.0])
+
+        assert bool(circuit_locked_days(df).iloc[-1]) is True
+
+    def test_tick_rounding_around_a_band_still_counts(self):
+        df = _ohlcv([100.0, 101.8], ranges=[1.0, 0.0])  # 1.8%, just under 2%
+
+        assert bool(circuit_locked_days(df).iloc[-1]) is True
+
+    def test_a_move_between_bands_is_not_a_lock(self):
+        """Band matching, not a floor: 3.5% is not a statutory limit, so a
+        zero-range day there is thin trading, not a lock."""
+        df = _ohlcv([100.0, 103.5], ranges=[1.0, 0.0])
+
+        assert bool(circuit_locked_days(df).iloc[-1]) is False
+
+    def test_moves_beyond_the_widest_band_still_count(self):
+        df = _ohlcv([100.0, 135.0], ranges=[1.0, 0.0])
+
+        assert bool(circuit_locked_days(df).iloc[-1]) is True
+
+    def test_bands_are_configurable(self):
+        df = _ohlcv([100.0, 102.0], ranges=[1.0, 0.0])
+
+        assert bool(circuit_locked_days(df, bands=(0.10, 0.20)).iloc[-1]) is False

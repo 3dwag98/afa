@@ -125,3 +125,52 @@ class TestSectorCapacity:
 
     def test_zero_portfolio_value_is_unbounded(self):
         assert math.isinf(sector_capacity_inr("TCS.NS", 0.0, {}, self.SECTOR_MAP, 0.25))
+
+
+class TestUnknownSectorBudget:
+    """Indian sector maps are chronically incomplete in exactly the small- and
+    micro-cap segment where concentration risk is worst, so an exempt UNKNOWN
+    pool would be a route around the cap."""
+
+    PARTIAL_MAP = {"TCS.NS": "IT", "INFY.NS": "IT"}
+
+    def test_unmapped_names_share_one_wider_budget(self):
+        capacity = sector_capacity_inr(
+            "MICRO.NS", 1_000_000.0, {}, self.PARTIAL_MAP, 0.25, max_unknown_pct=0.30
+        )
+
+        assert capacity == pytest.approx(300_000.0)
+
+    def test_the_unmapped_pool_is_exhaustible(self):
+        """200 unmapped micro-caps must not be able to become 100% of the book."""
+        held = {f"MICRO{i}.NS": 100_000.0 for i in range(3)}
+
+        capacity = sector_capacity_inr(
+            "MICRO9.NS", 1_000_000.0, held, self.PARTIAL_MAP, 0.25, max_unknown_pct=0.30
+        )
+
+        assert capacity == 0.0
+
+    def test_unmapped_exposure_does_not_consume_a_mapped_sectors_allowance(self):
+        held = {"MICRO.NS": 300_000.0}
+
+        capacity = sector_capacity_inr(
+            "TCS.NS", 1_000_000.0, held, self.PARTIAL_MAP, 0.25, max_unknown_pct=0.30
+        )
+
+        assert capacity == pytest.approx(250_000.0)
+
+    def test_with_no_map_at_all_the_cap_stays_inactive(self):
+        """Otherwise a missing CSV freezes the whole portfolio at 30% invested."""
+        capacity = sector_capacity_inr(
+            "ANY.NS", 1_000_000.0, {}, {}, 0.25, max_unknown_pct=0.30
+        )
+
+        assert math.isinf(capacity)
+
+    def test_unknown_budget_can_be_disabled(self):
+        capacity = sector_capacity_inr(
+            "MICRO.NS", 1_000_000.0, {}, self.PARTIAL_MAP, 0.25, max_unknown_pct=0.0
+        )
+
+        assert math.isinf(capacity)

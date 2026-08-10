@@ -142,6 +142,7 @@ class BacktestEngine:
         kelly_min_trades: int = 50,
         kelly_shrinkage_strength: float = 20.0,
         max_sector_pct: float = 0.0,
+        max_unknown_sector_pct: float = 0.30,
         sector_map_csv: Optional[str] = None,
         max_portfolio_drawdown_pct: float = 0.0,
         drawdown_reentry_pct: float = 0.10,
@@ -182,6 +183,8 @@ class BacktestEngine:
             kelly_min_trades: Minimum realized trades required before Kelly sizing is trusted.
             kelly_shrinkage_strength: Beta-prior strength shrinking the realized
                 win rate toward 0.5 before it reaches Kelly (see src/risk.py).
+            max_unknown_sector_pct: Aggregate cap on tickers missing from the
+                sector map, so an incomplete map is not a way around the cap.
             max_sector_pct: Cap on any one sector's share of portfolio value.
                 0 (the default here) disables the cap; BacktesterAgent passes
                 the configured value through.
@@ -241,6 +244,7 @@ class BacktestEngine:
         # is inactive rather than applied to a single UNKNOWN pool — pooling
         # would cap total invested capital, not sector concentration.
         self.max_sector_pct = max_sector_pct
+        self.max_unknown_sector_pct = max_unknown_sector_pct
         self.sector_map = load_sector_map(sector_map_csv) if max_sector_pct > 0 else {}
         if max_sector_pct > 0 and not sector_cap_is_enforceable(self.sector_map):
             logger.warning(
@@ -1083,6 +1087,22 @@ class BacktestEngine:
 
         return executed_trades
     
+    @staticmethod
+    def _net_return_pct(trade: Dict[str, Any]) -> float:
+        """A closed trade's return on cost basis, net of costs and taxes.
+
+        `net_pnl` already has brokerage, STT, exchange and SEBI charges, GST,
+        stamp duty and capital gains tax deducted, so this is the return the
+        portfolio actually kept — the only version Kelly's payoff ratio should
+        be estimated from.
+        """
+        entry_price = float(trade.get("entry_price") or 0.0)
+        quantity = float(trade.get("quantity") or 0.0)
+        cost_basis = entry_price * quantity
+        if cost_basis <= 0:
+            return 0.0
+        return float(trade.get("net_pnl", 0.0)) / cost_basis * 100.0
+
     def _kelly_quantity(self, entry_price: float) -> int:
         """Fractional-Kelly position size from this run's realized trade_log so far.
 
@@ -1093,8 +1113,18 @@ class BacktestEngine:
         # Only *closed* round trips are realized outcomes. Open BUY legs carry
         # net_pnl = -transaction_costs, so counting them here classified every
         # open position as a loss and dragged the Kelly win probability down.
+        # Both Kelly inputs are measured net of friction. The trade log's
+        # `return_pct` is a GROSS figure (gross_pnl / cost basis), so feeding
+        # it to Kelly would pair a net win/loss classification with a gross
+        # payoff ratio b — and b is what f* is most sensitive to after p. On a
+        # trade whose gross reward:risk is 2.0, round-trip costs take the
+        # realized ratio nearer 1.8, so a gross b systematically overstates
+        # the edge and Kelly over-bets on it.
         realized = [
-            {"outcome": "WIN" if t.get("net_pnl", 0.0) > 0 else "LOSS", "return_pct": t.get("return_pct", 0.0)}
+            {
+                "outcome": "WIN" if t.get("net_pnl", 0.0) > 0 else "LOSS",
+                "return_pct": self._net_return_pct(t),
+            }
             for t in self.trade_log
             if t.get("exit_date") is not None
         ]
@@ -1303,6 +1333,7 @@ class BacktestEngine:
             position_values=position_values,
             sector_map=self.sector_map,
             max_sector_pct=self.max_sector_pct,
+            max_unknown_pct=self.max_unknown_sector_pct,
         )
         if math.isinf(capacity):
             # The cap does not apply to this ticker (disabled, or unmapped

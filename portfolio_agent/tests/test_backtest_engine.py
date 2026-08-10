@@ -568,3 +568,82 @@ class TestBenchmarkWiring:
         signals = engine._generate_signals(pd.Timestamp("2023-03-01"))
 
         assert isinstance(signals, dict)
+
+
+class TestKellyUsesNetReturns:
+    """Kelly's payoff ratio b is what f* is most sensitive to after p. The
+    trade log's `return_pct` is GROSS, so feeding it to Kelly would pair a net
+    win/loss classification with a gross payoff ratio and over-bet."""
+
+    def _engine(self, synthetic_data):
+        return BacktestEngine(
+            start_date="2023-01-02", end_date="2023-03-31",
+            initial_capital=1_000_000.0, universe_tickers=synthetic_data['tickers'],
+            use_kelly_sizing=True, kelly_min_trades=10, kelly_shrinkage_strength=0.0,
+        )
+
+    @staticmethod
+    def _trade(entry_price, quantity, gross_pnl, costs):
+        net = gross_pnl - costs
+        return {
+            'entry_price': entry_price, 'quantity': quantity,
+            'gross_pnl': gross_pnl, 'net_pnl': net,
+            'return_pct': gross_pnl / (entry_price * quantity) * 100,
+            'exit_date': '2023-02-01',
+        }
+
+    def test_net_return_pct_deducts_costs_and_taxes(self, synthetic_data):
+        engine = self._engine(synthetic_data)
+        trade = self._trade(entry_price=100.0, quantity=100, gross_pnl=1000.0, costs=200.0)
+
+        assert trade['return_pct'] == pytest.approx(10.0)          # gross
+        assert engine._net_return_pct(trade) == pytest.approx(8.0)  # net
+
+    def test_zero_cost_basis_is_handled(self, synthetic_data):
+        engine = self._engine(synthetic_data)
+
+        assert engine._net_return_pct({'entry_price': 0.0, 'quantity': 0, 'net_pnl': 5.0}) == 0.0
+
+    def test_kelly_sizes_smaller_off_net_than_gross_returns(self, synthetic_data):
+        """Costs shave the winners more than they help the losers, so the net
+        payoff ratio is lower and Kelly must bet less on it."""
+        engine = self._engine(synthetic_data)
+        engine.risk_params.max_single_position_pct = 0.9
+        engine.portfolio_value = 1_000_000.0
+
+        # 12 wins of +10% gross, 8 losses of -5% gross, 2% of cost basis in
+        # friction on every trade.
+        engine.trade_log = (
+            [self._trade(100.0, 100, 1000.0, 200.0) for _ in range(12)]
+            + [self._trade(100.0, 100, -500.0, 200.0) for _ in range(8)]
+        )
+
+        net_quantity = engine._kelly_quantity(entry_price=100.0)
+
+        # Same history scored off the gross column, as the code used to.
+        from src.risk import calculate_kelly_quantity, estimate_kelly_inputs
+        gross_inputs = estimate_kelly_inputs(
+            [
+                {"outcome": "WIN" if t["net_pnl"] > 0 else "LOSS", "return_pct": t["return_pct"]}
+                for t in engine.trade_log
+            ],
+            min_trades=10, shrinkage_strength=0.0,
+        )
+        gross_quantity = calculate_kelly_quantity(
+            entry_price=100.0, portfolio_value_inr=engine.portfolio_value,
+            max_single_position_pct=0.9,
+            win_probability=gross_inputs[0], reward_risk_ratio=gross_inputs[1],
+            kelly_fraction=engine.kelly_fraction,
+        )
+
+        assert net_quantity < gross_quantity
+
+    def test_open_positions_are_excluded(self, synthetic_data):
+        """An open BUY leg carries net_pnl = -costs and no exit; counting it
+        would classify every open position as a realized loss."""
+        engine = self._engine(synthetic_data)
+        engine.trade_log = [
+            {'entry_price': 100.0, 'quantity': 10, 'net_pnl': -20.0, 'exit_date': None}
+        ] * 50
+
+        assert engine._kelly_quantity(entry_price=100.0) == 0

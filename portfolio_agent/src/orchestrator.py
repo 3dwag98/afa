@@ -228,6 +228,7 @@ def _sector_capped_quantity(
         position_values=planned_sector_values,
         sector_map=sector_map,
         max_sector_pct=config.risk.max_sector_pct,
+        max_unknown_pct=config.risk.max_unknown_sector_pct,
     )
     if math.isinf(capacity):
         # The cap does not apply to this ticker (disabled, or unmapped sector).

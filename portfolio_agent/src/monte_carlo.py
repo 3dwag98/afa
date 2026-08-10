@@ -33,6 +33,8 @@ runs a portfolio-level bootstrap resampling of a completed backtest's realized
 trade log to report risk-of-ruin as an output metric, not a scoring input.
 """
 
+import math
+
 import numpy as np
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Optional
@@ -43,6 +45,10 @@ if TYPE_CHECKING:
 # Minimum realized returns required before the block bootstrap is trusted; a
 # resample of a very short history just re-prints the same few days.
 MIN_BOOTSTRAP_OBSERVATIONS = 60
+
+# Student-t variance nu/(nu-2) is only finite above 2; below this the draw is
+# not usable as a unit-variance shock.
+MIN_INNOVATION_DF = 2.1
 
 SimulationMethod = Literal["gaussian", "block_bootstrap", "jump_diffusion"]
 
@@ -152,6 +158,40 @@ class MonteCarloSettings:
         )
 
 
+def _standardized_shocks(
+    rng: np.random.Generator,
+    size: tuple,
+    innovation_df: Optional[float] = None,
+) -> np.ndarray:
+    """Draw unit-variance shocks — Student-t when a fitted nu is available.
+
+    GJR-GARCH is fitted with Student-t innovations precisely because Indian
+    equity returns are fat-tailed (docs/QUANT_RESEARCH.md section 3). Drawing
+    Gaussian shocks from that fit throws the estimate away and leaves VaR and
+    CVaR optimistic exactly where they matter — the 5% tail the compliance
+    gate reads.
+
+    Student-t with nu degrees of freedom has variance nu/(nu-2), so the draw
+    is divided by sqrt(nu/(nu-2)) to keep unit variance. Without that
+    rescaling, switching to t-innovations would silently inflate every
+    simulated path's volatility on top of widening its tails, and the two
+    effects would be impossible to tell apart.
+
+    Args:
+        rng: Seeded generator.
+        size: Output shape.
+        innovation_df: Fitted degrees of freedom, or None for Gaussian.
+
+    Returns:
+        Unit-variance shocks of the requested shape.
+    """
+    if innovation_df is None or innovation_df <= MIN_INNOVATION_DF:
+        return rng.normal(0.0, 1.0, size=size)
+
+    scale = math.sqrt(innovation_df / (innovation_df - 2.0))
+    return rng.standard_t(df=innovation_df, size=size) / scale
+
+
 def _block_bootstrap_shocks(
     demeaned_log_returns: np.ndarray,
     simulations: int,
@@ -206,6 +246,7 @@ def _jump_diffusion_shocks(
     jump_mean: float,
     jump_volatility: float,
     rng: np.random.Generator,
+    innovation_df: Optional[float] = None,
 ) -> np.ndarray:
     """Draw Gaussian diffusion shocks plus a compound-Poisson jump component.
 
@@ -227,7 +268,9 @@ def _jump_diffusion_shocks(
     Returns:
         Array of shape (simulations, horizon_days).
     """
-    diffusion = rng.normal(0.0, 1.0, size=(simulations, horizon_days)) * sigma_path[None, :]
+    diffusion = _standardized_shocks(
+        rng, (simulations, horizon_days), innovation_df
+    ) * sigma_path[None, :]
 
     daily_intensity = max(0.0, jump_intensity_per_year) / 252.0
     if daily_intensity <= 0:
@@ -254,6 +297,7 @@ def run_monte_carlo(
     jump_intensity_per_year: float = 12.0,
     jump_mean: float = -0.02,
     jump_volatility: float = 0.05,
+    innovation_df: Optional[float] = None,
 ) -> MonteCarloResult:
     """Run Monte Carlo simulation on historical returns using log returns.
 
@@ -276,6 +320,11 @@ def run_monte_carlo(
         jump_intensity_per_year: Expected jumps per year for method="jump_diffusion".
         jump_mean: Mean log jump size for method="jump_diffusion".
         jump_volatility: Std dev of log jump size for method="jump_diffusion".
+        innovation_df: Student-t degrees of freedom for the shock draw, e.g.
+            the nu fitted by GJR-GARCH. None draws Gaussian shocks. Applies to
+            the "gaussian" method and to jump_diffusion's diffusion leg;
+            block_bootstrap already inherits the empirical tail shape by
+            construction and ignores it.
 
     Returns:
         MonteCarloResult with simulation statistics.
@@ -337,6 +386,7 @@ def run_monte_carlo(
         shocks = _jump_diffusion_shocks(
             sigma_path, simulations, horizon_days,
             jump_intensity_per_year, jump_mean, jump_volatility, rng,
+            innovation_df=innovation_df,
         )
         # Compensated drift: subtracting the jump component's expected
         # contribution keeps the process's mean return equal to the historical
@@ -350,7 +400,9 @@ def run_monte_carlo(
         cumulative_returns = np.full(simulations, mu * horizon_days)
     else:
         daily_drift_path = mu - 0.5 * sigma_path ** 2
-        random_shocks = rng.normal(0.0, 1.0, size=(simulations, horizon_days)) * sigma_path[None, :]
+        random_shocks = _standardized_shocks(
+            rng, (simulations, horizon_days), innovation_df
+        ) * sigma_path[None, :]
         cumulative_returns = (daily_drift_path[None, :] + random_shocks).sum(axis=1)
 
     # Probability profit = mean(cumulative_returns > 0)
@@ -430,6 +482,10 @@ def run_monte_carlo_garch(
     if forecast is None:
         forecast = forecast_volatility(daily_returns, horizon_days)
     daily_vol_forecast = forecast.daily_sigma if forecast is not None else None
+    # The fitted Student-t nu travels with the volatility path. Fitting
+    # fat-tailed innovations and then simulating Gaussian shocks would discard
+    # the tail estimate the fit exists to produce.
+    innovation_df = forecast.distribution_df if forecast is not None else None
 
     return run_monte_carlo(
         symbol=symbol,
@@ -443,4 +499,5 @@ def run_monte_carlo_garch(
         jump_intensity_per_year=jump_intensity_per_year,
         jump_mean=jump_mean,
         jump_volatility=jump_volatility,
+        innovation_df=innovation_df,
     )

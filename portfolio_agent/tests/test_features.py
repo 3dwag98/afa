@@ -412,3 +412,42 @@ class TestNormalizeFeatures:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestNormalizationIsCausal:
+    """Z-scoring with statistics fitted over the whole panel would leak future
+    volatility and price levels into every training row — the classic way a
+    walk-forward Sharpe of 2.0 turns into a live loss."""
+
+    @staticmethod
+    def _ohlcv(n=300, seed=3):
+        rng = np.random.default_rng(seed)
+        close = 100 * np.exp(np.cumsum(rng.normal(0.0005, 0.01, n)))
+        return pd.DataFrame({
+            'open': close, 'high': close * 1.01, 'low': close * 0.99,
+            'close': close, 'volume': np.full(n, 1e6),
+        }, index=pd.bdate_range('2022-01-03', periods=n))
+
+    def test_early_rows_do_not_change_when_later_data_is_appended(self):
+        """The decisive test: if normalization used full-sample statistics,
+        adding future bars would rewrite the past."""
+        full = self._ohlcv(n=300)
+        truncated = full.iloc[:200]
+
+        names = ['sma_20', 'rsi_14', 'atr_14']
+        normalized_full = build_features(full, names, normalize=True, normalize_window=252)
+        normalized_short = build_features(truncated, names, normalize=True, normalize_window=252)
+
+        overlap_full = normalized_full.iloc[:200].dropna()
+        overlap_short = normalized_short.dropna()
+        common = overlap_full.index.intersection(overlap_short.index)
+
+        assert len(common) > 100
+        assert np.allclose(
+            overlap_full.loc[common].values, overlap_short.loc[common].values, equal_nan=True
+        )
+
+    def test_normalization_is_off_in_the_shipped_config(self):
+        from portfolio_agent.config.loader import load_config
+
+        assert load_config().features.normalize is False
