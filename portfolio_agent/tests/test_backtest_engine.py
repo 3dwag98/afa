@@ -976,3 +976,44 @@ class TestDrawdownBreakerCooldown:
         engine._update_circuit_breaker(pd.Timestamp("2023-12-01"))
 
         assert engine.buying_halted is True
+
+
+class TestExitTriggerQueueing:
+    def test_a_breaker_tripping_on_the_first_day_still_honours_the_cooldown(self):
+        """`or` instead of `is None` reads day zero as 'never tripped', which
+        makes the cooldown permanently unsatisfiable."""
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-12-29",
+            initial_capital=1_000_000.0, universe_tickers=[],
+            max_portfolio_drawdown_pct=0.15, drawdown_reentry_pct=0.10,
+            drawdown_halt_max_days=5,
+        )
+        engine.trading_day_count = 0
+        engine.portfolio_value = 800_000.0
+        engine._update_circuit_breaker(pd.Timestamp("2023-01-02"))
+        assert engine.buying_halted is True
+        assert engine.halted_since_day == 0
+
+        engine.trading_day_count = 5
+        engine._update_circuit_breaker(pd.Timestamp("2023-01-09"))
+        assert engine.buying_halted is False
+
+    def test_an_unfilled_exit_is_not_queued_twice(self, synthetic_data):
+        """A sell that could not fill yesterday is still pending; stacking a
+        second one sells a quantity the book does not hold."""
+        ticker = synthetic_data['tickers'][0]
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-06-30",
+            initial_capital=1_000_000.0, universe_tickers=synthetic_data['tickers'],
+        )
+        engine.holdings[ticker] = 100
+
+        df = engine.ticker_data[ticker]
+        lock_date = df.index[-1]
+        df.loc[df.index[-2], ['open', 'high', 'low', 'close']] = 100.0
+        df.loc[lock_date, ['open', 'high', 'low', 'close']] = [98.0, 98.0, 95.0, 95.0]
+
+        engine._create_pending_orders({}, lock_date)
+        engine._create_pending_orders({}, lock_date)
+
+        assert len([o for o in engine.pending_orders if o['action'] == 'SELL']) == 1

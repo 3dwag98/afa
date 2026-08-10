@@ -1347,7 +1347,11 @@ class BacktestEngine:
             )
             return
 
-        halted_days = self.trading_day_count - (self.halted_since_day or self.trading_day_count)
+        # `is None`, not `or`: trading_day_count starts at 0, and a falsy check
+        # would read a breaker that tripped on day zero as never having tripped,
+        # leaving the cooldown permanently unsatisfiable.
+        started = self.halted_since_day if self.halted_since_day is not None else self.trading_day_count
+        halted_days = self.trading_day_count - started
         if self.drawdown_halt_max_days > 0 and halted_days >= self.drawdown_halt_max_days:
             self.buying_halted = False
             self.halted_since_day = None
@@ -1482,9 +1486,15 @@ class BacktestEngine:
         signal_sells = {
             t for t, s in signals.items() if s.signal == 'SELL' and t in self.holdings
         }
+        # An order that could not fill yesterday (a market holiday, a missing
+        # bar) is still queued. Re-queueing the same exit on each subsequent
+        # day would stack sells against a position only large enough for one.
+        already_queued = {
+            o['ticker'] for o in self.pending_orders if o['action'] == 'SELL'
+        }
         for ticker in sorted(forced_exits.keys() | signal_sells):
             quantity = self.holdings.get(ticker, 0)
-            if quantity <= 0:
+            if quantity <= 0 or ticker in already_queued:
                 continue
             reason = forced_exits.get(ticker)
             if reason is not None:

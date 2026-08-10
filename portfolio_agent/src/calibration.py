@@ -93,8 +93,11 @@ def pool_adjacent_violators(
 
     fitted = np.repeat(np.asarray(block_means), np.asarray(block_sizes))
 
-    # Collapse runs of identical fitted values into knots; interpolation
-    # between them reproduces the step function exactly and stores far less.
+    # Collapse runs of identical fitted values into knots. Every original x
+    # still maps to exactly its fitted value (a dropped point sits between two
+    # knots that share that value), and predict() interpolates linearly between
+    # distinct levels rather than stepping — the standard isotonic predictor,
+    # and the smoother choice for a probability map.
     keep = np.ones(len(x), dtype=bool)
     keep[1:-1] = ~(
         np.isclose(fitted[1:-1], fitted[:-2]) & np.isclose(fitted[1:-1], fitted[2:])
