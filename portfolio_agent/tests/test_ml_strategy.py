@@ -113,5 +113,88 @@ class TestMLStrategy:
         assert signals["SHORT.NS"].rationale == "Insufficient history for model input"
 
 
+class TestInputStandardization:
+    """The network is fitted on standardized inputs, so inference has to apply
+    the identical transform. Scoring raw price levels against weights trained
+    on z-scores is not a small error — it is feeding the model values tens of
+    thousands of standard deviations from anything it ever saw."""
+
+    def test_scaler_from_metadata_is_applied_before_the_forward_pass(
+        self, trained_checkpoint, monkeypatch
+    ):
+        scaler_payload = {
+            "mean": [100.0] * len(FEATURE_NAMES),
+            "std": [10.0] * len(FEATURE_NAMES),
+            "clip": 10.0,
+        }
+        metadata_path = trained_checkpoint / "metadata.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata["feature_scaler"] = scaler_payload
+        metadata_path.write_text(json.dumps(metadata))
+
+        strategy = MLStrategy(StrategyConfig(), models_dir=str(trained_checkpoint))
+        assert strategy.load()
+
+        seen = []
+        original = strategy._loader.predict_batch
+        monkeypatch.setattr(
+            strategy._loader, "predict_batch",
+            lambda tensor: (seen.append(tensor.clone()), original(tensor))[1],
+        )
+
+        n = SEQUENCE_LENGTH + 2
+        raw = pd.DataFrame(
+            {name: np.full(n, 150.0) for name in FEATURE_NAMES} | {"close": np.full(n, 150.0)}
+        )
+        context = StrategyContext(risk=RiskParams(0.55, 1.5, 20.0, 1000000.0, 0.01, 0.03), weights={})
+
+        strategy.score_batch({"AAA.NS": raw}, context)
+
+        # (150 - 100) / 10 == 5.0, not the raw 150.
+        assert seen and torch.allclose(seen[0], torch.full_like(seen[0], 5.0))
+
+    def test_checkpoints_without_a_scaler_are_scored_on_raw_features(
+        self, trained_checkpoint, monkeypatch
+    ):
+        """Checkpoints trained before standardization existed carry no scaler
+        and must keep behaving exactly as they did."""
+        strategy = MLStrategy(StrategyConfig(), models_dir=str(trained_checkpoint))
+        assert strategy.load()
+        assert strategy._loader.scaler is None
+
+        seen = []
+        original = strategy._loader.predict_batch
+        monkeypatch.setattr(
+            strategy._loader, "predict_batch",
+            lambda tensor: (seen.append(tensor.clone()), original(tensor))[1],
+        )
+
+        n = SEQUENCE_LENGTH + 2
+        raw = pd.DataFrame(
+            {name: np.full(n, 150.0) for name in FEATURE_NAMES} | {"close": np.full(n, 150.0)}
+        )
+        context = StrategyContext(risk=RiskParams(0.55, 1.5, 20.0, 1000000.0, 0.01, 0.03), weights={})
+
+        strategy.score_batch({"AAA.NS": raw}, context)
+
+        assert seen and torch.allclose(seen[0], torch.full_like(seen[0], 150.0))
+
+    def test_infinite_feature_rows_are_dropped_like_nans(self, trained_checkpoint):
+        """A zero-priced bar makes the ratio features infinite; dropna() leaves
+        those rows in place and the whole forward pass comes back NaN."""
+        strategy = MLStrategy(StrategyConfig(), models_dir=str(trained_checkpoint))
+        assert strategy.load()
+
+        n = SEQUENCE_LENGTH + 4
+        features = _features_df(9).iloc[:n].copy()
+        features.iloc[2, 0] = np.inf
+
+        sequence = strategy._sequence_tensor(features)
+
+        assert sequence is not None
+        assert torch.isfinite(sequence).all()
+        assert len(sequence) == SEQUENCE_LENGTH
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

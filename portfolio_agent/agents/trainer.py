@@ -20,12 +20,13 @@ from tqdm import tqdm
 from portfolio_agent.config.schema import AppConfig, TrainingConfig
 from portfolio_agent.data.dataset import TimeSeriesDataset, create_dataloaders
 from portfolio_agent.features.pipeline import build_features
+from portfolio_agent.features.scaling import FeatureScaler
 from portfolio_agent.models.pytorch_models import PointLoss, QuantileLoss, sorted_quantiles
 from portfolio_agent.models.registry import get_model
 from portfolio_agent.src.calibration import IsotonicCalibrator, calibration_error
 from portfolio_agent.src.data_store import load_ticker_data
 from portfolio_agent.src.universe import resolve_backtest_universe
-from portfolio_agent.utils.device import get_device
+from portfolio_agent.utils.device import get_device, mixed_precision_support
 
 TRAINING_FEATURE_NAMES = [
     'sma_20', 'sma_50', 'rsi_14', 'macd',
@@ -33,6 +34,26 @@ TRAINING_FEATURE_NAMES = [
 ]
 
 TRADING_DAYS_PER_YEAR = 252
+
+# Global gradient-norm cap. Recurrent models on financial data produce
+# occasional very large gradients (a single volatile window is enough), and one
+# unclipped step is all it takes to move the weights somewhere every subsequent
+# loss evaluates to NaN from. 1.0 is the standard choice for LSTMs.
+GRAD_CLIP_NORM = 1.0
+
+
+def _non_finite_loss_advice(use_mixed_precision: bool) -> str:
+    """What to actually do about NaN/inf losses, given the current setup."""
+    if use_mixed_precision:
+        return (
+            "Mixed precision is on: fp16 overflows at 65504, which any price-level "
+            "feature can exceed. Set training.use_mixed_precision=false and re-run "
+            "if this persists."
+        )
+    return (
+        "Check the cached bars for the affected tickers — zero or missing prices "
+        "make the ratio features (return_1d, bollinger_pct_b) non-finite."
+    )
 
 
 def head_width(training: TrainingConfig) -> int:
@@ -311,8 +332,14 @@ def prepare_features(df: pd.DataFrame, config: AppConfig, verbose: bool = True) 
     target_name = target_column_name(config.training.target)
     feature_df[target_name] = build_forward_return(df['close'], config.training.target)
 
-    # Drop NaN values
-    feature_df = feature_df.dropna()
+    # Drop rows that are not finite — NaN *or* infinite. dropna() alone leaves
+    # the infinities behind, and every one of them turns into a NaN loss the
+    # moment it reaches the network. They are not hypothetical on this data:
+    # several features are ratios (`return_1d` divides by the previous close,
+    # `volume_ratio_20` by a 20-day average volume, `bollinger_pct_b` by the
+    # band width), and a cached bar with a zero price or a zero-volume week
+    # makes the denominator zero. So does the forward-return target itself.
+    feature_df = feature_df.replace([np.inf, -np.inf], np.nan).dropna()
 
     if verbose:
         print(f"Built feature matrix with {len(feature_df)} samples and {len(feature_df.columns)} columns")
@@ -455,6 +482,8 @@ def _train_model(
     progress_label: str = "",
     on_improve=None,
     loss_fn: Optional[nn.Module] = None,
+    grad_clip_norm: float = GRAD_CLIP_NORM,
+    verbose: bool = True,
 ) -> Tuple[List[float], List[float], float]:
     """Train `model` with early stopping on validation loss.
 
@@ -480,9 +509,13 @@ def _train_model(
             call still works; real runs pass build_loss(config.training), and
             folds must be given the *same* objective as the final fit or the
             generalization estimate describes a different model.
+        grad_clip_norm: Global gradient-norm cap. 0 disables clipping.
+        verbose: Print a one-line summary after every epoch.
 
     Returns:
-        (train_losses, val_losses, best_val_loss).
+        (train_losses, val_losses, best_val_loss). A returned loss is NaN only
+        when every batch in that epoch was non-finite, which is reported
+        loudly rather than being left to surface as a silent `nan`.
     """
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
     loss_fn = (loss_fn or PointLoss()).to(device)
@@ -492,6 +525,10 @@ def _train_model(
     val_losses: List[float] = []
     best_val_loss = float('inf')
     patience_counter = 0
+    # Counted across the whole run, not per epoch: one bad batch is a data
+    # artifact, thousands mean the run is not training and the operator needs
+    # to be told why rather than reading `nan` off a progress bar.
+    skipped_batches = 0
 
     for epoch in range(epochs):
         model.train()
@@ -508,28 +545,55 @@ def _train_model(
             batch_x = batch_x.to(device, non_blocking=True)
             batch_y = batch_y.to(device, non_blocking=True)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             if use_mixed_precision:
                 with torch.autocast('cuda'):
                     outputs = model(batch_x)
                     loss = loss_fn(outputs, batch_y)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
             else:
                 outputs = model(batch_x)
                 loss = loss_fn(outputs, batch_y)
+
+            # A non-finite loss cannot produce a usable gradient, and stepping
+            # on it writes NaN into every weight — after which *every*
+            # subsequent batch is NaN and the whole run is dead while still
+            # printing epochs. Skipping the batch keeps one bad window (or one
+            # fp16 overflow) from destroying the model.
+            if not torch.isfinite(loss):
+                skipped_batches += 1
+                continue
+
+            if use_mixed_precision:
+                scaler.scale(loss).backward()
+                if grad_clip_norm > 0:
+                    # Gradients are still multiplied by the scale factor here,
+                    # so they have to be unscaled before a norm computed in
+                    # real units means anything.
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
                 loss.backward()
+                if grad_clip_norm > 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
 
             epoch_train_loss += loss.item()
             num_train_batches += 1
+            pbar.set_postfix(loss=f"{epoch_train_loss / num_train_batches:.6f}", refresh=False)
 
-        avg_train_loss = epoch_train_loss / max(num_train_batches, 1)
+        # NaN rather than 0.0 when nothing was usable: a zero would read as a
+        # perfectly fitted epoch and would win every early-stopping comparison.
+        avg_train_loss = (
+            epoch_train_loss / num_train_batches if num_train_batches else float('nan')
+        )
         train_losses.append(avg_train_loss)
 
         if val_loader is None:
+            if verbose:
+                print(f"  {progress_label}Epoch {epoch + 1}/{epochs}: train_loss={avg_train_loss:.6f}")
             continue
 
         model.eval()
@@ -546,12 +610,25 @@ def _train_model(
                 else:
                     outputs = model(batch_x)
                     loss = loss_fn(outputs, batch_y)
+                if not torch.isfinite(loss):
+                    skipped_batches += 1
+                    continue
                 epoch_val_loss += loss.item()
                 num_val_batches += 1
 
-        avg_val_loss = epoch_val_loss / max(num_val_batches, 1)
+        avg_val_loss = (
+            epoch_val_loss / num_val_batches if num_val_batches else float('nan')
+        )
         val_losses.append(avg_val_loss)
 
+        if verbose:
+            print(
+                f"  {progress_label}Epoch {epoch + 1}/{epochs}: "
+                f"train_loss={avg_train_loss:.6f} val_loss={avg_val_loss:.6f}"
+            )
+
+        # NaN fails this comparison, so a dead epoch can never be checkpointed
+        # as the best model.
         if avg_val_loss < best_val_loss - min_delta:
             best_val_loss = avg_val_loss
             patience_counter = 0
@@ -562,6 +639,12 @@ def _train_model(
             if patience_counter >= patience:
                 print(f"  Early stopping triggered (patience={patience} exceeded)")
                 break
+
+    if skipped_batches:
+        print(
+            f"  WARNING: skipped {skipped_batches} batch(es) whose loss was not finite. "
+            f"{_non_finite_loss_advice(use_mixed_precision)}"
+        )
 
     return train_losses, val_losses, best_val_loss
 
@@ -795,6 +878,17 @@ def run_walk_forward_validation(
             print(f"Fold {fold + 1}/{n_splits}: skipped (not enough rows)")
             continue
 
+        # Standardize with statistics from this fold's training block only.
+        # Re-fitting per fold is not an optimization — a scaler fitted on the
+        # whole panel would carry the mean and spread of the test period into
+        # the training inputs, which is exactly the leakage the date split
+        # exists to prevent.
+        fold_scaler = FeatureScaler.fit(train_data[0])
+        train_data = (fold_scaler.transform(train_data[0]), train_data[1])
+        test_data = (fold_scaler.transform(test_data[0]), test_data[1])
+        if val_data is not None:
+            val_data = (fold_scaler.transform(val_data[0]), val_data[1])
+
         train_loader = _make_loader(*train_data, training, drop_last=True)
         val_loader = _make_loader(*val_data, training) if val_data is not None else None
         test_loader = _make_loader(*test_data, training)
@@ -821,6 +915,9 @@ def run_walk_forward_validation(
             use_mixed_precision=use_mixed_precision,
             progress_label=f"[fold {fold + 1}/{n_splits}] ",
             loss_fn=loss_fn,
+            # Folds print one summary line each (below); a per-epoch line per
+            # fold would bury it.
+            verbose=False,
         )
 
         predictions, actuals = _predict(model, test_loader, device, median_index)
@@ -921,17 +1018,20 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
     device = get_device(config.training.device)
     config.training.device = device.type
 
-    # Mixed precision is a CUDA-only win here; torch.amp's CPU path would add
-    # overhead without the tensor-core speedup.
-    use_mixed_precision = config.training.use_mixed_precision and device.type == "cuda"
+    # Mixed precision is only ever enabled on hardware where fp16 is both fast
+    # and numerically safe. On a card without tensor cores — the GeForce GTX
+    # 16-series in particular — autocast buys nothing and reliably turns the
+    # loss into NaN, so it is refused here with the reason rather than left to
+    # produce a run whose every epoch prints `nan`.
+    amp_supported, amp_reason = mixed_precision_support(device)
+    use_mixed_precision = config.training.use_mixed_precision and amp_supported
 
     if use_mixed_precision:
-        print("Mixed Precision: Enabled")
+        print(f"Mixed Precision: Enabled ({amp_reason})")
+    elif config.training.use_mixed_precision:
+        print(f"Mixed Precision: Disabled — {amp_reason}")
     else:
-        if config.training.use_mixed_precision and device.type != "cuda":
-            print(f"Mixed Precision: Disabled (requires CUDA; running on {device.type})")
-        else:
-            print("Mixed Precision: Disabled")
+        print("Mixed Precision: Disabled (training.use_mixed_precision=false)")
 
     # =========================================================================
     # 2. Load and featurize training data (real cached tickers by default)
@@ -959,6 +1059,27 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
     feature_df = pd.concat(train_parts + val_parts + test_parts, ignore_index=True)
     print(f"Built training panel from {len(panel_by_ticker)} tickers: {len(feature_df)} total rows")
 
+    # Extract feature and target names for metadata
+    feature_names = list(feature_df.columns[:-1])
+    target_name = feature_df.columns[-1]
+
+    # =========================================================================
+    # 3b. Standardize the inputs
+    # =========================================================================
+    # Half of these features are price levels: across a 4000-name Indian
+    # universe `sma_20` spans roughly ₹5 to ₹1,50,000 while `return_1d` sits
+    # in ±0.2. Unscaled, that overflows fp16 outright and diverges in fp32, and
+    # both failure modes present identically — a NaN loss on every epoch. The
+    # scaler is fitted on the training rows only and shipped in the checkpoint
+    # so inference applies the identical transform (see features/scaling.py).
+    scaler = FeatureScaler.fit(feature_df.iloc[:int(len(feature_df) * 0.70), :-1].values)
+    feature_df = feature_df.copy()
+    feature_df[feature_names] = scaler.transform(feature_df[feature_names].values)
+    print(
+        f"Standardized {len(feature_names)} input features on the training split "
+        f"(clipped to ±{scaler.clip:g} sigma)"
+    )
+
     # =========================================================================
     # 4. Create DataLoaders
     # =========================================================================
@@ -966,10 +1087,6 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
     train_loader, val_loader, test_loader = create_dataloaders(
         feature_df, config.training
     )
-
-    # Extract feature and target names for metadata
-    feature_names = list(feature_df.columns[:-1])
-    target_name = feature_df.columns[-1]
 
     # =========================================================================
     # 5. Initialize model from registry
@@ -1044,6 +1161,7 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
             'device': str(device),
             'quantiles': list(config.training.quantiles) if n_outputs > 1 else None,
             'n_outputs': n_outputs,
+            'feature_scaler': scaler.to_dict(),
         }, model_path)
         print(f"  ✓ Saved best model to {model_path}")
 
@@ -1092,6 +1210,10 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
         'n_outputs': n_outputs,
         'median_quantile_index': median_index,
         'loss': config.training.loss,
+        # Inference MUST apply this same transform: the network was fitted on
+        # standardized inputs, so feeding it raw price levels would be feeding
+        # it values tens of thousands of sigma from anything it ever saw.
+        'feature_scaler': scaler.to_dict(),
         # The fitted score -> probability map, produced from the walk-forward
         # test folds. MLStrategy applies it so the confidence it publishes is a
         # frequency that held up out of sample, not a raw network output.
@@ -1122,6 +1244,12 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
     print("Training Complete")
     print("=" * 60)
     print(f"  Epochs trained: {len(train_losses)}")
+    if not math.isfinite(best_val_loss):
+        print(
+            "  WARNING: no epoch produced a finite validation loss, so no checkpoint "
+            "was written. This run trained nothing.\n"
+            f"  {_non_finite_loss_advice(use_mixed_precision)}"
+        )
     print(f"  Best validation loss: {best_val_loss:.6f}")
     if train_losses:
         print(f"  Final train loss: {train_losses[-1]:.6f}")

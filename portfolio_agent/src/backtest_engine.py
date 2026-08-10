@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 import numpy as np
+from tqdm import tqdm
 
 from portfolio_agent.config.schema import StrategyConfig
 from portfolio_agent.features.pipeline import build_features
@@ -165,6 +166,7 @@ class BacktestEngine:
         benchmark_symbol: Optional[str] = None,
         exit_on_lower_circuit_lock: bool = True,
         liquidate_on_drawdown_halt: bool = False,
+        show_progress: bool = False,
     ):
         """
         Initialize the BacktestEngine.
@@ -234,7 +236,12 @@ class BacktestEngine:
                 permanent loss, and existing positions already carry stops.
                 Turn it on for mandates where a hard equity floor outranks
                 recovery potential.
+            show_progress: Draw tqdm progress bars for the two phases that take
+                real time — loading the universe and replaying the trading days.
+                Defaults to False so library and test callers stay silent; the
+                CLI turns it on.
         """
+        self.show_progress = show_progress
         self.start_date = pd.to_datetime(start_date)
         self.end_date = pd.to_datetime(end_date)
         self.initial_capital = initial_capital
@@ -390,19 +397,42 @@ class BacktestEngine:
         # Execution simulator for realistic friction modeling
         self.execution_sim = ExecutionSimulator()
     
+    def _progress(self, iterable, desc: str, unit: str, total: Optional[int] = None):
+        """Wrap `iterable` in a tqdm bar, or return it untouched when disabled.
+
+        `disable=None` is tqdm's "auto" mode: the bar draws on a terminal and
+        suppresses itself when output is redirected to a file or captured by a
+        test, so enabling progress never pollutes a log.
+        """
+        return tqdm(
+            iterable,
+            desc=desc,
+            unit=unit,
+            total=total,
+            disable=None if self.show_progress else True,
+            dynamic_ncols=True,
+            mininterval=0.5,
+        )
+
     def _load_all_data(self) -> None:
-        """Load all ticker data into memory using data_store.load_ticker_data."""
-        import logging
-        logger = logging.getLogger(__name__)
-        
-        # Log progress for large universes
+        """Load all ticker data into memory using data_store.load_ticker_data.
+
+        Progress is a tqdm bar rather than periodic ``logger.info`` calls: the
+        CLI never configures logging, so those lines went to a root logger with
+        no handler and the user watched a silent terminal for the several
+        minutes it takes to read a 4000-ticker universe off disk.
+        """
         total_tickers = len(self.universe_tickers)
-        if total_tickers > 100:
-            logger.info(f"Loading data for {total_tickers} tickers (this may take a while)...")
-        
+
         loaded_count = 0
-        for i, ticker in enumerate(self.universe_tickers):
-            df = load_ticker_data(ticker, 
+        ticker_iter = self._progress(
+            self.universe_tickers,
+            desc="Loading ticker data",
+            unit="ticker",
+            total=total_tickers,
+        )
+        for ticker in ticker_iter:
+            df = load_ticker_data(ticker,
                                   start_date=self.start_date.strftime('%Y-%m-%d'),
                                   end_date=self.end_date.strftime('%Y-%m-%d'))
             if df is not None and len(df) > 0:
@@ -420,13 +450,12 @@ class BacktestEngine:
             else:
                 # Mark as untradeable if no data
                 self.untradeable_tickers.add(ticker)
-                logger.warning(f"No data available for {ticker}, marking as untradeable")
-            
-            # Log progress every 50 tickers for large universes
-            if total_tickers > 100 and (i + 1) % 50 == 0:
-                logger.info(f"Loaded {i + 1}/{total_tickers} tickers...")
-        
-        logger.info(f"Successfully loaded {loaded_count}/{total_tickers} tickers")
+                logger.debug(f"No data available for {ticker}, marking as untradeable")
+
+        message = f"Loaded {loaded_count}/{total_tickers} tickers with usable history"
+        logger.info(message)
+        if self.show_progress:
+            print(message)
     
     def _build_master_date_index(self) -> pd.DatetimeIndex:
         """
@@ -1811,8 +1840,15 @@ class BacktestEngine:
         """
         equity_curve = {}
 
+        day_bar = self._progress(
+            self.master_date_index,
+            desc="Backtesting",
+            unit="day",
+            total=len(self.master_date_index),
+        )
+
         try:
-            for i, current_date in enumerate(self.master_date_index):
+            for i, current_date in enumerate(day_bar):
                 self.trading_day_count = i + 1
                 date_str = current_date.strftime('%Y-%m-%d')
 
@@ -1908,10 +1944,26 @@ class BacktestEngine:
                 # Step G: Every 20 trading days, trigger evaluate_and_learn
                 if self.trading_day_count % 20 == 0:
                     self._evaluate_and_learn()
+
+                # The date and equity are what tell an operator the run is
+                # progressing *and* whether it is going anywhere — a bar that
+                # only counts days looks identical for a working strategy and
+                # one that stopped trading in year one.
+                if self.show_progress:
+                    day_bar.set_postfix(
+                        date=date_str,
+                        equity=f"{self.portfolio_value:,.0f}",
+                        open=len(self.holdings),
+                        trades=len(self.trade_log),
+                        refresh=False,
+                    )
         finally:
             # Workers are per-run, so they are released here whether the run
             # finished or raised.
             self.shutdown_workers()
+            # A bar left open corrupts every line printed after it, including
+            # the traceback when the run is ending because something raised.
+            day_bar.close()
 
         # Final brain snapshot
         final_snapshot = {

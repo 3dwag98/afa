@@ -157,10 +157,70 @@ def describe_devices() -> List[str]:
                 f"  [{index}] {props.name} — {props.total_memory / (1024 ** 3):.2f} GB, "
                 f"compute capability {props.major}.{props.minor}"
             )
+        supported, reason = mixed_precision_support(torch.device("cuda"))
+        lines.append(
+            f"Mixed precision:  {'usable' if supported else 'NOT usable'} — {reason}"
+        )
     else:
         lines.extend(cuda_unavailable_reason())
 
     return lines
+
+
+# GeForce GTX 16-series cards (Turing TU116/TU117) report compute capability
+# 7.5 — the same as an RTX 2060 — but the die ships *without* tensor cores.
+# Two consequences, both of which matter here: fp16 autocast buys no speedup
+# because there is no tensor-core path to take, and these cards' half-precision
+# arithmetic is the one that is widely reported to return NaN/inf on workloads
+# that run clean everywhere else. A capability check alone cannot tell them
+# apart from a card that does have tensor cores, so the marketing name is the
+# only signal available.
+_NO_TENSOR_CORE_MARKERS = ("gtx 16", "mx450", "mx550")
+
+
+def mixed_precision_support(device: Optional[torch.device] = None) -> tuple[bool, str]:
+    """Whether fp16 autocast is safe *and* worth enabling on `device`.
+
+    Automatic mixed precision is not a free win. It pays off on GPUs with
+    tensor cores and is actively harmful without them: on a GTX 16-series card
+    the fp16 path produces NaN losses rather than a speedup, and on pre-Volta
+    hardware fp16 is emulated slowly. Rather than let training silently print
+    `nan` for every epoch, the decision is made here, once, with the reason
+    attached so the caller can say *why* it turned AMP off.
+
+    Args:
+        device: Device training will run on. Defaults to the resolved device.
+
+    Returns:
+        (supported, reason). `reason` explains the verdict either way.
+    """
+    device = device or resolve_device("auto")
+
+    if device.type != "cuda":
+        return False, f"requires CUDA; running on {device.type}"
+
+    try:
+        props = torch.cuda.get_device_properties(device.index or 0)
+    except Exception:  # pragma: no cover - defensive: driver hiccup
+        return False, "could not query the CUDA device's properties"
+
+    name = props.name
+    lowered = name.lower()
+
+    if any(marker in lowered for marker in _NO_TENSOR_CORE_MARKERS):
+        return False, (
+            f"{name} has no tensor cores, and its fp16 path is known to produce "
+            f"NaN losses — AMP would cost accuracy without buying speed"
+        )
+
+    # Volta (7.0) introduced tensor cores; below that fp16 is emulated.
+    if (props.major, props.minor) < (7, 0):
+        return False, (
+            f"{name} is compute capability {props.major}.{props.minor}; tensor "
+            f"cores need 7.0 or newer"
+        )
+
+    return True, f"{name} has tensor cores (compute capability {props.major}.{props.minor})"
 
 
 def resolve_device(config_device: str = "auto") -> torch.device:

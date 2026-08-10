@@ -236,6 +236,7 @@ def cmd_backtest(args) -> int:
             max_workers=args.workers,
             start_date=start_date,
             end_date=end_date,
+            show_progress=not args.no_progress,
         )
 
         if result.get('status') == 'success':
@@ -487,6 +488,11 @@ def create_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Output Excel file path"
+    )
+    backtest_parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Suppress the progress bars (useful when logging output to a file)"
     )
     backtest_parser.set_defaults(func=cmd_backtest)
     

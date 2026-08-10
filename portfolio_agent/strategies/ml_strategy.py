@@ -17,6 +17,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -24,6 +25,7 @@ import torch.nn as nn
 from .base import BaseStrategy
 from .types import StrategyContext, StrategySignal
 from portfolio_agent.config.schema import StrategyConfig
+from portfolio_agent.features.scaling import FeatureScaler
 from portfolio_agent.models.pytorch_models import sorted_quantiles
 from portfolio_agent.models.registry import get_model
 from portfolio_agent.src.calibration import IsotonicCalibrator
@@ -47,6 +49,7 @@ class ModelLoader:
         self.model: Optional[nn.Module] = None
         self.metadata: Optional[Dict[str, Any]] = None
         self._calibrator: Optional[IsotonicCalibrator] = None
+        self._scaler: Optional[FeatureScaler] = None
         self._model_loaded = False
 
     def load_model(self, model_name: str = "lstm") -> bool:
@@ -158,6 +161,18 @@ class ModelLoader:
         return min(range(len(levels)), key=lambda i: abs(levels[i] - 0.5))
 
     @property
+    def scaler(self) -> Optional[FeatureScaler]:
+        """Input standardization this checkpoint was trained with, if any.
+
+        None for checkpoints written before input standardization existed;
+        those were fitted on raw features and must keep being scored on raw
+        features, so the absence is honoured rather than defaulted.
+        """
+        if self._scaler is None and self.metadata is not None:
+            self._scaler = FeatureScaler.from_dict(self.metadata.get('feature_scaler'))
+        return self._scaler
+
+    @property
     def calibrator(self) -> Optional[IsotonicCalibrator]:
         """Fitted score -> probability map shipped with this checkpoint, if any."""
         if self._calibrator is None and self.metadata is not None:
@@ -213,13 +228,22 @@ class MLStrategy(BaseStrategy):
         raise RuntimeError("MLStrategy.load() must be called before required_features() is meaningful")
 
     def _sequence_tensor(self, features: pd.DataFrame) -> Optional[torch.Tensor]:
+        """Most recent `sequence_length` rows, standardized the way training was.
+
+        Infinities are dropped alongside NaNs: the ratio features divide by
+        prices and volumes that a thin ticker can print as zero, and an `inf`
+        row survives `dropna()` only to make the whole forward pass NaN.
+        """
         seq_len = self._loader.sequence_length
         feature_names = self._loader.feature_names
-        usable = features[feature_names].dropna()
+        usable = features[feature_names].replace([np.inf, -np.inf], np.nan).dropna()
         if len(usable) < seq_len:
             return None
         recent = usable.iloc[-seq_len:].values
-        return torch.tensor(recent, dtype=torch.float32)
+        scaler = self._loader.scaler
+        if scaler is not None:
+            recent = scaler.transform(recent)
+        return torch.tensor(np.asarray(recent, dtype=np.float32), dtype=torch.float32)
 
     def score(self, symbol: str, features: pd.DataFrame, context: StrategyContext) -> StrategySignal:
         return self.score_batch({symbol: features}, context)[symbol]

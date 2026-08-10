@@ -129,6 +129,15 @@ Device selection resolves once, up front, and never returns an accelerator PyTor
 
 CUDA is used for two things: **training** (with automatic mixed precision and cuDNN benchmarking) and **ML-strategy inference**, where all eligible tickers on a date are scored in a single batched forward pass. Rule-based strategies are CPU work; parallelize those with `--parallel` instead.
 
+### Mixed precision is refused on cards that cannot do it safely
+
+`use_mixed_precision` is a request, not a command. Before enabling `torch.amp`, training checks the actual card and turns AMP off — printing the reason — when fp16 would be unsafe or pointless:
+
+- **GeForce GTX 16-series (1650/1660/1660 Ti).** These Turing dies report compute capability 7.5, the same as an RTX 2060, but ship **without tensor cores**. AMP buys no speedup on them, and their fp16 path is the one widely reported to return NaN. Left enabled, it produced a training run where every epoch printed `nan`.
+- **Anything older than compute capability 7.0** (pre-Volta), where fp16 is emulated rather than accelerated.
+
+`portfolio-agent gpu-check` reports the verdict for your card under `Mixed precision:`. Nothing needs changing in `config.yaml` — the check is automatic, and the run continues in fp32.
+
 ## Strategies (plug-and-play)
 
 Every strategy — built-in or your own — implements one interface (`portfolio_agent/strategies/base.py::BaseStrategy`) and is looked up by name from `portfolio_agent/strategies/registry.py`. Because the live agent and the backtest engine both go through this same registry, they always make identical decisions from identical inputs — there's no separate "live" vs "backtest" scoring logic to keep in sync.
@@ -241,7 +250,7 @@ Optimizations already applied, controlled via `config.yaml`'s `training` section
 | Setting | Default | What it does |
 |---|---|---|
 | `parallel_data_loading` | `true` | Loads and featurizes tickers across a CPU process pool (`data_load_workers`, default: CPU count) instead of one at a time — this is what makes training on ~2,400 tickers practical. |
-| `use_mixed_precision` | `true` | Automatic mixed precision (`torch.amp`) on CUDA. |
+| `use_mixed_precision` | `true` | Automatic mixed precision (`torch.amp`), on CUDA cards that have tensor cores. Silently — and deliberately — ignored elsewhere; see [above](#mixed-precision-is-refused-on-cards-that-cannot-do-it-safely). |
 | `use_torch_compile` | `false` | Wraps the model with `torch.compile()` for faster training (PyTorch 2.0+, biggest win on CUDA). Off by default — enable it once you're doing longer training runs. |
 | `batch_size` | `128` | Sized for GPU throughput; lower it on CPU-only or memory-constrained machines. |
 | `num_workers` | `2` | PyTorch `DataLoader` workers (separate from `data_load_workers`, which is for building the panel, not iterating it). |
@@ -249,6 +258,19 @@ Optimizations already applied, controlled via `config.yaml`'s `training` section
 | `loss` | `quantile` | Training objective. See below. |
 | `quantiles` | `[0.1, 0.5, 0.9]` | Percentiles of the forward return the model predicts. |
 | `calibrate_confidence` | `true` | Fits an isotonic score→probability map on the walk-forward folds and ships it with the checkpoint. |
+
+### Inputs are standardized before they reach the network
+
+Half the model's features are price *levels* (`sma_20`, `sma_50`, `macd`, `atr_14`). Across a 4,000-name Indian universe those span roughly ₹5 to ₹1,50,000, sitting next to `return_1d` at ±0.02 and `rsi_14` in [0, 100]. Fed in raw, that breaks training two ways, and both present identically as a NaN loss on every epoch:
+
+- fp16 tops out at **65,504**, so any feature above it becomes `inf` on the first autocast matmul;
+- even in fp32, inputs of 1e5 through a recurrent layer at `lr=3e-3` diverge within a few hundred steps.
+
+`portfolio_agent/features/scaling.py` therefore standardizes each feature (mean 0, std 1, clipped to ±10σ) before it reaches the model. The statistics are fitted on **training rows only** — per fold during walk-forward validation, so no fold sees its own test period's distribution — and the fitted constants are written into `models/metadata.json` and the checkpoint, so `MLStrategy` applies the identical transform at inference. Checkpoints trained before this existed carry no scaler and keep being scored on raw features unchanged.
+
+This is deliberately *not* `features.normalize`: that flag rewrites the shared feature pipeline, whose output the rule-based strategies read in raw units ("RSI below 30"), so turning it on to fix training would change what every other strategy trades.
+
+Rows that are non-finite — not just NaN — are dropped when the panel is built. Several features are ratios (`return_1d` divides by the previous close, `bollinger_pct_b` by the band width), and a cached bar with a zero price makes them infinite; `dropna()` alone leaves those rows in, and each one produces a NaN loss.
 
 ### What the model predicts, and why it isn't a single number
 
@@ -304,6 +326,21 @@ portfolio-agent backtest --strategy rule_based --years 2 --parallel --workers 4
 Determinism is guaranteed by construction, not by luck: parallel results are reassembled in universe order (never completion order), orders are queued SELL-first then BUYs by descending score so that finite cash is allocated reproducibly, and both Monte Carlo simulations are seeded from `simulation.random_seed`. `portfolio_agent/tests/test_parallel_determinism.py` enforces this by running the same backtest both ways and comparing the exported workbook sheet by sheet. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#determinism-guarantees).
 
 `--parallel` is not free: for small universes, process startup can cost more than it saves. It pays off from a few dozen tickers upward.
+
+### Watching a backtest run
+
+`portfolio-agent backtest` draws a progress bar for each of the two phases that take real time — reading the universe off disk, then replaying the trading days:
+
+```
+Loading ticker data: 100%|██████████| 3847/3847 [02:11<00:00, 29.3ticker/s]
+Loaded 3612/3847 tickers with usable history
+Replaying 2020-08-11 to 2025-08-10 with strategy 'Trend Breakout Volume MC' over 1237 trading days
+Backtesting:  34%|███▍      | 421/1237 [08:52<17:12, 1.27s/day, date=2022-04-19, equity=1,143,208, open=7, trades=96]
+```
+
+The day bar carries the simulated date, current equity, open positions and cumulative trade count, so a run that has quietly stopped trading is visible immediately rather than at the end. Progress goes to the terminal directly and suppresses itself when output is redirected to a file; `--no-progress` turns it off explicitly.
+
+(Previously the engine reported progress through `logger.info`, but the CLI configures no logging handlers, so those records were discarded and a multi-hour run printed nothing between "Running backtest..." and its final report.)
 
 ## Configuration
 
