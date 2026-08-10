@@ -25,9 +25,11 @@ try:
     from .data_store import load_or_fetch_data, load_ticker_data
     from .indicators import calculate_indicators
     from .monte_carlo import MonteCarloResult, MonteCarloSettings
-    from .risk import calculate_position_quantity
+    from .risk import calculate_position_quantity, to_net_realized_trades
+    from .execution_sim import cost_fraction_per_side
     from .compliance import run_compliance_checks
     from .learning import evaluate_and_learn
+    from .regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
     from .reporting import export_excel_report
     from .models import Recommendation
     from .outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
@@ -44,9 +46,11 @@ except ImportError:
     from data_store import load_or_fetch_data, load_ticker_data
     from indicators import calculate_indicators
     from monte_carlo import MonteCarloResult, MonteCarloSettings
-    from risk import calculate_position_quantity
+    from risk import calculate_position_quantity, to_net_realized_trades
+    from execution_sim import cost_fraction_per_side
     from compliance import run_compliance_checks
     from learning import evaluate_and_learn
+    from regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
     from reporting import export_excel_report
     from models import Recommendation
     from outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
@@ -151,13 +155,15 @@ def _prepare_all_tickers(
     return [by_ticker[t] for t in data if t in by_ticker]
 
 
-def _load_benchmark_close(config: AppConfig, logger) -> Optional[pd.Series]:
-    """Cached close series for the configured market benchmark, if any.
+def _load_benchmark_frame(config: AppConfig, logger) -> Optional[pd.DataFrame]:
+    """Cached OHLC frame for the configured market benchmark, if any.
 
     Read from the ordinary per-ticker parquet cache, so `download-data`
-    populating it is the only setup step. Returns None when the symbol was
-    never cached — src/regime.py then falls back to an equal-weighted
-    composite of the traded universe.
+    populating it is the only setup step. The whole frame is returned rather
+    than just the closes because ADX — and therefore the SIDEWAYS_CHOP
+    classification — needs the daily range. Returns None when the symbol was
+    never cached; src/regime.py then falls back to an equal-weighted composite
+    of the traded universe.
     """
     symbol = getattr(config.data, "benchmark_symbol", "")
     if not symbol:
@@ -172,7 +178,47 @@ def _load_benchmark_close(config: AppConfig, logger) -> Optional[pd.Series]:
         return None
 
     logger.info(f"Loaded benchmark {symbol} ({len(df)} bars) for the market-regime filter")
-    return df['close'].sort_index()
+    return df.sort_index()
+
+
+def _classify_market_regime(
+    benchmark_frame: Optional[pd.DataFrame],
+    data: Dict[str, pd.DataFrame],
+) -> Optional[str]:
+    """Name today's market state, from the index if cached and the book if not.
+
+    Mirrors BacktestEngine._classify_regime so live and backtested runs gate
+    models on the same definition. The composite fallback is what keeps the
+    meta-orchestrator's regime map from going silently inert on an install that
+    never downloaded an index: without it the label is UNKNOWN, every model is
+    permitted in every state, and nothing in the logs says the gating stopped
+    working.
+
+    Args:
+        benchmark_frame: Cached OHLC for the configured index, or None.
+        data: Per-ticker OHLCV for the traded universe.
+
+    Returns:
+        A regime classification, or None when neither an index nor a usable
+        composite exists — read downstream as "permit every model".
+    """
+    if benchmark_frame is not None and 'close' in benchmark_frame.columns:
+        return assess_market_regime(
+            benchmark_frame['close'], market_ohlcv=benchmark_frame
+        ).classification
+
+    proxy = build_market_proxy(
+        {
+            ticker: df['close']
+            for ticker, df in data.items()
+            if df is not None and 'close' in df.columns and not df.empty
+        },
+        lookback=DEFAULT_TREND_WINDOW + 1,
+    )
+    if proxy is None:
+        return None
+    # A composite has no meaningful high/low, so ADX uses its close-only proxy.
+    return assess_market_regime(proxy).classification
 
 
 def _scaled_quantity(quantity: int, signal: StrategySignal) -> int:
@@ -298,9 +344,18 @@ def run_orchestrator(
         logger.info(f"Loaded brain from {config.paths.brain_file}")
 
         # Step 4: Load trade outcomes from SQLite into brain.trade_history
+        #
+        # Restated net of round-trip friction on the way in. The stored
+        # outcomes carry a gross price move, which is the right thing for a
+        # report but the wrong thing for every consumer of brain.trade_history:
+        # Kelly sizes off the payoff ratio b (risk.py::estimate_kelly_inputs)
+        # and the weight learner off the per-trigger win rate, and a ~0.8%
+        # round-trip cost both shrinks b and turns marginally-positive trades
+        # into losses. Netting once here keeps a single definition of "did this
+        # trade make money" across both.
         trade_outcomes = get_trade_history(config.paths.sqlite_path)
-        for outcome in trade_outcomes:
-            brain.trade_history.append({
+        gross_history = [
+            {
                 "trade_id": outcome.trade_id,
                 "symbol": outcome.symbol,
                 "signal_trigger": outcome.signal_trigger,
@@ -310,8 +365,17 @@ def run_orchestrator(
                 "exit_price": outcome.exit_price,
                 "outcome": outcome.outcome,
                 "return_pct": outcome.return_pct,
-                "outcome_source": outcome.outcome_source
-            })
+                "outcome_source": outcome.outcome_source,
+            }
+            for outcome in trade_outcomes
+        ]
+        brain.trade_history.extend(
+            to_net_realized_trades(
+                gross_history,
+                buy_cost_pct=cost_fraction_per_side("BUY", config.risk.slippage_pct_per_side),
+                sell_cost_pct=cost_fraction_per_side("SELL", config.risk.slippage_pct_per_side),
+            )
+        )
         logger.info(f"Loaded {len(trade_outcomes)} trade outcomes from SQLite")
 
         # Step 5: Run evaluate_and_learn()
@@ -359,7 +423,10 @@ def run_orchestrator(
         # filter. It comes from the same parquet cache as everything else; when
         # it was never cached the filter falls back to a composite of the
         # traded universe, so a missing index is a downgrade, not a failure.
-        benchmark_close = _load_benchmark_close(config, logger)
+        benchmark_frame = _load_benchmark_frame(config, logger)
+        benchmark_close = benchmark_frame['close'] if benchmark_frame is not None else None
+        regime_label = _classify_market_regime(benchmark_frame, data)
+        logger.info(f"Market regime classified as {regime_label or 'UNKNOWN (no usable market series)'}")
 
         signals: Dict[str, StrategySignal] = {}
         if strategy.requires_full_batch or strategy.supports_gpu_batch:
@@ -368,6 +435,8 @@ def run_orchestrator(
                 weights=dict(brain.weights),
                 run_id=run_id,
                 benchmark_close=benchmark_close,
+                benchmark_ohlcv=benchmark_frame,
+                regime_label=regime_label,
             )
             signals = strategy.score_batch(features_by_ticker, batch_context)
         else:
@@ -377,6 +446,9 @@ def run_orchestrator(
                     weights=dict(brain.weights),
                     mc_result=mc_by_ticker.get(ticker),
                     run_id=run_id,
+                    benchmark_close=benchmark_close,
+                    benchmark_ohlcv=benchmark_frame,
+                    regime_label=regime_label,
                 )
                 try:
                     signals[ticker] = strategy.score(ticker, features, context)
@@ -486,19 +558,25 @@ def run_orchestrator(
             simulated = simulate_outcome_fn(top_rec)
             save_trade_outcome(config.paths.sqlite_path, simulated)
 
-            # Also add to brain's trade_history
-            brain.trade_history.append({
-                "trade_id": simulated.trade_id,
-                "symbol": simulated.symbol,
-                "signal_trigger": simulated.signal_trigger,
-                "entry_date": simulated.entry_date,
-                "entry_price": simulated.entry_price,
-                "exit_date": simulated.exit_date,
-                "exit_price": simulated.exit_price,
-                "outcome": simulated.outcome,
-                "return_pct": simulated.return_pct,
-                "outcome_source": simulated.outcome_source
-            })
+            # Also add to brain's trade_history — netted the same way the
+            # stored history was on load, so one appended trade cannot be the
+            # single gross record in an otherwise net series.
+            brain.trade_history.extend(to_net_realized_trades(
+                [{
+                    "trade_id": simulated.trade_id,
+                    "symbol": simulated.symbol,
+                    "signal_trigger": simulated.signal_trigger,
+                    "entry_date": simulated.entry_date,
+                    "entry_price": simulated.entry_price,
+                    "exit_date": simulated.exit_date,
+                    "exit_price": simulated.exit_price,
+                    "outcome": simulated.outcome,
+                    "return_pct": simulated.return_pct,
+                    "outcome_source": simulated.outcome_source,
+                }],
+                buy_cost_pct=cost_fraction_per_side("BUY", config.risk.slippage_pct_per_side),
+                sell_cost_pct=cost_fraction_per_side("SELL", config.risk.slippage_pct_per_side),
+            ))
             logger.info(f"Added simulated outcome for {top_rec.symbol}: {simulated.outcome}")
 
         # Step 11: Optionally update outcomes from market data

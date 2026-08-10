@@ -119,7 +119,10 @@ class BacktesterAgent:
             sector_map_csv=self.config.paths.sector_map_csv,
             max_portfolio_drawdown_pct=self.config.risk.max_portfolio_drawdown_pct,
             drawdown_reentry_pct=self.config.risk.drawdown_reentry_pct,
+            drawdown_halt_max_days=self.config.risk.drawdown_halt_max_days,
             benchmark_symbol=self.config.data.benchmark_symbol,
+            exit_on_lower_circuit_lock=self.config.risk.exit_on_lower_circuit_lock,
+            liquidate_on_drawdown_halt=self.config.risk.liquidate_on_drawdown_halt,
         )
 
         logger.info(f"Running backtest from {start_date} to {end_date} with strategy '{strategy.name}'")
@@ -180,6 +183,13 @@ class BacktesterAgent:
                 f"see 'circuit_breaker_log' in the returned results"
             )
 
+        if engine.exit_trigger_log:
+            logger.info(
+                f"Forced exits fired {len(engine.exit_trigger_log)} time(s) during this run "
+                f"(lower-circuit locks and/or drawdown liquidation); see 'exit_trigger_log' "
+                f"in the returned results"
+            )
+
         return {
             'status': 'success',
             'output_file': output_file,
@@ -187,6 +197,7 @@ class BacktesterAgent:
             'trade_count': len(engine.trade_log),
             'strategy': strategy.name,
             'circuit_breaker_log': engine.circuit_breaker_log,
+            'exit_trigger_log': engine.exit_trigger_log,
         }
 
 

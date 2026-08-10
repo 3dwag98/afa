@@ -24,7 +24,9 @@ import torch.nn as nn
 from .base import BaseStrategy
 from .types import StrategyContext, StrategySignal
 from portfolio_agent.config.schema import StrategyConfig
+from portfolio_agent.models.pytorch_models import sorted_quantiles
 from portfolio_agent.models.registry import get_model
+from portfolio_agent.src.calibration import IsotonicCalibrator
 from portfolio_agent.utils.device import resolve_device
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,7 @@ class ModelLoader:
         self.device = resolve_device(device)
         self.model: Optional[nn.Module] = None
         self.metadata: Optional[Dict[str, Any]] = None
+        self._calibrator: Optional[IsotonicCalibrator] = None
         self._model_loaded = False
 
     def load_model(self, model_name: str = "lstm") -> bool:
@@ -73,13 +76,16 @@ class ModelLoader:
             logger.error(f"Model class not found: {e}")
             return False
 
+        # A quantile head is n_outputs wide. Metadata written before quantile
+        # training existed carries neither key, so both default to the old
+        # single-output shape and those checkpoints keep loading unchanged.
         self.model = model_class(
             n_features=n_features,
             hidden_size=64,
             n_layers=2,
             sequence_length=sequence_length,
             dropout=0.2,
-            n_outputs=1,
+            n_outputs=self.n_outputs,
         )
 
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
@@ -92,12 +98,20 @@ class ModelLoader:
         return True
 
     def predict_batch(self, features: torch.Tensor) -> torch.Tensor:
-        """Predict on a batch. features shape: (batch_size, sequence_length, n_features)."""
+        """Predict on a batch. features shape: (batch_size, sequence_length, n_features).
+
+        Quantile outputs come back sorted ascending, so a crossed set (which a
+        network can and does emit) cannot leave the 90th percentile sitting
+        where the median belongs.
+        """
         if not self._model_loaded:
             raise RuntimeError("Model not loaded. Call load_model() first.")
         with torch.no_grad():
             features = features.to(self.device, non_blocking=True)
-            return self.model(features)
+            outputs = self.model(features)
+            if self.quantiles:
+                outputs = sorted_quantiles(outputs)
+            return outputs
 
     @property
     def feature_names(self) -> List[str]:
@@ -110,6 +124,47 @@ class ModelLoader:
     @property
     def target_name(self) -> str:
         return "" if self.metadata is None else self.metadata.get('target', '')
+
+    @property
+    def quantiles(self) -> Optional[List[float]]:
+        """Quantile levels this checkpoint's head emits, or None for a point head."""
+        if self.metadata is None:
+            return None
+        levels = self.metadata.get('quantiles')
+        return [float(q) for q in levels] if levels else None
+
+    @property
+    def n_outputs(self) -> int:
+        """Head width. Defaults to 1 so pre-quantile checkpoints still load."""
+        if self.metadata is None:
+            return 1
+        recorded = self.metadata.get('n_outputs')
+        if recorded:
+            return int(recorded)
+        levels = self.quantiles
+        return len(levels) if levels else 1
+
+    @property
+    def median_index(self) -> Optional[int]:
+        """Output column holding the median quantile, or None for a point head."""
+        if self.metadata is None:
+            return None
+        recorded = self.metadata.get('median_quantile_index')
+        if recorded is not None:
+            return int(recorded)
+        levels = self.quantiles
+        if not levels:
+            return None
+        return min(range(len(levels)), key=lambda i: abs(levels[i] - 0.5))
+
+    @property
+    def calibrator(self) -> Optional[IsotonicCalibrator]:
+        """Fitted score -> probability map shipped with this checkpoint, if any."""
+        if self._calibrator is None and self.metadata is not None:
+            self._calibrator = IsotonicCalibrator.from_dict(
+                self.metadata.get('confidence_calibration')
+            )
+        return self._calibrator
 
 
 def _predicted_value_to_probability(value: float) -> float:
@@ -194,36 +249,88 @@ class MLStrategy(BaseStrategy):
             batch = torch.stack([eligible[s] for s in symbols])  # (n_tickers, seq_len, n_features)
             predictions = self._loader.predict_batch(batch)
 
+            quantiles = self._loader.quantiles
+            median_index = self._loader.median_index
+            calibrator = self._loader.calibrator
+
             for i, symbol in enumerate(symbols):
-                raw_value = float(predictions[i].squeeze().item())
+                row = predictions[i].reshape(-1)
+                if quantiles and median_index is not None and row.numel() > 1:
+                    quantile_values = [float(v) for v in row.tolist()]
+                    raw_value = quantile_values[median_index]
+                    lower, upper = quantile_values[0], quantile_values[-1]
+                else:
+                    quantile_values = None
+                    raw_value = float(row[0].item())
+                    lower = upper = None
+
                 prob = _predicted_value_to_probability(raw_value)
+                calibrated = (
+                    calibrator.predict_one(raw_value) if calibrator is not None else None
+                )
+                # The calibrated figure is what everything downstream consumes:
+                # it is a frequency measured on out-of-sample folds, whereas the
+                # squashed raw output is a network activation wearing a
+                # probability's clothes. Kelly and the trigger engine's EV
+                # hurdle are both far more sensitive to an optimistic p than to
+                # a pessimistic one, so the measured number wins.
+                confidence = calibrated if calibrated is not None else prob
+
                 close = last_close[symbol]
 
-                if prob > 0.6:
+                if confidence > 0.6:
                     signal = "BUY"
-                elif prob < 0.4:
+                elif confidence < 0.4:
                     signal = "SELL"
                 else:
                     signal = "HOLD"
 
-                stop_price = close * 0.98
-                target_price = close * 1.03
+                # With a quantile head the stop and target come from the
+                # predicted distribution rather than fixed 2%/3% cuts: the 10th
+                # percentile is the downside the model actually expects and the
+                # 90th is the upside, so a name the model sees as wide gets a
+                # wide stop instead of one calibrated to nothing.
+                if lower is not None and upper is not None and upper > 0 > lower:
+                    stop_price = close * (1.0 + lower)
+                    target_price = close * (1.0 + upper)
+                else:
+                    stop_price = close * 0.98
+                    target_price = close * 1.03
+
                 risk = close - stop_price
                 reward_risk = (target_price - close) / risk if risk > 0 else 0.0
+
+                rationale = (
+                    f"model={self._model_name} median={raw_value:.4f} "
+                    f"confidence={confidence:.2f}"
+                )
+                if quantile_values is not None:
+                    rationale += (
+                        f" interval=[{lower:.4f}, {upper:.4f}] "
+                        f"q={quantiles}"
+                    )
+                if calibrated is not None:
+                    rationale += f" (calibrated from raw {prob:.2f})"
 
                 results[symbol] = StrategySignal(
                     symbol=symbol,
                     signal=signal,
-                    score=round(prob * 100, 2),
+                    score=round(confidence * 100, 2),
                     trigger="Model",
                     entry_price=close,
                     stop_price=stop_price,
                     target_price=target_price,
                     reward_risk=round(reward_risk, 4),
-                    probability_profit=round(prob, 6),
-                    component_scores={"Model": prob},
-                    rationale=f"model={self._model_name} predicted={raw_value:.4f} prob={prob:.2f}",
-                    extra={"model_probability": prob, "raw_prediction": raw_value},
+                    probability_profit=round(confidence, 6),
+                    component_scores={"Model": confidence},
+                    rationale=rationale,
+                    extra={
+                        "model_probability": confidence,
+                        "uncalibrated_probability": prob,
+                        "raw_prediction": raw_value,
+                        "quantiles": quantiles,
+                        "quantile_predictions": quantile_values,
+                    },
                 )
 
         # Tickers with insufficient history are skipped (HOLD, not scored by the model).

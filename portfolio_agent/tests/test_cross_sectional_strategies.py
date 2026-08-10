@@ -47,6 +47,7 @@ class TestMomentumStrategy:
             "close", "mom_9m_skip1m", "atr_14", "realized_vol_60",
             "traded_value_60", "zero_return_fraction_60",
             "circuit_lock_fraction_60", "circuit_locked_today",
+            "operator_trap_fraction_60", "operator_trap_today",
         ]
 
     def test_liquidity_filter_features_drop_out_when_disabled(self):
@@ -146,6 +147,7 @@ class TestLowVolatilityStrategy:
             "close", "realized_vol_60", "atr_14",
             "traded_value_60", "zero_return_fraction_60",
             "circuit_lock_fraction_60", "circuit_locked_today",
+            "operator_trap_fraction_60", "operator_trap_today",
         ]
         assert strategy.entry_rules()["min_universe"] >= 30
 
@@ -361,6 +363,8 @@ class TestTradabilityScreen:
             "zero_return_fraction_60": 0.0,
             "circuit_lock_fraction_60": 0.0,
             "circuit_locked_today": 0.0,
+            "operator_trap_fraction_60": 0.0,
+            "operator_trap_today": 0.0,
         }
         row.update(overrides)
         return row
@@ -523,3 +527,78 @@ class TestBenchmarkDrivenRegime:
         signals = strategy.score_batch(crashing_universe, StrategyContext(risk=_risk_params()))
 
         assert signals["SYM40"].extra["regime"] == "crash_risk"
+
+
+class TestOperatorTrapScreen:
+    """The 2% upper-circuit trap: the stock traded a real intraday range and
+    only locked at the close, so the zero-range detector never fires and
+    momentum reads the printed move as strength."""
+
+    @staticmethod
+    def _tradable(**overrides):
+        row = {
+            "traded_value_60": 50_000_000.0,
+            "zero_return_fraction_60": 0.0,
+            "circuit_lock_fraction_60": 0.0,
+            "circuit_locked_today": 0.0,
+            "operator_trap_fraction_60": 0.0,
+            "operator_trap_today": 0.0,
+        }
+        row.update(overrides)
+        return row
+
+    def _universe_with(self, leader_overrides, n_symbols=10):
+        universe = {}
+        for i in range(1, n_symbols + 1):
+            symbol = f"SYM{i}"
+            extra = self._tradable(**leader_overrides) if symbol == "SYM10" else self._tradable()
+            universe[symbol] = _features(
+                close=100.0, mom_9m_skip1m=i / 100.0, realized_vol_60=0.20, **extra
+            )
+        return universe
+
+    def test_a_stock_locked_in_an_upper_circuit_never_becomes_a_buy(self):
+        """The DoD: the momentum leader shut pinned at its upper limit, so the
+        BUY it would otherwise generate is a phantom — there is no offer."""
+        strategy = MomentumStrategy(_momentum_config(top_percentile=0.2, min_universe=5))
+        universe = self._universe_with({"operator_trap_today": 1.0})
+        context = StrategyContext(risk=_risk_params())
+
+        signals = strategy.score_batch(universe, context)
+
+        assert signals["SYM10"].signal == "AVOID"
+        assert "upper circuit" in signals["SYM10"].rationale
+        assert signals["SYM10"].extra["position_scale"] == 0.0
+        # And it left the cross-section entirely rather than shifting percentiles.
+        assert signals["SYM9"].signal == "BUY"
+        assert signals["SYM9"].score == 100.0
+
+    def test_a_sustained_operator_footprint_is_dropped(self):
+        strategy = MomentumStrategy(_momentum_config(top_percentile=0.2, min_universe=5))
+        universe = self._universe_with({"operator_trap_fraction_60": 0.4})
+        context = StrategyContext(risk=_risk_params())
+
+        signals = strategy.score_batch(universe, context)
+
+        assert signals["SYM10"].signal == "AVOID"
+        assert "operator footprint" in signals["SYM10"].rationale
+
+    def test_an_occasional_lock_is_tolerated(self):
+        """One lock is a news day. The screen excludes structural
+        untradeability, not every stock that ever hit a limit."""
+        strategy = MomentumStrategy(_momentum_config(top_percentile=0.2, min_universe=5))
+        universe = self._universe_with({"operator_trap_fraction_60": 0.02})
+        context = StrategyContext(risk=_risk_params())
+
+        signals = strategy.score_batch(universe, context)
+
+        assert signals["SYM10"].signal == "BUY"
+
+    def test_the_screen_is_tunable(self):
+        strategy = MomentumStrategy(
+            _momentum_config(top_percentile=0.2, min_universe=5, max_operator_trap_fraction=0.5)
+        )
+        universe = self._universe_with({"operator_trap_fraction_60": 0.4})
+        context = StrategyContext(risk=_risk_params())
+
+        assert strategy.score_batch(universe, context)["SYM10"].signal == "BUY"

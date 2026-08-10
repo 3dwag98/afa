@@ -50,6 +50,21 @@ DEFAULT_MAX_SCALE = 1.0           # never lever up; scaling only ever cuts expos
 DEFAULT_MIN_SCALE = 0.25          # floor so a vol spike dampens rather than deletes
 DEFAULT_CRASH_VOL_MULTIPLE = 1.5  # market vol above 1.5x target = panic state
 DEFAULT_BEAR_EXPOSURE = 0.0       # exposure retained in a confirmed downtrend
+DEFAULT_ADX_PERIOD = 14           # Wilder's default
+DEFAULT_CHOP_ADX = 20.0           # ADX below this = no persistent trend
+DEFAULT_CHOP_BAND = 0.02          # within 2% of the 200-day MA = "at" the mean
+
+# Regime classifications used by the meta-orchestrator to decide which models
+# are allowed to buy (config/strategies/uma_meta_orchestrator.yaml). Distinct
+# from MarketRegime.label, which describes how hard to scale exposure; these
+# describe *what kind of market it is*, which is a different question with a
+# different answer — a chop and a calm uptrend can call for the same exposure
+# scalar while suiting completely different strategies.
+BULL_RISK_ON = "BULL_RISK_ON"
+BEAR_CRASH_RISK = "BEAR_CRASH_RISK"
+SIDEWAYS_CHOP = "SIDEWAYS_CHOP"
+NEUTRAL = "NEUTRAL"
+UNKNOWN = "UNKNOWN"
 
 
 @dataclass
@@ -62,6 +77,13 @@ class MarketRegime:
     vol_scalar: float  # volatility-targeting multiplier in [min_scale, max_scale]
     exposure_scalar: float  # final multiplier applied to position size, in [0, 1]
     reason: str  # human-readable explanation, surfaced on signal rationales
+    # Phase 4 classification (BULL_RISK_ON / BEAR_CRASH_RISK / SIDEWAYS_CHOP /
+    # NEUTRAL / UNKNOWN). `label` above answers "how much exposure?"; this
+    # answers "what kind of market?", and the meta-orchestrator keys its
+    # model-to-regime map off it.
+    classification: str = UNKNOWN
+    trend_distance: Optional[float] = None  # (price / trend_MA - 1), signed
+    adx: Optional[float] = None  # trend strength of the benchmark
 
     @property
     def blocks_new_entries(self) -> bool:
@@ -83,7 +105,82 @@ def neutral_regime(reason: str = "insufficient history to assess market regime")
         vol_scalar=1.0,
         exposure_scalar=1.0,
         reason=reason,
+        classification=UNKNOWN,
     )
+
+
+def classify_regime(
+    trend_distance: Optional[float],
+    market_volatility: Optional[float],
+    adx: Optional[float],
+    target_volatility: float = DEFAULT_TARGET_VOLATILITY,
+    crash_vol_multiple: float = DEFAULT_CRASH_VOL_MULTIPLE,
+    chop_adx: float = DEFAULT_CHOP_ADX,
+    chop_band: float = DEFAULT_CHOP_BAND,
+) -> str:
+    """Name the market state the way the meta-orchestrator's model map does.
+
+    The three headline definitions are:
+
+    - ``BULL_RISK_ON``     — index above its 200-day average, realized vol
+                             below target.
+    - ``BEAR_CRASH_RISK``  — index below its 200-day average, *or* realized
+                             vol above `crash_vol_multiple` x target.
+    - ``SIDEWAYS_CHOP``    — index within `chop_band` of its 200-day average
+                             and ADX below `chop_adx`.
+
+    As stated they overlap, so the order of the checks is doing real work and
+    is not arbitrary:
+
+    1. **A volatility spike is checked first.** Vol above 1.5x target is
+       unambiguous panic regardless of where price sits relative to the
+       average, and misreading a crash as a chop would leave mean reversion
+       buying into it.
+    2. **Chop is checked next**, because it is the most specific condition —
+       "near the mean *and* directionless" — and because an index sitting 1%
+       below its 200-day average in a calm market is a chop, not a bear. Taking
+       the bear branch's "below the MA" clause literally there would mute the
+       trend strategies during exactly the drift they handle fine.
+    3. **Then the bear branch's trend clause**, then the bull branch.
+    4. Anything left — above the average but with volatility between target and
+       the crash multiple — is ``NEUTRAL``: not risk-on, not a crash. Naming it
+       rather than forcing it into one of the three keeps the map honest, since
+       the strategies suited to a calm uptrend are not the ones suited to a
+       jittery one.
+
+    Any input that could not be measured yields ``UNKNOWN``, and the
+    meta-orchestrator treats that as "permit everything" rather than standing
+    the book down on a missing statistic.
+
+    Args:
+        trend_distance: Signed distance from the trend average, as a fraction
+            (price / MA - 1).
+        market_volatility: Annualized realized volatility of the benchmark.
+        adx: Benchmark ADX; None disables the chop test.
+        target_volatility: Annualized volatility budget.
+        crash_vol_multiple: Multiple of target that marks a panic state.
+        chop_adx: ADX below which the market is treated as directionless.
+        chop_band: Half-width of the "at the mean" band, as a fraction.
+
+    Returns:
+        One of the module's regime classification constants.
+    """
+    if trend_distance is None:
+        return UNKNOWN
+
+    if market_volatility is not None and market_volatility > crash_vol_multiple * target_volatility:
+        return BEAR_CRASH_RISK
+
+    if adx is not None and adx < chop_adx and abs(trend_distance) <= chop_band:
+        return SIDEWAYS_CHOP
+
+    if trend_distance <= 0:
+        return BEAR_CRASH_RISK
+
+    if market_volatility is not None and market_volatility < target_volatility:
+        return BULL_RISK_ON
+
+    return NEUTRAL
 
 
 def build_market_proxy(
@@ -188,6 +285,40 @@ def volatility_target_scalar(
     return float(min(max_scale, max(min_scale, target_volatility / volatility)))
 
 
+def _benchmark_adx(
+    market_close: pd.Series,
+    market_ohlcv: Optional[pd.DataFrame],
+    period: int = DEFAULT_ADX_PERIOD,
+) -> Optional[float]:
+    """Latest ADX of the benchmark, preferring a real OHLC frame.
+
+    When the caller supplies OHLC the range is real; otherwise the close series
+    is passed through as a degenerate frame and calculate_adx falls back to its
+    close-only proxy. Returns None when ADX cannot be computed at all, which
+    disables the chop test rather than guessing at it.
+    """
+    try:
+        from .indicators import calculate_adx
+    except ImportError:  # pragma: no cover - direct-module execution fallback
+        from indicators import calculate_adx
+
+    frame = market_ohlcv
+    if frame is None or "close" not in getattr(frame, "columns", []):
+        frame = pd.DataFrame({"close": market_close})
+    elif len(frame) < period + 1:
+        return None
+
+    try:
+        series = calculate_adx(frame, period=period).dropna()
+    except Exception:
+        return None
+
+    if series.empty:
+        return None
+    value = float(series.iloc[-1])
+    return value if math.isfinite(value) else None
+
+
 def assess_market_regime(
     market_close: Optional[pd.Series],
     trend_window: int = DEFAULT_TREND_WINDOW,
@@ -197,6 +328,10 @@ def assess_market_regime(
     bear_exposure: float = DEFAULT_BEAR_EXPOSURE,
     min_scale: float = DEFAULT_MIN_SCALE,
     max_scale: float = DEFAULT_MAX_SCALE,
+    market_ohlcv: Optional[pd.DataFrame] = None,
+    adx_period: int = DEFAULT_ADX_PERIOD,
+    chop_adx: float = DEFAULT_CHOP_ADX,
+    chop_band: float = DEFAULT_CHOP_BAND,
 ) -> MarketRegime:
     """Classify the market state and derive an exposure multiplier.
 
@@ -221,6 +356,13 @@ def assess_market_regime(
             above 0 to dampen rather than fully stand down.
         min_scale: Lower clamp on the volatility scalar.
         max_scale: Upper clamp on the volatility scalar.
+        market_ohlcv: Optional benchmark OHLC frame aligned to market_close.
+            Only ADX needs the daily range, and only the SIDEWAYS_CHOP
+            classification needs ADX; without it the index falls back to a
+            close-only proxy (see indicators.calculate_adx).
+        adx_period: Wilder smoothing period for ADX.
+        chop_adx: ADX below which the market counts as directionless.
+        chop_band: Half-width of the "at the 200-day average" band.
 
     Returns:
         A MarketRegime. Falls back to neutral_regime() whenever there is not
@@ -234,9 +376,22 @@ def assess_market_regime(
     trend_ma = float(market_close.iloc[-trend_window:].mean())
     last = float(market_close.iloc[-1])
     trend_ok = last > trend_ma
+    trend_distance = (last / trend_ma - 1.0) if trend_ma else None
 
     market_vol = realized_volatility(market_close, vol_window)
     vol_scalar = volatility_target_scalar(market_vol, target_volatility, min_scale, max_scale)
+
+    adx = _benchmark_adx(market_close, market_ohlcv, adx_period)
+    classification = classify_regime(
+        trend_distance=trend_distance,
+        market_volatility=market_vol,
+        adx=adx,
+        target_volatility=target_volatility,
+        crash_vol_multiple=crash_vol_multiple,
+        chop_adx=chop_adx,
+        chop_band=chop_band,
+    )
+    tagged = dict(classification=classification, trend_distance=trend_distance, adx=adx)
 
     vol_spike = market_vol is not None and market_vol > crash_vol_multiple * target_volatility
     vol_text = f"{market_vol:.1%}" if market_vol is not None else "n/a"
@@ -254,6 +409,7 @@ def assess_market_regime(
                 f"and realized vol {vol_text} > {crash_vol_multiple:.1f}x target "
                 f"{target_volatility:.0%}; momentum exposure -> {exposure:.0%}"
             ),
+            **tagged,
         )
 
     if not trend_ok:
@@ -271,6 +427,7 @@ def assess_market_regime(
                 f"downtrend: market {last:.2f} below {trend_window}d MA {trend_ma:.2f}; "
                 f"vol {vol_text}; exposure -> {exposure:.0%}"
             ),
+            **tagged,
         )
 
     if vol_spike:
@@ -286,6 +443,7 @@ def assess_market_regime(
                 f"{crash_vol_multiple:.1f}x target {target_volatility:.0%}; "
                 f"exposure -> {exposure:.0%}"
             ),
+            **tagged,
         )
 
     exposure = max(0.0, min(1.0, vol_scalar))
@@ -299,4 +457,5 @@ def assess_market_regime(
             f"risk on: market above {trend_window}d MA, vol {vol_text}; "
             f"exposure -> {exposure:.0%}"
         ),
+        **tagged,
     )

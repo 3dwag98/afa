@@ -194,6 +194,33 @@ class TrainingConfig(BaseModel):
         "not to produce the shipped weights, so this defaults to min(20, training.epochs) to keep "
         "validation affordable; set explicitly to train folds to full length.",
     )
+    loss: Literal["quantile", "mse"] = Field(
+        default="quantile",
+        description="Training objective. 'quantile' fits pinball loss over `quantiles`, so the "
+        "model predicts a distribution of the forward return rather than a point. This is the "
+        "default because squared error is minimized by the conditional mean, the conditional mean "
+        "of a 5-day equity return is nearly constant, and a network trained on MSE therefore "
+        "collapses to a near-constant output that validates beautifully and forecasts nothing. "
+        "Quantile outputs also give the trigger engine a native confidence interval instead of a "
+        "bare number. 'mse' restores the single-output point forecast.",
+    )
+    quantiles: List[float] = Field(
+        default_factory=lambda: [0.1, 0.5, 0.9],
+        description="Quantile levels predicted when loss='quantile', in ascending order. The "
+        "median is the point forecast; the outer pair is the confidence interval. Levels must lie "
+        "strictly inside (0, 1) — the 0th and 100th percentiles of a return distribution are not "
+        "estimable from a few years of daily bars.",
+    )
+    calibrate_confidence: bool = Field(
+        default=True,
+        description="Fit an isotonic map from raw model score to realized win rate on the "
+        "walk-forward test folds (src/calibration.py) and ship it beside the checkpoint. Networks "
+        "on noisy financial data are systematically overconfident, and the score feeds Kelly "
+        "sizing and the trigger engine's expected-value hurdle — both far more sensitive to an "
+        "optimistic probability than to a pessimistic one. Calibration preserves the model's "
+        "ranking (which walk-forward actually measured) and discards its scale (which nothing "
+        "measured).",
+    )
     walk_forward_min_train_fraction: float = Field(
         default=0.4,
         description="Fraction of the panel used to train the first walk-forward fold. Subsequent "
@@ -235,6 +262,23 @@ class RiskConfig(BaseModel):
     )
     max_single_position_pct: float = Field(
         default=0.03, description="Maximum allocation to a single position"
+    )
+    atr_stop_multiplier: float = Field(
+        default=1.5,
+        description="ATR multiple below entry for the stop. **Match this to the signal's own "
+        "horizon.** A measured example: cross-sectional momentum forms on a 9-month window, and "
+        "at 1.5x ATR its positions exited at a 5-day median holding period with 71% of exits at "
+        "the stop, turning a multi-month factor into day-trading and losing 2.0% gross on "
+        "deployed capital. At 6.0x the same signal over the same universe and window held for a "
+        "94-day median and returned +4.4% gross. The stop was cutting the thesis short, not "
+        "protecting it. 1.5 is retained as the default because it suits the per-ticker "
+        "trend/breakout strategy this platform started with; raise it for anything with a "
+        "formation window measured in months.",
+    )
+    atr_target_multiplier: float = Field(
+        default=2.0,
+        description="ATR multiple above entry for the target. Scale it with atr_stop_multiplier "
+        "— the ratio between them is the gross reward:risk every signal is screened on.",
     )
     use_kelly_sizing: bool = Field(
         default=False,
@@ -295,6 +339,34 @@ class RiskConfig(BaseModel):
         description="Drawdown level at which the circuit breaker re-arms and buying resumes. "
         "Kept below max_portfolio_drawdown_pct so the breaker cannot flicker on and off at "
         "the trip point.",
+    )
+    drawdown_halt_max_days: int = Field(
+        default=60,
+        description="Trading days after which a halted drawdown breaker re-arms regardless of "
+        "recovery, resetting the equity peak to current equity. Recovery-only re-arming "
+        "deadlocks and does so silently: the breaker halts buying, the open positions exit "
+        "through their own stops, the book is now all cash — and cash cannot appreciate back "
+        "toward a peak it is measured against, so the halt is permanent. A 5-year backtest hit "
+        "exactly this, tripping in month 7 and sitting in cash for four years, which reads in "
+        "the report as a flat equity curve rather than a stuck flag. Set to 0 to disable the "
+        "cooldown and restore recovery-only behaviour.",
+    )
+    exit_on_lower_circuit_lock: bool = Field(
+        default=True,
+        description="Queue an immediate exit when a holding closes pinned at its lower circuit. "
+        "The modelled stop assumes a fill is available near it; on a lock there is no bid, so "
+        "waiting for the stop means holding through however many further locked sessions it takes "
+        "to find one. Every one of those realizes a loss the position sizing never priced — the "
+        "same asymmetry that biases the payoff ratio Kelly estimates from. The exit is queued for "
+        "the next session, the earliest a real order could work.",
+    )
+    liquidate_on_drawdown_halt: bool = Field(
+        default=False,
+        description="Also sell every open position when the drawdown circuit breaker trips, "
+        "instead of only suppressing new BUYs. Off by default: open positions already carry stops "
+        "and targets, and force-liquidating an entire book at a drawdown trough is how a bad "
+        "quarter becomes a permanent loss. Turn it on for mandates where a hard equity floor "
+        "outranks recovery potential.",
     )
     slippage_pct_per_side: float = Field(
         default=0.0025,

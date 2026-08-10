@@ -6,6 +6,8 @@ import pytest
 
 from src.liquidity import (
     circuit_locked_days,
+    lower_circuit_locked_days,
+    operator_trap_days,
     split_intraday_and_overnight,
     zero_return_days,
 )
@@ -113,10 +115,10 @@ class TestSplitIntradayAndOvernight:
 
 
 class TestDynamicCircuitBands:
-    """Exchanges impose ad-hoc 2% bands on volatile or operator-suspected
-    scrips, not just the 5/10/20% defaults."""
+    """Exchanges impose ad-hoc 1% and 2% ASM/GSM bands on volatile or
+    operator-suspected scrips, not just the 5/10/20% defaults."""
 
-    @pytest.mark.parametrize("band", [0.02, 0.05, 0.10, 0.20])
+    @pytest.mark.parametrize("band", [0.01, 0.02, 0.05, 0.10, 0.20])
     def test_every_statutory_band_is_detected_in_both_directions(self, band):
         up = _ohlcv([100.0, 100.0 * (1 + band)], ranges=[1.0, 0.0])
         down = _ohlcv([100.0, 100.0 * (1 - band)], ranges=[1.0, 0.0])
@@ -152,3 +154,90 @@ class TestDynamicCircuitBands:
         df = _ohlcv([100.0, 102.0], ranges=[1.0, 0.0])
 
         assert bool(circuit_locked_days(df, bands=(0.10, 0.20)).iloc[-1]) is False
+
+
+def _ohlcv_closing_at(closes, closes_at="high", locked=None):
+    """OHLCV where flagged sessions close at their session high (or low).
+
+    `locked[i]` True means session i traded a real intraday range and then shut
+    pinned at the limit — the operator footprint the zero-range detector misses.
+    """
+    n = len(closes)
+    closes = np.asarray(closes, dtype=float)
+    locked = np.zeros(n, dtype=bool) if locked is None else np.asarray(locked, dtype=bool)
+
+    high = np.where(locked & (closes_at == "high"), closes, closes + 1.0)
+    low = np.where(locked & (closes_at == "low"), closes, closes - 1.0)
+    return pd.DataFrame(
+        {
+            "open": closes,
+            "high": high,
+            "low": low,
+            "close": closes,
+            "volume": np.full(n, 1_000_000.0),
+        },
+        index=pd.bdate_range("2023-01-02", periods=n),
+    )
+
+
+class TestOnePercentBand:
+    """ASM/GSM impose 1% bands on exactly the names most likely to be
+    operator-driven, so it is the band that matters most."""
+
+    def test_a_one_percent_lock_is_detected(self):
+        df = _ohlcv([100.0, 101.0], ranges=[1.0, 0.0])
+
+        assert bool(circuit_locked_days(df).iloc[-1]) is True
+
+    def test_tick_rounding_around_the_one_percent_band_still_counts(self):
+        df = _ohlcv([100.0, 100.9], ranges=[1.0, 0.0])
+
+        assert bool(circuit_locked_days(df).iloc[-1]) is True
+
+    def test_the_tolerance_narrows_with_the_band(self):
+        """A flat 40bp window around a 1% band would accept anything from 0.6%
+        to 1.4% — half the quiet days on the tape. 0.6% is not a limit move."""
+        df = _ohlcv([100.0, 100.6], ranges=[1.0, 0.0])
+
+        assert bool(circuit_locked_days(df).iloc[-1]) is False
+
+    def test_wider_bands_keep_the_absolute_tolerance(self):
+        """The relative cap only binds below 2%; the ladder already in use is
+        unchanged."""
+        df = _ohlcv([100.0, 104.6], ranges=[1.0, 0.0])  # 4.6%, within 40bp of 5%
+
+        assert bool(circuit_locked_days(df).iloc[-1]) is True
+
+
+class TestOperatorTrapDays:
+    def test_flags_a_session_that_ran_up_and_locked_at_the_close(self):
+        """The whole point: this session traded a real range, so the zero-range
+        detector waves it through, yet it shut with no offer left."""
+        df = _ohlcv_closing_at([100.0, 102.0], locked=[False, True])
+
+        assert bool(circuit_locked_days(df).iloc[-1]) is False
+        assert bool(operator_trap_days(df).iloc[-1]) is True
+
+    def test_a_close_at_the_high_without_a_band_move_is_not_a_trap(self):
+        df = _ohlcv_closing_at([100.0, 103.5], locked=[False, True])
+
+        assert bool(operator_trap_days(df).iloc[-1]) is False
+
+    def test_a_band_move_that_did_not_close_at_the_high_is_not_a_trap(self):
+        df = _ohlcv_closing_at([100.0, 102.0], locked=[False, False])
+
+        assert bool(operator_trap_days(df).iloc[-1]) is False
+
+    def test_a_lower_circuit_close_is_not_an_upper_trap(self):
+        """Asymmetric on purpose: a down-lock is an exit that cannot be taken,
+        not an entry that cannot be filled."""
+        df = _ohlcv_closing_at([100.0, 98.0], closes_at="low", locked=[False, True])
+
+        assert bool(operator_trap_days(df).iloc[-1]) is False
+        assert bool(lower_circuit_locked_days(df).iloc[-1]) is True
+
+    def test_missing_columns_yield_no_flags(self):
+        df = pd.DataFrame({"close": [100.0, 102.0]})
+
+        assert not operator_trap_days(df).any()
+        assert not lower_circuit_locked_days(df).any()

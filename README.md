@@ -26,6 +26,7 @@ A lightweight, CLI-first platform for training and backtesting trading strategie
 - [Parallelism](#parallelism)
 - [Configuration](#configuration)
 - [Scheduling (cron / Task Scheduler)](#scheduling-cron--task-scheduler)
+- [Backtest findings and known limitations](#backtest-findings-and-known-limitations)
 - [Testing](#testing)
 - [Project Structure](#project-structure)
 - [Optional: Docker](#optional-docker)
@@ -181,15 +182,40 @@ portfolio-agent backtest --strategy ensemble --strategy-config config/strategies
 portfolio-agent list-strategies --name ensemble --strategy-config config/strategies/example_uma.yaml
 ```
 
-Two combination methods, selectable per UMA:
+Three combination methods, selectable per UMA:
 
-- **`weighted_blend`** (default) — each member's signal is mapped to a strength (BUY=1, WATCH=0.3, HOLD=0, AVOID=-0.3, SELL=-1) and averaged by weight; score, entry/stop/target, and probability-of-profit are likewise weighted averages. Good default for mixing strategies of different character (e.g. a fast rule-based signal with a slower ML one).
-- **`vote`** — each member casts a BUY/SELL/HOLD-bucketed vote; `vote.mode: majority` requires >50% agreement, `vote.mode: unanimous` requires all members to agree. More conservative — fewer but higher-conviction signals.
+- **`trigger`** — members are converted to `ModelVerdict`s and arbitrated by [`src/trigger_engine.py`](portfolio_agent/src/trigger_engine.py). **Use this for anything that trades real money.** The other two average, and averaging is the wrong operation for votes on a decision: a strong BUY blended with a strong SELL comes out as a weak BUY — a trade neither member would take, entered exactly when the models disagree most. The trigger engine instead discounts buy-side conviction by the strongest opposing conviction (`c_eff = c_buy × (1 − max c_opposing)`), applies hard vetoes for tradability, regime and expected value, and emits a **position-size multiplier** so a trade that barely clears its bar is taken at half size.
+- **`weighted_blend`** (default, kept so existing UMA files behave as they did) — each member's signal is mapped to a strength (BUY=1, WATCH=0.3, HOLD=0, AVOID=-0.3, SELL=-1) and averaged by weight; score, entry/stop/target, and probability-of-profit are likewise weighted averages. Cheap and smooth, and wrong in the way described above whenever members conflict.
+- **`vote`** — each member casts a BUY/SELL/HOLD-bucketed vote; `vote.mode: majority` requires >50% agreement, `vote.mode: unanimous` requires all members to agree. It cannot manufacture a signal out of disagreement, but it discards conviction magnitude, position sizing and the expected-value hurdle.
+
+### The multi-regime meta-orchestrator
+
+[`config/strategies/uma_meta_orchestrator.yaml`](portfolio_agent/config/strategies/uma_meta_orchestrator.yaml) is the production configuration: four sleeves, arbitrated by the trigger engine and gated on the Nifty 50 regime.
+
+```bash
+portfolio-agent backtest --strategy ensemble \
+  --strategy-config config/strategies/uma_meta_orchestrator.yaml
+```
+
+A `regimes:` block maps each market state to the members allowed to generate BUY signals in it:
+
+| Regime | Definition (Nifty 50) | Sleeves permitted |
+|---|---|---|
+| `BULL_RISK_ON` | Above 200-day SMA, realized vol < target | Quality momentum, trend rules, neural |
+| `BEAR_CRASH_RISK` | Below 200-day SMA, **or** vol > 1.5× target | Defensive low-volatility only |
+| `SIDEWAYS_CHOP` | Within 2% of the 200-day SMA and ADX < 20 | Trend rules, neural, defensive |
+| `NEUTRAL` | Above the SMA but vol between target and 1.5× | Everything except momentum |
+
+The definitions overlap by design, so the classifier checks them in a specific order — a volatility spike is unambiguous panic wherever price sits and wins first; chop is the most specific condition and is checked before the bear branch's "below the SMA" clause, because an index 1% under its average in a calm market is a range, not a bear.
+
+Members outside a regime's list are **muted, not vetoed**: one sleeve being out of season must not stop the sleeve that is in it. A regime the map does not mention — including `UNKNOWN`, when no benchmark is cached — permits every member, since not knowing the regime is not evidence that every model is wrong.
 
 Notes:
-- Member weights only matter for `weighted_blend`; they're ignored by `vote`.
-- A UMA is not GPU-batched even if one of its members is (correctness — a rule-based member needs a genuine per-ticker Monte Carlo result, which the batched path skips). If you want maximum ML-inference throughput, run that strategy directly (`--strategy lstm`) rather than wrapping it in a UMA.
-- `list-strategies --name ensemble --strategy-config <file>` shows you the resolved member list and weights for a given UMA file.
+- Member weights only matter for `weighted_blend`; they're ignored by `vote` and `trigger`.
+- Cross-sectional members (`momentum`, `low_volatility`) require `method: trigger`, which scores every member across the whole eligible universe before arbitrating. The averaging methods combine through per-ticker `score()`, where decile ranking degenerates to a universe of one, so they reject such members at construction.
+- A UMA takes each member's name from the UMA file (`name:` on the member, or `params.name`), which is what `regimes:` keys off. Member names must be unique — the trigger engine treats each verdict as an independent voice.
+- Inside a batched UMA, a `rule_based` member receives no per-ticker Monte Carlo result and scores its `MC_Prob` component at zero. Mixing an MC-dependent member with a cross-sectional one is a real trade-off, not a free composition.
+- `list-strategies --name ensemble --strategy-config <file>` shows you the resolved member list, weights, trigger thresholds and regime map for a given UMA file.
 
 ## Quant research basis
 
@@ -219,6 +245,37 @@ Optimizations already applied, controlled via `config.yaml`'s `training` section
 | `use_torch_compile` | `false` | Wraps the model with `torch.compile()` for faster training (PyTorch 2.0+, biggest win on CUDA). Off by default — enable it once you're doing longer training runs. |
 | `batch_size` | `128` | Sized for GPU throughput; lower it on CPU-only or memory-constrained machines. |
 | `num_workers` | `2` | PyTorch `DataLoader` workers (separate from `data_load_workers`, which is for building the panel, not iterating it). |
+| `model` | `lstm` | Architecture from `models/registry.py`. **`patchtst` is the recommended one** — see below. |
+| `loss` | `quantile` | Training objective. See below. |
+| `quantiles` | `[0.1, 0.5, 0.9]` | Percentiles of the forward return the model predicts. |
+| `calibrate_confidence` | `true` | Fits an isotonic score→probability map on the walk-forward folds and ships it with the checkpoint. |
+
+### What the model predicts, and why it isn't a single number
+
+Squared error is minimized by the conditional mean, and the conditional mean of a 5-day equity return is very close to a constant. A network trained on `MSELoss` therefore converges to a near-constant output that scores excellently on the loss curve and forecasts nothing — the mean-reversion trap. It also hands downstream code a bare point estimate, which the trigger engine cannot turn into an expected value without inventing a distribution around it.
+
+The default is **pinball (quantile) loss** over the 10th, 50th and 90th percentiles. A constant answer cannot satisfy three asymmetric penalties at once, and the outer pair is a confidence interval that comes out of the fit rather than being bolted on: `MLStrategy` derives its stop and target from the predicted 10th/90th percentiles instead of fixed 2%/3% cuts, so a name the model reads as wide gets a wide stop. Crossed quantiles are repaired by sorting at inference — exact and free — rather than penalized during training, where the penalty would distort the quantiles it was protecting.
+
+Set `loss: mse` to restore the single-output point forecast.
+
+### Architectures
+
+| `training.model` | What it is |
+|---|---|
+| `lstm` | The original vanilla LSTM. Compresses a 60-day multi-feature window into one hidden vector and predicts from the final timestep — everything the sequence held has to survive that bottleneck. |
+| `patchtst` | **Recommended.** Cuts the window into 5-day patches and attends over them: a single day's return is nearly pure noise, a week of them has shape. Channel-independent encoding (every feature runs through the same weights, separately) keeps attention from fitting spurious cross-feature relationships, and per-window instance normalization lets one set of weights serve a ₹30 small-cap and a ₹3,000 large-cap. Attention costs 12×12 instead of 60×60. |
+
+```bash
+uv run portfolio-agent train --device auto   # set training.model: patchtst in config.yaml
+```
+
+Existing single-output checkpoints keep loading unchanged: head width and quantile levels come from `models/metadata.json` and default to the old scalar shape when absent.
+
+### Confidence calibration
+
+Networks on noisy financial data are systematically overconfident — the score at which the model says 80% is typically won far less than 80% of the time. That matters more here than in most settings, because the number feeds Kelly sizing and the trigger engine's expected-value hurdle, and both are far more sensitive to an optimistic `p` than a pessimistic one.
+
+`calibrate_confidence` fits an isotonic (monotone) map from raw score to realized win rate on the **walk-forward test folds** — the only genuinely out-of-sample scores a run produces. Fitting on training predictions would measure memorization and hand back a map that makes an overfitted model look perfectly calibrated. Monotonicity is the point: it preserves the model's ranking, which walk-forward actually measured, and discards its scale, which nothing did. Training prints the expected calibration error before and after, so the correction is auditable rather than a black box.
 
 Plus, already in place from the underlying `DataLoader`/device setup: `pin_memory` on CUDA, `persistent_workers`/`prefetch_factor` for the training loop, and `cudnn.benchmark` enabled on fixed-size CUDA inputs.
 
@@ -302,7 +359,10 @@ training:
 | Tradability screen | `liquidity_filter` params | Drops circuit-locked and zombie stocks from the ranking ([§15](docs/QUANT_RESEARCH.md)) |
 | Sector cap | `risk.max_sector_pct`, `risk.max_unknown_sector_pct` | Trims orders so no sector exceeds 25%, with unmapped tickers sharing a wider 30% budget so an incomplete map isn't a bypass. **Requires a `ticker,sector` CSV at `paths.sector_map_csv`** — with no map at all the cap is inactive (and logs a warning), since capping the unmapped pool would limit total invested capital rather than sector concentration |
 | Drawdown breaker | `risk.max_portfolio_drawdown_pct` | Halts new entries past 15% drawdown, re-arms at 10% |
-| Kelly guards | `risk.kelly_*` | 50-trade floor, Beta-shrunk win rate, kappa hard-capped at quarter-Kelly |
+| Drawdown liquidation | `risk.liquidate_on_drawdown_halt` | **Off by default.** Also sells the whole book when the breaker trips. Left off because open positions already carry stops and force-liquidating at a drawdown trough turns a bad quarter into a permanent loss; turn it on for mandates with a hard equity floor |
+| Lower-circuit exit | `risk.exit_on_lower_circuit_lock` | Exits a holding that closed pinned at its lower circuit at the next session, instead of waiting for a modelled stop no bid will fill |
+| Signal arbitration | UMA `trigger:` block | Blocks the trade when a strong model opposes, when expected value misses the hurdle, or when the regime mutes every buyer — and sizes the rest by conviction |
+| Kelly guards | `risk.kelly_*` | 50-trade floor, Beta-shrunk win rate, kappa hard-capped at quarter-Kelly, and **both inputs measured net of friction** on the live path as well as in backtests |
 
 ## Scheduling (cron / Task Scheduler)
 
@@ -318,6 +378,91 @@ There's no scheduler baked into the app — run the CLI on your own schedule.
 ```
 
 **Windows (Task Scheduler):** create a task that runs `uv run portfolio-agent run-agent` from the project directory on your desired schedule.
+
+## Backtest findings and known limitations
+
+Running the end-to-end backtest surfaced three defects that no unit test would
+have caught, because each one presents as a *plausible number* rather than an
+error. They are fixed; the findings are recorded here because two of them
+change how the platform should be configured.
+
+**The engine discarded every strategy's exit plan.** Filled positions were
+given a hardcoded 5% stop and 10% target regardless of what the strategy
+computed. That made `atr_stop_multiplier` dead config, and — worse — meant
+`min_reward_risk` screened signals on a net-of-cost reward:risk derived from
+ATR levels the engine then ignored, gating on one exit plan and trading
+another. The quantile model's distribution-derived stop and target went the
+same way, and Kelly's payoff ratio was estimated from trades exited under a
+rule the signals were never screened against. Fills now carry the signal's own
+levels, as distances re-applied to the price actually paid.
+
+**Exit horizon has to match signal horizon, and by default it did not.** Once
+the exit plan actually reached the fill, the same momentum signal over the same
+universe and window behaved completely differently depending on the stop width:
+
+| `atr_stop_multiplier` | Round trips | Median hold | Stop-loss exits | Gross return on deployed | Net P&L |
+|---|---|---|---|---|---|
+| 1.5 (default) | 590 | 5 days | 71% | **−2.02%** | −₹481,861 |
+| 6.0 | 113 | **94 days** | 31% | **+4.44%** | +₹55,807 |
+
+Cross-sectional momentum forms on a 9-month window. At 1.5× ATR it was exiting
+in a working week, which turns a multi-month factor into day-trading and pays
+~0.8% of round-trip friction for the privilege. The signal has edge; the stop
+was cutting the thesis short rather than protecting it. The default stays 1.5
+because it suits the per-ticker trend/breakout strategy the platform started
+with — **set `risk.atr_stop_multiplier` to match your signal's horizon.**
+
+**The drawdown breaker could deadlock.** It halts new buys at 15% drawdown and
+re-arms on recovery to 10%. But halting buys does not freeze the book: open
+positions keep exiting through their stops until only cash is left, and cash
+cannot appreciate back toward a peak it is measured against. A 5-year run
+tripped in month seven and sat in cash for four years, reporting a 15.04% max
+drawdown that actually meant "stopped trading". `risk.drawdown_halt_max_days`
+(60) now re-arms on a cooldown and resets the peak.
+
+### End-to-end results after the fixes
+
+120 tickers, 2021-01 to 2025-12 (~4.3 years of cached data), ₹10L initial
+capital, fractional-Kelly sizing, full friction stack (STT 0.1% both legs,
+stamp duty, GST, exchange and SEBI charges, ATR- and volume-scaled slippage,
+STCG/LTCG), `atr_stop_multiplier: 6.0`:
+
+| | Total return | CAGR | Max DD | Win rate | Profit factor | Sharpe |
+|---|---|---|---|---|---|---|
+| `momentum` alone | **+15.2%** | 3.27% | **12.9%** | 53.4% | 1.60 | −0.40 |
+| Meta-orchestrator UMA | +1.5% | 0.34% | 27.8% | 44.8% | 1.03 | −0.44 |
+
+Read the Sharpe carefully: it is negative *despite* a positive return, because
+`RiskAnalyzer` measures excess return over a 6.5% Indian risk-free rate. A
+3.3% CAGR loses to government bonds. The strategy survives the friction stack —
+profit factor 1.60 net of every cost the simulator models — but it does not
+yet clear the opportunity cost of not trading at all.
+
+The meta-orchestrator underperforming its own momentum sleeve is worth naming
+rather than hiding: on this universe the additional sleeves diluted the one
+that had edge, and the regime map was running off the composite fallback rather
+than a real index. That is a result about this configuration and this data, not
+a verdict on the architecture — but it is the result.
+
+### What is not verified here
+
+- **The performance target is not met.** The roadmap's goal of a net Sharpe
+  above 1.2 with max drawdown under 15% is not reached on the data available in
+  this repository. Max drawdown clears comfortably for the momentum sleeve
+  (12.9%); Sharpe does not, and nothing here should be read as claiming it does.
+- **The cache is ~4.5 years, not 10.** `data/market_data/` starts in 2021, so
+  the 2018 IL&FS crisis and the 2020 COVID crash are outside it. The regime
+  classifier is exercised on the 2022 small-cap drawdown and the 2023 mid-cap
+  rally only.
+- **The universe is an alphabetical slice, not the Nifty 500.**
+  `resolve_backtest_universe(max_tickers=N)` takes the first N cached tickers,
+  which is heavily micro-cap. Decile ranking over that is not the cross-section
+  the research describes.
+- **`^NSEI` is not cached**, so the regime filter runs off the equal-weighted
+  composite of the traded universe rather than the real index. That fallback is
+  what `src/regime.py` was designed for and it produces a sensible regime series
+  (bear through 2022, bull through 2023, neutral from mid-2024), but an index
+  feed is the better gauge.
 
 ## Testing
 

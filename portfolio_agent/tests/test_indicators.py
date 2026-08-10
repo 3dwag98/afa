@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 
-from src.indicators import calculate_indicators, calculate_all_indicators
+from src.indicators import calculate_adx, calculate_indicators, calculate_all_indicators
 from src.models import IndicatorSnapshot
 
 
@@ -224,3 +224,71 @@ class TestCalculateAllIndicators:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestCalculateADX:
+    """ADX is what separates a chop from a trend at the same distance from the
+    moving average, so the regime map depends on it being right."""
+
+    @staticmethod
+    def _frame(closes, width=1.0):
+        closes = np.asarray(closes, dtype=float)
+        return pd.DataFrame(
+            {
+                'open': closes,
+                'high': closes + width,
+                'low': closes - width,
+                'close': closes,
+            },
+            index=pd.bdate_range("2022-01-03", periods=len(closes)),
+        )
+
+    def test_a_clean_trend_scores_high(self):
+        rising = self._frame([100 + i for i in range(120)])
+
+        assert calculate_adx(rising).dropna().iloc[-1] > 40
+
+    def test_an_oscillating_market_scores_low(self):
+        chop = self._frame([100 + (2 if i % 2 else -2) for i in range(120)])
+
+        assert calculate_adx(chop).dropna().iloc[-1] < 25
+
+    def test_direction_does_not_change_the_strength(self):
+        """ADX measures persistence, not sign: a clean downtrend is as strong
+        a trend as a clean uptrend."""
+        up = calculate_adx(self._frame([100 + i for i in range(120)])).dropna().iloc[-1]
+        down = calculate_adx(self._frame([100 - i * 0.5 for i in range(120)])).dropna().iloc[-1]
+
+        assert down == pytest.approx(up, rel=0.05)
+
+    def test_a_close_only_frame_still_produces_a_reading(self):
+        """Index series are often cached as closes alone; the formulas stay
+        well defined with high = low = close."""
+        closes = pd.DataFrame({'close': [100 + i for i in range(120)]})
+
+        value = calculate_adx(closes).dropna().iloc[-1]
+
+        assert 0 <= value <= 100
+
+    def test_a_flat_series_is_unmeasurable_rather_than_zero(self):
+        """Zero range carries no directional information at all, and 0/0
+        reported as 0 would read as a confident 'no trend'."""
+        flat = pd.DataFrame({'close': [100.0] * 120})
+
+        assert calculate_adx(flat).dropna().empty
+
+    def test_values_stay_within_bounds(self):
+        rng = np.random.default_rng(9)
+        closes = 100 + np.cumsum(rng.normal(0, 1.0, 300))
+        frame = self._frame(closes, width=1.5)
+
+        values = calculate_adx(frame).dropna()
+
+        assert values.min() >= 0
+        assert values.max() <= 100
+
+    def test_too_little_history_returns_nan(self):
+        assert calculate_adx(pd.DataFrame({'close': [100.0]})).isna().all()
+
+    def test_a_frame_without_a_close_column_returns_nan(self):
+        assert calculate_adx(pd.DataFrame({'high': [1.0, 2.0]})).isna().all()

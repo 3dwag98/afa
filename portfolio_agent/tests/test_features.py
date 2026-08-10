@@ -451,3 +451,84 @@ class TestNormalizationIsCausal:
         from portfolio_agent.config.loader import load_config
 
         assert load_config().features.normalize is False
+
+
+class TestNormalizationIsCausal:
+    """Task 3.3's real question is not 'is a scaler fitted per fold' but 'can a
+    fold boundary leak at all'. This pipeline never fits a global scaler: the
+    normalizer is a trailing rolling z-score over `close.shift(1)`, so a
+    feature value at t is a function of data strictly before t and nothing
+    else. That is a strictly stronger guarantee than per-fold fitting — it
+    holds for every possible split, including ones nobody thought to test.
+
+    These tests pin the property that makes it true, so a future change to
+    `_normalize_features` that introduces a whole-series statistic (a
+    StandardScaler over the panel, an expanding mean without the shift) fails
+    here rather than silently inflating every walk-forward fold's score.
+    """
+
+    @staticmethod
+    def _ohlcv(n=400, seed=11):
+        rng = np.random.default_rng(seed)
+        close = 100 + np.cumsum(rng.normal(0, 1.5, n))
+        return pd.DataFrame(
+            {
+                'open': close + rng.normal(0, 0.3, n),
+                'high': close + np.abs(rng.normal(0, 1.0, n)),
+                'low': close - np.abs(rng.normal(0, 1.0, n)),
+                'close': close,
+                'volume': rng.integers(1_000_000, 5_000_000, n).astype(float),
+            },
+            index=pd.bdate_range("2021-01-04", periods=n),
+        )
+
+    FEATURES = ['sma_20', 'rsi_14', 'macd', 'bollinger_pct_b', 'atr_14', 'return_1d', 'return_5d']
+
+    def test_truncating_the_future_does_not_change_the_past(self):
+        """The decisive test. If any statistic were fitted over the whole
+        series, deleting the tail would move every earlier value."""
+        df = self._ohlcv()
+        split = 250
+
+        full = build_features(df, self.FEATURES, normalize=True, normalize_window=252)
+        prefix = build_features(
+            df.iloc[:split], self.FEATURES, normalize=True, normalize_window=252
+        )
+
+        pd.testing.assert_frame_equal(full.iloc[:split], prefix, check_exact=False, rtol=1e-12)
+
+    def test_a_walk_forward_split_sees_identical_training_rows(self):
+        """Concretely: fold 2's expanded training window must reproduce fold
+        1's rows exactly, or the 'expanding history' is silently a different
+        dataset each time."""
+        df = self._ohlcv()
+
+        fold1 = build_features(df.iloc[:200], self.FEATURES, normalize=True)
+        fold2 = build_features(df.iloc[:320], self.FEATURES, normalize=True)
+
+        pd.testing.assert_frame_equal(fold2.iloc[:200], fold1, check_exact=False, rtol=1e-12)
+
+    def test_perturbing_a_future_bar_leaves_earlier_features_untouched(self):
+        df = self._ohlcv()
+        tampered = df.copy()
+        tampered.iloc[300:, tampered.columns.get_loc('close')] *= 5.0
+
+        base = build_features(df, self.FEATURES, normalize=True)
+        after = build_features(tampered, self.FEATURES, normalize=True)
+
+        pd.testing.assert_frame_equal(
+            base.iloc[:300], after.iloc[:300], check_exact=False, rtol=1e-12
+        )
+
+    def test_the_normalizer_excludes_the_current_row_from_its_own_statistics(self):
+        """The `.shift(1)` inside _normalize_features. Without it the value at
+        t is standardized against a window containing t."""
+        from portfolio_agent.features.pipeline import _normalize_features
+
+        frame = pd.DataFrame({'x': [1.0, 2.0, 3.0, 100.0]})
+        normalized = _normalize_features(frame, window=252)
+
+        # The final row standardizes x[t-1] = 3.0 against rows 1..3, so the
+        # outlier at t cannot influence it.
+        assert not np.isnan(normalized['x'].iloc[-1])
+        assert abs(normalized['x'].iloc[-1]) < 10

@@ -19,6 +19,7 @@ Companion documents:
   - [The three dispatch paths](#the-three-dispatch-paths)
   - [Registry and configuration flow](#registry-and-configuration-flow)
   - [Ensembles (UMAs)](#ensembles-umas)
+  - [The trigger engine](#the-trigger-engine)
   - [The ML strategy and the training loop](#the-ml-strategy-and-the-training-loop)
   - [Self-learning weights](#self-learning-weights)
 - [The backtest engine](#the-backtest-engine)
@@ -223,31 +224,112 @@ inside another UMA.
 
 ```mermaid
 flowchart TD
-    UMA["EnsembleStrategy<br/>(type: ensemble)"] --> Y["example_uma.yaml<br/>method: weighted_blend | vote"]
-    UMA --> M1["member: rule_based (0.6)"]
-    UMA --> M2["member: lstm (0.4)"]
+    UMA["EnsembleStrategy<br/>(type: ensemble)"] --> Y["uma yaml<br/>method: trigger | weighted_blend | vote"]
+    UMA --> M1["member: momentum"]
+    UMA --> M2["member: rule_based"]
+    UMA --> M3["member: lstm"]
 
-    M1 --> S1["StrategySignal"]
-    M2 --> S2["StrategySignal"]
+    M1 -->|score_batch, full universe| S1["StrategySignal"]
+    M2 -->|per-ticker score| S2["StrategySignal"]
+    M3 -->|score_batch, one GPU pass| S3["StrategySignal"]
 
     S1 --> COMB{"method"}
     S2 --> COMB
+    S3 --> COMB
 
-    COMB -->|weighted_blend| WB["map signal to strength<br/>BUY=1, WATCH=0.3, HOLD=0,<br/>AVOID=-0.3, SELL=-1<br/>weighted mean of strength,<br/>score, prices, probability"]
-    COMB -->|vote| VT["bucket to BUY/SELL/HOLD<br/>majority: >50% agree<br/>unanimous: all agree"]
+    COMB -->|trigger| TR["ModelVerdicts -> TriggerEngine<br/>conflict penalty, vetoes,<br/>firing rule, size multiplier"]
+    COMB -->|weighted_blend| WB["map signal to strength<br/>BUY=1, WATCH=0.3, HOLD=0,<br/>AVOID=-0.3, SELL=-1<br/>weighted mean"]
+    COMB -->|vote| VT["bucket to BUY/SELL/HOLD<br/>majority | unanimous"]
 
-    WB --> OUT["combined StrategySignal"]
+    TR --> OUT["combined StrategySignal"]
+    WB --> OUT
     VT --> OUT
 ```
 
-Two consequences worth knowing:
+Each member is asked the way that member needs to be asked — cross-sectional
+rankers and GPU-batched models get one `score_batch()` spanning the whole
+eligible universe, everything else is looped per ticker — and only then are the
+per-symbol results combined. That ordering is what lets a decile ranker be a
+member at all: ranking is a statement about a cross-section, and a per-ticker
+loop hands it a universe of one.
 
-- A UMA is **not** GPU-batched even when a member is. Members are scored
-  per-ticker so that a rule-based member receives its genuine per-ticker Monte
-  Carlo result. For maximum ML throughput, run that strategy directly.
-- Cross-sectional strategies (`momentum`, `low_volatility`) **cannot** be UMA
-  members, because a UMA scores members per-ticker and their ranking would
-  degenerate.
+Three consequences worth knowing:
+
+- Cross-sectional members require `method: trigger`. The averaging methods
+  combine through per-ticker `score()`, so they reject such members at
+  construction rather than quietly ranking each stock against itself.
+- `context.mc_result` is per-ticker and batching callers build one context per
+  round, so a `rule_based` member inside a batched UMA sees no Monte Carlo
+  result and scores its `MC_Prob` component at zero.
+- Members are addressed by the name the UMA file declares (`name:`, or
+  `params.name`), because a rule-based member names itself from its own YAML
+  and an ML member from its checkpoint. The `regimes:` map keys off those
+  names, and duplicates are rejected — the trigger engine treats each verdict
+  as an independent voice.
+
+### The trigger engine
+
+`src/trigger_engine.py` exists because averaging is the right operation for
+*estimates of the same quantity* and the wrong operation for *votes on a
+decision*. Blend a momentum model at BUY 0.90 with a mean-reversion model at
+SELL 0.85 and the result is a mild BUY — a trade neither member would take,
+entered exactly when the models disagree most, and then stopped out by
+whichever of them was right.
+
+Members are first flattened into a common contract:
+
+```
+StrategySignal  ──ModelVerdict.from_signal()──▶  ModelVerdict
+(entry/stop/target,                              (action, confidence 0-1,
+ strategy-specific 0-100 score)                   expected_net_ev_pct,
+                                                  regime_compatible,
+                                                  liquidity_pass)
+```
+
+`score` is a goodness scale in every strategy here, so a BUY's conviction is
+`score/100` and a SELL's is its complement — a model emitting SELL at score 15
+is 85% convinced, not 15%. Expected value is derived from the reward:risk the
+signal already carries, which this platform computes *net* of friction, so the
+cost stack is not charged twice. A model that cannot estimate an EV reports
+`None`, not zero; otherwise the hurdle would bite hardest on the models most
+honest about their uncertainty.
+
+Arbitration then runs in a fixed order, vetoes before arithmetic:
+
+```mermaid
+flowchart TD
+    V["ModelVerdicts"] --> L{"any liquidity_pass = False?"}
+    L -->|yes| B1["BLOCK — untradeable"]
+    L -->|no| R{"regime-incompatible buyers"}
+    R -->|policy: mute| MU["silence them"]
+    R -->|policy: veto| B2["BLOCK — regime"]
+    MU --> C{"any contributors left?"}
+    C -->|no| B3["BLOCK — all buyers muted"]
+    C -->|yes| X{"max opposing confidence<br/>>= conflict_veto?"}
+    X -->|yes| B4["BLOCK — models conflict"]
+    X -->|no| E{"weighted EV < hurdle?"}
+    E -->|yes| B5["BLOCK — EV below hurdle"]
+    E -->|no| F["c_eff = c_buy x (1 - max c_opposing)"]
+    F --> G{"strong_single or consensus fires?"}
+    G -->|no| B6["BLOCK — no trigger"]
+    G -->|yes| S["BUY, size x0.5 to x1.0<br/>scaled by margin over threshold"]
+```
+
+Two design choices are worth stating outright:
+
+- **A regime-incompatible model is muted, not a veto.** A veto reading would
+  mean any single out-of-season sleeve stands the whole book down, which makes
+  the regime map useless. `regime_policy: veto` restores the strict reading.
+- **What survives is a size, not a boolean.** A trade that only just clears its
+  threshold is a trade the evidence only just supports; it is taken at
+  `min_size_multiplier` (0.5 by default) and scales to full size at full
+  conviction. The multiplier rides out on
+  `StrategySignal.extra["position_scale"]` — the same channel cross-sectional
+  volatility targeting already uses, so the backtest engine and live
+  orchestrator honour it with no extra wiring.
+
+The engine is stateless and pure, so a decision replays exactly from a logged
+verdict list, and the live and backtest paths cannot drift.
 
 ### The ML strategy and the training loop
 
@@ -537,22 +619,24 @@ portfolio_agent/
 │   ├── schema.py           pydantic AppConfig (the full settings surface)
 │   ├── loader.py           config.yaml + AFA_* env overrides
 │   └── strategies/*.yaml   per-strategy rule files, incl. example_uma.yaml
+│                           and uma_meta_orchestrator.yaml (multi-regime)
 ├── features/
 │   ├── registry.py         @register_feature name -> function
 │   ├── technical.py        the lag-safe indicators themselves
 │   └── pipeline.py         build_features(df, names) -> DataFrame
 ├── strategies/
 │   ├── base.py             BaseStrategy — the interface you implement
-│   ├── types.py            RiskParams, StrategyContext, StrategySignal
+│   ├── types.py            RiskParams, StrategyContext, StrategySignal,
+│                           ModelVerdict (the trigger engine's input contract)
 │   ├── registry.py         register_strategy / load_strategy
 │   ├── rule_based.py       trend + breakout + volume + Monte Carlo
 │   ├── cross_sectional.py  momentum, low_volatility (requires_full_batch)
 │   ├── ml_strategy.py      trained model, GPU-batched (supports_gpu_batch)
-│   ├── ensemble.py         UMAs: weighted_blend / vote
+│   ├── ensemble.py         UMAs: trigger / weighted_blend / vote
 │   └── weighting.py        pure weight-adaptation used live and in backtests
 ├── models/
 │   ├── registry.py         @register_model name -> nn.Module class
-│   └── pytorch_models.py   LSTM forecaster
+│   └── pytorch_models.py   LSTM and PatchTST forecasters, pinball loss
 ├── agents/
 │   ├── trainer.py          training loop, panel construction, checkpointing
 │   └── backtester.py       wires strategy -> engine -> analytics -> Excel
@@ -565,8 +649,12 @@ portfolio_agent/
     │                       plus the quantity-free round-trip cost estimator
     ├── risk.py             position sizing incl. fractional Kelly (capped at
     │                       quarter-Kelly), Beta-shrunk win rate, net-of-cost RR
-    ├── regime.py           market regime + volatility targeting (momentum crash filter)
-    ├── liquidity.py        circuit-lock / illiquidity / zombie screening
+    ├── trigger_engine.py   signal arbitration: conflict penalty, vetoes,
+    │                       firing modes, position-size multiplier
+    ├── regime.py           market regime classification + volatility targeting
+    ├── calibration.py      isotonic (PAVA) score -> probability calibration
+    ├── liquidity.py        circuit-lock (1/2/5/10/20% bands), operator-trap
+    │                       and illiquidity / zombie screening
     ├── sectors.py          ticker->sector map and concentration caps
     ├── risk_analytics.py   CAGR/Sharpe/Sortino/drawdown, bootstrap MC
     ├── monte_carlo.py      per-symbol forward simulation (scoring input):

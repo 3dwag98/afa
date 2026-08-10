@@ -26,7 +26,9 @@ from portfolio_agent.strategies.weighting import evaluate_and_learn
 # Import from src module
 try:
     from .data_store import load_ticker_data
+    from .liquidity import lower_circuit_locked_days
     from .models import AgentBrain
+    from .regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
     from .execution_sim import ExecutionSimulator
     from .monte_carlo import MonteCarloSettings
     from .risk import MAX_KELLY_FRACTION, calculate_kelly_quantity, estimate_kelly_inputs
@@ -35,7 +37,9 @@ try:
     )
 except ImportError:
     from data_store import load_ticker_data
+    from liquidity import lower_circuit_locked_days
     from models import AgentBrain
+    from regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
     from execution_sim import ExecutionSimulator
     from monte_carlo import MonteCarloSettings
     from risk import MAX_KELLY_FRACTION, calculate_kelly_quantity, estimate_kelly_inputs
@@ -55,10 +59,15 @@ def _score_one_ticker(
     risk_params: RiskParams,
     weights: Dict[str, float],
     mc_settings: MonteCarloSettings,
+    regime_label: Optional[str] = None,
 ) -> Optional[StrategySignal]:
     """Score a single ticker: run Monte Carlo + build features + call strategy.score().
 
     Module-level (not a method) so it is picklable for ProcessPoolExecutor dispatch.
+
+    `regime_label` is classified once per day by the caller and passed down,
+    not re-derived per ticker: the benchmark is the same for everyone, and a
+    UMA whose members are regime-gated must see one classification per round.
     """
     try:
         daily_returns = hist_data['close'].pct_change().dropna().tolist()
@@ -66,7 +75,10 @@ def _score_one_ticker(
             symbol=ticker, daily_returns=daily_returns, ohlcv=hist_data
         )
         features = build_features(hist_data, required_features)
-        context = StrategyContext(risk=risk_params, weights=weights, mc_result=mc_result)
+        context = StrategyContext(
+            risk=risk_params, weights=weights, mc_result=mc_result,
+            regime_label=regime_label,
+        )
         return strategy.score(ticker, features, context)
     except Exception:
         logger.debug(f"Signal generation failed for {ticker}", exc_info=True)
@@ -98,14 +110,17 @@ def _init_scoring_worker(
 
 
 def _score_one_ticker_in_worker(
-    ticker: str, hist_data: pd.DataFrame, weights: Dict[str, float]
+    ticker: str,
+    hist_data: pd.DataFrame,
+    weights: Dict[str, float],
+    regime_label: Optional[str] = None,
 ) -> Optional[StrategySignal]:
     """Worker-side entry point: only the per-day varying arguments travel."""
     if _WORKER_STRATEGY is None or _WORKER_RISK is None:
         raise RuntimeError("Scoring worker was not initialized")
     return _score_one_ticker(
         _WORKER_STRATEGY, ticker, hist_data, _WORKER_FEATURES,
-        _WORKER_RISK, weights, _WORKER_MC_SETTINGS,
+        _WORKER_RISK, weights, _WORKER_MC_SETTINGS, regime_label,
     )
 
 
@@ -146,7 +161,10 @@ class BacktestEngine:
         sector_map_csv: Optional[str] = None,
         max_portfolio_drawdown_pct: float = 0.0,
         drawdown_reentry_pct: float = 0.10,
+        drawdown_halt_max_days: int = 60,
         benchmark_symbol: Optional[str] = None,
+        exit_on_lower_circuit_lock: bool = True,
+        liquidate_on_drawdown_halt: bool = False,
     ):
         """
         Initialize the BacktestEngine.
@@ -193,10 +211,29 @@ class BacktestEngine:
                 positions once drawdown from the equity peak reaches this
                 fraction. 0 disables it.
             drawdown_reentry_pct: Drawdown level at which buying resumes.
+            drawdown_halt_max_days: Trading days after which a halted breaker
+                re-arms regardless of recovery, resetting the equity peak to
+                current equity. Without it the breaker deadlocks — see
+                _update_circuit_breaker. 0 disables the cooldown and restores
+                the recovery-only behaviour.
             benchmark_symbol: Optional market index (e.g. "^NSEI") whose cached
                 history drives the momentum crash filter's trend and
                 volatility tests. Without it the filter falls back to a
                 composite of the traded universe.
+            exit_on_lower_circuit_lock: Queue an immediate exit when a holding
+                closes pinned at its lower circuit. A locked-down stock cannot
+                be sold at the modelled stop, so waiting for that stop is
+                waiting for a fill that will not come at that price; the exit
+                is queued for the next session, which is the earliest a real
+                order could work. On by default — this is a correction to how
+                the modelled stop behaves, not a strategy opinion.
+            liquidate_on_drawdown_halt: Also sell every open position when the
+                drawdown circuit breaker trips, rather than only suppressing
+                new BUYs. Off by default and deliberately so: force-liquidating
+                a whole book at a drawdown trough converts a bad quarter into a
+                permanent loss, and existing positions already carry stops.
+                Turn it on for mandates where a hard equity floor outranks
+                recovery potential.
         """
         self.start_date = pd.to_datetime(start_date)
         self.end_date = pd.to_datetime(end_date)
@@ -259,6 +296,9 @@ class BacktestEngine:
         # cached, in which case the filter uses its composite fallback.
         self.benchmark_symbol = benchmark_symbol
         self.benchmark_close: Optional[pd.Series] = None
+        # The full OHLC frame, kept alongside the closes because ADX — and so
+        # the SIDEWAYS_CHOP classification — needs the daily range.
+        self.benchmark_ohlcv: Optional[pd.DataFrame] = None
         if benchmark_symbol:
             benchmark_df = load_ticker_data(
                 benchmark_symbol,
@@ -267,6 +307,7 @@ class BacktestEngine:
             )
             if benchmark_df is not None and 'close' in benchmark_df.columns:
                 self.benchmark_close = benchmark_df['close'].sort_index()
+                self.benchmark_ohlcv = benchmark_df.sort_index()
                 logger.info(
                     f"Loaded benchmark {benchmark_symbol} "
                     f"({len(self.benchmark_close)} bars) for the market-regime filter"
@@ -280,9 +321,16 @@ class BacktestEngine:
         # Drawdown circuit breaker state.
         self.max_portfolio_drawdown_pct = max_portfolio_drawdown_pct
         self.drawdown_reentry_pct = drawdown_reentry_pct
+        self.drawdown_halt_max_days = drawdown_halt_max_days
         self.equity_peak = initial_capital
         self.buying_halted = False
+        self.halted_since_day: Optional[int] = None
         self.circuit_breaker_log: List[Dict[str, Any]] = []
+
+        # Forced-exit triggers (see the constructor docstring).
+        self.exit_on_lower_circuit_lock = exit_on_lower_circuit_lock
+        self.liquidate_on_drawdown_halt = liquidate_on_drawdown_halt
+        self.exit_trigger_log: List[Dict[str, Any]] = []
 
 
         # Track untradeable tickers (delisted or NaN issues) - initialize BEFORE loading data
@@ -763,17 +811,33 @@ class BacktestEngine:
                 ticker: build_features(hist_data, self.strategy.required_features())
                 for ticker, hist_data in eligible.items()
             }
+            benchmark_close = self._benchmark_up_to(current_date)
+            benchmark_ohlcv = self._benchmark_ohlcv_up_to(current_date)
             context = StrategyContext(
                 risk=self.risk_params,
                 weights=weights,
                 # Strictly before T, exactly like every other input: the
                 # regime filter must not see the day it is deciding on.
-                benchmark_close=self._benchmark_up_to(current_date),
+                benchmark_close=benchmark_close,
+                benchmark_ohlcv=benchmark_ohlcv,
+                # Classified once per round and shared, so every model in the
+                # round is arbitrated against the same market state.
+                regime_label=self._classify_regime(
+                    benchmark_close, benchmark_ohlcv, eligible
+                ),
             )
             return self.strategy.score_batch(features_by_symbol, context)
 
+        # Classified once for the whole round, so the per-ticker path gates
+        # models on the same market state the batched path does.
+        regime_label = self._classify_regime(
+            self._benchmark_up_to(current_date),
+            self._benchmark_ohlcv_up_to(current_date),
+            eligible,
+        )
+
         if self.parallel and len(eligible) > 1:
-            parallel_signals = self._score_tickers_parallel(eligible, weights)
+            parallel_signals = self._score_tickers_parallel(eligible, weights, regime_label)
             if parallel_signals is not None:
                 return parallel_signals
 
@@ -783,7 +847,7 @@ class BacktestEngine:
         for ticker, hist_data in eligible.items():
             result = _score_one_ticker(
                 self.strategy, ticker, hist_data, required_features,
-                self.risk_params, weights, self.mc_settings,
+                self.risk_params, weights, self.mc_settings, regime_label,
             )
             if result is not None:
                 signals[ticker] = result
@@ -799,6 +863,65 @@ class BacktestEngine:
             return None
         truncated = self.benchmark_close[self.benchmark_close.index < current_date]
         return truncated if not truncated.empty else None
+
+    def _benchmark_ohlcv_up_to(self, current_date: pd.Timestamp) -> Optional[pd.DataFrame]:
+        """Benchmark OHLC bars strictly before `current_date`."""
+        if self.benchmark_ohlcv is None:
+            return None
+        truncated = self.benchmark_ohlcv[self.benchmark_ohlcv.index < current_date]
+        return truncated if not truncated.empty else None
+
+    def _classify_regime(
+        self,
+        benchmark_close: Optional[pd.Series],
+        benchmark_ohlcv: Optional[pd.DataFrame],
+        eligible: Optional[Dict[str, pd.DataFrame]] = None,
+    ) -> Optional[str]:
+        """Name the market state for this scoring round.
+
+        Derived here, once, rather than inside each strategy: a UMA whose
+        members are gated by regime and whose cross-sectional members each
+        assess their own regime could otherwise be muted against one
+        classification while sizing against another.
+
+        **The composite fallback is what keeps the regime map from going
+        silently inert.** A cached index is the better gauge and is used
+        whenever it exists, but requiring one means that on any installation
+        without `^NSEI` in the cache — which is every installation until
+        somebody runs `download-data` against an index directory — the
+        classification is UNKNOWN, every model is permitted in every state, and
+        the meta-orchestrator's whole point quietly evaporates with nothing in
+        the logs to say so. src/regime.py is built to derive the market state
+        from the traded universe itself for exactly this reason, so the same
+        equal-weighted composite the cross-sectional strategies already fall
+        back to is used here too.
+
+        Returns None only when neither an index nor a usable composite is
+        available, which the meta-orchestrator reads as "permit every model"
+        rather than as a reason to stand the book down.
+        """
+        if benchmark_close is not None:
+            return assess_market_regime(
+                benchmark_close, market_ohlcv=benchmark_ohlcv
+            ).classification
+
+        if not eligible:
+            return None
+
+        # Only the trailing trend window can affect either test, and this runs
+        # once per trading day over the full universe.
+        proxy = build_market_proxy(
+            {
+                ticker: history['close']
+                for ticker, history in eligible.items()
+                if 'close' in history.columns and not history.empty
+            },
+            lookback=DEFAULT_TREND_WINDOW + 1,
+        )
+        if proxy is None:
+            return None
+        # No high/low on a composite, so ADX uses its close-only proxy.
+        return assess_market_regime(proxy).classification
 
     def _get_scoring_executor(self) -> ProcessPoolExecutor:
         """Return this run's scoring process pool, creating it on first use.
@@ -829,7 +952,10 @@ class BacktestEngine:
             self._scoring_executor = None
 
     def _score_tickers_parallel(
-        self, eligible: Dict[str, pd.DataFrame], weights: Dict[str, float]
+        self,
+        eligible: Dict[str, pd.DataFrame],
+        weights: Dict[str, float],
+        regime_label: Optional[str] = None,
     ) -> Optional[Dict[str, StrategySignal]]:
         """Score every eligible ticker across the run's CPU process pool.
 
@@ -847,7 +973,9 @@ class BacktestEngine:
         try:
             executor = self._get_scoring_executor()
             futures = {
-                ticker: executor.submit(_score_one_ticker_in_worker, ticker, hist_data, weights)
+                ticker: executor.submit(
+                    _score_one_ticker_in_worker, ticker, hist_data, weights, regime_label
+                )
                 for ticker, hist_data in eligible.items()
             }
         except Exception:
@@ -977,11 +1105,9 @@ class BacktestEngine:
                     self.holdings[ticker] = self.holdings.get(ticker, 0) + quantity
                     self._open_position(ticker, quantity, adjusted_price, execution_date)
 
-                    # Set stop-loss and take-profit levels
-                    # Stop-loss at 5% below entry
-                    self.stop_loss_levels[ticker] = adjusted_price * 0.95
-                    # Take-profit at 10% above entry
-                    self.take_profit_levels[ticker] = adjusted_price * 1.10
+                    stop_level, target_level = self._exit_levels(order, adjusted_price)
+                    self.stop_loss_levels[ticker] = stop_level
+                    self.take_profit_levels[ticker] = target_level
                     
                     # Record BUY trade with all 16 required fields
                     trade_record = {
@@ -1156,6 +1282,24 @@ class BacktestEngine:
         worst. Open positions are left alone — their stops and targets are
         already the exit plan, and force-liquidating a whole book at a
         drawdown trough is how a bad quarter becomes a permanent loss.
+
+        **The cooldown is not optional.** Recovery-only re-arming deadlocks,
+        and does so silently. The breaker halts buying; the open positions then
+        exit through their own stops and targets; the book is now entirely
+        cash. Cash does not appreciate, so equity is frozen at its trough
+        forever — permanently below the re-entry threshold, which is measured
+        against a peak it can no longer approach. A 5-year backtest observed
+        exactly this: the breaker tripped 15% down in month 7 and the strategy
+        sat in cash for the remaining four years, which reads in the report as
+        a flat equity curve rather than as a stuck flag.
+
+        After `drawdown_halt_max_days` trading days halted, the breaker
+        therefore re-arms regardless and **resets the peak to current equity**.
+        Resetting matters as much as re-arming: leaving the old peak in place
+        would put the very next bar straight back over the trip threshold. The
+        reset is an admission of what actually happened — this is the capital
+        the strategy has now, and the drawdown to measure from here is the one
+        that starts today.
         """
         if self.max_portfolio_drawdown_pct <= 0 or self.max_portfolio_drawdown_pct >= 1:
             return
@@ -1166,34 +1310,120 @@ class BacktestEngine:
 
         drawdown = (self.equity_peak - self.portfolio_value) / self.equity_peak
 
-        if not self.buying_halted and drawdown >= self.max_portfolio_drawdown_pct:
-            self.buying_halted = True
+        def _log(event: str, note: str) -> Dict[str, Any]:
             entry = {
                 'date': current_date.strftime('%Y-%m-%d'),
-                'event': 'HALT',
+                'event': event,
                 'drawdown_pct': round(drawdown * 100, 2),
                 'portfolio_value': round(self.portfolio_value, 2),
                 'peak_value': round(self.equity_peak, 2),
+                'note': note,
             }
             self.circuit_breaker_log.append(entry)
+            return entry
+
+        if not self.buying_halted and drawdown >= self.max_portfolio_drawdown_pct:
+            self.buying_halted = True
+            self.halted_since_day = self.trading_day_count
+            entry = _log('HALT', 'drawdown threshold reached')
             logger.warning(
                 f"Drawdown circuit breaker tripped on {entry['date']}: "
                 f"{entry['drawdown_pct']:.2f}% below peak; halting new BUY orders"
             )
-        elif self.buying_halted and drawdown <= self.drawdown_reentry_pct:
+            return
+
+        if not self.buying_halted:
+            return
+
+        if drawdown <= self.drawdown_reentry_pct:
             self.buying_halted = False
-            entry = {
-                'date': current_date.strftime('%Y-%m-%d'),
-                'event': 'RESUME',
-                'drawdown_pct': round(drawdown * 100, 2),
-                'portfolio_value': round(self.portfolio_value, 2),
-                'peak_value': round(self.equity_peak, 2),
-            }
-            self.circuit_breaker_log.append(entry)
+            self.halted_since_day = None
+            entry = _log('RESUME', 'recovered to the re-entry threshold')
             logger.info(
                 f"Drawdown circuit breaker re-armed on {entry['date']}: "
                 f"recovered to {entry['drawdown_pct']:.2f}% below peak; buying resumed"
             )
+            return
+
+        # `is None`, not `or`: trading_day_count starts at 0, and a falsy check
+        # would read a breaker that tripped on day zero as never having tripped,
+        # leaving the cooldown permanently unsatisfiable.
+        started = self.halted_since_day if self.halted_since_day is not None else self.trading_day_count
+        halted_days = self.trading_day_count - started
+        if self.drawdown_halt_max_days > 0 and halted_days >= self.drawdown_halt_max_days:
+            self.buying_halted = False
+            self.halted_since_day = None
+            entry = _log(
+                'RESUME',
+                f'cooldown of {self.drawdown_halt_max_days} trading days elapsed; '
+                f'peak reset to current equity',
+            )
+            # Reset last: the log entry above should report the drawdown that
+            # justified the cooldown, not the 0% the reset creates.
+            self.equity_peak = self.portfolio_value
+            logger.info(
+                f"Drawdown circuit breaker re-armed on {entry['date']} after "
+                f"{halted_days} halted trading days at {entry['drawdown_pct']:.2f}% "
+                f"below peak; peak reset and buying resumed"
+            )
+
+    def _is_locked_down(self, ticker: str, current_date: pd.Timestamp) -> bool:
+        """Whether `ticker` closed pinned at its lower circuit on `current_date`.
+
+        Read from the raw bar rather than a feature column, because this runs
+        against the holdings book — which contains positions in names that may
+        have dropped out of the scored universe entirely.
+        """
+        df = self.ticker_data.get(ticker)
+        if df is None or current_date not in df.index:
+            return False
+
+        position = df.index.get_loc(current_date)
+        if not isinstance(position, int) or position < 1:
+            return False
+
+        # Two bars are the minimum: the lock is defined against the prior close.
+        window = df.iloc[position - 1:position + 1]
+        window = window.rename(columns={c: c.lower() for c in window.columns})
+        try:
+            return bool(lower_circuit_locked_days(window).iloc[-1])
+        except Exception:
+            return False
+
+    def _exit_trigger_reasons(self, current_date: pd.Timestamp) -> Dict[str, str]:
+        """Holdings that must be exited regardless of what the strategy says.
+
+        Two conditions, both of which invalidate the exit plan a position was
+        opened with rather than merely arguing against holding it:
+
+        - **Locked at the lower circuit.** The modelled stop assumes a fill is
+          available somewhere near it. On a lock there is no bid, so the stop is
+          not a stop — it is a hope. Every further locked session realizes a
+          loss the sizing never priced, which is precisely the asymmetry that
+          biases the measured payoff ratio Kelly reads. Exiting is queued for
+          the next session, the earliest a real order could work.
+        - **The drawdown breaker has tripped** and this run is configured to
+          liquidate on it (off by default; see the constructor docstring).
+
+        Returns:
+            ticker -> reason, for holdings with a live position.
+        """
+        reasons: Dict[str, str] = {}
+        if not self.holdings:
+            return reasons
+
+        if self.liquidate_on_drawdown_halt and self.buying_halted:
+            for ticker, quantity in self.holdings.items():
+                if quantity > 0:
+                    reasons[ticker] = "portfolio drawdown circuit breaker tripped"
+            return reasons
+
+        if self.exit_on_lower_circuit_lock:
+            for ticker, quantity in self.holdings.items():
+                if quantity > 0 and self._is_locked_down(ticker, current_date):
+                    reasons[ticker] = "locked at the lower circuit; modelled stop is unfillable"
+
+        return reasons
 
     def _current_position_values(self, current_date: pd.Timestamp) -> Dict[str, float]:
         """Mark every open holding to T's close, for sector-exposure accounting."""
@@ -1243,21 +1473,50 @@ class BacktestEngine:
         while execution_date.weekday() >= 5:
             execution_date += pd.Timedelta(days=1)
 
-        sells = sorted(
-            (t for t, s in signals.items() if s.signal == 'SELL' and t in self.holdings)
-        )
-        for ticker in sells:
-            quantity = self.holdings[ticker]
-            if quantity > 0:
-                self.pending_orders.append({
-                    'ticker': ticker,
-                    'action': 'SELL',
-                    'quantity': quantity,
-                    'execution_date': execution_date,
-                    'trigger': signals[ticker].trigger or 'SIGNAL'
-                })
-
+        # Forced exits are evaluated first and win any tie with a strategy
+        # signal: they exist because the position's exit plan has stopped being
+        # valid, which no amount of conviction in holding can restore. The
+        # breaker is updated before this so a trip on today's equity can fire
+        # today's liquidation rather than tomorrow's.
         self._update_circuit_breaker(current_date)
+        forced_exits = self._exit_trigger_reasons(current_date)
+
+        signal_sells = {
+            t for t, s in signals.items() if s.signal == 'SELL' and t in self.holdings
+        }
+        # An order that could not fill yesterday (a market holiday, a missing
+        # bar) is still queued. Re-queueing the same exit on each subsequent
+        # day would stack sells against a position only large enough for one.
+        already_queued = {
+            o['ticker'] for o in self.pending_orders if o['action'] == 'SELL'
+        }
+        for ticker in sorted(forced_exits.keys() | signal_sells):
+            quantity = self.holdings.get(ticker, 0)
+            if quantity <= 0 or ticker in already_queued:
+                continue
+            reason = forced_exits.get(ticker)
+            if reason is not None:
+                trigger = 'EXIT_TRIGGER'
+                self.exit_trigger_log.append({
+                    'date': current_date.strftime('%Y-%m-%d'),
+                    'ticker': ticker,
+                    'quantity': quantity,
+                    'reason': reason,
+                })
+                logger.info(
+                    f"Exit trigger on {current_date.strftime('%Y-%m-%d')} for {ticker}: {reason}"
+                )
+            else:
+                trigger = signals[ticker].trigger or 'SIGNAL'
+
+            self.pending_orders.append({
+                'ticker': ticker,
+                'action': 'SELL',
+                'quantity': quantity,
+                'execution_date': execution_date,
+                'trigger': trigger,
+            })
+
         if self.buying_halted:
             return
 
@@ -1291,8 +1550,71 @@ class BacktestEngine:
                     'action': 'BUY',
                     'quantity': quantity,
                     'execution_date': execution_date,
-                    'trigger': sig.trigger or 'SIGNAL'
+                    'trigger': sig.trigger or 'SIGNAL',
+                    # The signal's own exit plan travels with the order; see
+                    # _exit_levels for why the distances rather than the levels.
+                    'signal_entry_price': sig.entry_price,
+                    'stop_price': sig.stop_price,
+                    'target_price': sig.target_price,
                 })
+
+    # Exit plan used when a strategy supplies no usable stop or target.
+    # Deliberately wide relative to the old hardcoded pair: these are a
+    # fallback for a strategy that declined to specify an exit, not a
+    # replacement for one that did.
+    DEFAULT_STOP_FRACTION = 0.05
+    DEFAULT_TARGET_FRACTION = 0.10
+
+    def _exit_levels(self, order: Dict[str, Any], fill_price: float) -> tuple:
+        """Stop and target for a filled BUY, from the signal that produced it.
+
+        This used to be a hardcoded 5% stop and 10% target, which silently
+        discarded every strategy's own exit plan. The consequences reached well
+        past the exit itself, because the rest of the platform gates on the
+        plan it thought was being used:
+
+        - `atr_stop_multiplier` / `atr_target_multiplier` were dead config.
+        - `min_reward_risk` screened signals on a net-of-cost reward:risk
+          computed from ATR levels the engine then ignored — gating on one exit
+          plan and trading another.
+        - The quantile model's stop and target, derived from its predicted
+          10th/90th percentiles, were thrown away along with them.
+        - Kelly's payoff ratio b was estimated from trades exited under the 5/10
+          rule while the signals feeding it were screened under the ATR rule.
+
+        On Indian small- and mid-caps a flat 5% stop is roughly one session of
+        noise, which is why backtests exited at a 2-day median holding period
+        with 82% of exits at the stop.
+
+        **Distances, not levels.** The signal's stop and target were computed
+        off T-1's close; the fill lands at T+1's open plus slippage. Copying the
+        absolute levels across would put a gapped-up entry immediately through
+        its own target, so the *fractional* distances are preserved and
+        re-applied to the price actually paid.
+
+        Args:
+            order: The pending order, carrying the signal's entry/stop/target.
+            fill_price: Slippage-adjusted execution price.
+
+        Returns:
+            (stop_price, target_price).
+        """
+        signal_entry = float(order.get('signal_entry_price') or 0.0)
+        signal_stop = float(order.get('stop_price') or 0.0)
+        signal_target = float(order.get('target_price') or 0.0)
+
+        stop_fraction = self.DEFAULT_STOP_FRACTION
+        target_fraction = self.DEFAULT_TARGET_FRACTION
+        if signal_entry > 0:
+            if 0 < signal_stop < signal_entry:
+                stop_fraction = (signal_entry - signal_stop) / signal_entry
+            if signal_target > signal_entry:
+                target_fraction = (signal_target - signal_entry) / signal_entry
+
+        return (
+            fill_price * (1.0 - stop_fraction),
+            fill_price * (1.0 + target_fraction),
+        )
 
     @staticmethod
     def _apply_position_scale(quantity: int, signal: StrategySignal) -> int:
@@ -1608,6 +1930,7 @@ class BacktestEngine:
             'brain_evolution': self.brain_evolution,
             'daily_activity_log': self.daily_activity_log,
             'circuit_breaker_log': self.circuit_breaker_log,
+            'exit_trigger_log': self.exit_trigger_log,
         }
 
     def _position_value(self, ticker: str, current_date: pd.Timestamp) -> Optional[float]:

@@ -647,3 +647,453 @@ class TestKellyUsesNetReturns:
         ] * 50
 
         assert engine._kelly_quantity(entry_price=100.0) == 0
+
+
+class TestExitTriggers:
+    """A modelled stop assumes a fill is available near it. Two conditions
+    invalidate that assumption rather than merely arguing against the position."""
+
+    @staticmethod
+    def _engine(synthetic_data, **kwargs):
+        return BacktestEngine(
+            start_date="2023-01-02",
+            end_date="2023-06-30",
+            initial_capital=1_000_000.0,
+            universe_tickers=synthetic_data['tickers'],
+            **kwargs,
+        )
+
+    def test_a_lower_circuit_lock_queues_an_immediate_exit(self, synthetic_data):
+        ticker = synthetic_data['tickers'][0]
+        engine = self._engine(synthetic_data)
+        engine.holdings[ticker] = 100
+
+        # Rewrite the last two bars into a 5% lower-circuit close.
+        df = engine.ticker_data[ticker]
+        lock_date = df.index[-1]
+        prev_close = 100.0
+        df.loc[df.index[-2], ['open', 'high', 'low', 'close']] = prev_close
+        df.loc[lock_date, ['open', 'high', 'low', 'close']] = [98.0, 98.0, 95.0, 95.0]
+
+        engine._create_pending_orders({}, lock_date)
+
+        sells = [o for o in engine.pending_orders if o['action'] == 'SELL']
+        assert [o['ticker'] for o in sells] == [ticker]
+        assert sells[0]['trigger'] == 'EXIT_TRIGGER'
+        assert 'lower circuit' in engine.exit_trigger_log[0]['reason']
+
+    def test_the_lock_exit_can_be_switched_off(self, synthetic_data):
+        ticker = synthetic_data['tickers'][0]
+        engine = self._engine(synthetic_data, exit_on_lower_circuit_lock=False)
+        engine.holdings[ticker] = 100
+
+        df = engine.ticker_data[ticker]
+        lock_date = df.index[-1]
+        df.loc[df.index[-2], ['open', 'high', 'low', 'close']] = 100.0
+        df.loc[lock_date, ['open', 'high', 'low', 'close']] = [98.0, 98.0, 95.0, 95.0]
+
+        engine._create_pending_orders({}, lock_date)
+
+        assert engine.pending_orders == []
+
+    def test_an_ordinary_fall_is_not_an_exit_trigger(self, synthetic_data):
+        """Band matching, not a floor: 3.5% is not a statutory limit."""
+        ticker = synthetic_data['tickers'][0]
+        engine = self._engine(synthetic_data)
+        engine.holdings[ticker] = 100
+
+        df = engine.ticker_data[ticker]
+        fall_date = df.index[-1]
+        df.loc[df.index[-2], ['open', 'high', 'low', 'close']] = 100.0
+        df.loc[fall_date, ['open', 'high', 'low', 'close']] = [99.0, 99.0, 96.5, 96.5]
+
+        engine._create_pending_orders({}, fall_date)
+
+        assert engine.pending_orders == []
+
+    def test_drawdown_liquidation_is_opt_in(self, synthetic_data):
+        tickers = synthetic_data['tickers']
+        date = pd.Timestamp("2023-06-01")
+
+        holding_engine = self._engine(
+            synthetic_data, max_portfolio_drawdown_pct=0.15, drawdown_reentry_pct=0.10,
+        )
+        holding_engine.holdings = {t: 10 for t in tickers}
+        holding_engine.portfolio_value = 700_000.0
+        holding_engine._create_pending_orders({}, date)
+
+        assert holding_engine.buying_halted is True
+        assert holding_engine.pending_orders == []
+
+    def test_drawdown_liquidation_sells_the_whole_book_when_enabled(self, synthetic_data):
+        tickers = synthetic_data['tickers']
+        engine = self._engine(
+            synthetic_data,
+            max_portfolio_drawdown_pct=0.15,
+            drawdown_reentry_pct=0.10,
+            liquidate_on_drawdown_halt=True,
+        )
+        engine.holdings = {t: 10 for t in tickers}
+        engine.portfolio_value = 700_000.0
+
+        engine._create_pending_orders({}, pd.Timestamp("2023-06-01"))
+
+        sells = [o for o in engine.pending_orders if o['action'] == 'SELL']
+        assert sorted(o['ticker'] for o in sells) == sorted(tickers)
+        assert all(o['trigger'] == 'EXIT_TRIGGER' for o in sells)
+
+    def test_a_forced_exit_does_not_duplicate_a_signal_sell(self, synthetic_data):
+        """Both paths want the same position gone; queueing it twice would sell
+        a quantity the book does not hold."""
+        from portfolio_agent.strategies.types import StrategySignal
+
+        ticker = synthetic_data['tickers'][0]
+        engine = self._engine(synthetic_data)
+        engine.holdings[ticker] = 100
+
+        df = engine.ticker_data[ticker]
+        lock_date = df.index[-1]
+        df.loc[df.index[-2], ['open', 'high', 'low', 'close']] = 100.0
+        df.loc[lock_date, ['open', 'high', 'low', 'close']] = [98.0, 98.0, 95.0, 95.0]
+
+        signals = {ticker: StrategySignal(
+            symbol=ticker, signal="SELL", score=10.0, trigger="Model",
+            entry_price=95.0, stop_price=0.0, target_price=0.0,
+            reward_risk=0.0, probability_profit=0.0,
+        )}
+        engine._create_pending_orders(signals, lock_date)
+
+        sells = [o for o in engine.pending_orders if o['action'] == 'SELL']
+        assert len(sells) == 1
+        assert sells[0]['trigger'] == 'EXIT_TRIGGER'
+
+
+class TestTriggerUMAThroughTheEngine:
+    """End to end: a regime-gated trigger UMA containing a cross-sectional
+    member has to survive the engine's full-batch dispatch, and its size
+    multiplier has to reach the sized quantity."""
+
+    @staticmethod
+    def _uma_yaml(tmp_path, regimes=None):
+        import yaml
+        spec = {
+            "name": "Engine Trigger UMA",
+            "method": "trigger",
+            "trigger": {
+                "mode": "strong_or_consensus",
+                "strong_confidence": 0.6,
+                "min_net_ev_pct": -100.0,   # the hurdle is exercised elsewhere
+            },
+            "members": [
+                {"type": "momentum",
+                 "params": {"name": "mom", "min_universe": 2, "top_percentile": 0.5,
+                            "regime_filter": False}},
+                {"type": "rule_based", "name": "rules",
+                 "config_path": "config/strategies/trend_breakout.yaml"},
+            ],
+        }
+        if regimes is not None:
+            spec["regimes"] = regimes
+        path = tmp_path / "engine_uma.yaml"
+        with open(path, "w") as f:
+            yaml.safe_dump(spec, f)
+        return str(path)
+
+    def _engine(self, synthetic_data, tmp_path, **kwargs):
+        strategy = load_strategy(StrategyConfig(
+            type="ensemble", config_path=self._uma_yaml(tmp_path, **kwargs)
+        ))
+        return BacktestEngine(
+            start_date="2023-01-02",
+            end_date="2023-12-29",
+            initial_capital=1_000_000.0,
+            universe_tickers=synthetic_data['tickers'],
+            strategy=strategy,
+        )
+
+    def test_a_full_batch_uma_runs_to_completion(self, synthetic_data, tmp_path):
+        engine = self._engine(synthetic_data, tmp_path)
+
+        assert engine.strategy.requires_full_batch is True
+
+        results = engine.run_backtest()
+
+        assert len(results['daily_equity_curve']) > 0
+        assert 'exit_trigger_log' in results
+
+    def test_the_engine_classifies_a_regime_for_the_round(self, synthetic_data, tmp_path):
+        """Without this the regime map is inert and every member always speaks."""
+        engine = self._engine(synthetic_data, tmp_path)
+        engine.benchmark_close = None
+
+        # Nothing to classify from at all -> None, read as "permit all".
+        assert engine._classify_regime(None, None) is None
+
+        prices = pd.Series(
+            [100.0 * (1.0003 ** i) for i in range(400)],
+            index=pd.bdate_range("2021-01-04", periods=400),
+        )
+        assert engine._classify_regime(prices, None) == "BULL_RISK_ON"
+
+    def test_it_falls_back_to_a_universe_composite_without_an_index(
+        self, synthetic_data, tmp_path
+    ):
+        """Requiring a cached index would leave the regime map inert on every
+        installation that never downloaded one — with nothing in the logs to
+        say the gating had stopped working."""
+        engine = self._engine(synthetic_data, tmp_path)
+        index = pd.bdate_range("2021-01-04", periods=400)
+        eligible = {
+            f"SYN{i}": pd.DataFrame(
+                {"close": [100.0 * (1.0004 ** d) for d in range(400)]}, index=index
+            )
+            for i in range(3)
+        }
+
+        assert engine._classify_regime(None, None, eligible) == "BULL_RISK_ON"
+
+    def test_a_composite_too_short_to_judge_returns_none(self, synthetic_data, tmp_path):
+        engine = self._engine(synthetic_data, tmp_path)
+        eligible = {
+            "SYN0": pd.DataFrame(
+                {"close": [100.0] * 20}, index=pd.bdate_range("2023-01-02", periods=20)
+            )
+        }
+
+        assert engine._classify_regime(None, None, eligible) == "UNKNOWN"
+
+    def test_the_trigger_size_multiplier_reaches_the_sized_quantity(self, synthetic_data, tmp_path):
+        """The multiplier travels on extra['position_scale'], the same channel
+        volatility targeting uses, so sizing picks it up with no extra wiring."""
+        from portfolio_agent.strategies.types import StrategySignal
+
+        engine = self._engine(synthetic_data, tmp_path)
+        half = StrategySignal(
+            symbol="X", signal="BUY", score=80.0, trigger="Trigger:strong_single",
+            entry_price=100.0, stop_price=95.0, target_price=110.0,
+            reward_risk=2.0, probability_profit=0.6,
+            extra={"position_scale": 0.5},
+        )
+
+        assert engine._apply_position_scale(100, half) == 50
+
+
+class TestDrawdownBreakerCooldown:
+    """Recovery-only re-arming deadlocks: the breaker halts buying, the open
+    positions exit through their stops, and a book that is entirely cash can
+    never appreciate back toward the peak it is measured against."""
+
+    @staticmethod
+    def _engine(synthetic_data, **kwargs):
+        params = dict(
+            start_date="2023-01-02",
+            end_date="2023-12-29",
+            initial_capital=1_000_000.0,
+            universe_tickers=synthetic_data['tickers'],
+            max_portfolio_drawdown_pct=0.15,
+            drawdown_reentry_pct=0.10,
+        )
+        params.update(kwargs)
+        return BacktestEngine(**params)
+
+    def test_a_cash_book_re_arms_on_the_cooldown(self, synthetic_data):
+        engine = self._engine(synthetic_data, drawdown_halt_max_days=30)
+        engine.portfolio_value = 800_000.0  # 20% below the initial peak
+
+        engine.trading_day_count = 10
+        engine._update_circuit_breaker(pd.Timestamp("2023-03-01"))
+        assert engine.buying_halted is True
+
+        # Equity frozen: nothing is invested, so it cannot recover on its own.
+        engine.trading_day_count = 39
+        engine._update_circuit_breaker(pd.Timestamp("2023-04-10"))
+        assert engine.buying_halted is True
+
+        engine.trading_day_count = 40
+        engine._update_circuit_breaker(pd.Timestamp("2023-04-11"))
+        assert engine.buying_halted is False
+
+    def test_the_cooldown_resets_the_peak(self):
+        """Without the reset the very next bar trips the breaker again, because
+        the old peak is still 20% above current equity."""
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-12-29",
+            initial_capital=1_000_000.0, universe_tickers=[],
+            max_portfolio_drawdown_pct=0.15, drawdown_reentry_pct=0.10,
+            drawdown_halt_max_days=5,
+        )
+        engine.portfolio_value = 800_000.0
+        engine.trading_day_count = 1
+        engine._update_circuit_breaker(pd.Timestamp("2023-03-01"))
+        engine.trading_day_count = 6
+        engine._update_circuit_breaker(pd.Timestamp("2023-03-08"))
+
+        assert engine.equity_peak == pytest.approx(800_000.0)
+
+        engine.trading_day_count = 7
+        engine._update_circuit_breaker(pd.Timestamp("2023-03-09"))
+        assert engine.buying_halted is False
+
+    def test_the_resume_entry_reports_the_drawdown_that_justified_it(self):
+        """Logging after the peak reset would report a meaningless 0%."""
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-12-29",
+            initial_capital=1_000_000.0, universe_tickers=[],
+            max_portfolio_drawdown_pct=0.15, drawdown_reentry_pct=0.10,
+            drawdown_halt_max_days=5,
+        )
+        engine.portfolio_value = 800_000.0
+        engine.trading_day_count = 1
+        engine._update_circuit_breaker(pd.Timestamp("2023-03-01"))
+        engine.trading_day_count = 6
+        engine._update_circuit_breaker(pd.Timestamp("2023-03-08"))
+
+        resume = [e for e in engine.circuit_breaker_log if e['event'] == 'RESUME'][0]
+        assert resume['drawdown_pct'] == pytest.approx(20.0)
+        assert 'cooldown' in resume['note']
+
+    def test_recovery_still_re_arms_before_the_cooldown(self, synthetic_data):
+        engine = self._engine(synthetic_data, drawdown_halt_max_days=60)
+        engine.portfolio_value = 800_000.0
+        engine.trading_day_count = 1
+        engine._update_circuit_breaker(pd.Timestamp("2023-03-01"))
+
+        engine.portfolio_value = 950_000.0  # 5% below peak
+        engine.trading_day_count = 5
+        engine._update_circuit_breaker(pd.Timestamp("2023-03-06"))
+
+        assert engine.buying_halted is False
+        assert engine.equity_peak == pytest.approx(1_000_000.0)
+
+    def test_the_cooldown_can_be_disabled(self, synthetic_data):
+        """0 restores the recovery-only behaviour for callers that want it."""
+        engine = self._engine(synthetic_data, drawdown_halt_max_days=0)
+        engine.portfolio_value = 800_000.0
+        engine.trading_day_count = 1
+        engine._update_circuit_breaker(pd.Timestamp("2023-03-01"))
+
+        engine.trading_day_count = 5_000
+        engine._update_circuit_breaker(pd.Timestamp("2023-12-01"))
+
+        assert engine.buying_halted is True
+
+
+class TestExitTriggerQueueing:
+    def test_a_breaker_tripping_on_the_first_day_still_honours_the_cooldown(self):
+        """`or` instead of `is None` reads day zero as 'never tripped', which
+        makes the cooldown permanently unsatisfiable."""
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-12-29",
+            initial_capital=1_000_000.0, universe_tickers=[],
+            max_portfolio_drawdown_pct=0.15, drawdown_reentry_pct=0.10,
+            drawdown_halt_max_days=5,
+        )
+        engine.trading_day_count = 0
+        engine.portfolio_value = 800_000.0
+        engine._update_circuit_breaker(pd.Timestamp("2023-01-02"))
+        assert engine.buying_halted is True
+        assert engine.halted_since_day == 0
+
+        engine.trading_day_count = 5
+        engine._update_circuit_breaker(pd.Timestamp("2023-01-09"))
+        assert engine.buying_halted is False
+
+    def test_an_unfilled_exit_is_not_queued_twice(self, synthetic_data):
+        """A sell that could not fill yesterday is still pending; stacking a
+        second one sells a quantity the book does not hold."""
+        ticker = synthetic_data['tickers'][0]
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-06-30",
+            initial_capital=1_000_000.0, universe_tickers=synthetic_data['tickers'],
+        )
+        engine.holdings[ticker] = 100
+
+        df = engine.ticker_data[ticker]
+        lock_date = df.index[-1]
+        df.loc[df.index[-2], ['open', 'high', 'low', 'close']] = 100.0
+        df.loc[lock_date, ['open', 'high', 'low', 'close']] = [98.0, 98.0, 95.0, 95.0]
+
+        engine._create_pending_orders({}, lock_date)
+        engine._create_pending_orders({}, lock_date)
+
+        assert len([o for o in engine.pending_orders if o['action'] == 'SELL']) == 1
+
+
+class TestExitLevelsComeFromTheSignal:
+    """The engine used to overwrite every strategy's exit plan with a flat
+    5%/10% pair, so `min_reward_risk` screened trades on ATR levels the engine
+    then ignored — gating on one exit plan and trading another."""
+
+    @staticmethod
+    def _engine(synthetic_data):
+        return BacktestEngine(
+            start_date="2023-01-02", end_date="2023-06-30",
+            initial_capital=1_000_000.0, universe_tickers=synthetic_data['tickers'],
+        )
+
+    def test_the_signals_distances_are_preserved(self, synthetic_data):
+        engine = self._engine(synthetic_data)
+        order = {
+            'signal_entry_price': 100.0, 'stop_price': 92.0, 'target_price': 116.0,
+        }
+
+        stop, target = engine._exit_levels(order, fill_price=200.0)
+
+        # 8% below and 16% above, re-applied to the price actually paid.
+        assert stop == pytest.approx(184.0)
+        assert target == pytest.approx(232.0)
+
+    def test_a_wider_atr_stop_produces_a_wider_engine_stop(self, synthetic_data):
+        """The regression: widening atr_stop_multiplier changed nothing,
+        because the engine never read the resulting stop."""
+        engine = self._engine(synthetic_data)
+
+        tight = engine._exit_levels(
+            {'signal_entry_price': 100.0, 'stop_price': 97.0, 'target_price': 104.0}, 100.0
+        )
+        wide = engine._exit_levels(
+            {'signal_entry_price': 100.0, 'stop_price': 88.0, 'target_price': 116.0}, 100.0
+        )
+
+        assert wide[0] < tight[0]
+        assert wide[1] > tight[1]
+
+    def test_a_strategy_with_no_exit_plan_gets_the_documented_fallback(self, synthetic_data):
+        engine = self._engine(synthetic_data)
+
+        stop, target = engine._exit_levels({}, fill_price=100.0)
+
+        assert stop == pytest.approx(95.0)
+        assert target == pytest.approx(110.0)
+
+    @pytest.mark.parametrize("bad", [
+        {'signal_entry_price': 100.0, 'stop_price': 105.0, 'target_price': 120.0},
+        {'signal_entry_price': 100.0, 'stop_price': 0.0, 'target_price': 120.0},
+        {'signal_entry_price': 0.0, 'stop_price': 90.0, 'target_price': 120.0},
+    ])
+    def test_an_unusable_stop_falls_back_rather_than_inverting(self, synthetic_data, bad):
+        """A stop at or above entry would otherwise become a stop *above* the
+        fill price, closing the position on any upward move."""
+        engine = self._engine(synthetic_data)
+
+        stop, _ = engine._exit_levels(bad, fill_price=100.0)
+
+        assert stop < 100.0
+
+    def test_the_exit_plan_travels_from_the_signal_onto_the_order(self, synthetic_data):
+        from portfolio_agent.strategies.types import StrategySignal
+
+        engine = self._engine(synthetic_data)
+        ticker = synthetic_data['tickers'][0]
+        signals = {ticker: StrategySignal(
+            symbol=ticker, signal="BUY", score=90.0, trigger="Momentum",
+            entry_price=100.0, stop_price=91.0, target_price=112.0,
+            reward_risk=1.33, probability_profit=0.6,
+        )}
+
+        engine._create_pending_orders(signals, pd.Timestamp("2023-03-01"))
+
+        buy = [o for o in engine.pending_orders if o['action'] == 'BUY'][0]
+        assert buy['stop_price'] == 91.0
+        assert buy['target_price'] == 112.0
+        assert buy['signal_entry_price'] == 100.0

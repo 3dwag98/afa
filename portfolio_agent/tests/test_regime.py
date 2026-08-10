@@ -5,8 +5,14 @@ import pandas as pd
 import pytest
 
 from src.regime import (
+    BEAR_CRASH_RISK,
+    BULL_RISK_ON,
     DEFAULT_TREND_WINDOW,
+    NEUTRAL,
+    SIDEWAYS_CHOP,
+    UNKNOWN,
     assess_market_regime,
+    classify_regime,
     build_market_proxy,
     neutral_regime,
     realized_volatility,
@@ -191,3 +197,119 @@ class TestNeutralRegime:
         assert regime.trend_ok is True
         assert regime.blocks_new_entries is False
         assert regime.reason == "because"
+
+
+class TestRegimeClassification:
+    """The Phase 4 labels the meta-orchestrator keys its model map off.
+
+    The three definitions overlap as stated, so the order of the checks is
+    load-bearing and each of these tests pins one edge of it.
+    """
+
+    def test_a_calm_uptrend_is_risk_on(self):
+        assert classify_regime(trend_distance=0.08, market_volatility=0.15, adx=30) == BULL_RISK_ON
+
+    def test_a_downtrend_is_crash_risk(self):
+        assert classify_regime(trend_distance=-0.10, market_volatility=0.15, adx=30) == BEAR_CRASH_RISK
+
+    def test_a_volatility_spike_is_crash_risk_even_in_an_uptrend(self):
+        """Vol above 1.5x target is unambiguous panic wherever price sits."""
+        assert classify_regime(trend_distance=0.08, market_volatility=0.40, adx=30) == BEAR_CRASH_RISK
+
+    def test_a_volatility_spike_outranks_the_chop_test(self):
+        """Misreading a crash as a chop would leave mean reversion buying into
+        it — which is why the vol check runs first."""
+        assert classify_regime(trend_distance=0.001, market_volatility=0.45, adx=10) == BEAR_CRASH_RISK
+
+    def test_directionless_near_the_mean_is_chop(self):
+        assert classify_regime(trend_distance=0.01, market_volatility=0.15, adx=12) == SIDEWAYS_CHOP
+
+    def test_chop_outranks_the_bear_trend_clause(self):
+        """1% below the 200-day average in a calm market is a chop, not a bear.
+        Reading the bear branch literally there would mute the trend sleeves
+        during drift they handle fine."""
+        assert classify_regime(trend_distance=-0.01, market_volatility=0.15, adx=12) == SIDEWAYS_CHOP
+
+    def test_a_strong_trend_near_the_mean_is_not_chop(self):
+        """Both conditions are required: crossing the average with conviction
+        is a transition, not a range."""
+        assert classify_regime(trend_distance=0.01, market_volatility=0.15, adx=35) == BULL_RISK_ON
+
+    def test_far_from_the_mean_is_not_chop_however_weak_the_trend(self):
+        assert classify_regime(trend_distance=0.10, market_volatility=0.15, adx=5) == BULL_RISK_ON
+
+    def test_a_jittery_uptrend_is_neutral(self):
+        """Above the average, vol between target and the crash multiple: not
+        risk-on, not a crash. Naming it keeps the map honest."""
+        assert classify_regime(trend_distance=0.08, market_volatility=0.25, adx=30) == NEUTRAL
+
+    def test_an_unmeasurable_trend_is_unknown(self):
+        assert classify_regime(trend_distance=None, market_volatility=0.2, adx=20) == UNKNOWN
+
+    def test_a_missing_adx_disables_only_the_chop_test(self):
+        assert classify_regime(trend_distance=0.01, market_volatility=0.15, adx=None) == BULL_RISK_ON
+
+    def test_thresholds_are_configurable(self):
+        assert classify_regime(
+            trend_distance=0.01, market_volatility=0.15, adx=25, chop_adx=30.0
+        ) == SIDEWAYS_CHOP
+
+
+class TestRegimeClassificationOnSeries:
+    """End to end from a price series, the way the engine calls it."""
+
+    @staticmethod
+    def _series(values):
+        return pd.Series(values, index=pd.bdate_range("2018-01-01", periods=len(values)))
+
+    def test_a_steady_uptrend_classifies_as_bull(self):
+        prices = self._series([100.0 * (1.0003 ** i) for i in range(400)])
+
+        regime = assess_market_regime(prices)
+
+        assert regime.classification == BULL_RISK_ON
+        assert regime.trend_distance > 0
+
+    def test_a_sustained_decline_classifies_as_bear(self):
+        prices = self._series([100.0 * (0.999 ** i) for i in range(400)])
+
+        regime = assess_market_regime(prices)
+
+        assert regime.classification == BEAR_CRASH_RISK
+
+    def test_too_little_history_is_unknown_and_leaves_exposure_alone(self):
+        regime = assess_market_regime(self._series([100.0] * 50))
+
+        assert regime.classification == UNKNOWN
+        assert regime.exposure_scalar == 1.0
+
+    def test_an_ohlc_frame_produces_a_real_adx(self):
+        """ADX from a genuine, varying range differs from the close-only proxy
+        — which is the reason the frame is threaded through at all.
+
+        Note the range has to *vary*: with a constant high-low spread, the
+        daily highs and lows move exactly as the closes do, so +DM and -DM come
+        out the same and the true range cancels between the numerator and
+        denominator of DX. Constant-range OHLC and close-only agree exactly,
+        which is a property of Wilder's formulas rather than a bug.
+        """
+        rng = np.random.default_rng(5)
+        closes = 100 + np.cumsum(rng.normal(0, 0.4, 400))
+        widths = np.abs(rng.normal(0, 1.5, 400))
+        index = pd.bdate_range("2018-01-01", periods=400)
+        frame = pd.DataFrame(
+            {
+                "open": closes,
+                "high": closes + widths,
+                "low": closes - widths,
+                "close": closes,
+            },
+            index=index,
+        )
+
+        with_range = assess_market_regime(pd.Series(closes, index=index), market_ohlcv=frame)
+        close_only = assess_market_regime(pd.Series(closes, index=index))
+
+        assert with_range.adx is not None
+        assert close_only.adx is not None
+        assert with_range.adx != pytest.approx(close_only.adx)
