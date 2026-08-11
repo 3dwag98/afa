@@ -428,6 +428,31 @@ class LearningConfig(BaseModel):
     min_trades_for_learning: int = Field(
         default=5, description="Minimum number of realized trades required before weights are adjusted"
     )
+    min_trades_per_component: int = Field(
+        default=30,
+        description="Minimum realized trades attributed to a single component before that "
+        "component's weight may move. The overall floor above is not a substitute: with only a "
+        "total-trade floor, a component credited with three trades could move on the strength of "
+        "a fifty-trade sample it barely contributed to. At 30 trades a win rate still carries a "
+        "~9 percentage point standard error, so this is a floor, not a comfort.",
+    )
+    shrinkage_strength: float = Field(
+        default=20.0,
+        description="Beta-prior strength (in pseudo-trades) used to shrink a component's realized "
+        "win rate toward 0.5 before it moves that component's weight — the same prior the Kelly "
+        "path applies in src/risk.py. Weight adaptation is a feedback loop (weights change which "
+        "trades are taken, which changes the outcomes the next adaptation sees), so an unshrunk "
+        "win rate makes noise self-reinforcing. 0 disables shrinkage.",
+    )
+    significance_level: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        description="One-sided alpha a component's win rate must clear, on an exact binomial test "
+        "against a coin flip, before its weight moves at all. Without it weights moved on every "
+        "evaluation whether or not the difference was distinguishable from zero. Set to 1.0 to "
+        "adapt on every evaluation regardless of significance.",
+    )
 
 
 class SimulationConfig(BaseModel):

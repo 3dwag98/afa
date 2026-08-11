@@ -1727,12 +1727,23 @@ class BacktestEngine:
         return max(0, max_quantity)
 
 
-    def _evaluate_and_learn(self, learning_rate: float = 0.15, min_trades_for_learning: int = 3) -> None:
+    def _evaluate_and_learn(
+        self,
+        learning_rate: float = 0.15,
+        min_trades_for_learning: int = 3,
+        min_trades_per_component: int = 30,
+        shrinkage_strength: float = 20.0,
+        significance_level: float = 0.05,
+    ) -> None:
         """
         Trigger agent learning every N trading days.
 
         Uses the same pure weight-adaptation function (strategies/weighting.py)
         as the live orchestrator, so backtest and live learning stay identical.
+        That identity is the point of the shared function, and it extends to
+        the sample-size and significance guards: a backtest that adapted
+        weights on evidence the live path would refuse to act on would be
+        measuring a strategy the platform cannot run.
         """
         # Snapshot brain state before learning
         brain_snapshot = {
@@ -1748,6 +1759,9 @@ class BacktestEngine:
                 trade_history=self.agent_brain.trade_history,
                 learning_rate=learning_rate,
                 min_trades_for_learning=min_trades_for_learning,
+                min_trades_per_component=min_trades_per_component,
+                shrinkage_strength=shrinkage_strength,
+                significance_level=significance_level,
             )
             self.agent_brain.weights = new_weights
             if message is not None:

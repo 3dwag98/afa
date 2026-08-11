@@ -8,8 +8,50 @@ AppConfig, no AgentBrain, no I/O.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from portfolio_agent.src.risk import shrink_win_probability
+except ImportError:  # flat `src` layout
+    from src.risk import shrink_win_probability
+
+# Minimum realized trades attributed to a single component before its win rate
+# is allowed to move that component's weight. The platform's own Kelly path
+# argues that a raw win rate has a +/-7 percentage point standard error at 50
+# trades; at 5 it is +/-22 points, which is not an estimate of anything.
+DEFAULT_MIN_TRADES_PER_COMPONENT = 30
+
+# One-sided significance required before a weight moves at all.
+DEFAULT_SIGNIFICANCE_LEVEL = 0.05
+
+
+def binomial_tail_probability(wins: int, total: int, null_win_rate: float = 0.5) -> float:
+    """P(X >= wins) for X ~ Binomial(total, null_win_rate) — an exact one-sided test.
+
+    Computed exactly rather than by normal approximation: the samples this is
+    asked about are small, which is precisely where the approximation is worst
+    and where a spurious "significant" result does the most damage.
+
+    Returns 1.0 for degenerate input, so a caller gating on p < alpha does
+    nothing rather than something arbitrary.
+    """
+    if total <= 0 or wins <= 0:
+        return 1.0
+    if wins > total:
+        return 0.0
+    if not 0.0 < null_win_rate < 1.0:
+        return 1.0
+
+    tail = 0.0
+    for k in range(int(wins), int(total) + 1):
+        tail += (
+            math.comb(total, k)
+            * null_win_rate**k
+            * (1.0 - null_win_rate) ** (total - k)
+        )
+    return min(1.0, tail)
 
 
 def normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
@@ -65,17 +107,46 @@ def evaluate_and_learn(
     trade_history: List[Dict[str, Any]],
     learning_rate: float,
     min_trades_for_learning: int,
+    min_trades_per_component: int = DEFAULT_MIN_TRADES_PER_COMPONENT,
+    shrinkage_strength: float = 20.0,
+    significance_level: float = DEFAULT_SIGNIFICANCE_LEVEL,
 ) -> Tuple[Dict[str, float], Optional[str]]:
     """Adjust component weights based on realized trade win rate per trigger.
 
     Pure function: takes/returns plain dicts, no AppConfig/AgentBrain coupling.
+
+    **Three guards, because this is a feedback loop.** Weights adapt on
+    realized outcomes, which changes which trades are taken, which changes the
+    outcomes the next adaptation sees. That makes noise self-reinforcing unless
+    each update has to clear a real bar:
+
+    1. *Shrinkage.* The raw win rate used to move weights directly, at a floor
+       of 5 trades where its standard error is ~22 percentage points. The same
+       Beta prior the Kelly path already applies (src/risk.py) is used here, so
+       the two paths finally agree about what a win rate is worth.
+    2. *A sample floor per component.* The floor was on the *total* trade
+       count, so a component with three trades to its name could move on the
+       strength of a fifty-trade sample it contributed almost nothing to.
+    3. *A significance test.* An exact one-sided binomial test against a
+       coin-flip null. Without it, weights moved on every evaluation regardless
+       of whether the win-rate difference was distinguishable from zero.
+
+    None of this makes the loop out-of-sample — for that the weights have to be
+    fitted on walk-forward training folds and frozen for the test fold, the way
+    model checkpoints already are. It does stop the loop from chasing noise.
 
     Args:
         weights: Current component weights.
         trade_history: List of trade dicts with "outcome" ("WIN"/"LOSS"/other)
             and "signal_trigger" keys.
         learning_rate: Rate at which weights move toward realized win rate.
-        min_trades_for_learning: Minimum realized (WIN/LOSS) trades required.
+        min_trades_for_learning: Minimum realized (WIN/LOSS) trades overall.
+        min_trades_per_component: Minimum realized trades attributed to a
+            single component before its own weight may move.
+        shrinkage_strength: Beta-prior strength in pseudo-trades; 0 uses the
+            raw win rate.
+        significance_level: One-sided alpha a component's win rate must clear
+            before its weight moves. Set to 1.0 to disable the test.
 
     Returns:
         Tuple of (new_weights, log_message). log_message is None when weights
@@ -98,13 +169,27 @@ def evaluate_and_learn(
             stats["wins"] += 1
 
     new_weights: Dict[str, float] = dict(weights)
+    moved: set[str] = set()
     for trigger, stats in trigger_stats.items():
         total, wins = stats["total"], stats["wins"]
-        win_rate = wins / total if total > 0 else 0.5
+        if total < min_trades_per_component:
+            continue
+
+        # Two-sided in effect: a component is promoted only on significant
+        # evidence of an edge and demoted only on significant evidence against.
+        win_tail = binomial_tail_probability(wins, total)
+        loss_tail = binomial_tail_probability(total - wins, total)
+        if min(win_tail, loss_tail) > significance_level:
+            continue
+
+        win_rate = shrink_win_probability(
+            wins=wins, total=total, prior_strength=shrinkage_strength
+        )
         old_weight = weights.get(trigger, 25.0)
         adjustment = (win_rate - 0.5) * learning_rate
         new_weight = max(5.0, old_weight * (1 + adjustment))
         new_weights[trigger] = new_weight
+        moved.add(trigger)
 
     total_weight = sum(new_weights.values())
     if total_weight > 0:
@@ -124,7 +209,12 @@ def evaluate_and_learn(
         stats = trigger_stats[trigger]
         wr_pct = int(round(stats["wins"] / stats["total"] * 100)) if stats["total"] > 0 else 50
         wt = rounded_weights.get(trigger, 0)
-        log_parts.append(f"{trigger} WR:{wr_pct}% (Wt:{wt:.1f})")
+        # A component whose sample was too small or whose edge was not
+        # significant is marked "held", so the log distinguishes "no evidence"
+        # from "evidence of no edge" instead of showing a win rate that did
+        # nothing and letting the reader assume it did.
+        held = "" if trigger in moved else " held"
+        log_parts.append(f"{trigger} WR:{wr_pct}% n={stats['total']} (Wt:{wt:.1f}{held})")
 
     log_message = f"{datetime.now().strftime('%Y-%m-%d')} Learning Update: {' | '.join(log_parts)}"
     return rounded_weights, log_message
