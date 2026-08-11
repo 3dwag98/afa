@@ -32,7 +32,12 @@ try:
     from .regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
     from .execution_sim import ExecutionSimulator
     from .monte_carlo import MonteCarloSettings
-    from .risk import MAX_KELLY_FRACTION, calculate_kelly_quantity, estimate_kelly_inputs
+    from .risk import (
+        MAX_KELLY_FRACTION,
+        calculate_kelly_quantity,
+        estimate_kelly_inputs,
+        loss_given_stop_pct,
+    )
     from .sectors import (
         load_sector_map, sector_cap_is_enforceable, sector_capacity_inr, sector_of,
     )
@@ -43,7 +48,12 @@ except ImportError:
     from regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
     from execution_sim import ExecutionSimulator
     from monte_carlo import MonteCarloSettings
-    from risk import MAX_KELLY_FRACTION, calculate_kelly_quantity, estimate_kelly_inputs
+    from risk import (
+        MAX_KELLY_FRACTION,
+        calculate_kelly_quantity,
+        estimate_kelly_inputs,
+        loss_given_stop_pct,
+    )
     from sectors import (
         load_sector_map, sector_cap_is_enforceable, sector_capacity_inr, sector_of,
     )
@@ -1258,12 +1268,19 @@ class BacktestEngine:
             return 0.0
         return float(trade.get("net_pnl", 0.0)) / cost_basis * 100.0
 
-    def _kelly_quantity(self, entry_price: float) -> int:
+    def _kelly_quantity(self, entry_price: float, stop_price: Optional[float] = None) -> int:
         """Fractional-Kelly position size from this run's realized trade_log so far.
 
         Returns 0 (triggering the caller's fixed-fractional fallback) when
         there aren't yet enough realized trades to estimate Kelly inputs
         reliably (see risk.py::estimate_kelly_inputs).
+
+        Args:
+            entry_price: Price the position would be opened at.
+            stop_price: The signal's stop, when it has one. Kelly's allocation
+                fraction scales as 1/l, so this trade's own distance to the
+                stop is a sizing input, not a downstream detail — passing it
+                is what stops a wide-stop signal being sized like a tight one.
         """
         # Only *closed* round trips are realized outcomes. Open BUY legs carry
         # net_pnl = -transaction_costs, so counting them here classified every
@@ -1290,14 +1307,19 @@ class BacktestEngine:
         )
         if kelly_inputs is None:
             return 0
-        win_probability, reward_risk_ratio = kelly_inputs
         return calculate_kelly_quantity(
             entry_price=entry_price,
             portfolio_value_inr=self.portfolio_value,
             max_single_position_pct=self.risk_params.max_single_position_pct,
-            win_probability=win_probability,
-            reward_risk_ratio=reward_risk_ratio,
+            win_probability=kelly_inputs.win_probability,
+            avg_win_pct=kelly_inputs.avg_win_pct,
+            avg_loss_pct=kelly_inputs.avg_loss_pct,
             kelly_fraction=self.kelly_fraction,
+            loss_given_stop_pct=(
+                loss_given_stop_pct(entry_price, stop_price)
+                if stop_price is not None
+                else None
+            ),
         )
 
     def _update_circuit_breaker(self, current_date: pd.Timestamp) -> None:
@@ -1562,7 +1584,11 @@ class BacktestEngine:
         for ticker in buys:
             sig = signals[ticker]
             price = sig.entry_price or 100
-            quantity = self._kelly_quantity(price) if self.use_kelly_sizing else 0
+            quantity = (
+                self._kelly_quantity(price, sig.stop_price)
+                if self.use_kelly_sizing
+                else 0
+            )
 
             if quantity <= 0:
                 # Default / Kelly-unavailable fallback: 10% of portfolio per position.

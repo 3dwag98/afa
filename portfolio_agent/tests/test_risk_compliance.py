@@ -7,8 +7,10 @@ from src.risk import (
     calculate_quantity,
     calculate_stop_target,
     calculate_max_loss,
+    MAX_GROSS_EXPOSURE,
     calculate_kelly_fraction,
     calculate_kelly_quantity,
+    kelly_allocation_fraction,
     calculate_position_quantity,
     estimate_kelly_inputs,
 )
@@ -472,9 +474,12 @@ class TestEstimateKellyInputs:
         trades = self._trades(12, 8, win_pct=6.0, loss_pct=-3.0)
         result = estimate_kelly_inputs(trades, min_trades=10, shrinkage_strength=0.0)
         assert result is not None
-        win_probability, reward_risk_ratio = result
-        assert win_probability == pytest.approx(0.6)
-        assert reward_risk_ratio == pytest.approx(2.0)
+        assert result.win_probability == pytest.approx(0.6)
+        assert result.reward_risk_ratio == pytest.approx(2.0)
+        # The two averages are kept, not collapsed into their ratio: the
+        # allocation fraction needs the scale of the loss, not just b.
+        assert result.avg_win_pct == pytest.approx(6.0)
+        assert result.avg_loss_pct == pytest.approx(3.0)
 
     def test_shrinks_win_rate_toward_coin_flip_by_default(self):
         # Same 12/8 sample, but with the default 20-pseudo-trade Beta(10, 10)
@@ -484,11 +489,10 @@ class TestEstimateKellyInputs:
         trades = self._trades(12, 8, win_pct=6.0, loss_pct=-3.0)
         result = estimate_kelly_inputs(trades, min_trades=10)
         assert result is not None
-        win_probability, reward_risk_ratio = result
-        assert win_probability == pytest.approx(0.55)
+        assert result.win_probability == pytest.approx(0.55)
         # The payoff ratio is a magnitude average, not a proportion, so it is
         # reported unshrunk.
-        assert reward_risk_ratio == pytest.approx(2.0)
+        assert result.reward_risk_ratio == pytest.approx(2.0)
 
     def test_shrinkage_fades_as_evidence_accumulates(self):
         # The same 60% raw win rate over 20 vs 400 trades: the prior dominates
@@ -496,8 +500,8 @@ class TestEstimateKellyInputs:
         small = estimate_kelly_inputs(self._trades(12, 8), min_trades=10)
         large = estimate_kelly_inputs(self._trades(240, 160), min_trades=10)
         assert small is not None and large is not None
-        assert small[0] == pytest.approx(0.55)
-        assert large[0] == pytest.approx(0.5952, abs=1e-4)
+        assert small.win_probability == pytest.approx(0.55)
+        assert large.win_probability == pytest.approx(0.5952, abs=1e-4)
 
     def test_default_min_trades_rejects_small_samples(self):
         # 30 realized trades is below the 50-trade floor, so Kelly is not
@@ -533,17 +537,75 @@ class TestCalculateKellyQuantity:
     """Tests for calculate_kelly_quantity()."""
 
     def test_basic_sizing(self):
+        # A deliberately thin edge, so no cap binds and the arithmetic is
+        # visible: p = 0.51, g = 5.5%, l = 5%.
+        #   f* = (0.51*0.055 - 0.49*0.05) / (0.055*0.05) = 0.00355/0.00275
+        #      = 1.2909 -> quarter-Kelly 0.32273 -> 322,727 INR -> 3227 shares
         qty = calculate_kelly_quantity(
             entry_price=100.0,
             portfolio_value_inr=1_000_000.0,
             max_single_position_pct=0.5,
-            win_probability=0.6,
-            reward_risk_ratio=2.0,
+            win_probability=0.51,
+            avg_win_pct=5.5,
+            avg_loss_pct=5.0,
             kelly_fraction=0.25,
         )
-        # f* = 0.4, quarter-Kelly = 0.1 -> position value ~= 100,000 -> qty ~= 1000
-        # (floor of a floating-point division, so off-by-one from binary rounding is fine)
-        assert qty in (999, 1000)
+        assert qty == 3227
+
+    def test_allocation_units_not_binary_stake_units(self):
+        """The D1 regression test.
+
+        The binary-bet form f* = p - (1-p)/b is a *stake* fraction and was
+        being spent as an *allocation* fraction, which under-bets by 1/l. At
+        p = 0.55, b = 1.8 and l = 6% that is a factor of 16.7 — the system ran
+        at ~6% of the quarter-Kelly it documented, and every safety mechanism
+        above it (the kappa cap, the trade floor, the Beta shrinkage) was
+        guarding a quantity already an order of magnitude too small.
+        """
+        p, g, l = 0.55, 10.8, 6.0
+        binary_f = calculate_kelly_fraction(p, g / l)
+        allocation_f = kelly_allocation_fraction(p, g, l)
+
+        assert binary_f == pytest.approx(0.30, abs=1e-9)
+        assert allocation_f == pytest.approx(5.0, abs=1e-9)
+        assert allocation_f == pytest.approx(binary_f / (l / 100.0), rel=1e-9)
+
+    def test_gross_exposure_is_capped_at_fully_funded(self):
+        """f* > 1 is meaningful in allocation units, but this is a cash
+        delivery account: MAX_GROSS_EXPOSURE, not a units bug, is what stops
+        it from levering."""
+        qty = calculate_kelly_quantity(
+            entry_price=100.0,
+            portfolio_value_inr=1_000_000.0,
+            max_single_position_pct=1.0,  # concentration cap deliberately open
+            win_probability=0.9,
+            avg_win_pct=20.0,
+            avg_loss_pct=2.0,
+            kelly_fraction=MAX_KELLY_FRACTION,
+        )
+        assert MAX_GROSS_EXPOSURE == 1.0
+        assert qty == 10_000  # the whole book, and not one share more
+
+    def test_wider_stop_is_sized_smaller(self):
+        """The correction is signal-dependent, not a constant rescale: two
+        signals with the same realized edge but different stop distances are
+        two different bets."""
+        common = dict(
+            entry_price=100.0,
+            portfolio_value_inr=1_000_000.0,
+            max_single_position_pct=0.9,
+            win_probability=0.51,
+            avg_win_pct=5.5,
+            avg_loss_pct=5.0,
+            kelly_fraction=0.25,
+        )
+        tight = calculate_kelly_quantity(loss_given_stop_pct=3.0, **common)
+        wide = calculate_kelly_quantity(loss_given_stop_pct=9.0, **common)
+
+        assert 0 < wide < tight
+        # f* scales as 1/l with the payoff ratio b held fixed, so tripling the
+        # stop distance thirds the allocation.
+        assert tight == pytest.approx(wide * 3, rel=0.01)
 
     def test_kappa_is_hard_capped_at_quarter_kelly(self):
         """The cap lives in calculate_kelly_quantity(), not in the config, so
@@ -552,8 +614,9 @@ class TestCalculateKellyQuantity:
             entry_price=100.0,
             portfolio_value_inr=1_000_000.0,
             max_single_position_pct=0.9,
-            win_probability=0.6,
-            reward_risk_ratio=2.0,
+            win_probability=0.51,
+            avg_win_pct=5.5,
+            avg_loss_pct=5.0,
         )
 
         at_cap = calculate_kelly_quantity(kelly_fraction=MAX_KELLY_FRACTION, **common)
@@ -570,10 +633,12 @@ class TestCalculateKellyQuantity:
             portfolio_value_inr=1_000_000.0,
             max_single_position_pct=0.05,
             win_probability=0.6,
-            reward_risk_ratio=2.0,
+            avg_win_pct=6.0,
+            avg_loss_pct=3.0,
             kelly_fraction=0.5,
         )
-        # Uncapped would be 2000 shares (200,000 INR); cap is 5% = 50,000 INR -> 500 shares
+        # Quarter-Kelly here is 2.0 of the book, cut to MAX_GROSS_EXPOSURE and
+        # then to the 5% concentration cap = 50,000 INR -> 500 shares.
         assert qty == 500
 
     def test_zero_quantity_on_negative_edge(self):
@@ -582,7 +647,8 @@ class TestCalculateKellyQuantity:
             portfolio_value_inr=1_000_000.0,
             max_single_position_pct=0.5,
             win_probability=0.3,
-            reward_risk_ratio=1.0,
+            avg_win_pct=3.0,
+            avg_loss_pct=3.0,
             kelly_fraction=0.5,
         )
         assert qty == 0
@@ -593,7 +659,8 @@ class TestCalculateKellyQuantity:
             portfolio_value_inr=1_000_000.0,
             max_single_position_pct=0.5,
             win_probability=0.6,
-            reward_risk_ratio=2.0,
+            avg_win_pct=6.0,
+            avg_loss_pct=3.0,
         )
         assert qty == 0
 
@@ -632,8 +699,15 @@ class TestCalculatePositionQuantity:
         actual = calculate_position_quantity(
             entry_price=100.0, stop_price=95.0, config=config, trade_history=trade_history
         )
-        # p=0.6, b=2.0 -> f*=0.4, quarter-Kelly=0.1 -> ~100,000 INR / 100 = ~1000 shares
-        assert actual in (999, 1000)
+        # p=0.6, b=2.0, and this trade's stop is 5% away, so l=5% and g=10%:
+        #   f* = (0.6*0.10 - 0.4*0.05) / (0.10*0.05) = 8.0
+        # Quarter-Kelly is 2.0 of the book, cut to MAX_GROSS_EXPOSURE and then
+        # to the 50% concentration cap. With the units right, a 60%/2:1 edge
+        # genuinely saturates every cap above it -- which is the honest reading
+        # of Kelly for a bet that can only lose 5%, and is why the position
+        # limit (and, in time, a portfolio-level covariance constraint) is what
+        # actually sizes this book.
+        assert actual == 5000
 
     def test_shrinkage_sizes_more_conservatively_than_raw_win_rate(self):
         """Default shrinkage must never size *larger* than the raw estimate."""
@@ -652,9 +726,13 @@ class TestCalculatePositionQuantity:
             entry_price=100.0, stop_price=95.0, config=config, trade_history=trade_history
         )
 
-        # p=0.55, b=2.0 -> f*=0.325, quarter-Kelly=0.08125 -> ~812 shares
-        assert shrunk == 812
-        assert shrunk < raw
+        # Both saturate the 50% concentration cap at this edge, so the
+        # shrinkage is measured where it is observable -- on the allocation
+        # fraction itself, before any cap.
+        assert shrunk == raw == 5000
+        assert kelly_allocation_fraction(0.55, 10.0, 5.0) < kelly_allocation_fraction(
+            0.60, 10.0, 5.0
+        )
 
 
 if __name__ == "__main__":
@@ -740,10 +818,9 @@ class TestNetRealizedReturn:
         net_history = to_net_realized_trades(gross_history, buy_cost_pct=0.004, sell_cost_pct=0.004)
 
         def _quantity(history):
-            p, b = estimate_kelly_inputs(history, min_trades=50)
-            return calculate_kelly_quantity(
-                entry_price=100.0, portfolio_value_inr=1_000_000.0,
-                max_single_position_pct=1.0, win_probability=p, reward_risk_ratio=b,
+            inputs = estimate_kelly_inputs(history, min_trades=50)
+            return kelly_allocation_fraction(
+                inputs.win_probability, inputs.avg_win_pct, inputs.avg_loss_pct
             )
 
         assert _quantity(net_history) < _quantity(gross_history)
