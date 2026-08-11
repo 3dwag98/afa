@@ -164,6 +164,7 @@ class MonteCarloSettings:
     separate_overnight_gaps: bool = True
     prior_annual_drift_std: float = DEFAULT_PRIOR_ANNUAL_DRIFT_STD
     propagate_drift_uncertainty: bool = True
+    garch_refit_interval_days: int = 1
 
     @classmethod
     def from_simulation_config(cls, simulation) -> "MonteCarloSettings":
@@ -181,6 +182,7 @@ class MonteCarloSettings:
             separate_overnight_gaps=simulation.separate_overnight_gaps,
             prior_annual_drift_std=simulation.prior_annual_drift_std,
             propagate_drift_uncertainty=simulation.propagate_drift_uncertainty,
+            garch_refit_interval_days=simulation.garch_refit_interval_days,
         )
 
     def run(
@@ -240,6 +242,7 @@ class MonteCarloSettings:
             overnight_returns=overnight,
             prior_annual_drift_std=self.prior_annual_drift_std,
             propagate_drift_uncertainty=self.propagate_drift_uncertainty,
+            garch_refit_interval_days=self.garch_refit_interval_days,
         )
 
 
@@ -569,6 +572,7 @@ def run_monte_carlo_garch(
     overnight_returns: Optional[list[float]] = None,
     prior_annual_drift_std: float = DEFAULT_PRIOR_ANNUAL_DRIFT_STD,
     propagate_drift_uncertainty: bool = True,
+    garch_refit_interval_days: int = 1,
 ) -> MonteCarloResult:
     """Like run_monte_carlo(), but forecasts volatility with GJR-GARCH(1,1)
     (see volatility_models.py) instead of assuming a flat historical
@@ -590,6 +594,15 @@ def run_monte_carlo_garch(
     independent — a failed gap-aware fit drops to close-to-close GARCH, and a
     failed GARCH fit drops to constant volatility.
 
+    `garch_refit_interval_days` controls how often the coefficients are
+    re-estimated. This is what decides whether the GARCH path is usable at all:
+    scoring every ticker on every bar of the documented backtest is ~4.5
+    million MLE fits, and refitting monthly instead cuts that ~21x while the
+    variance recursion still consumes every new bar (see
+    volatility_models.forecast_volatility). The symbol is the cache identity,
+    so the saving only materializes when tickers are scored repeatedly — which
+    is exactly what a backtest does.
+
     Falls back to run_monte_carlo()'s constant-volatility path whenever
     there isn't enough history to fit GARCH reliably or the fit fails.
     """
@@ -601,10 +614,19 @@ def run_monte_carlo_garch(
     forecast = None
     if intraday_returns is not None and overnight_returns is not None:
         forecast = forecast_volatility_gap_aware(
-            intraday_returns, overnight_returns, horizon_days
+            intraday_returns,
+            overnight_returns,
+            horizon_days,
+            refit_interval_days=garch_refit_interval_days,
+            cache_key=symbol,
         )
     if forecast is None:
-        forecast = forecast_volatility(daily_returns, horizon_days)
+        forecast = forecast_volatility(
+            daily_returns,
+            horizon_days,
+            refit_interval_days=garch_refit_interval_days,
+            cache_key=symbol,
+        )
     daily_vol_forecast = forecast.daily_sigma if forecast is not None else None
     # The fitted Student-t nu travels with the volatility path. Fitting
     # fat-tailed innovations and then simulating Gaussian shocks would discard

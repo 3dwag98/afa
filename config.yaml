@@ -97,6 +97,15 @@ training:
   # stocks. Rank is the default: on Indian data a circuit-limited print
   # dominates the cross-sectional mean but moves a ranking by one place.
   target_transform: cross_sectional_rank
+  # Charge modelled round-trip friction against the label, so the network
+  # learns the sign of the return the portfolio keeps rather than the one the
+  # tape prints — a forecast +0.4% five-day move is a positive gross label and
+  # a losing trade against ~0.8% of round-trip cost. The rate is read from
+  # src/execution_sim.py, not hardcoded here. Be aware of the interaction with
+  # target_transform above: the cost is a constant and both cross-sectional
+  # transforms are invariant to a constant, so under the default rank target
+  # this changes no ordering and therefore nothing. It binds on 'absolute'.
+  cost_adjust_target: true
   sequence_length: 60
   train_fraction: 0.8
   batch_size: 128
@@ -233,6 +242,18 @@ simulation:
   # NSE opens after the US close, so gaps are frequent and destabilize a
   # close-to-close fit.
   separate_overnight_gaps: true
+  # Bars between GJR-GARCH maximum-likelihood refits. Refitting every bar is
+  # one MLE per ticker per day — 3,612 tickers x 1,237 days is ~4.5 million
+  # fits, or 62-248 hours of optimizer time before a single path is simulated,
+  # which is the real reason use_garch_volatility was off by default rather
+  # than any judgement that the model is optional. Coefficients move on the
+  # scale of months, so 21 (one trading month) re-estimates on a schedule and
+  # runs the variance recursion forward arithmetically in between: every new
+  # bar still updates conditional volatility, it just does not re-run the
+  # optimizer. Measured ~22x faster. Set to 1 for the exact-but-unaffordable
+  # behaviour. The fitted window is anchored to history length, not call
+  # order, so parallel runs stay deterministic.
+  garch_refit_interval_days: 21
   # The sample mean of daily returns has a standard error of sigma/sqrt(T) —
   # about 14% a year for a 2%/day name over five years — so propagating it
   # forward unshrunk made probability-of-profit mostly estimation noise:

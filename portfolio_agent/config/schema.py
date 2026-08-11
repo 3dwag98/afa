@@ -182,6 +182,19 @@ class TrainingConfig(BaseModel):
         "small to rank. Note this changes what the model predicts, so a checkpoint trained under "
         "one setting should not be scored under another.",
     )
+    cost_adjust_target: bool = Field(
+        default=True,
+        description="Subtract modelled round-trip friction from the forward-return label, so the "
+        "network learns the sign of the return the portfolio *keeps* rather than the one the tape "
+        "prints (agents/trainer.py::build_forward_return). The rate is read from the platform's own "
+        "cost stack (src/execution_sim.py::round_trip_cost_pct, ~0.8% a round trip at the default "
+        "25 bps/side slippage), not hardcoded. Note the interaction with target_transform: the cost "
+        "is a constant, and both cross-sectional transforms are invariant to a constant, so under "
+        "the default 'cross_sectional_rank' this changes no ordering and therefore nothing. It "
+        "binds on 'absolute', where a +0.4% forecast is otherwise a positive label and a losing "
+        "trade. Making friction discriminate between names needs a per-ticker liquidity-scaled "
+        "cost, which is Phase 7 work.",
+    )
     max_abs_target: float = Field(
         default=5.0,
         gt=0.0,
@@ -559,7 +572,21 @@ class SimulationConfig(BaseModel):
         "(src/volatility_models.py) instead of assuming a flat historical standard deviation. "
         "Falls back to the flat assumption automatically when there isn't enough history to fit "
         "GARCH reliably. Off by default since per-ticker GARCH fitting is much slower than the "
-        "closed-form flat-vol path.",
+        "closed-form flat-vol path — see garch_refit_interval_days for what makes it affordable.",
+    )
+    garch_refit_interval_days: int = Field(
+        default=21,
+        ge=1,
+        description="Bars between GJR-GARCH maximum-likelihood refits when use_garch_volatility is "
+        "on (src/volatility_models.py). Refitting every bar means one MLE per ticker per day — "
+        "3,612 tickers x 1,237 days is ~4.5 million fits, or 62-248 hours of optimizer time before "
+        "a single path is simulated, which is the real reason GARCH was off by default rather than "
+        "any judgement that it is optional. GARCH coefficients move on the scale of months, so 21 "
+        "(one trading month) re-estimates them on a schedule and runs the variance recursion "
+        "forward arithmetically in between: every new bar still updates conditional volatility, it "
+        "just does not re-run the optimizer. Set to 1 to refit on every bar (the exact but "
+        "unaffordable behaviour). The fitted window is anchored to the history length rather than "
+        "to call order, so results do not depend on how work is distributed across processes.",
     )
     prior_annual_drift_std: float = Field(
         default=0.10,

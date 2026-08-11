@@ -231,7 +231,7 @@ Notes:
 **[docs/QUANT_RESEARCH.md](docs/QUANT_RESEARCH.md)** is the mathematical/research foundation behind the platform's strategies and risk models — academic evidence (with an emphasis on India-specific studies), exact formulations, and an honest list of what's implementable with OHLCV-only data versus what needs a new data source (fundamentals, institutional flows). Covers:
 
 - Cross-sectional momentum and the low-volatility anomaly (`strategies/cross_sectional.py`)
-- GJR-GARCH(1,1) conditional volatility with Student-t innovations, used as an optional drop-in replacement for the Monte Carlo simulation's flat historical-volatility assumption (`src/volatility_models.py`; enable via `simulation.use_garch_volatility: true`)
+- GJR-GARCH(1,1) conditional volatility with Student-t innovations, used as an optional drop-in replacement for the Monte Carlo simulation's flat historical-volatility assumption (`src/volatility_models.py`; enable via `simulation.use_garch_volatility: true`). Coefficients are re-estimated on a schedule (`simulation.garch_refit_interval_days`) and the variance recursion is run forward from the cached fit in between — one MLE per ticker per *bar* is ~4.5 million fits for the documented backtest, which is why the model was previously unreachable rather than merely slow
 - Fractional-Kelly position sizing in *allocation* units — the fraction of wealth a stop-loss trade justifies, which is the binary-bet Kelly fraction divided by the loss-given-stop (`src/risk.py::kelly_allocation_fraction`; enable via `risk.use_kelly_sizing: true`)
 - Portfolio covariance estimation and constrained long-only allocation: Ledoit-Wolf shrinkage, a turnover-penalized mean-variance optimizer, and hierarchical risk parity for when expected returns are not trustworthy (`src/portfolio.py`)
 - Selection-bias-aware performance statistics — probabilistic and deflated Sharpe, probability of backtest overfitting, cross-sectional rank IC, and the Newey-West correction for overlapping labels (`src/performance_stats.py`)
@@ -387,8 +387,10 @@ simulation:
   method: block_bootstrap       # gaussian | block_bootstrap | jump_diffusion
   use_garch_volatility: false   # true = GJR-GARCH(1,1) instead of flat historical std
   separate_overnight_gaps: true # fit GARCH to sessions, add gap risk separately
+  garch_refit_interval_days: 21 # bars between MLE refits; 1 refits every bar
 training:
   walk_forward_splits: 5        # expanding-window validation folds; 0 to skip
+  cost_adjust_target: true      # charge round-trip friction against the label
 ```
 
 ### Risk controls

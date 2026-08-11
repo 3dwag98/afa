@@ -19,6 +19,7 @@ from portfolio_agent.agents.trainer import (
     prepare_features,
     run_walk_forward_validation,
     target_column_name,
+    training_label_cost_pct,
     _generate_synthetic_ohlcv,
     _target_horizon_days,
 )
@@ -60,7 +61,14 @@ class TestPrepareFeatures:
         feature_df = prepare_features(df, config, verbose=False)
 
         target_col = target_column_name(config.training.target)
-        expected = build_forward_return(df['close'], config.training.target)
+        # Net of the same round-trip friction prepare_features charges, so this
+        # keeps testing that the label looks *forward* rather than accidentally
+        # re-testing whether the cost adjustment is on.
+        expected = build_forward_return(
+            df['close'],
+            config.training.target,
+            cost_pct=training_label_cost_pct(config),
+        )
 
         aligned = expected.reindex(feature_df.index)
         assert np.allclose(feature_df[target_col].values, aligned.values)
@@ -515,3 +523,89 @@ class TestCrossSectionalTarget:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestNetOfCostTarget:
+    """The label must be the return the portfolio keeps, not the one printed.
+
+    A gross label teaches the network a sign it cannot trade: a +0.4% five-day
+    forecast is a positive label and a losing trade once the round trip's
+    brokerage, STT on both delivery legs, exchange and SEBI charges, GST,
+    stamp duty and slippage are paid.
+    """
+
+    def test_cost_is_charged_against_the_label(self):
+        close = pd.Series(np.linspace(100.0, 120.0, 40))
+
+        gross = build_forward_return(close, "return_5d")
+        net = build_forward_return(close, "return_5d", cost_pct=0.008)
+
+        pd.testing.assert_series_equal(net, gross - 0.008, check_names=False)
+
+    def test_a_move_smaller_than_the_round_trip_becomes_a_negative_label(self):
+        """The whole point: signals inside the cost band stop reading as wins."""
+        close = pd.Series([100.0] * 10 + [100.4] * 20)  # +0.4% over the 5 days from t=5
+
+        gross = build_forward_return(close, "return_5d")
+        net = build_forward_return(close, "return_5d", cost_pct=0.008)
+
+        assert gross.iloc[5] == pytest.approx(0.004)
+        assert gross.iloc[5] > 0
+        assert net.iloc[5] < 0
+
+    def test_rate_comes_from_the_platforms_own_cost_stack(self):
+        """Not a hardcoded constant, so it cannot drift from what is charged."""
+        from portfolio_agent.agents.trainer import training_label_cost_pct
+        from portfolio_agent.src.execution_sim import round_trip_cost_pct
+
+        config = AppConfig()
+        config.training.cost_adjust_target = True
+
+        assert training_label_cost_pct(config) == pytest.approx(
+            round_trip_cost_pct(slippage_pct=config.risk.slippage_pct_per_side)
+        )
+        # And it lands in the range the research doc quotes for a round trip.
+        assert 0.005 < training_label_cost_pct(config) < 0.015
+
+    def test_switching_it_off_restores_the_gross_label(self):
+        config = AppConfig()
+        config.training.cost_adjust_target = False
+
+        from portfolio_agent.agents.trainer import training_label_cost_pct
+
+        assert training_label_cost_pct(config) == 0.0
+
+    def test_cross_sectional_transforms_are_invariant_to_the_cost(self):
+        """Pinned deliberately: under the default target this changes nothing.
+
+        The cost is a constant, and both cross-sectional transforms are
+        invariant to a constant — demeaning subtracts it back out and ranking
+        never sees it. So `cost_adjust_target` binds on the 'absolute' target
+        and is a no-op under the shipped default of 'cross_sectional_rank'.
+        That is not a defect in either piece: a relative label already asks
+        "which name is better", which a uniform fee cannot answer. Making
+        friction discriminate between names needs a per-ticker
+        liquidity-scaled cost, which is Phase 7 capacity work.
+
+        This asserts the non-property so it cannot be quietly assumed away.
+        """
+        target = "target_return_5d"
+        rng = np.random.default_rng(4)
+        index = pd.bdate_range("2023-01-02", periods=30)
+
+        gross_panel, net_panel = {}, {}
+        for name in ["A", "B", "C", "D", "E", "F"]:
+            values = rng.normal(0.01, 0.05, len(index))
+            gross_panel[name] = pd.DataFrame({target: values}, index=index)
+            net_panel[name] = pd.DataFrame({target: values - 0.008}, index=index)
+
+        for method in ("cross_sectional_rank", "cross_sectional_demean"):
+            gross_out = apply_cross_sectional_target(gross_panel, target, method)
+            net_out = apply_cross_sectional_target(net_panel, target, method)
+            for name in gross_out:
+                np.testing.assert_allclose(
+                    gross_out[name][target].to_numpy(),
+                    net_out[name][target].to_numpy(),
+                    atol=1e-12,
+                    err_msg=f"{method} should be invariant to a constant cost",
+                )

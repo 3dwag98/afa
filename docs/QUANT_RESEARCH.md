@@ -330,6 +330,10 @@ with \(c\) from `cost_fraction_per_side()` — the statutory rates above plus an
 
 Rather than document a config that cannot fire, the geometry was widened to match the economics: the take-profit multiple is now **3.0× ATR** (2.0 gross, ~1.2–1.7 net across realistic ATR levels) and `min_reward_risk` is **1.2**, a threshold good setups clear and marginal ones fail. Signals carry both `reward_risk` (net) and `extra["gross_reward_risk"]`, so the size of the friction haircut stays visible instead of implicit. `src/compliance.py::check_risk_reward_ratio` measures the same net quantity, so the strategy gate and the compliance gate cannot disagree about what a trade's reward:risk is.
 
+**The same argument reaches the training label.** A network trained on the gross forward return learns a sign it cannot trade: a forecast +0.4% five-day move is a positive label and a losing trade against ~0.8% of round-trip friction, so every signal inside the cost band is trained as an opportunity and realized as a fee. `training.cost_adjust_target` charges the same `round_trip_cost_pct()` against the label, so the model is asked for the return the portfolio *keeps*.
+
+Its reach is narrower than it looks, and the default configuration conceals that. The cost is a constant, and both cross-sectional target transforms (§24) are invariant to a constant — demeaning subtracts it back out, ranking never sees it. So under the shipped `cross_sectional_rank` target the adjustment changes no ordering and therefore nothing; it binds on `absolute`. Neither piece is at fault: a relative label already asks "which name is better", and a uniform fee cannot answer that. Making friction discriminate *between* names requires a per-ticker liquidity-scaled cost — the same square-root-impact and ADV machinery the capacity model needs — which the platform does not have yet.
+
 ### 13.3 Sector concentration
 
 Ranking on one characteristic and buying the extreme decile has no term in the objective that cares what those stocks *are*. In Indian equities that reliably produces a portfolio which is nominally 10 names and economically one bet — momentum concentrated in IT through 2020-21, then Banking/PSU through 2022-23. The factor exposure is intended; the sector exposure is an accident, and it is what turns a factor drawdown into a portfolio drawdown.
@@ -439,6 +443,43 @@ $$
 $$
 
 with \(\sigma_{\text{gap}}\) the unconditional standard deviation of the gap series. Independence is the standard simplification and a conservative one here: positive correlation between a gap and the session following it would only widen the total. Enabled by `simulation.separate_overnight_gaps`; each fallback is independent, so a failed gap-aware fit drops to close-to-close GARCH rather than all the way to constant volatility.
+
+### 16.1 The same gap has to reach the fill, not only the variance
+
+Modelling gap risk in the volatility estimate and then filling every stop at the stop is an inconsistency, not a simplification. An ATR stop is an *intraday* construct: it presumes a continuous tape on which a resting order can be worked at the price it names. Between 15:30 and 09:15 there is no tape, so a level the market gaps through is filled at the open:
+
+$$
+\text{fill}_{\text{stop}} = \min(\text{open}_t,\ S), \qquad \text{fill}_{\text{target}} = \max(\text{open}_t,\ T)
+$$
+
+for a long position with stop \(S\) and target \(T\). Both directions matter, and for different reasons. The stop side is the risk one: the gaps that blow through a long's stop are precisely the adverse ones, so assuming a fill at \(S\) puts *all* of the unmodelled slippage in one direction and makes the realized loss distribution systematically better than it was. That propagates — the average loss feeding Kelly's payoff ratio \(b\) is understated, so \(f^*\) is overstated, on top of the units defect in §21's companion. The target side is included because charging the adverse gap while ignoring the favourable one is a different bias rather than neutrality: a limit sell resting at \(T\) when the market opens above it genuinely executes at the open.
+
+Gap fills are evaluated before the intraday high/low tests, because a gap is settled in the opening auction, ahead of anything the session goes on to do. When both levels are touched *within* a session, the stop still wins — OHLC cannot say which came first, and the adverse assumption is the honest one.
+
+This closes half of the gap-risk gap. The other half is position *sizing*: risk-per-share is still \(\text{entry} - S\), which is the intraday risk, and the overnight component \(z\,\sigma_{\text{gap}}\,\text{entry}\) is unhedgeable in a cash long book and should be added to it. That is recorded as outstanding in `docs/REVIEW_STATUS.md`.
+
+### 16.2 Refitting on a schedule is what makes GARCH reachable
+
+GJR-GARCH was documented as an optional enhancement and defaulted to off. The real constraint was arithmetic rather than editorial: scoring every ticker on every bar means one maximum-likelihood fit per ticker per bar, and the documented backtest (3,612 tickers × 1,237 trading days) is ≈4.5 million fits — 62–248 hours of optimizer time at a realistic 50–200 ms each, before a single path is simulated. The most sophisticated component in the platform was, in practice, unreachable.
+
+The fix separates two things the naive integration conflates. GARCH *coefficients* move on the scale of months; the conditional *variance* moves every bar. So the coefficients are re-estimated every `simulation.garch_refit_interval_days` bars and cached, and between refits the recursion is carried forward arithmetically — filtering each new observation
+
+$$
+\sigma_t^2 = \omega + \left(\alpha + \gamma\,\mathbb{1}[\varepsilon_{t-1} < 0]\right)\varepsilon_{t-1}^2 + \beta\,\sigma_{t-1}^2
+$$
+
+and then projecting the horizon. One step ahead the sign of the last residual is known, so the leverage term applies exactly; beyond that it is unknown and symmetric standardized innovations put it below zero half the time, which is where the familiar persistence \(\alpha + \gamma/2 + \beta\) comes from:
+
+$$
+\mathbb{E}\!\left[\sigma_{t+h}^2\right] = \omega + \left(\alpha + \tfrac{\gamma}{2} + \beta\right)\mathbb{E}\!\left[\sigma_{t+h-1}^2\right], \qquad h \ge 2
+$$
+
+Two properties are worth stating because neither is automatic:
+
+- **The projection is exact.** It reproduces `arch`'s own analytic multi-step forecast to ~\(10^{-16}\) relative error, pinned by test. The only approximation introduced is the staleness of the coefficients between refits — every new bar still updates conditional volatility.
+- **The fitted window is anchored to the history length, not to call order.** The obvious scheduling rule ("refit if N bars have passed since this symbol was last fitted") makes the answer depend on the order calls arrive in, and per-ticker scoring is dispatched to worker processes holding independent caches — different workers would hit different refit points and produce different volatility paths for the same ticker on the same date. Anchoring to \(\lfloor n/k \rfloor \cdot k\) makes the cache pure memoization: it changes how long the answer takes, never what it is.
+
+Measured at 22× on a 63-bar walk-forward for one ticker, matching the 21-bar interval. Note that making a model affordable is a separate question from whether it improves results; `use_garch_volatility` remains off by default, and that is a judgement for the measurement layer in §23 rather than an assumption.
 
 ---
 

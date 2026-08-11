@@ -306,7 +306,9 @@ class BacktesterAgent:
                         'portfolio_volatility_target': risk.portfolio_volatility_target,
                         'simulation_method': self.config.simulation.method,
                         'use_garch_volatility': self.config.simulation.use_garch_volatility,
+                        'garch_refit_interval_days': self.config.simulation.garch_refit_interval_days,
                         'target_transform': self.config.training.target_transform,
+                        'cost_adjust_target': self.config.training.cost_adjust_target,
                     },
                     metrics={
                         'cagr': float(analytics_report.get('cagr', 0.0)),

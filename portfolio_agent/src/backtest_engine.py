@@ -720,6 +720,7 @@ class BacktestEngine:
             # Get high and low for the day
             high = None
             low = None
+            open_price = None
             for h_col in ['high', 'High']:
                 if h_col in row.index:
                     high = row[h_col]
@@ -728,10 +729,21 @@ class BacktestEngine:
                 if l_col in row.index:
                     low = row[l_col]
                     break
-            
+            for o_col in ['open', 'Open']:
+                if o_col in row.index:
+                    open_price = row[o_col]
+                    break
+
             if high is None or low is None:
                 continue
-            
+
+            # A missing or nonsensical open leaves the gap tests out of it and
+            # falls back to the intraday path, rather than guessing.
+            if open_price is None or pd.isna(open_price) or float(open_price) <= 0:
+                open_price = None
+            else:
+                open_price = float(open_price)
+
             stop_price = self.stop_loss_levels.get(ticker)
             target_price = self.take_profit_levels.get(ticker)
             # The position's actual cost basis — NOT the previous close, which
@@ -743,19 +755,50 @@ class BacktestEngine:
             triggered = False
             trigger_price = None
             trigger_type = None
-            
+
+            # A level the market *gapped through* overnight is filled at the
+            # open, not at the level. An ATR stop is an intraday construct: it
+            # assumes a continuous tape on which a resting order can be worked
+            # at the price it names. Between 15:30 and 09:15 there is no tape,
+            # and NSE opens after both the US close and the Asian session, so
+            # gaps are frequent and large (docs/QUANT_RESEARCH.md section 16 —
+            # the same fact the gap-aware GARCH decomposition exists for).
+            # Assuming the stop always fills at the stop credits the book with
+            # liquidity that was not there, and it does so asymmetrically: the
+            # gaps that blow through a long's stop are precisely the adverse
+            # ones, so the unmodelled slippage is all in one direction and the
+            # realized loss distribution is systematically understated. That
+            # also biases Kelly's payoff ratio b upward, since the true average
+            # loss is larger than the one recorded here.
+            #
+            # Checked before the intraday tests because a gap is settled at
+            # 09:15, ahead of anything the session goes on to do.
+            if open_price is not None and stop_price is not None and open_price <= stop_price:
+                triggered = True
+                trigger_price = open_price  # = min(open, stop): gapped down through the stop
+                trigger_type = 'STOP_LOSS'
+
+            # The mirror case, and it runs in the book's favour: a limit sell
+            # resting at the target when the market opens above it fills at the
+            # open. Modelling only the adverse half would be a different bias,
+            # not neutrality.
+            elif open_price is not None and target_price is not None and open_price >= target_price:
+                triggered = True
+                trigger_price = open_price  # = max(open, target): gapped up through the target
+                trigger_type = 'TAKE_PROFIT'
+
             # Check stop-loss (price hit or went below stop)
-            if stop_price is not None and low <= stop_price:
+            elif stop_price is not None and low <= stop_price:
                 triggered = True
                 trigger_price = stop_price
                 trigger_type = 'STOP_LOSS'
-            
+
             # Check take-profit (price hit or went above target)
             elif target_price is not None and high >= target_price:
                 triggered = True
                 trigger_price = target_price
                 trigger_type = 'TAKE_PROFIT'
-            
+
             if triggered:
                 # Exits pay the same friction as any other sale — brokerage,
                 # STT, exchange charges, GST and capital gains tax. Booking

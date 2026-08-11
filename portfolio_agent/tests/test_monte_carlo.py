@@ -398,7 +398,7 @@ class TestStudentTInnovations:
         monkeypatch.setattr(mc, "run_monte_carlo", spy)
         monkeypatch.setattr(
             "src.volatility_models.forecast_volatility",
-            lambda returns, horizon: GarchForecast(
+            lambda returns, horizon, **kwargs: GarchForecast(
                 daily_sigma=np.full(5, 0.02), leverage_gamma=0.1,
                 persistence=0.9, distribution_df=4.2,
             ),

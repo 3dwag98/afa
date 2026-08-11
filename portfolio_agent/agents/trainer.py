@@ -326,20 +326,63 @@ def target_column_name(target: str) -> str:
     return f"target_{target}"
 
 
-def build_forward_return(close: pd.Series, target: str) -> pd.Series:
+def training_label_cost_pct(config: AppConfig) -> float:
+    """Round-trip friction to charge against the training label, as a fraction.
+
+    Read from the same cost stack the backtest and the signal gate use
+    (src/execution_sim.py) rather than hardcoded, so the label cannot drift
+    away from the costs the platform actually charges when the statutory rates
+    change. Returns 0.0 when the adjustment is switched off.
+    """
+    if not config.training.cost_adjust_target:
+        return 0.0
+    from portfolio_agent.src.execution_sim import round_trip_cost_pct
+
+    return float(round_trip_cost_pct(slippage_pct=config.risk.slippage_pct_per_side))
+
+
+def build_forward_return(
+    close: pd.Series,
+    target: str,
+    cost_pct: float = 0.0,
+) -> pd.Series:
     """Realized *forward* return over the horizon encoded in `target`.
 
     For target="return_5d": (close[t+5] - close[t]) / close[t] — what the
     model is supposed to predict, dated at the decision point t. The value is
     unknown at t by construction, which is the point; rows near the end of the
     series are NaN and get dropped.
+
+    `cost_pct` subtracts modelled round-trip friction, so the label becomes the
+    return the *portfolio* receives rather than the one the tape prints. The
+    gross label makes the network learn a sign it cannot trade: a forecast +0.4%
+    five-day move is a positive label and a losing trade once brokerage, STT
+    on both delivery legs, exchange and SEBI charges, GST, stamp duty and
+    slippage are paid — around 0.8% a round trip on the platform's own cost
+    stack (src/execution_sim.py::round_trip_cost_pct). Every signal inside that
+    band is trained as an opportunity and realized as a fee.
+
+    **What this does and does not reach.** Subtracting a constant shifts the
+    label's level, which is exactly what the `absolute` target needs and
+    exactly what the cross-sectional transforms remove by construction: both
+    demeaning and ranking are invariant to a constant, so under the default
+    `cross_sectional_rank` the ordering is unchanged and this changes nothing.
+    That is not a defect in either piece — a relative label already asks "which
+    name is better", a question a uniform fee cannot answer. Making friction
+    discriminate *between* names needs a per-ticker cost (liquidity-scaled
+    slippage), which is a Phase 7 capacity-model input this does not have yet.
+    A test pins the invariance so it cannot be quietly assumed away.
     """
     periods = 1
     if 'return' in target:
         digits = "".join(ch for ch in target if ch.isdigit())
         if digits:
             periods = max(1, int(digits))
-    return close.shift(-periods).pct_change(periods)
+
+    gross = close.shift(-periods).pct_change(periods)
+    if not cost_pct:
+        return gross
+    return gross - float(cost_pct)
 
 
 # Below this many names on a date there is no cross-section to rank against, so
@@ -466,7 +509,11 @@ def prepare_features(df: pd.DataFrame, config: AppConfig, verbose: bool = True) 
     # column, so a feature of the same name (e.g. the trailing return_5d)
     # stays an input and never silently becomes the label.
     target_name = target_column_name(config.training.target)
-    feature_df[target_name] = build_forward_return(df['close'], config.training.target)
+    feature_df[target_name] = build_forward_return(
+        df['close'],
+        config.training.target,
+        cost_pct=training_label_cost_pct(config),
+    )
 
     # Drop rows that are not finite — NaN *or* infinite. dropna() alone leaves
     # the infinities behind, and every one of them turns into a NaN loss the
@@ -1182,6 +1229,7 @@ def run_walk_forward_validation(
         "embargo_days": horizon_days,
         "folds": fold_metrics,
         "target_transform": training.target_transform,
+        "cost_adjust_target": training.cost_adjust_target,
         "mean_mse": _mean("mse"),
         "mean_directional_accuracy": _mean("directional_accuracy"),
         "mean_rank_ic": _mean("rank_ic"),

@@ -45,6 +45,14 @@ def rising_market(monkeypatch):
     return {'dates': dates, 'df': df}
 
 
+# The first bar of `rising_market` on which the take-profit at 110 is crossed
+# *within the session* — it opens at 108.40 and trades up through 110. Later
+# bars open well above the target, which is a gap-through and fills at the open
+# rather than at the level (see TestGapFills), so a test that wants to assert a
+# clean fill at 110 has to exit on a bar where 110 was reachable on the tape.
+TARGET_CROSSED_INTRADAY = 10
+
+
 class TestTradeLogAccounting:
     """Trade records must describe the trade that actually happened."""
 
@@ -61,7 +69,7 @@ class TestTradeLogAccounting:
         engine.stop_loss_levels["UP.NS"] = 95.0
         engine.take_profit_levels["UP.NS"] = 110.0
 
-        exit_date = engine.master_date_index[40]
+        exit_date = engine.master_date_index[TARGET_CROSSED_INTRADAY]
         trades = engine._check_stop_loss_take_profit(exit_date)
 
         assert len(trades) == 1
@@ -81,7 +89,7 @@ class TestTradeLogAccounting:
         engine._open_position("UP.NS", 100, 100.0, entry_date)
         engine.take_profit_levels["UP.NS"] = 110.0
 
-        exit_date = engine.master_date_index[40]
+        exit_date = engine.master_date_index[TARGET_CROSSED_INTRADAY]
         trade = engine._check_stop_loss_take_profit(exit_date)[0]
 
         expected_days = (exit_date - entry_date).days
@@ -97,7 +105,7 @@ class TestTradeLogAccounting:
         engine._open_position("UP.NS", 100, 100.0, engine.master_date_index[5])
         engine.take_profit_levels["UP.NS"] = 110.0
 
-        trade = engine._check_stop_loss_take_profit(engine.master_date_index[40])[0]
+        trade = engine._check_stop_loss_take_profit(engine.master_date_index[TARGET_CROSSED_INTRADAY])[0]
 
         assert trade['transaction_costs'] > 0, "sell leg pays brokerage/STT/GST"
         assert trade['taxes'] > 0, "a profitable short-term exit owes STCG"
@@ -115,7 +123,7 @@ class TestTradeLogAccounting:
         engine.take_profit_levels["UP.NS"] = 110.0
         cash_before = engine.cash
 
-        trade = engine._check_stop_loss_take_profit(engine.master_date_index[40])[0]
+        trade = engine._check_stop_loss_take_profit(engine.master_date_index[TARGET_CROSSED_INTRADAY])[0]
 
         expected = cash_before + 100 * 110.0 - trade['transaction_costs'] - trade['taxes']
         assert engine.cash == pytest.approx(expected)
@@ -129,7 +137,7 @@ class TestTradeLogAccounting:
         engine._open_position("UP.NS", 100, 100.0, engine.master_date_index[5])
         engine.take_profit_levels["UP.NS"] = 110.0
 
-        engine._check_stop_loss_take_profit(engine.master_date_index[40])
+        engine._check_stop_loss_take_profit(engine.master_date_index[TARGET_CROSSED_INTRADAY])
 
         assert "UP.NS" not in engine.open_positions
         assert "UP.NS" not in engine.holdings
@@ -502,3 +510,132 @@ class TestMonthlyHeatmap:
         # A ~10% move over three months: percent units, not fractions.
         assert values.size > 0
         assert np.nanmax(np.abs(values)) > 0.1
+
+
+@pytest.fixture
+def gapping_market(monkeypatch):
+    """A flat tape interrupted by one gap down and one gap up.
+
+    Bar 40 opens 12% below the previous close and never trades back up; bar 60
+    opens 12% above it. Both are ordinary NSE behaviour — the exchange is shut
+    for 17.75 hours a day and reopens after the US close and the Asian session.
+    """
+    dates = pd.bdate_range(start="2023-01-02", periods=120)
+    close = np.full(len(dates), 100.0)
+    open_ = np.full(len(dates), 100.0)
+
+    open_[40], close[40] = 88.0, 87.0   # gapped down through a 95 stop
+    open_[60], close[60] = 112.0, 113.0  # gapped up through a 110 target
+
+    df = pd.DataFrame(
+        {
+            'open': open_,
+            'high': np.maximum(open_, close) + 0.5,
+            'low': np.minimum(open_, close) - 0.5,
+            'close': close,
+            'volume': np.full(len(dates), 5_000_000.0),
+        },
+        index=dates,
+    )
+    monkeypatch.setattr(
+        "src.backtest_engine.load_ticker_data",
+        lambda ticker, start_date=None, end_date=None: df.copy() if ticker == "GAP.NS" else None,
+    )
+    return {'dates': dates, 'df': df}
+
+
+class TestGapFills:
+    """A level the market gapped through fills at the open, not at the level.
+
+    An ATR stop is an intraday construct: it assumes a continuous tape on which
+    a resting order can be worked at the price it names. Overnight there is no
+    tape. Booking every stop at the stop credits the book with liquidity that
+    was not there, and asymmetrically — the gaps that blow through a long's
+    stop are the adverse ones — so the realized loss distribution comes out
+    systematically better than it was, which also biases Kelly's payoff ratio.
+    """
+
+    def _engine(self):
+        return BacktestEngine(
+            start_date="2023-01-02", end_date="2023-06-16",
+            initial_capital=500_000.0, universe_tickers=["GAP.NS"],
+        )
+
+    def test_stop_gapped_through_fills_at_the_open(self, gapping_market):
+        engine = self._engine()
+        engine.holdings["GAP.NS"] = 100
+        engine._open_position("GAP.NS", 100, 100.0, engine.master_date_index[5])
+        engine.stop_loss_levels["GAP.NS"] = 95.0
+
+        trade = engine._check_stop_loss_take_profit(engine.master_date_index[40])[0]
+
+        assert trade['exit_reason'] == 'stop_loss'
+        # 88, the price at which the position could actually be sold — not 95,
+        # which no one was bidding by the time the market reopened.
+        assert trade['exit_price'] == pytest.approx(88.0)
+        assert trade['gross_pnl'] == pytest.approx(-1200.0)
+
+    def test_the_unmodelled_slippage_is_a_real_loss_not_a_rounding_error(self, gapping_market):
+        """The old model would have booked this exit ₹700 better than it was."""
+        engine = self._engine()
+        engine.holdings["GAP.NS"] = 100
+        engine._open_position("GAP.NS", 100, 100.0, engine.master_date_index[5])
+        engine.stop_loss_levels["GAP.NS"] = 95.0
+
+        trade = engine._check_stop_loss_take_profit(engine.master_date_index[40])[0]
+
+        assumed_at_the_stop = (95.0 - 100.0) * 100
+        assert trade['gross_pnl'] < assumed_at_the_stop
+        assert assumed_at_the_stop - trade['gross_pnl'] == pytest.approx(700.0)
+
+    def test_target_gapped_through_fills_at_the_open(self, gapping_market):
+        """The mirror case runs in the book's favour and must also be modelled.
+
+        A limit sell resting at 110 when the market opens at 112 executes at
+        112. Charging the adverse gap but not the favourable one would be a
+        different bias, not neutrality.
+        """
+        engine = self._engine()
+        engine.holdings["GAP.NS"] = 100
+        engine._open_position("GAP.NS", 100, 100.0, engine.master_date_index[5])
+        engine.take_profit_levels["GAP.NS"] = 110.0
+
+        trade = engine._check_stop_loss_take_profit(engine.master_date_index[60])[0]
+
+        assert trade['exit_reason'] == 'target'
+        assert trade['exit_price'] == pytest.approx(112.0)
+
+    def test_a_level_reached_without_a_gap_still_fills_at_the_level(self, gapping_market):
+        """The intraday path is unchanged — this only touches gapped bars.
+
+        Bar 60 opens at 112 and trades to a high of 113.5. A target at 113 was
+        not gapped through (the open is below it), so it fills at 113.
+        """
+        engine = self._engine()
+        engine.holdings["GAP.NS"] = 100
+        engine._open_position("GAP.NS", 100, 100.0, engine.master_date_index[5])
+        engine.take_profit_levels["GAP.NS"] = 113.0
+
+        trade = engine._check_stop_loss_take_profit(engine.master_date_index[60])[0]
+
+        assert trade['exit_price'] == pytest.approx(113.0)
+
+    def test_a_gap_down_beats_a_target_the_session_later_reaches(self, gapping_market):
+        """Precedence: the gap is settled at 09:15, before the session runs.
+
+        Bar 60 gaps up to 112 and reaches 113.5, so a position holding both a
+        95 stop and a 113 target sees the target intraday — but this bar never
+        trades near 95, so the stop must not fire. The converse ordering (a
+        gap through the stop outranking an intraday target) is what protects
+        the book from booking the good half of a bad day.
+        """
+        engine = self._engine()
+        engine.holdings["GAP.NS"] = 100
+        engine._open_position("GAP.NS", 100, 100.0, engine.master_date_index[5])
+        engine.stop_loss_levels["GAP.NS"] = 95.0
+        engine.take_profit_levels["GAP.NS"] = 113.0
+
+        trade = engine._check_stop_loss_take_profit(engine.master_date_index[60])[0]
+
+        assert trade['exit_reason'] == 'target'
+        assert trade['exit_price'] == pytest.approx(113.0)

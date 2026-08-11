@@ -18,7 +18,7 @@ not.
 | D2 | MC `probability_profit` dominated by drift-estimation noise | **Done** | `src/monte_carlo.py::shrink_drift` |
 | D3 | No portfolio covariance anywhere | **Done**, wired into sizing | `src/portfolio.py`, `BacktestEngine._apply_portfolio_risk_cap` |
 | D4 | Neural target is absolute, not cross-sectional | **Done** (target); feature normalization not done | `agents/trainer.py::apply_cross_sectional_target` |
-| D5 | GJR-GARCH unusable at platform scale | **Not done** | — |
+| D5 | GJR-GARCH unusable at platform scale | **Done** — refit scheduling, measured 22x | `src/volatility_models.py::forecast_volatility` |
 | D6 | No Markov chains / regime-switching models | **Done** as a module; not switched on | `src/markov_regime.py` |
 | D7 | Sharpe mis-specified; no PSR/DSR/PBO | **Done** | `src/performance_stats.py` |
 | D8 | Adaptive weighting unshrunk, in-sample | **Partly done** — shrunk and gated, still in-sample | `strategies/weighting.py` |
@@ -55,6 +55,20 @@ marginal distribution. It is off by default because it converts the entry
 threshold from an absolute quality bar into a percentile — under it a roughly
 fixed share of the universe always clears 60, whatever the market is doing.
 
+**The net-of-cost label (0.8).** `training.cost_adjust_target` is on by default
+and charges the platform's own round-trip friction (~0.8%, read from
+`execution_sim.py` rather than hardcoded) against the forward-return label, so
+a +0.4% five-day forecast stops being a positive label and a losing trade.
+What it does *not* do is worth stating plainly, because the default
+configuration hides it: the cost is a constant, and both cross-sectional
+transforms are invariant to a constant — demeaning subtracts it back out,
+ranking never sees it. So under the shipped `cross_sectional_rank` target this
+changes no ordering and therefore nothing at all. It binds on `absolute`.
+Neither piece is at fault: a relative label already asks "which name is
+better", which a uniform fee cannot answer. Making friction discriminate
+*between* names requires a per-ticker liquidity-scaled cost, which is Phase 7
+capacity work. A test pins the invariance so it cannot be quietly assumed away.
+
 ## Smaller findings (D11)
 
 | Issue | Status |
@@ -63,7 +77,7 @@ fixed share of the universe always clears 60, whatever the market is doing.
 | `f*` clamp to [0,1] becomes load-bearing | **Done** — replaced by an explicit leverage constraint |
 | Isotonic calibration pooled across regimes | Not done |
 | Calibrating `p` but not the payoff `b` for Kelly | Not done |
-| Training label gross of costs | Not done |
+| Training label gross of costs | **Done** — `training.cost_adjust_target`, but see the note below |
 | No ASM/GSM/ESM/T2T awareness | Not done — inferred from price data, not ingested |
 | No lot sizes, no T+1 cash settlement | Not done |
 | No turnover or capacity model | Partly — the optimizer has a turnover penalty; no ADV participation cap |
@@ -77,7 +91,7 @@ them in India.
 | § | Issue | Blocked on |
 |---|---|---|
 | 5.1 | Circuit limits break the return-generating assumption; a locked day is a censored observation, not a price | A Tobit-style censored GARCH likelihood; at minimum, excluding locked days from volatility estimation |
-| 5.2 | Gap risk reaches volatility estimation but not the stop fill or position sizing | `fill = min(open, stop)` for longs, and adding the overnight component to risk-per-share |
+| 5.2 | **Half done.** Gap risk now reaches the stop fill — a level the market gapped through fills at the open, both directions. It still does not reach position *sizing* | Adding the overnight component to risk-per-share: `(entry − stop) + z·σ_gap·entry`. The gap sigma already exists in `volatility_models.py`; it is not plumbed to `_kelly_quantity` |
 | 5.3 | SEBI surveillance frameworks are published, objective and change tradability | A daily scraper for the NSE ASM/GSM/ESM/T2T lists (Phase 2 data) |
 | 5.4 | No tax-lot accounting; no 365-day LTCG boundary optimization | FIFO lots per demat; a real India-specific alpha source left unclaimed |
 | 5.5 | Momentum and low-vol run without factor neutralization | Residual momentum needs only the sector map from Phase 2 |
@@ -86,7 +100,7 @@ them in India.
 
 | Phase | Status |
 |---|---|
-| 0 — Correctness | 6 of 8: Kelly, drift shrinkage, arithmetic Sharpe, weighting guards, rank composite (opt-in), leverage constraint. **Missing:** GARCH refit scheduling (0.5), gap-aware stop fills (0.7), net-of-cost training label (0.8) |
+| 0 — Correctness | **Complete.** Kelly units, drift shrinkage, arithmetic Sharpe, weighting guards, rank composite (opt-in), leverage constraint, GARCH refit scheduling (0.5), gap-aware stop fills (0.7), net-of-cost label (0.8) |
 | 1 — Measurement | Essentially complete: PSR, DSR, trial log, PBO, rank IC/ICIR, Newey–West. See the note on 1.6 below |
 | 2 — Data | **Not started.** Every downstream number is limited by this |
 | 3 — Portfolio construction | Estimators, optimizer and HRP built and wired as a volatility cap. Per-trade sizing is **not** retired (3.4) — the cap sits on top of it rather than replacing it |
@@ -107,13 +121,58 @@ right-boundary purge is a requirement of K-fold, where test blocks sit in the
 middle of the sample. Moving to purged K-fold is a legitimate proposal (it uses
 more of the data), but it is a methodology change, not a leak being fixed.
 
+### What made GARCH affordable (D5 / 0.5)
+
+The review's diagnosis was that `use_garch_volatility: false` was not a
+considered default but the only setting under which the backtest terminates:
+one MLE per ticker per bar is ~4.5 million fits for the documented run.
+
+Option 1 from the review is what shipped — refit on a schedule, cache the
+coefficients, run the recursion forward daily. Two details were not obvious
+going in and are worth recording:
+
+- **The fitted window is anchored to the history length, not to call order.**
+  The natural implementation ("refit if N bars have passed since we last fitted
+  this symbol") makes the answer depend on the sequence calls arrive in, and
+  both the backtest and the orchestrator dispatch per-ticker scoring to worker
+  processes holding independent caches. Different workers would hit different
+  refit points and produce different volatility paths for the same ticker on
+  the same date. Anchoring to `floor(n / interval) * interval` makes the cache
+  pure memoization: it changes how long the answer takes, never what it is.
+  `test_result_does_not_depend_on_call_order` pins this.
+- **The forward step is exact, not an approximation.** One step ahead the sign
+  of the last residual is known so the leverage term applies exactly; beyond
+  that symmetric innovations put it below zero half the time, giving the
+  familiar `alpha + gamma/2 + beta`. `test_matches_arch_forecast_exactly_at_a_refit_boundary`
+  checks the closed-form path against `arch`'s own analytic forecast and it
+  agrees to ~1e-16 relative. So the only approximation is the *staleness of the
+  coefficients* between refits — every new bar still updates conditional
+  volatility.
+
+Measured at 22x on a 63-bar walk-forward for one ticker, which is the expected
+saving for a 21-bar interval. `use_garch_volatility` remains `false`: making it
+affordable is a separate question from whether it improves results, and that is
+a judgement Phase 1's measurement layer exists to make rather than assume.
+
 ## What has not changed by default
 
-Backtest numbers move because of three changed defaults, all reversible:
-`training.target_transform`, the Monte Carlo drift shrinkage, and the weighting
-guards. Deliberately unchanged: `risk.portfolio_volatility_target` is off,
-`scoring.method` is `weighted_sum`, `src/regime.py` is untouched, and
-`paper_trading_mode` is true.
+Backtest numbers move because of four changed defaults, all reversible:
+`training.target_transform`, the Monte Carlo drift shrinkage, the weighting
+guards, and `training.cost_adjust_target` (which, per the note above, moves
+nothing under the default rank target). Deliberately unchanged:
+`risk.portfolio_volatility_target` is off, `scoring.method` is `weighted_sum`,
+`simulation.use_garch_volatility` is still false, `src/regime.py` is untouched,
+and `paper_trading_mode` is true.
+
+One default change is **not** opt-in and cannot be reverted by config: gap-aware
+stop fills. A level the market gapped through now fills at the open rather than
+at the level, in both directions. There is no flag for it because the old
+behaviour was not a modelling choice with a defensible other side — it credited
+the book with liquidity that did not exist, asymmetrically, since the gaps that
+blow through a long's stop are the adverse ones. Expect reported drawdowns and
+realized losses to get slightly worse and more honest; the same correction also
+removes an upward bias in Kelly's payoff ratio `b`, which had been fed an
+average loss smaller than the one actually taken.
 
 ## The caveat that outlives all of this
 
