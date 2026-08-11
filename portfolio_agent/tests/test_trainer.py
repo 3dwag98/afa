@@ -203,6 +203,32 @@ class TestEvaluatePredictions:
         assert evaluate_predictions(np.array([1.0]), np.array([1.0, 2.0]))["n_samples"] == 0
 
 
+    def test_overlapping_labels_widen_the_t_statistic_denominator(self):
+        """A daily-sampled 5-day return shares 4 days with its neighbour.
+        Treating the observations as independent understates the standard error
+        by roughly sqrt(H), in the direction that manufactures significance.
+        """
+        rng = np.random.default_rng(0)
+        daily = rng.normal(0.0004, 0.01, size=2000)
+        overlapping = pd.Series(daily).rolling(5).sum().dropna().to_numpy()
+        predictions = np.ones_like(overlapping)
+
+        metrics = evaluate_predictions(predictions, overlapping, horizon_days=5)
+
+        naive_t = np.mean(overlapping) / (
+            np.std(overlapping, ddof=0) / math.sqrt(len(overlapping))
+        )
+        assert metrics["strategy_t_stat"] != 0.0
+        assert abs(metrics["strategy_t_stat"]) < abs(naive_t)
+
+    def test_a_relative_target_reports_no_t_statistic(self):
+        """A rank is not a return, so neither is its mean."""
+        actuals = np.array([0.5, -0.5, 0.25, -0.25, 1.0, -1.0])
+        metrics = evaluate_predictions(actuals, actuals, horizon_days=5, relative_target=True)
+
+        assert metrics["strategy_t_stat"] == 0.0
+        assert metrics["rank_ic"] == pytest.approx(1.0)
+
 class TestTargetHorizon:
     def test_parses_the_horizon_from_the_target_name(self):
         assert _target_horizon_days("return_5d") == 5

@@ -239,7 +239,7 @@ Notes:
 - The original trend/breakout/volume/Monte-Carlo rule-based strategy
 - Researched-but-not-implemented strategy families (cointegration pairs trading, Fama-French factors, quality/QMJ, FII/DII flows, calendar anomalies) and exactly why each is scoped out (architectural gap vs. data gap vs. weak evidence)
 
-Four of these were added in response to a quantitative review; §21–24 of the research doc set out what each was measuring wrongly and what the corrected version measures instead.
+These were added in response to a quantitative review; §21–26 of the research doc set out what each was measuring wrongly and what the corrected version measures instead. **[docs/REVIEW_STATUS.md](docs/REVIEW_STATUS.md)** tracks that review item by item — what is done, what is partly done and why, and what is not started — including the finding that invalidates every cross-sectional backtest number until the universe becomes point-in-time.
 
 ## Training
 

@@ -25,6 +25,7 @@ from portfolio_agent.models.pytorch_models import PointLoss, QuantileLoss, sorte
 from portfolio_agent.models.registry import get_model
 from portfolio_agent.src.calibration import IsotonicCalibrator, calibration_error
 from portfolio_agent.src.data_store import load_ticker_data
+from portfolio_agent.src.performance_stats import newey_west_standard_error
 from portfolio_agent.src.universe import resolve_backtest_universe
 from portfolio_agent.utils.device import get_device, mixed_precision_support
 
@@ -507,6 +508,12 @@ def evaluate_predictions(
     meaningful as a comparison between strategy and benchmark, both of which
     are computed on the identical overlapping sample.
 
+    - ``strategy_t_stat`` — t-statistic of the strategy's mean return with a
+      Newey-West standard error at lag H-1. Daily-sampled H-day targets overlap
+      by H-1 days, and treating them as independent understates the standard
+      error by roughly sqrt(H) — in the direction that manufactures
+      significance. The Sharpe is still the right point estimate; what the
+      naive error gets wrong is how much to believe it.
     - ``rank_ic`` — Spearman correlation between the predicted and realized
       ordering. This is the metric a ranking system should be judged on: it is
       far less noisy than a backtested P&L and it does not confound signal
@@ -532,7 +539,8 @@ def evaluate_predictions(
     empty = {
         "n_samples": 0, "mse": 0.0, "directional_accuracy": 0.0,
         "strategy_sharpe": 0.0, "benchmark_sharpe": 0.0, "excess_sharpe": 0.0,
-        "rank_ic": 0.0, "relative_target": float(relative_target),
+        "strategy_t_stat": 0.0, "rank_ic": 0.0,
+        "relative_target": float(relative_target),
     }
     if predictions.size == 0 or predictions.size != actuals.size:
         return empty
@@ -562,12 +570,26 @@ def evaluate_predictions(
             return 0.0
         return float(np.mean(returns) / sigma * annualization)
 
+    strategy_t_stat = 0.0
     if relative_target:
         strategy_sharpe = benchmark_sharpe = 0.0
     else:
         strategy_returns = np.where(predictions > 0, actuals, 0.0)
         strategy_sharpe = _sharpe(strategy_returns)
         benchmark_sharpe = _sharpe(actuals)
+
+        # Overlapping labels: a daily-sampled H-day return shares H-1 days with
+        # its neighbour, so treating the observations as independent understates
+        # the standard error by roughly sqrt(H) — in the direction that
+        # manufactures significance. The Sharpe above is still the right point
+        # estimate; what the naive standard error gets wrong is how much to
+        # believe it, so the correction is reported as a t-statistic rather than
+        # applied to the ratio.
+        standard_error = newey_west_standard_error(
+            strategy_returns, lags=max(0, horizon_days - 1)
+        )
+        if standard_error > 0:
+            strategy_t_stat = float(np.mean(strategy_returns) / standard_error)
 
     return {
         "n_samples": int(predictions.size),
@@ -576,6 +598,10 @@ def evaluate_predictions(
         "strategy_sharpe": strategy_sharpe,
         "benchmark_sharpe": benchmark_sharpe,
         "excess_sharpe": strategy_sharpe - benchmark_sharpe,
+        # Newey-West corrected, so it can be read against a conventional
+        # hurdle. Harvey, Liu & Zhu argue for t > 3.0 rather than 2.0 on
+        # anything drawn from a wide search, which this is.
+        "strategy_t_stat": strategy_t_stat,
         "rank_ic": rank_ic,
         "relative_target": float(relative_target),
     }
