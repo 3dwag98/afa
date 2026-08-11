@@ -147,6 +147,23 @@ class TrainingConfig(BaseModel):
     target: str = Field(
         default="return_5d", description="Target variable for prediction"
     )
+    target_transform: Literal[
+        "absolute", "cross_sectional_demean", "cross_sectional_rank"
+    ] = Field(
+        default="cross_sectional_rank",
+        description="How the forward-return label is measured before training "
+        "(agents/trainer.py::apply_cross_sectional_target). 'absolute' predicts the raw forward "
+        "return, most of whose variance in an equity panel is the common market factor — which "
+        "is both nearly unforecastable and unusable by a long-only book with no index hedge, so "
+        "the network spends its capacity on the one component it cannot act on. The two "
+        "cross-sectional forms measure each name against the rest of the universe on the same "
+        "date, leaving the idiosyncratic part the system actually monetizes by choosing between "
+        "stocks. 'cross_sectional_rank' maps to [-1, 1] and is the more robust of the two on "
+        "Indian data, where a circuit-limited print dominates the cross-sectional mean but moves "
+        "a rank by one place. Falls back to 'absolute' automatically when the universe is too "
+        "small to rank. Note this changes what the model predicts, so a checkpoint trained under "
+        "one setting should not be scored under another.",
+    )
     sequence_length: int = Field(
         default=60, description="Length of input sequences"
     )

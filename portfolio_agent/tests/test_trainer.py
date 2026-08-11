@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 from portfolio_agent.agents.trainer import (
+    apply_cross_sectional_target,
     build_forward_return,
     evaluate_predictions,
     load_data,
@@ -236,7 +237,9 @@ class TestWalkForwardValidation:
         }
 
     def test_runs_every_fold_and_reports_the_benchmark_comparison(self):
-        config = self._config()
+        """An absolute return target is in return units, so the Sharpe-style
+        comparison against always-long is the meaningful headline."""
+        config = self._config(target_transform="absolute")
         result = run_walk_forward_validation(
             self._panel_by_ticker(config), config, get_device("cpu")
         )
@@ -246,6 +249,24 @@ class TestWalkForwardValidation:
         for key in ("mean_mse", "mean_directional_accuracy",
                     "mean_strategy_sharpe", "mean_benchmark_sharpe", "mean_excess_sharpe"):
             assert key in result
+
+    def test_a_relative_target_is_scored_on_rank_ic_not_sharpe(self):
+        """A cross-sectional rank is not a return: +0.4 is a position in the
+        ordering, not 40%. Reporting a Sharpe on it would be a confident number
+        about the wrong quantity, so rank IC carries the evaluation instead."""
+        config = self._config()
+        assert config.training.target_transform == "cross_sectional_rank"
+
+        result = run_walk_forward_validation(
+            self._panel_by_ticker(config), config, get_device("cpu")
+        )
+
+        assert result["target_transform"] == "cross_sectional_rank"
+        for key in ("mean_rank_ic", "rank_icir", "folds_with_positive_ic"):
+            assert key in result
+        for key in ("mean_strategy_sharpe", "mean_benchmark_sharpe", "mean_excess_sharpe"):
+            assert key not in result
+        assert all(-1.0 <= fold["rank_ic"] <= 1.0 for fold in result["folds"])
 
     def test_training_windows_expand_and_never_reach_the_test_period(self):
         config = self._config()
@@ -314,6 +335,156 @@ class TestWalkForwardValidation:
         result = run_walk_forward_validation(panel, config, get_device("cpu"))
 
         assert "skipped" in result
+
+
+
+class TestCrossSectionalTarget:
+    """The neural stack was aimed at the wrong quantity.
+
+    Most of the variance of a 5-day equity return is the common market factor,
+    which a long-only book with no index hedge cannot act on. Measuring the
+    label against the cross-section leaves the idiosyncratic part — the only
+    component the platform monetizes by choosing between stocks.
+    """
+
+    def _panel(self, values_by_date):
+        """Build a tiny panel from {ticker: {date: target}}."""
+        dates = pd.date_range("2024-01-01", periods=len(next(iter(values_by_date.values()))))
+        return {
+            ticker: pd.DataFrame(
+                {"feature": np.arange(len(values), dtype=float), "target_return_5d": values},
+                index=dates,
+            )
+            for ticker, values in values_by_date.items()
+        }
+
+    def test_rank_target_maps_the_cross_section_onto_minus_one_to_one(self):
+        panel = self._panel({
+            "A": [0.10, -0.05], "B": [0.05, 0.00],
+            "C": [0.00, 0.05], "D": [-0.05, 0.10], "E": [-0.10, 0.15],
+        })
+
+        out = apply_cross_sectional_target(panel, "target_return_5d", "cross_sectional_rank")
+
+        # Five names: ranks 1..5 map to 2*r/6 - 1 = -2/3, -1/3, 0, 1/3, 2/3.
+        first_day = sorted(out[t]["target_return_5d"].iloc[0] for t in out)
+        assert first_day == pytest.approx([-2 / 3, -1 / 3, 0.0, 1 / 3, 2 / 3])
+        # The best performer on day one is the worst on day two.
+        assert out["A"]["target_return_5d"].iloc[0] == pytest.approx(2 / 3)
+        assert out["A"]["target_return_5d"].iloc[1] == pytest.approx(-2 / 3)
+
+    def test_demeaned_target_removes_the_common_move(self):
+        """A day when every name rose 10% carries no cross-sectional signal,
+        and an absolute target would teach the model that it did."""
+        panel = self._panel({
+            "A": [0.10], "B": [0.10], "C": [0.10], "D": [0.10], "E": [0.10],
+        })
+
+        out = apply_cross_sectional_target(panel, "target_return_5d", "cross_sectional_demean")
+
+        for ticker in out:
+            assert out[ticker]["target_return_5d"].iloc[0] == pytest.approx(0.0)
+
+    def test_rank_is_immune_to_a_circuit_limited_outlier(self):
+        """Why rank beats demeaning on Indian data: one +20% upper-circuit
+        print drags the cross-sectional mean and every other name's label with
+        it, but moves the ranking by nothing at all."""
+        base = {"A": [0.01], "B": [0.02], "C": [0.03], "D": [0.04], "E": [0.05]}
+        shocked = dict(base, E=[0.20])
+
+        ranks_base = apply_cross_sectional_target(
+            self._panel(base), "target_return_5d", "cross_sectional_rank"
+        )
+        ranks_shocked = apply_cross_sectional_target(
+            self._panel(shocked), "target_return_5d", "cross_sectional_rank"
+        )
+        demeaned_base = apply_cross_sectional_target(
+            self._panel(base), "target_return_5d", "cross_sectional_demean"
+        )
+        demeaned_shocked = apply_cross_sectional_target(
+            self._panel(shocked), "target_return_5d", "cross_sectional_demean"
+        )
+
+        for ticker in "ABCD":
+            assert ranks_base[ticker]["target_return_5d"].iloc[0] == pytest.approx(
+                ranks_shocked[ticker]["target_return_5d"].iloc[0]
+            )
+            assert demeaned_base[ticker]["target_return_5d"].iloc[0] != pytest.approx(
+                demeaned_shocked[ticker]["target_return_5d"].iloc[0]
+            )
+
+    def test_uses_only_labels_dated_at_the_same_decision_point(self):
+        """No look-ahead beyond what the forward return already carries.
+
+        Changing what happens on day two must not alter any day-one label.
+        """
+        panel = self._panel({
+            "A": [0.10, -0.05], "B": [0.05, 0.00], "C": [0.00, 0.05],
+            "D": [-0.05, 0.10], "E": [-0.10, 0.15],
+        })
+        altered = self._panel({
+            "A": [0.10, 9.99], "B": [0.05, -9.99], "C": [0.00, 9.99],
+            "D": [-0.05, -9.99], "E": [-0.10, 9.99],
+        })
+
+        out = apply_cross_sectional_target(panel, "target_return_5d", "cross_sectional_rank")
+        out_altered = apply_cross_sectional_target(
+            altered, "target_return_5d", "cross_sectional_rank"
+        )
+
+        for ticker in out:
+            assert out[ticker]["target_return_5d"].iloc[0] == pytest.approx(
+                out_altered[ticker]["target_return_5d"].iloc[0]
+            )
+
+    def test_drops_dates_with_too_thin_a_cross_section(self):
+        """Ranking three names on a day the rest of the universe has no history
+        encodes which tickers were listed, not which ones outperformed."""
+        dates = pd.date_range("2024-01-01", periods=3)
+        panel = {
+            ticker: pd.DataFrame(
+                {"feature": [1.0, 2.0, 3.0], "target_return_5d": [np.nan, np.nan, 0.01 * i]},
+                index=dates,
+            )
+            for i, ticker in enumerate("ABCDE")
+        }
+        # Only the last date has all five names.
+        panel["A"].loc[dates[1], "target_return_5d"] = 0.02
+
+        out = apply_cross_sectional_target(panel, "target_return_5d", "cross_sectional_rank")
+
+        for frame in out.values():
+            assert list(frame.index) == [dates[2]]
+
+    def test_leaves_the_panel_alone_for_an_absolute_target(self):
+        panel = self._panel({"A": [0.10], "B": [0.05]})
+        assert apply_cross_sectional_target(panel, "target_return_5d", "absolute") is panel
+
+    def test_a_single_ticker_cannot_be_ranked_against_anything(self):
+        panel = self._panel({"A": [0.10, 0.20]})
+        assert apply_cross_sectional_target(panel, "target_return_5d") is panel
+
+    def test_rejects_an_unknown_transform(self):
+        panel = self._panel({"A": [0.1], "B": [0.2]})
+        with pytest.raises(ValueError, match="unknown target transform"):
+            apply_cross_sectional_target(panel, "target_return_5d", "sideways")
+
+    def test_preserves_features_and_column_order(self):
+        """The target must stay the last column: everything downstream — the
+        walk-forward splitter, the loaders, the checkpoint metadata — reads it
+        positionally."""
+        panel = self._panel({
+            "A": [0.10], "B": [0.05], "C": [0.0], "D": [-0.05], "E": [-0.10],
+        })
+
+        out = apply_cross_sectional_target(panel, "target_return_5d", "cross_sectional_rank")
+
+        for ticker, frame in out.items():
+            assert list(frame.columns) == ["feature", "target_return_5d"]
+            assert frame["feature"].to_numpy() == pytest.approx(
+                panel[ticker]["feature"].to_numpy()
+            )
+
 
 
 if __name__ == "__main__":
