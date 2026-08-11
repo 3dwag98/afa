@@ -480,3 +480,142 @@ class TestSummarizeBookRisk:
         summary = summarize_book_risk([0.03, 0.03, 0.03], cov)
 
         assert summary["max_risk_contribution"] > summary["max_weight"]
+
+
+class TestShrunkEwmaCovariance:
+    """Task 3.1: EWMA weighting and Ledoit-Wolf shrinkage, composed.
+
+    Both halves already existed but nothing ran them together, and the two
+    properties that make the result usable by an optimizer — positive
+    semi-definiteness and a bounded condition number — were not asserted
+    anywhere. They matter for a concrete reason: a mean-variance optimizer
+    inverts this matrix, and a wide universe estimated over a short window
+    gives a *singular* sample covariance, whose inverse is where crash-state
+    volatility blowups come from.
+    """
+
+    @staticmethod
+    def _wide_panel(n_assets=60, n_periods=40, seed=11):
+        """More assets than observations — the realistic case, and the one the
+        raw sample covariance cannot survive."""
+        rng = np.random.default_rng(seed)
+        market = rng.normal(0.0, 0.012, size=(n_periods, 1))
+        betas = rng.uniform(0.6, 1.4, size=(1, n_assets))
+        idiosyncratic = rng.normal(0.0, 0.008, size=(n_periods, n_assets))
+        return pd.DataFrame(
+            market @ betas + idiosyncratic,
+            columns=[f"T{i:03d}" for i in range(n_assets)],
+        )
+
+    def test_result_is_positive_semi_definite(self):
+        from src.portfolio import shrunk_ewma_covariance
+
+        returns = self._wide_panel()
+        cov, _ = shrunk_ewma_covariance(returns)
+        eigenvalues = np.linalg.eigvalsh(np.asarray(cov))
+
+        # Symmetric to machine precision, and no negative eigenvalue beyond it.
+        assert np.allclose(np.asarray(cov), np.asarray(cov).T, atol=1e-15)
+        assert eigenvalues.min() >= -1e-12
+
+    def test_result_is_strictly_positive_definite_where_the_sample_is_singular(self):
+        """N > T makes the sample covariance rank-deficient, so it has exact
+        zero eigenvalues and no inverse. Shrinkage is what buys invertibility."""
+        from src.portfolio import shrunk_ewma_covariance
+
+        returns = self._wide_panel(n_assets=60, n_periods=40)
+        raw = np.asarray(sample_covariance(returns))
+        shrunk, intensity = shrunk_ewma_covariance(returns)
+
+        assert np.linalg.eigvalsh(raw).min() < 1e-10  # singular, as expected
+        assert intensity > 0.0
+        assert np.linalg.eigvalsh(np.asarray(shrunk)).min() > 1e-12
+
+    def test_condition_number_is_far_lower_than_the_sample_matrix(self):
+        """The acceptance criterion.
+
+        Condition number is the amplification factor from input error to
+        output error when the matrix is inverted. The sample matrix's is
+        effectively infinite here; what matters is that the shrunk one is
+        small enough that optimizer weights are a function of the data rather
+        than of the noise in the smallest eigenvalue.
+        """
+        from src.portfolio import shrunk_ewma_covariance
+
+        returns = self._wide_panel()
+        raw_condition = np.linalg.cond(np.asarray(sample_covariance(returns)))
+        shrunk_condition = np.linalg.cond(
+            np.asarray(shrunk_ewma_covariance(returns)[0])
+        )
+
+        assert shrunk_condition < raw_condition / 1e6
+        assert shrunk_condition < 1e4
+
+    def test_uniform_weighting_reproduces_the_unweighted_estimator_exactly(self):
+        """The EWMA path must be a strict generalization.
+
+        With half_life=None the weights are uniform and every expression has
+        to collapse to the existing, separately-tested Ledoit-Wolf result —
+        otherwise this silently changes every number the platform already
+        reports.
+        """
+        from src.portfolio import shrunk_ewma_covariance
+
+        returns = self._wide_panel(n_assets=12, n_periods=250)
+        composed, composed_intensity = shrunk_ewma_covariance(
+            returns, half_life_days=None
+        )
+        baseline, baseline_intensity = ledoit_wolf_covariance(returns)
+
+        assert composed_intensity == pytest.approx(baseline_intensity, rel=1e-12)
+        np.testing.assert_allclose(
+            np.asarray(composed), np.asarray(baseline), rtol=1e-12, atol=1e-18
+        )
+
+    def test_recent_observations_dominate_after_a_regime_shift(self):
+        """Why the half-life is there at all.
+
+        A book that was uncorrelated for a year and then moved as one block
+        must be estimated as correlated *now*. An equally-weighted window
+        averages the two regimes and is wrong about both.
+        """
+        from src.portfolio import shrunk_ewma_covariance
+
+        # Three half-lives of shock, so it carries 1 - 2^-3 = 87.5% of the
+        # weight. The threshold below follows from that rather than being
+        # picked to pass: at one half-life the answer would be ~0.5, and
+        # asserting 0.8 there would be asserting something untrue.
+        rng = np.random.default_rng(5)
+        calm = rng.normal(0.0, 0.01, size=(400, 2))
+        shock = rng.normal(0.0, 0.01, size=(180, 1)) @ np.ones((1, 2))
+        returns = pd.DataFrame(np.vstack([calm, shock]), columns=["A", "B"])
+
+        def correlation(cov):
+            cov = np.asarray(cov)
+            return cov[0, 1] / math.sqrt(cov[0, 0] * cov[1, 1])
+
+        equal_weighted, _ = shrunk_ewma_covariance(returns, half_life_days=None)
+        recent, _ = shrunk_ewma_covariance(returns, half_life_days=60.0)
+
+        assert correlation(recent) > correlation(equal_weighted)
+        assert correlation(recent) > 0.8
+
+    def test_preserves_asset_labels(self):
+        from src.portfolio import shrunk_ewma_covariance
+
+        returns = self._wide_panel(n_assets=5, n_periods=80)
+        cov, _ = shrunk_ewma_covariance(returns)
+
+        assert isinstance(cov, pd.DataFrame)
+        assert list(cov.columns) == list(returns.columns)
+        assert list(cov.index) == list(returns.columns)
+
+    def test_is_deterministic(self):
+        from src.portfolio import shrunk_ewma_covariance
+
+        returns = self._wide_panel()
+        first, first_intensity = shrunk_ewma_covariance(returns)
+        second, second_intensity = shrunk_ewma_covariance(returns)
+
+        np.testing.assert_array_equal(np.asarray(first), np.asarray(second))
+        assert first_intensity == second_intensity
