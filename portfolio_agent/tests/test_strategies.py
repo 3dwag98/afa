@@ -342,3 +342,191 @@ class TestIntegrationWithConfig:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestRankCompositeScoring:
+    """The weighted sum adds an ordinal, a binary, a skewed continuous and a
+    near-constant onto one 0-100 scale. Ranking each within the date's
+    cross-section makes them commensurable by construction."""
+
+    @staticmethod
+    def _rank_strategy():
+        return RuleBasedStrategy(
+            StrategyConfig(
+                type="rule_based",
+                params={
+                    "yaml_path": "config/strategies/trend_breakout.yaml",
+                    "scoring_mode": "rank_composite",
+                },
+            )
+        )
+
+    def test_rejects_an_unknown_mode(self):
+        with pytest.raises(ValueError, match="Unknown scoring mode"):
+            RuleBasedStrategy(
+                StrategyConfig(
+                    type="rule_based",
+                    params={
+                        "yaml_path": "config/strategies/trend_breakout.yaml",
+                        "scoring_mode": "softmax",
+                    },
+                )
+            )
+
+    def test_weighted_sum_stays_the_default(self):
+        strategy = RuleBasedStrategy(_strategy_config())
+        assert strategy.scoring_mode == "weighted_sum"
+        assert strategy.requires_full_batch is False
+
+    def test_rank_mode_demands_the_full_cross_section(self):
+        assert self._rank_strategy().requires_full_batch is True
+
+    @staticmethod
+    def _four_name_cross_section():
+        symbols = ["A", "B", "C", "D"]
+        features_by_symbol = {
+            s: _features(volume_ratio_20=v)
+            for s, v in zip(symbols, [0.4, 0.9, 1.4, 2.0])
+        }
+        # MC_Prob barely separates these names -- a 0.03 spread, and not even
+        # monotone in the volume ordering.
+        mc_results = {
+            s: _mc_result(p) for s, p in zip(symbols, [0.48, 0.49, 0.50, 0.47])
+        }
+        return symbols, features_by_symbol, mc_results
+
+    def test_a_weight_now_means_what_it_says(self):
+        """The point of the transform: influence is set by the weight, not by
+        the accident of a component's units.
+
+        Under the weighted sum, a near-constant MC_Prob at 30% weight
+        contributes ~30 nearly fixed points to every name -- level, not
+        discrimination -- while a component with a wide natural range gets
+        outsized say. Under the rank composite each component contributes its
+        weight times a percentile, so zeroing MC_Prob's weight and giving it
+        to Volume produces exactly the Volume ordering, with nothing left over.
+        """
+        strategy = self._rank_strategy()
+        symbols, features_by_symbol, mc_results = self._four_name_cross_section()
+
+        volume_only = strategy.score_batch(
+            features_by_symbol,
+            StrategyContext(
+                risk=_risk_params(),
+                weights={"Trend": 25.0, "Breakout": 25.0, "Volume": 50.0, "MC_Prob": 0.0},
+                mc_results=mc_results,
+            ),
+        )
+
+        assert sorted(symbols, key=lambda s: volume_only[s].score) == ["A", "B", "C", "D"]
+        # Ten points of spread per rank step at a 50% weight on a 4-name
+        # cross-section: 50 * (1/5) = 10.
+        assert volume_only["D"].score - volume_only["A"].score == pytest.approx(30.0)
+
+    def test_a_components_weight_budget_becomes_discrimination_not_level(self):
+        """The precise defect, isolated.
+
+        MC_Prob has a realized standard deviation near 0.05 around a mean near
+        0.48. Give it the entire weight budget and the weighted sum produces
+        scores of 47-50: a fixed ~48 points handed to everyone and 3 points of
+        actual separation. The rank composite spends the same budget entirely
+        on separation.
+
+        This cuts both ways and is worth being explicit about: ranking also
+        amplifies a component that is *pure noise*, since a rank ignores how
+        small the differences are. That is an argument for giving MC_Prob less
+        weight, not for keeping the level-based sum -- under the sum, the
+        weight was silently buying almost nothing either way.
+        """
+        strategy = self._rank_strategy()
+        symbols, features_by_symbol, mc_results = self._four_name_cross_section()
+        weights = {"Trend": 0.0, "Breakout": 0.0, "Volume": 0.0, "MC_Prob": 100.0}
+
+        ranked = strategy.score_batch(
+            features_by_symbol,
+            StrategyContext(risk=_risk_params(), weights=weights, mc_results=mc_results),
+        )
+        summed = {
+            s: RuleBasedStrategy(_strategy_config()).score(
+                s, features_by_symbol[s],
+                StrategyContext(
+                    risk=_risk_params(), weights=weights, mc_result=mc_results[s]
+                ),
+            ).score
+            for s in symbols
+        }
+
+        summed_spread = max(summed.values()) - min(summed.values())
+        ranked_scores = [sig.score for sig in ranked.values()]
+        ranked_spread = max(ranked_scores) - min(ranked_scores)
+
+        assert summed_spread == pytest.approx(3.0)   # 100 * (0.50 - 0.47)
+        assert ranked_spread == pytest.approx(60.0)  # 100 * (4/5 - 1/5)
+        # Both orderings agree -- the transform changes the scale, not the view.
+        assert sorted(summed, key=summed.get) == sorted(ranked, key=lambda s: ranked[s].score)
+
+    def test_components_still_reach_the_signal(self):
+        strategy = self._rank_strategy()
+        features_by_symbol = {"A": _features(), "B": _features(volume_ratio_20=0.2)}
+        context = StrategyContext(
+            risk=_risk_params(),
+            weights={"Trend": 25.0, "Breakout": 25.0, "Volume": 20.0, "MC_Prob": 30.0},
+            mc_results={"A": _mc_result(0.70), "B": _mc_result(0.60)},
+        )
+
+        signals = strategy.score_batch(features_by_symbol, context)
+
+        assert set(signals) == {"A", "B"}
+        assert signals["A"].component_scores["Volume"] == 1.0
+        assert signals["A"].probability_profit == pytest.approx(0.70)
+
+    def test_a_universe_of_one_falls_back_to_the_weighted_sum(self):
+        """A percentile rank against a universe of one is not a rank; scoring
+        every component at the midpoint would discard the signal entirely."""
+        strategy = self._rank_strategy()
+        weights = {"Trend": 25.0, "Breakout": 25.0, "Volume": 20.0, "MC_Prob": 30.0}
+        context = StrategyContext(
+            risk=_risk_params(), weights=weights, mc_results={"A": _mc_result(0.70)}
+        )
+
+        batched = strategy.score_batch({"A": _features()}, context)["A"]
+        standalone = RuleBasedStrategy(_strategy_config()).score(
+            "A", _features(),
+            StrategyContext(risk=_risk_params(), weights=weights, mc_result=_mc_result(0.70)),
+        )
+
+        assert batched.score == pytest.approx(standalone.score)
+
+
+class TestBatchedMonteCarloReachesTheStrategy:
+    """A rule_based member inside a batched UMA used to receive no per-ticker
+    Monte Carlo result and score MC_Prob at zero -- a silent ~12-point level
+    shift versus the identical strategy scored standalone."""
+
+    def test_mc_for_prefers_the_per_symbol_result(self):
+        context = StrategyContext(
+            risk=_risk_params(),
+            mc_result=_mc_result(0.30),
+            mc_results={"A": _mc_result(0.80)},
+        )
+        assert context.mc_for("A").probability_profit == pytest.approx(0.80)
+        # An absent symbol falls back to the single-ticker field rather than
+        # to None, so a partially-populated batch degrades gracefully.
+        assert context.mc_for("B").probability_profit == pytest.approx(0.30)
+
+    def test_batched_and_standalone_scoring_now_agree(self):
+        strategy = RuleBasedStrategy(_strategy_config())
+        weights = {"Trend": 25.0, "Breakout": 25.0, "Volume": 20.0, "MC_Prob": 30.0}
+        mc = _mc_result(0.70)
+
+        standalone = strategy.score(
+            "A", _features(),
+            StrategyContext(risk=_risk_params(), weights=weights, mc_result=mc),
+        )
+        batched = strategy.score_batch(
+            {"A": _features()},
+            StrategyContext(risk=_risk_params(), weights=weights, mc_results={"A": mc}),
+        )["A"]
+
+        assert batched.score == pytest.approx(standalone.score)
+        assert batched.component_scores["MC_Prob"] == pytest.approx(0.70)

@@ -99,6 +99,98 @@ def is_win_rate_significant(wins: int, total: int, alpha: float = SIGNIFICANCE_A
     return float(scipy_stats.binomtest(wins, total, 0.5).pvalue) < alpha
 
 
+def combine_rank_composite(
+    component_scores_by_symbol: Dict[str, Dict[str, float]],
+    weights: Dict[str, float],
+) -> Dict[str, Tuple[float, str]]:
+    """Combine components by within-date percentile rank instead of by level.
+
+    combine_weighted() sums four quantities that do not live on a common
+    scale: an ordinal (Trend, three levels), a binary (Breakout), a
+    right-skewed continuous (Volume), and one that is nearly constant
+    (MC_Prob, standard deviation ~0.05 around ~0.48). Weighted-summing those
+    onto a 0-100 scale and thresholding at 60 is not a scoring function with a
+    probabilistic interpretation; it is four incommensurable numbers glued
+    together, and MC_Prob is the worst offender — it consumes a quarter of the
+    weight budget to contribute ~12 almost-fixed points that separate nothing.
+
+    Ranking each component within the date's cross-section fixes this by
+    construction:
+
+        S_i = sum_k w_k * rank_t(c_k,i) / (N_t + 1)
+
+    Every component now contributes on the same [0, 1] scale regardless of its
+    marginal distribution, a near-constant component contributes near-zero
+    *dispersion* rather than a large constant, and the composite is invariant
+    to any monotone rescaling of any input — so a component's influence is set
+    by its weight rather than by the accident of its units.
+
+    Ties take the average rank, so a binary component splits its cross-section
+    into two flat groups rather than imposing an arbitrary order within them.
+
+    Args:
+        component_scores_by_symbol: {symbol: {component: 0.0-1.0 sub-score}}.
+        weights: Raw (not necessarily normalized) weights per component.
+
+    Returns:
+        {symbol: (final_score 0-100, trigger)}. The trigger follows the same
+        Breakout > Trend > Volume precedence combine_weighted() uses, since it
+        describes *why* a signal fired and is not a ranking question.
+    """
+    if not component_scores_by_symbol:
+        return {}
+
+    symbols = list(component_scores_by_symbol)
+    normalized = normalize_weights(weights)
+    component_names = sorted(
+        {name for scores in component_scores_by_symbol.values() for name in scores}
+    )
+
+    # A universe of one has no cross-section to rank against; ranking it would
+    # score every component at the midpoint and discard the signal entirely.
+    if len(symbols) < 2:
+        symbol = symbols[0]
+        return {symbol: combine_weighted(component_scores_by_symbol[symbol], weights)}
+
+    n = len(symbols)
+    composite = {symbol: 0.0 for symbol in symbols}
+    for name in component_names:
+        values = [float(component_scores_by_symbol[s].get(name, 0.0)) for s in symbols]
+        weight = normalized.get(name, 0.0)
+        if weight == 0.0:
+            continue
+        for symbol, percentile in zip(symbols, _average_rank_percentiles(values)):
+            composite[symbol] += weight * percentile
+
+    return {
+        symbol: (
+            composite[symbol],
+            combine_weighted(component_scores_by_symbol[symbol], weights)[1],
+        )
+        for symbol in symbols
+    }
+
+
+def _average_rank_percentiles(values: List[float]) -> List[float]:
+    """rank / (N + 1) with ties taking the average rank, in (0, 1)."""
+    n = len(values)
+    order = sorted(range(n), key=lambda i: values[i])
+
+    ranks = [0.0] * n
+    position = 0
+    while position < n:
+        end = position
+        while end + 1 < n and values[order[end + 1]] == values[order[position]]:
+            end += 1
+        # Ranks are 1-based; a tied group shares the average of its span.
+        average_rank = (position + end) / 2.0 + 1.0
+        for index in order[position:end + 1]:
+            ranks[index] = average_rank
+        position = end + 1
+
+    return [rank / (n + 1.0) for rank in ranks]
+
+
 def evaluate_and_learn(
     weights: Dict[str, float],
     trade_history: List[Dict[str, Any]],

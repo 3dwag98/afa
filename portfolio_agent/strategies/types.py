@@ -113,6 +113,23 @@ class StrategyContext:
     # than each re-deriving it, and read by the meta-orchestrator to decide
     # which models the regime permits to buy. None means "not assessed".
     regime_label: Optional[str] = None
+    # Per-symbol Monte Carlo results for a batched scoring round. `mc_result`
+    # is the single-ticker field and cannot express a cross-section, so a
+    # batched caller previously had no way to supply one at all — which is why
+    # a rule_based member inside a batched UMA scored its MC_Prob component at
+    # zero and came out ~12 points lower than the identical strategy scored
+    # standalone, for a reason unrelated to the stock. Read through
+    # mc_for(symbol) rather than either field directly.
+    mc_results: Optional[Dict[str, "MonteCarloResult"]] = None
+
+    def mc_for(self, symbol: str) -> Optional["MonteCarloResult"]:
+        """This symbol's Monte Carlo result, from either the batch or the
+        single-ticker field."""
+        if self.mc_results is not None:
+            found = self.mc_results.get(symbol)
+            if found is not None:
+                return found
+        return self.mc_result
 
 
 @dataclass(frozen=True)

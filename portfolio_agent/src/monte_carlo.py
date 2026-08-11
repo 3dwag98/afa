@@ -658,13 +658,18 @@ def run_monte_carlo_garch(
     except ImportError:
         from volatility_models import forecast_volatility, forecast_volatility_gap_aware
 
+    # The symbol is the parameter cache key: GARCH parameters are stable over
+    # weeks, so the MLE runs monthly per ticker while the recursion -- which
+    # is what actually depends on today's bar -- runs every call. See
+    # volatility_models.GARCH_REFIT_INTERVAL for why the platform cannot
+    # afford one fit per ticker per day.
     forecast = None
     if intraday_returns is not None and overnight_returns is not None:
         forecast = forecast_volatility_gap_aware(
-            intraday_returns, overnight_returns, horizon_days
+            intraday_returns, overnight_returns, horizon_days, cache_key=symbol
         )
     if forecast is None:
-        forecast = forecast_volatility(daily_returns, horizon_days)
+        forecast = forecast_volatility(daily_returns, horizon_days, cache_key=symbol)
     daily_vol_forecast = forecast.daily_sigma if forecast is not None else None
     # The fitted Student-t nu travels with the volatility path. Fitting
     # fat-tailed innovations and then simulating Gaussian shocks would discard

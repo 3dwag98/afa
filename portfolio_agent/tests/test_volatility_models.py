@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from src.volatility_models import (
+    clear_garch_parameter_cache,
     forecast_volatility,
     forecast_volatility_gap_aware,
     GarchForecast,
@@ -169,3 +170,117 @@ class TestGapAwareForecast:
         assert forecast is not None
         assert forecast.gap_aware is False
         assert forecast.overnight_sigma is None
+
+
+class TestGarchRefitScheduling:
+    """One MLE per ticker per day is ~4.5 million fits for the documented
+    backtest. Parameters are stable over weeks; the conditional variance is
+    not. Only the fitting is scheduled."""
+
+    @staticmethod
+    def _garch_series(n=1200, seed=0):
+        rng = np.random.default_rng(seed)
+        returns = np.zeros(n)
+        variance = 1.0
+        for i in range(1, n):
+            previous = returns[i - 1]
+            variance = (
+                0.05 + (0.06 + (0.08 if previous < 0 else 0.0)) * previous ** 2 + 0.88 * variance
+            )
+            returns[i] = np.sqrt(variance) * rng.standard_t(6) / np.sqrt(6 / 4)
+        return returns / 100.0
+
+    def test_recursion_reproduces_the_optimizer_forecast(self):
+        """forecast_from_parameters must be arithmetically identical to what
+        arch itself projects, or the whole scheduling idea is a silent
+        approximation rather than an optimization."""
+        pytest.importorskip("arch")
+        from arch import arch_model
+
+        returns = self._garch_series()
+        fitted = arch_model(
+            returns * 100, mean="Constant", vol="GARCH", p=1, o=1, q=1, dist="t"
+        ).fit(disp="off", show_warning=False)
+        reference = np.sqrt(
+            np.asarray(fitted.forecast(horizon=20, reindex=False).variance.values[-1])
+        ) / 100.0
+
+        clear_garch_parameter_cache()
+        ours = forecast_volatility(list(returns), 20)
+
+        assert ours is not None
+        assert np.allclose(ours.daily_sigma, reference, rtol=1e-10)
+
+    def test_parameters_are_reused_within_the_refit_interval(self, monkeypatch):
+        pytest.importorskip("arch")
+        returns = self._garch_series(n=600)
+
+        import portfolio_agent.src.volatility_models as vm
+
+        fits = {"count": 0}
+        real_fit = vm.fit_garch_parameters
+
+        def counting_fit(returns_pct):
+            fits["count"] += 1
+            return real_fit(returns_pct)
+
+        monkeypatch.setattr(vm, "fit_garch_parameters", counting_fit)
+        vm.clear_garch_parameter_cache()
+
+        # 42 successive "days" at a 21-day refit interval: 2 fits, not 42.
+        for day in range(42):
+            vm.forecast_volatility(list(returns[: 500 + day]), 20, cache_key="T")
+
+        assert fits["count"] == 2
+
+    def test_no_cache_key_refits_every_call(self, monkeypatch):
+        pytest.importorskip("arch")
+        returns = self._garch_series(n=600)
+
+        import portfolio_agent.src.volatility_models as vm
+
+        fits = {"count": 0}
+        real_fit = vm.fit_garch_parameters
+
+        def counting_fit(returns_pct):
+            fits["count"] += 1
+            return real_fit(returns_pct)
+
+        monkeypatch.setattr(vm, "fit_garch_parameters", counting_fit)
+        vm.clear_garch_parameter_cache()
+
+        for day in range(5):
+            vm.forecast_volatility(list(returns[: 500 + day]), 20)
+
+        assert fits["count"] == 5
+
+    def test_the_variance_path_still_tracks_the_latest_bar(self):
+        """The parameters are cached; the conditional variance is not. A fresh
+        shock must move the forecast even when no refit happened."""
+        pytest.importorskip("arch")
+        returns = self._garch_series(n=600)
+        clear_garch_parameter_cache()
+
+        calm = forecast_volatility(list(returns), 5, cache_key="T")
+        shocked = forecast_volatility(list(returns) + [-0.15], 5, cache_key="T")
+
+        assert calm is not None and shocked is not None
+        assert shocked.daily_sigma[0] > calm.daily_sigma[0] * 1.5
+
+    def test_gap_aware_fit_is_namespaced_away_from_close_to_close(self):
+        """Two different models of two different series must not share a
+        cache slot."""
+        pytest.importorskip("arch")
+        import portfolio_agent.src.volatility_models as vm
+
+        session = self._garch_series(n=600, seed=1)
+        gaps = self._garch_series(n=600, seed=2) * 0.5
+
+        # vm.* consistently: the repo's `src` symlink means
+        # src.volatility_models and portfolio_agent.src.volatility_models are
+        # distinct module objects with distinct caches.
+        vm.clear_garch_parameter_cache()
+        vm.forecast_volatility(list(session), 5, cache_key="T")
+        vm.forecast_volatility_gap_aware(list(session), list(gaps), 5, cache_key="T")
+
+        assert set(vm._PARAMETER_CACHE) == {"T", "T::session"}

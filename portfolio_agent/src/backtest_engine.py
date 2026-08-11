@@ -889,6 +889,14 @@ class BacktestEngine:
                 ticker: build_features(hist_data, self.strategy.required_features())
                 for ticker, hist_data in eligible.items()
             }
+            # Per-symbol Monte Carlo for the batched path too. Without this a
+            # rule_based member inside a batched UMA saw no MC result at all
+            # and scored its MC_Prob component at zero -- a silent ~12-point
+            # level shift between two code paths that are supposed to agree,
+            # for a reason unrelated to the stock.
+            batch_drift_prior = self._drift_prior_for_round(eligible)
+            batch_mc_settings = self.mc_settings.with_drift_prior(batch_drift_prior)
+            mc_results = self._batch_mc_results(eligible, batch_mc_settings)
             benchmark_close = self._benchmark_up_to(current_date)
             benchmark_ohlcv = self._benchmark_ohlcv_up_to(current_date)
             context = StrategyContext(
@@ -903,6 +911,7 @@ class BacktestEngine:
                 regime_label=self._classify_regime(
                     benchmark_close, benchmark_ohlcv, eligible
                 ),
+                mc_results=mc_results,
             )
             return self.strategy.score_batch(features_by_symbol, context)
 
@@ -937,6 +946,28 @@ class BacktestEngine:
             if result is not None:
                 signals[ticker] = result
         return signals
+
+    def _batch_mc_results(
+        self,
+        eligible: Dict[str, pd.DataFrame],
+        mc_settings: MonteCarloSettings,
+    ) -> Dict[str, Any]:
+        """Run the forward simulation once per eligible ticker for a batched round.
+
+        A failed simulation for one ticker leaves that symbol absent from the
+        map, which StrategyContext.mc_for() resolves to None -- the same state
+        the per-ticker path reaches when the simulation cannot run.
+        """
+        results: Dict[str, Any] = {}
+        for ticker, hist_data in eligible.items():
+            try:
+                daily_returns = hist_data['close'].pct_change().dropna().tolist()
+                results[ticker] = mc_settings.run(
+                    symbol=ticker, daily_returns=daily_returns, ohlcv=hist_data
+                )
+            except Exception:
+                logger.debug(f"Batched Monte Carlo failed for {ticker}", exc_info=True)
+        return results
 
     # How many scoring rounds a cross-sectional drift prior is reused for.
     # mu_bar and tau^2 are panel-level hyperparameters that move on the

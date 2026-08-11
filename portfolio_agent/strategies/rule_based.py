@@ -12,14 +12,14 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import yaml
 
 from .base import BaseStrategy
 from .types import StrategyContext, StrategySignal
-from .weighting import combine_weighted
+from .weighting import combine_rank_composite, combine_weighted
 from portfolio_agent.config.schema import StrategyConfig
 
 try:
@@ -57,6 +57,20 @@ class RuleBasedStrategy(BaseStrategy):
         self._yaml_path = config.params.get("yaml_path", config.config_path)
         self._rules = self._load_rules()
 
+        # "weighted_sum" (the historical default) or "rank_composite". See
+        # weighting.combine_rank_composite for why the sum of an ordinal, a
+        # binary, a skewed continuous and a near-constant is not a score.
+        # Deliberately NOT "scoring": the rules YAML already uses that key for
+        # the component weight block.
+        mode = config.params.get(
+            "scoring_mode", self._rules.get("scoring_mode", "weighted_sum")
+        )
+        if mode not in ("weighted_sum", "rank_composite"):
+            raise ValueError(
+                f"Unknown scoring mode {mode!r}; expected 'weighted_sum' or 'rank_composite'"
+            )
+        self.scoring_mode = mode
+
     def _load_rules(self) -> Dict[str, Any]:
         """Load rules from the YAML configuration file."""
         yaml_path = Path(self._yaml_path)
@@ -92,7 +106,102 @@ class RuleBasedStrategy(BaseStrategy):
     def exit_rules(self) -> Dict[str, Any]:
         return self._rules.get("exit", {})
 
-    def score(self, symbol: str, features: pd.DataFrame, context: StrategyContext) -> StrategySignal:
+    def component_scores(
+        self, symbol: str, features: pd.DataFrame, context: StrategyContext
+    ) -> Optional[Dict[str, float]]:
+        """The four 0-1 sub-scores, without combining them.
+
+        Split out from score() so score_batch() can rank each component across
+        the whole cross-section before combining (see
+        weighting.combine_rank_composite). Returns None when there is no
+        feature data to score.
+        """
+        if features.empty:
+            return None
+
+        latest = features.iloc[-1]
+        close = _clean(latest.get("close")) or 0.0
+        sma50 = _clean(latest.get("sma_50"))
+        sma200 = _clean(latest.get("sma_200"))
+        donchian_upper = _clean(latest.get("donchian_upper_20"))
+        volume_ratio = _clean(latest.get("volume_ratio_20"))
+
+        if sma200 is None:
+            trend_score = 0.0
+        elif sma50 is not None and close > sma50 and close > sma200 and sma50 > sma200:
+            trend_score = 1.0
+        elif close > sma200:
+            trend_score = 0.5
+        else:
+            trend_score = 0.0
+
+        if donchian_upper is None:
+            breakout_score = 0.0
+        elif close > donchian_upper:
+            breakout_score = 1.0
+        else:
+            breakout_score = 0.0
+
+        volume_score = 0.0 if volume_ratio is None else min(volume_ratio / 2.0, 1.0)
+
+        mc_result = context.mc_for(symbol)
+        prob_profit = mc_result.probability_profit if mc_result is not None else 0.0
+
+        return {
+            "Trend": trend_score,
+            "Breakout": breakout_score,
+            "Volume": volume_score,
+            "MC_Prob": max(0.0, min(1.0, prob_profit)),
+        }
+
+    def score_batch(
+        self, features_by_symbol: Dict[str, pd.DataFrame], context: StrategyContext
+    ) -> Dict[str, StrategySignal]:
+        """Score the whole cross-section, combining components by rank.
+
+        Only used when `scoring_mode` is "rank_composite" (see
+        requires_full_batch); otherwise this falls through to the base class's
+        per-ticker loop, which is the historical behaviour.
+        """
+        if self.scoring_mode != "rank_composite":
+            return super().score_batch(features_by_symbol, context)
+
+        components = {}
+        for symbol, features in features_by_symbol.items():
+            scores = self.component_scores(symbol, features, context)
+            if scores is not None:
+                components[symbol] = scores
+
+        composites = combine_rank_composite(components, context.weights)
+        return {
+            symbol: self.score(symbol, features, context, composite=composites.get(symbol))
+            for symbol, features in features_by_symbol.items()
+        }
+
+    @property
+    def requires_full_batch(self) -> bool:
+        """True under rank-composite scoring: a percentile rank against a
+        universe of one is not a rank."""
+        return self.scoring_mode == "rank_composite"
+
+    def score(
+        self,
+        symbol: str,
+        features: pd.DataFrame,
+        context: StrategyContext,
+        composite: Optional[Tuple[float, str]] = None,
+    ) -> StrategySignal:
+        """Score one ticker.
+
+        Args:
+            symbol: Ticker being scored.
+            features: Lag-safe feature frame; the last row is the decision row.
+            context: Risk params, weights and this round's Monte Carlo results.
+            composite: Pre-combined (score, trigger) from score_batch's
+                cross-sectional ranking. None combines this ticker's own
+                components by weighted sum, which is all a single-ticker
+                caller can do.
+        """
         if features.empty:
             return StrategySignal(
                 symbol=symbol, signal="AVOID", score=0.0, trigger="None",
@@ -131,7 +240,8 @@ class RuleBasedStrategy(BaseStrategy):
         volume_score = 0.0 if volume_ratio is None else min(volume_ratio / 2.0, 1.0)
 
         # 4. Monte Carlo probability-of-profit score
-        prob_profit = context.mc_result.probability_profit if context.mc_result is not None else 0.0
+        mc_result = context.mc_for(symbol)
+        prob_profit = mc_result.probability_profit if mc_result is not None else 0.0
         mc_score = max(0.0, min(1.0, prob_profit))
 
         # The gate reads the lower confidence bound, not the point estimate.
@@ -142,8 +252,8 @@ class RuleBasedStrategy(BaseStrategy):
         # when the simulation did not run, so a stub MonteCarloResult blocks
         # the trade for the reason it always did rather than for a new one.
         gate_prob = prob_profit
-        if context.risk.gate_on_probability_lower_bound and context.mc_result is not None:
-            gate_prob = context.mc_result.probability_profit_gate
+        if context.risk.gate_on_probability_lower_bound and mc_result is not None:
+            gate_prob = mc_result.probability_profit_gate
 
         component_scores = {
             "Trend": trend_score,
@@ -151,7 +261,10 @@ class RuleBasedStrategy(BaseStrategy):
             "Volume": volume_score,
             "MC_Prob": mc_score,
         }
-        final_score, trigger = combine_weighted(component_scores, context.weights)
+        if composite is not None:
+            final_score, trigger = composite
+        else:
+            final_score, trigger = combine_weighted(component_scores, context.weights)
 
         # 5. Stop / target from ATR (YAML multipliers, falling back to context defaults)
         exit_rules = self.exit_rules()
@@ -220,11 +333,11 @@ class RuleBasedStrategy(BaseStrategy):
             rationale=rationale,
             extra={
                 "mc_prob_profit_lower": round(
-                    context.mc_result.probability_profit_gate, 6
-                ) if context.mc_result else 0.0,
-                "mc_drift_shrunk": bool(context.mc_result.drift_shrunk) if context.mc_result else False,
-                "mc_var_95_pct": round(context.mc_result.var_95, 6) if context.mc_result else 0.0,
-                "mc_cvar_95_pct": round(context.mc_result.cvar_95, 6) if context.mc_result else 0.0,
+                    mc_result.probability_profit_gate, 6
+                ) if mc_result else 0.0,
+                "mc_drift_shrunk": bool(mc_result.drift_shrunk) if mc_result else False,
+                "mc_var_95_pct": round(mc_result.var_95, 6) if mc_result else 0.0,
+                "mc_cvar_95_pct": round(mc_result.cvar_95, 6) if mc_result else 0.0,
                 # Reported alongside the (net) reward_risk so the gap between
                 # them is visible: on ATR-tight stops, round-trip friction is a
                 # large fraction of the risk being taken, and a strategy whose
