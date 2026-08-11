@@ -25,6 +25,10 @@ from portfolio_agent.models.pytorch_models import PointLoss, QuantileLoss, sorte
 from portfolio_agent.models.registry import get_model
 from portfolio_agent.src.calibration import IsotonicCalibrator, calibration_error
 from portfolio_agent.src.data_store import load_ticker_data
+from portfolio_agent.src.performance_stats import (
+    information_coefficient,
+    sharpe_ratio_overlapping,
+)
 from portfolio_agent.src.universe import resolve_backtest_universe
 from portfolio_agent.utils.device import get_device, mixed_precision_support
 
@@ -226,6 +230,15 @@ def load_panel_by_ticker(config: AppConfig) -> Dict[str, pd.DataFrame]:
             "training panel. Run `portfolio-agent download-data` first, or set "
             "training.use_synthetic_data=true for offline testing."
         )
+
+    # Applied here, once the whole panel exists, because a cross-sectional
+    # transform is by definition not computable one ticker at a time.
+    transform = getattr(config.training, "target_transform", "absolute")
+    if transform != "absolute":
+        ordered = apply_cross_sectional_target(
+            ordered, target_column_name(config.training.target), transform
+        )
+        print(f"Target re-expressed cross-sectionally ({transform}) across {len(ordered)} tickers")
     return ordered
 
 
@@ -287,20 +300,128 @@ def target_column_name(target: str) -> str:
     return f"target_{target}"
 
 
-def build_forward_return(close: pd.Series, target: str) -> pd.Series:
+def build_forward_return(
+    close: pd.Series,
+    target: str,
+    round_trip_cost: float = 0.0,
+) -> pd.Series:
     """Realized *forward* return over the horizon encoded in `target`.
 
     For target="return_5d": (close[t+5] - close[t]) / close[t] — what the
     model is supposed to predict, dated at the decision point t. The value is
     unknown at t by construction, which is the point; rows near the end of the
     series are NaN and get dropped.
+
+    Args:
+        close: Close price series.
+        target: Target name encoding the horizon, e.g. "return_5d".
+        round_trip_cost: Modelled friction as a fraction of turnover, charged
+            against the label so the network learns the sign of the return the
+            portfolio actually keeps rather than of one it never receives.
+
+    Returns:
+        The forward return, net of `round_trip_cost`.
     """
     periods = 1
     if 'return' in target:
         digits = "".join(ch for ch in target if ch.isdigit())
         if digits:
             periods = max(1, int(digits))
-    return close.shift(-periods).pct_change(periods)
+    return close.shift(-periods).pct_change(periods) - round_trip_cost
+
+
+def apply_cross_sectional_target(
+    by_ticker: Dict[str, pd.DataFrame],
+    target_name: str,
+    method: str,
+) -> Dict[str, pd.DataFrame]:
+    """Re-express the target as a cross-sectional quantity, per date.
+
+    The absolute forward return is the wrong thing for this platform to
+    predict. In an equity panel the overwhelming majority of the variance of a
+    5-day return is the common market factor — a typical Indian mid-cap has an
+    R^2 against the Nifty of 0.35-0.55 at daily frequency, and more over five
+    days. A network trained on the absolute return therefore spends most of
+    its capacity forecasting the market, which is (a) nearly unforecastable
+    and (b) unactionable here: the platform is long-only with no index hedge,
+    so it cannot trade a market view. The residual, idiosyncratic part — the
+    only part monetizable by choosing BETWEEN stocks — is a minority of the
+    training signal.
+
+    Two transforms, both standard since Gu, Kelly & Xiu:
+
+    - ``cross_sectional_demean``: y = r_i - mean_j(r_j) over the date's
+      cross-section.
+    - ``cross_sectional_rank``: y = 2*rank(r_i)/(N+1) - 1, in [-1, 1]. More
+      robust on Indian data, where a single circuit-locked +20% print
+      dominates the raw cross-sectional moments the demeaned form depends on.
+
+    Dates with fewer than two tickers are left untouched — there is no
+    cross-section to rank against, and dropping them would silently truncate
+    the panel's early history.
+
+    Args:
+        by_ticker: Date-indexed featurized frames, keyed by ticker.
+        target_name: Column to transform.
+        method: "absolute" (no-op), "cross_sectional_demean", or
+            "cross_sectional_rank".
+
+    Returns:
+        New frames with the target replaced. Input frames are not mutated.
+    """
+    if method == "absolute" or len(by_ticker) < 2:
+        return by_ticker
+    if method not in ("cross_sectional_demean", "cross_sectional_rank"):
+        raise ValueError(f"Unknown target transform: {method!r}")
+
+    usable = {
+        ticker: frame for ticker, frame in by_ticker.items()
+        if target_name in frame.columns and not frame.empty
+    }
+    if len(usable) < 2:
+        return by_ticker
+
+    # One wide (date x ticker) matrix, so each row is a date's cross-section.
+    wide = pd.DataFrame({t: f[target_name] for t, f in usable.items()})
+
+    if method == "cross_sectional_demean":
+        transformed = wide.sub(wide.mean(axis=1), axis=0)
+    else:
+        counts = wide.count(axis=1)
+        ranks = wide.rank(axis=1, method="average")
+        transformed = ranks.mul(2.0).div(counts + 1.0, axis=0) - 1.0
+
+    # A single-name date has no cross-section; keep the original value rather
+    # than emitting a degenerate 0.0 (demean) or 0.0 (rank of 1 of 1).
+    single_name_dates = wide.count(axis=1) < 2
+    transformed[single_name_dates] = wide[single_name_dates]
+
+    result = dict(by_ticker)
+    for ticker, frame in usable.items():
+        updated = frame.copy()
+        updated[target_name] = transformed[ticker].reindex(frame.index)
+        # The target must stay the LAST column: create_dataloaders, the
+        # walk-forward splitter and the MLStrategy metadata all rely on it.
+        updated = updated[[c for c in frame.columns if c != target_name] + [target_name]]
+        result[ticker] = updated.dropna(subset=[target_name])
+    return result
+
+
+def _round_trip_cost(config: AppConfig) -> float:
+    """Modelled buy + sell friction as a fraction of turnover, or 0.0 if off.
+
+    Imported lazily so agents/trainer.py does not pull the execution simulator
+    (and its config surface) in at module load; a missing or failing cost
+    model degrades to a gross label rather than to no training.
+    """
+    if not getattr(config.training, "target_net_of_costs", False):
+        return 0.0
+    try:
+        from portfolio_agent.src.execution_sim import cost_fraction_per_side
+    except ImportError:  # pragma: no cover
+        return 0.0
+    slippage = config.risk.slippage_pct_per_side
+    return cost_fraction_per_side("BUY", slippage) + cost_fraction_per_side("SELL", slippage)
 
 
 def prepare_features(df: pd.DataFrame, config: AppConfig, verbose: bool = True) -> pd.DataFrame:
@@ -330,7 +451,9 @@ def prepare_features(df: pd.DataFrame, config: AppConfig, verbose: bool = True) 
     # column, so a feature of the same name (e.g. the trailing return_5d)
     # stays an input and never silently becomes the label.
     target_name = target_column_name(config.training.target)
-    feature_df[target_name] = build_forward_return(df['close'], config.training.target)
+    feature_df[target_name] = build_forward_return(
+        df['close'], config.training.target, round_trip_cost=_round_trip_cost(config)
+    )
 
     # Drop rows that are not finite — NaN *or* infinite. dropna() alone leaves
     # the infinities behind, and every one of them turns into a NaN loss the
@@ -406,6 +529,8 @@ def evaluate_predictions(
     empty = {
         "n_samples": 0, "mse": 0.0, "directional_accuracy": 0.0,
         "strategy_sharpe": 0.0, "benchmark_sharpe": 0.0, "excess_sharpe": 0.0,
+        "rank_ic": 0.0, "strategy_sharpe_overlap_adjusted": 0.0,
+        "benchmark_sharpe_overlap_adjusted": 0.0,
     }
     if predictions.size == 0 or predictions.size != actuals.size:
         return empty
@@ -440,6 +565,22 @@ def evaluate_predictions(
         "strategy_sharpe": strategy_sharpe,
         "benchmark_sharpe": benchmark_sharpe,
         "excess_sharpe": strategy_sharpe - benchmark_sharpe,
+        # Rank IC is the metric this model should actually be judged on: the
+        # system acts on an ordering, and a rank correlation measures the
+        # ordering without confounding it with the sizing rules downstream.
+        # It is also far less noisy than a backtested Sharpe.
+        "rank_ic": information_coefficient(predictions, actuals),
+        # The Sharpes above annualize by sqrt(252/H) on daily-sampled H-day
+        # targets, whose neighbours share H-1 days. The naive standard error
+        # is therefore too small by roughly sqrt(H) and the ratios read high.
+        # These two use a Newey-West long-run variance at lag H-1 instead, and
+        # are the figures to quote in absolute terms.
+        "strategy_sharpe_overlap_adjusted": sharpe_ratio_overlapping(
+            strategy_returns, horizon_days=horizon_days
+        ),
+        "benchmark_sharpe_overlap_adjusted": sharpe_ratio_overlapping(
+            actuals, horizon_days=horizon_days
+        ),
     }
 
 

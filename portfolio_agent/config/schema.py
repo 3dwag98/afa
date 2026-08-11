@@ -227,6 +227,27 @@ class TrainingConfig(BaseModel):
         "ranking (which walk-forward actually measured) and discards its scale (which nothing "
         "measured).",
     )
+    target_transform: Literal["absolute", "cross_sectional_rank", "cross_sectional_demean"] = Field(
+        default="cross_sectional_rank",
+        description="What the network is asked to predict. 'absolute' is the raw forward return, "
+        "which is what this used to be and is the wrong quantity: most of the variance of a 5-day "
+        "equity return is the common market factor, so the network spends its capacity forecasting "
+        "the market -- which is nearly unforecastable AND unactionable here, since the platform is "
+        "long-only with no index hedge. Only the idiosyncratic part can be monetized, by choosing "
+        "BETWEEN stocks. 'cross_sectional_demean' subtracts the universe mean forward return per "
+        "date; 'cross_sectional_rank' (the default) maps each date's cross-section to [-1, 1] by "
+        "rank, which is additionally immune to the circuit-limit outliers that dominate raw "
+        "cross-sectional moments on Indian data.",
+    )
+    target_net_of_costs: bool = Field(
+        default=True,
+        description="Subtract modelled round-trip friction from the training label, so the network "
+        "learns the sign of the NET move rather than of a return the portfolio never receives. "
+        "Note the interaction with target_transform: friction is the same fraction for every "
+        "ticker, so under either cross-sectional transform it is a level shift the ranks are "
+        "invariant to. It changes the label only under target_transform='absolute' -- which is "
+        "itself an argument for the cross-sectional target.",
+    )
     walk_forward_min_train_fraction: float = Field(
         default=0.4,
         description="Fraction of the panel used to train the first walk-forward fold. Subsequent "

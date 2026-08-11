@@ -718,9 +718,11 @@ class BacktestEngine:
             
             row = df.loc[current_date]
             
-            # Get high and low for the day
+            # Get high, low and open for the day. The open matters because a
+            # stop is an intraday construct and NSE gaps: see below.
             high = None
             low = None
+            open_price = None
             for h_col in ['high', 'High']:
                 if h_col in row.index:
                     high = row[h_col]
@@ -729,9 +731,15 @@ class BacktestEngine:
                 if l_col in row.index:
                     low = row[l_col]
                     break
-            
+            for o_col in ['open', 'Open']:
+                if o_col in row.index:
+                    open_price = row[o_col]
+                    break
+
             if high is None or low is None:
                 continue
+            if open_price is not None and (pd.isna(open_price) or open_price <= 0):
+                open_price = None
             
             stop_price = self.stop_loss_levels.get(ticker)
             target_price = self.take_profit_levels.get(ticker)
@@ -745,13 +753,31 @@ class BacktestEngine:
             trigger_price = None
             trigger_type = None
             
-            # Check stop-loss (price hit or went below stop)
+            # Check stop-loss (price hit or went below stop).
+            #
+            # **Fills at min(open, stop), not at the stop.** A stop is an
+            # intraday construct: it says "get me out if the price trades
+            # here". When the market gaps below it overnight the price never
+            # trades there — the first available fill is the open, and it is
+            # worse. Assuming the stop level always fills is the single most
+            # optimistic assumption in a long-only Indian equity backtest,
+            # because NSE opens after both the US close and the Asian session
+            # and gap variance is a large fraction of total variance over a
+            # 5-day hold. It also biases Kelly: recording losses at the
+            # modelled stop rather than the realized open makes the average
+            # loss look smaller than it is, which inflates b and over-bets.
             if stop_price is not None and low <= stop_price:
                 triggered = True
                 trigger_price = stop_price
+                if open_price is not None and open_price < stop_price:
+                    trigger_price = open_price
                 trigger_type = 'STOP_LOSS'
-            
-            # Check take-profit (price hit or went above target)
+
+            # Check take-profit (price hit or went above target). The
+            # symmetric case is NOT symmetric in the trader's favour: a gap
+            # ABOVE the target also fills at the open, which is better, and
+            # modelling that would be assuming the gap always goes your way.
+            # Only the adverse side of the gap is modelled.
             elif target_price is not None and high >= target_price:
                 triggered = True
                 trigger_price = target_price

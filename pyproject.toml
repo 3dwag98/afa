@@ -15,6 +15,10 @@ dependencies = [
     "pyarrow>=10.0.0",
     "pydantic>=2.0.0",
     "arch>=6.0.0",
+    # Used directly by src/performance_stats.py (normal/rank/binomial
+    # distributions for PSR, DSR, PBO and the rank IC). Already an `arch`
+    # dependency; declared here because it is imported in our own code.
+    "scipy>=1.10.0",
 ]
 
 [project.optional-dependencies]

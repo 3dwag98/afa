@@ -1099,3 +1099,78 @@ class TestExitLevelsComeFromTheSignal:
         assert buy['stop_price'] == 91.0
         assert buy['target_price'] == 112.0
         assert buy['signal_entry_price'] == 100.0
+
+
+class TestGapAwareStopFills:
+    """A stop is an intraday construct: it says "get me out if the price
+    trades here". When NSE gaps below it overnight the price never trades
+    there, and the first available fill is the open."""
+
+    @staticmethod
+    def _engine(synthetic_data, **kwargs):
+        return BacktestEngine(
+            start_date="2023-01-02",
+            end_date="2023-06-30",
+            initial_capital=1_000_000.0,
+            universe_tickers=synthetic_data['tickers'],
+            **kwargs,
+        )
+
+    def _armed(self, synthetic_data, bar):
+        """An engine holding one position with a stop at 95 and a target at 110,
+        with the given day's OHLC written over the last bar."""
+        ticker = synthetic_data['tickers'][0]
+        engine = self._engine(synthetic_data)
+        engine.holdings[ticker] = 100
+        engine._open_position(ticker, 100, 100.0, pd.Timestamp("2023-01-02"))
+        engine.stop_loss_levels[ticker] = 95.0
+        engine.take_profit_levels[ticker] = 110.0
+
+        df = engine.ticker_data[ticker]
+        date = df.index[-1]
+        df.loc[date, ['open', 'high', 'low', 'close']] = bar
+        return engine, ticker, date
+
+    def test_gap_down_fills_at_the_open_not_at_the_stop(self, synthetic_data):
+        # Opens at 88, well below the 95 stop, and never trades back up to it.
+        engine, ticker, date = self._armed(synthetic_data, [88.0, 90.0, 86.0, 87.0])
+
+        trades = engine._check_stop_loss_take_profit(date)
+
+        assert len(trades) == 1
+        assert trades[0]['exit_reason'] == 'stop_loss'
+        assert trades[0]['exit_price'] == 88.0
+
+    def test_an_intraday_stop_hit_still_fills_at_the_stop(self, synthetic_data):
+        # Opens above the stop and trades down through it during the session,
+        # so the stop level is genuinely available.
+        engine, ticker, date = self._armed(synthetic_data, [99.0, 100.0, 93.0, 96.0])
+
+        trades = engine._check_stop_loss_take_profit(date)
+
+        assert len(trades) == 1
+        assert trades[0]['exit_price'] == 95.0
+
+    def test_a_favourable_gap_is_not_credited_on_the_target(self, synthetic_data):
+        """The adverse side of the gap is modelled; the favourable side is not.
+        Assuming a gap-up fills the exit above target is assuming the gap
+        always goes your way."""
+        engine, ticker, date = self._armed(synthetic_data, [115.0, 118.0, 114.0, 116.0])
+
+        trades = engine._check_stop_loss_take_profit(date)
+
+        assert len(trades) == 1
+        assert trades[0]['exit_reason'] == 'target'
+        assert trades[0]['exit_price'] == 110.0
+
+    def test_gap_fill_makes_the_realized_loss_worse(self, synthetic_data):
+        """Which is the point: recording losses at the modelled stop rather
+        than the realized open makes the average loss look smaller than it is,
+        which inflates Kelly's payoff ratio b and over-bets on it."""
+        gapped, _, gap_date = self._armed(synthetic_data, [88.0, 90.0, 86.0, 87.0])
+        intraday, _, intra_date = self._armed(synthetic_data, [99.0, 100.0, 93.0, 96.0])
+
+        gapped_pnl = gapped._check_stop_loss_take_profit(gap_date)[0]['net_pnl']
+        intraday_pnl = intraday._check_stop_loss_take_profit(intra_date)[0]['net_pnl']
+
+        assert gapped_pnl < intraday_pnl < 0

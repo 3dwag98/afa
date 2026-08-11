@@ -9,6 +9,8 @@ Excel report.
 from __future__ import annotations
 
 import logging
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -20,12 +22,45 @@ from portfolio_agent.strategies.types import RiskParams
 from portfolio_agent.src.backtest_engine import BacktestEngine
 from portfolio_agent.src.backtest_reporting import export_backtest_excel
 from portfolio_agent.src.risk_analytics import RiskAnalyzer
+from portfolio_agent.src.trial_log import Trial, config_hash, record_trial
 
 logger = logging.getLogger(__name__)
 
 
 class BacktesterAgent:
     """Runs a backtest for a configured strategy and exports the Excel report."""
+
+    def _record_trial(self, analytics_report: Dict[str, Any], strategy_name: str) -> None:
+        """Append this configuration and its Sharpe to the trial log.
+
+        Never raises: losing a log line must not lose a backtest.
+        """
+        try:
+            record_trial(
+                Trial(
+                    run_id=uuid.uuid4().hex[:12],
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    config_hash=config_hash(self.config),
+                    sharpe=float(analytics_report.get('sharpe_ratio', 0.0) or 0.0),
+                    cagr=float(analytics_report.get('cagr', 0.0) or 0.0),
+                    max_drawdown=float(analytics_report.get('max_drawdown', 0.0) or 0.0),
+                    n_observations=int(analytics_report.get('analysis_period_days', 0) or 0),
+                    n_trades=int(analytics_report.get('total_trades', 0) or 0),
+                    strategy=strategy_name,
+                    parameters={
+                        'strategy': strategy_name,
+                        'simulation_method': self.config.simulation.method,
+                        'use_garch_volatility': self.config.simulation.use_garch_volatility,
+                        'atr_stop_multiplier': self.config.risk.atr_stop_multiplier,
+                        'atr_target_multiplier': self.config.risk.atr_target_multiplier,
+                        'use_kelly_sizing': self.config.risk.use_kelly_sizing,
+                        'target_prob_profit': self.config.compliance.target_prob_profit,
+                    },
+                ),
+                path=self.trial_log_path,
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Could not record the backtest trial", exc_info=True)
 
     def __init__(
         self,
@@ -36,6 +71,7 @@ class BacktesterAgent:
         parallel: bool = False,
         max_workers: Optional[int] = None,
         show_progress: bool = True,
+        trial_log_path: Optional[str] = None,
     ):
         """Initialize the backtester agent.
 
@@ -53,6 +89,9 @@ class BacktesterAgent:
                 replay. On by default: this is the interactive entry point, and a
                 multi-year backtest over a few thousand tickers otherwise prints
                 nothing at all between "Running backtest..." and the report.
+            trial_log_path: Where to append this run's trial record. Defaults
+                to <paths.output_dir>/trials.jsonl. Every backtest is a trial,
+                and the Deflated Sharpe Ratio needs the count.
         """
         self.config = config
         self.show_progress = show_progress
@@ -65,6 +104,9 @@ class BacktesterAgent:
         self.inference_device = inference_device
         self.parallel = parallel
         self.max_workers = max_workers
+        self.trial_log_path = trial_log_path or str(
+            Path(config.paths.output_dir) / "trials.jsonl"
+        )
 
         logger.info(f"BacktesterAgent initialized: strategy={self.strategy_config.type}, "
                     f"device={inference_device}, parallel={parallel}")
@@ -150,8 +192,16 @@ class BacktesterAgent:
             daily_equity_curve=engine.daily_equity_curve,
             trade_log=engine.trade_log,
             random_seed=self.config.simulation.random_seed,
+            trial_log_path=self.trial_log_path,
         )
         analytics_report = analyzer.generate_analytics_report()
+
+        # Record the trial BEFORE the report is written, so a run that dies
+        # during the Excel export still counts toward N. The Deflated Sharpe
+        # Ratio is only meaningful if the denominator includes the trials that
+        # were abandoned -- those are precisely the ones that inflate the
+        # maximum. See src/trial_log.py.
+        self._record_trial(analytics_report, strategy_name=strategy.name)
 
         # Percentage metrics are handed to the exporter in PERCENT units
         # (18.5 == 18.5%) — the contract documented in

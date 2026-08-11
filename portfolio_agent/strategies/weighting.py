@@ -11,6 +11,29 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from src.risk import shrink_win_probability
+except ImportError:  # pragma: no cover - flat-path import
+    from risk import shrink_win_probability
+
+# Minimum realized trades attributable to ONE component before its weight may
+# move. The platform-wide `learning.min_trades_for_learning` floor is a
+# *total* across every trigger, so a 5-trade floor meant a component could be
+# re-weighted off two wins and a loss. At n = 5 the win-rate standard error is
+# +/-22 percentage points; at 30 it is +/-9.
+MIN_TRADES_PER_COMPONENT = 30
+
+# Beta-prior strength, in pseudo-trades, for shrinking a component's win rate
+# toward a coin flip. Same prior the Kelly path already uses
+# (src/risk.py::shrink_win_probability) — the two were inconsistent, with
+# Kelly correctly shrinking and the weight learner taking the raw rate.
+WIN_RATE_PRIOR_STRENGTH = 20.0
+
+# One-sided significance level for "is this component's win rate actually
+# different from a coin flip?". Weights used to move on every evaluation
+# regardless of whether the difference was distinguishable from zero.
+SIGNIFICANCE_ALPHA = 0.05
+
 
 def normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
     """Normalize weights to sum to 100.
@@ -60,6 +83,22 @@ def combine_weighted(component_scores: Dict[str, float], weights: Dict[str, floa
     return final_score, trigger
 
 
+def is_win_rate_significant(wins: int, total: int, alpha: float = SIGNIFICANCE_ALPHA) -> bool:
+    """Is this win rate distinguishable from a coin flip at level `alpha`?
+
+    A two-sided binomial test against p = 0.5, so a component is re-weighted
+    down on significant *under*-performance just as it is re-weighted up on
+    significant over-performance. Implemented against scipy's exact test
+    rather than a normal approximation: at n = 30 the approximation's tail is
+    noticeably wrong, and n = 30 is exactly where this gate operates.
+    """
+    if total <= 0:
+        return False
+    from scipy import stats as scipy_stats
+
+    return float(scipy_stats.binomtest(wins, total, 0.5).pvalue) < alpha
+
+
 def evaluate_and_learn(
     weights: Dict[str, float],
     trade_history: List[Dict[str, Any]],
@@ -76,6 +115,28 @@ def evaluate_and_learn(
             and "signal_trigger" keys.
         learning_rate: Rate at which weights move toward realized win rate.
         min_trades_for_learning: Minimum realized (WIN/LOSS) trades required.
+
+    Three guards, all of which the pre-existing version lacked and all of
+    which matter because this is a closed feedback loop — weights change which
+    trades are taken, which changes the outcomes the next adaptation sees:
+
+    1. **Shrinkage.** The raw win rate is replaced by the same Beta-Binomial
+       posterior mean the Kelly path uses. The two were inconsistent: Kelly
+       argued (correctly) that a win rate has +/-7pp of standard error at 50
+       trades and applied a 20-pseudo-trade prior, while this function took a
+       raw rate at a floor of 5 trades, where the error is +/-22pp.
+    2. **A real sample-size floor**, per component rather than in total.
+    3. **A significance test.** A component's weight moves only if a one-sided
+       binomial test rejects "this is a coin flip" at alpha = 0.05. Without it
+       every evaluation moved every weight, which is a random walk driven by
+       sampling noise dressed up as learning.
+
+    Args:
+        weights: Current component weights.
+        trade_history: List of trade dicts with "outcome" ("WIN"/"LOSS"/other)
+            and "signal_trigger" keys.
+        learning_rate: Rate at which weights move toward realized win rate.
+        min_trades_for_learning: Minimum realized (WIN/LOSS) trades in total.
 
     Returns:
         Tuple of (new_weights, log_message). log_message is None when weights
@@ -98,9 +159,24 @@ def evaluate_and_learn(
             stats["wins"] += 1
 
     new_weights: Dict[str, float] = dict(weights)
+    skipped: Dict[str, str] = {}
     for trigger, stats in trigger_stats.items():
         total, wins = stats["total"], stats["wins"]
-        win_rate = wins / total if total > 0 else 0.5
+
+        if total < MIN_TRADES_PER_COMPONENT:
+            skipped[trigger] = f"n={total}<{MIN_TRADES_PER_COMPONENT}"
+            continue
+
+        if not is_win_rate_significant(wins, total, alpha=SIGNIFICANCE_ALPHA):
+            skipped[trigger] = "not significant"
+            continue
+
+        # Shrunk, not raw: at these sample sizes the raw rate's deviation from
+        # 0.5 is mostly sampling error, and feeding it back scales that error
+        # into the scores that generate the next round of trades.
+        win_rate = shrink_win_probability(
+            wins=wins, total=total, prior_strength=WIN_RATE_PRIOR_STRENGTH
+        )
         old_weight = weights.get(trigger, 25.0)
         adjustment = (win_rate - 0.5) * learning_rate
         new_weight = max(5.0, old_weight * (1 + adjustment))
@@ -124,7 +200,9 @@ def evaluate_and_learn(
         stats = trigger_stats[trigger]
         wr_pct = int(round(stats["wins"] / stats["total"] * 100)) if stats["total"] > 0 else 50
         wt = rounded_weights.get(trigger, 0)
-        log_parts.append(f"{trigger} WR:{wr_pct}% (Wt:{wt:.1f})")
+        reason = skipped.get(trigger)
+        suffix = f" [held: {reason}]" if reason else ""
+        log_parts.append(f"{trigger} WR:{wr_pct}% (Wt:{wt:.1f}){suffix}")
 
     log_message = f"{datetime.now().strftime('%Y-%m-%d')} Learning Update: {' | '.join(log_parts)}"
     return rounded_weights, log_message

@@ -76,11 +76,7 @@ class TestEvaluateAndLearn:
         brain = AgentBrain(
             weights={"Trend": 25.0, "Breakout": 25.0, "Volume": 20.0, "MC_Prob": 30.0},
             trade_history=[
-                make_trade("Breakout", "LOSS", 100, 90),
-                make_trade("Breakout", "LOSS", 100, 85),
-                make_trade("Breakout", "LOSS", 100, 80),
-                make_trade("Breakout", "LOSS", 100, 75),
-                make_trade("Breakout", "LOSS", 100, 70),
+                make_trade("Breakout", "LOSS", 100, 90 - i) for i in range(30)
             ],
             learning_log=[],
         )
@@ -96,12 +92,11 @@ class TestEvaluateAndLearn:
         """Test case 3: All trend wins - trend weight increases."""
         brain = AgentBrain(
             weights={"Trend": 25.0, "Breakout": 25.0, "Volume": 20.0, "MC_Prob": 30.0},
+            # 30 trades, not 5: a component's weight only moves once its own
+            # sample clears MIN_TRADES_PER_COMPONENT and a binomial test
+            # rejects "coin flip". At n=5 a perfect record is not evidence.
             trade_history=[
-                make_trade("Trend", "WIN", 100, 110),
-                make_trade("Trend", "WIN", 100, 115),
-                make_trade("Trend", "WIN", 100, 120),
-                make_trade("Trend", "WIN", 100, 125),
-                make_trade("Trend", "WIN", 100, 130),
+                make_trade("Trend", "WIN", 100, 110 + i) for i in range(30)
             ],
             learning_log=[],
         )
@@ -112,6 +107,37 @@ class TestEvaluateAndLearn:
 
         # Trend weight should increase (all wins means win_rate = 1.0)
         assert result.weights["Trend"] > original_trend_weight
+
+    def test_small_sample_does_not_move_weights(self):
+        """A perfect 5-trade record is not evidence: at n=5 the win-rate
+        standard error is +/-22pp, and this is a closed feedback loop."""
+        brain = AgentBrain(
+            weights={"Trend": 25.0, "Breakout": 25.0, "Volume": 20.0, "MC_Prob": 30.0},
+            trade_history=[make_trade("Trend", "WIN", 100, 110) for _ in range(5)],
+            learning_log=[],
+        )
+        config = make_config(learning_rate=0.15, min_trades=5)
+
+        result = evaluate_and_learn(brain, config)
+
+        assert result.weights == brain.weights
+
+    def test_insignificant_win_rate_does_not_move_weights(self):
+        """35 trades at a 60% win rate does not clear a two-sided binomial
+        test against 0.5, so the weight is held rather than nudged on noise."""
+        brain = AgentBrain(
+            weights={"Trend": 25.0, "Breakout": 25.0, "Volume": 20.0, "MC_Prob": 30.0},
+            trade_history=(
+                [make_trade("Trend", "WIN", 100, 110) for _ in range(21)]
+                + [make_trade("Trend", "LOSS", 100, 95) for _ in range(14)]
+            ),
+            learning_log=[],
+        )
+        config = make_config(learning_rate=0.15, min_trades=5)
+
+        result = evaluate_and_learn(brain, config)
+
+        assert result.weights["Trend"] == brain.weights["Trend"]
 
     def test_weights_sum_to_100(self):
         """Test case 4: Weights always sum to exactly 100."""
@@ -141,11 +167,7 @@ class TestEvaluateAndLearn:
             weights={"Trend": 25.0, "Breakout": 25.0, "Volume": 20.0, "MC_Prob": 30.0},
             trade_history=[
                 # Many losses for Breakout to try to push weight down
-                make_trade("Breakout", "LOSS"),
-                make_trade("Breakout", "LOSS"),
-                make_trade("Breakout", "LOSS"),
-                make_trade("Breakout", "LOSS"),
-                make_trade("Breakout", "LOSS"),
+                *[make_trade("Breakout", "LOSS") for _ in range(30)],
             ],
             learning_log=[],
         )

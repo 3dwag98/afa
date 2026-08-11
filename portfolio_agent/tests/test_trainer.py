@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 from portfolio_agent.agents.trainer import (
+    apply_cross_sectional_target,
     build_forward_return,
     evaluate_predictions,
     load_data,
@@ -19,6 +20,7 @@ from portfolio_agent.agents.trainer import (
     run_walk_forward_validation,
     target_column_name,
     _generate_synthetic_ohlcv,
+    _round_trip_cost,
     _target_horizon_days,
 )
 from portfolio_agent.utils.device import get_device
@@ -59,15 +61,87 @@ class TestPrepareFeatures:
         feature_df = prepare_features(df, config, verbose=False)
 
         target_col = target_column_name(config.training.target)
-        expected = build_forward_return(df['close'], config.training.target)
+        # The label is net of modelled round-trip friction, so the network
+        # learns the sign of the move the portfolio actually keeps.
+        expected = build_forward_return(
+            df['close'], config.training.target, round_trip_cost=_round_trip_cost(config)
+        )
 
         aligned = expected.reindex(feature_df.index)
         assert np.allclose(feature_df[target_col].values, aligned.values)
+
         # A forward return is by definition unknown at the decision date, so it
         # must differ from the same-named trailing feature.
         assert not np.allclose(
             feature_df[target_col].values, feature_df[config.training.target].values
         )
+
+    def test_target_is_net_of_round_trip_friction(self):
+        config = AppConfig()
+        df = _make_ohlcv()
+
+        gross = build_forward_return(df['close'], config.training.target)
+        net = build_forward_return(
+            df['close'], config.training.target, round_trip_cost=_round_trip_cost(config)
+        )
+
+        cost = _round_trip_cost(config)
+        assert cost > 0
+        assert np.allclose((gross - net).dropna().values, cost)
+
+        config.training.target_net_of_costs = False
+        assert _round_trip_cost(config) == 0.0
+
+
+class TestCrossSectionalTarget:
+    """Most of the variance of a 5-day equity return is the market factor,
+    which this platform can neither forecast nor act on. Only the
+    cross-sectional part is monetizable."""
+
+    @staticmethod
+    def _panel():
+        idx = pd.bdate_range("2024-01-01", periods=6)
+        return {
+            "A": pd.DataFrame({"f": 1.0, "target_return_5d": [0.10, 0.02, -0.01, 0.05, 0.00, 0.03]}, index=idx),
+            "B": pd.DataFrame({"f": 2.0, "target_return_5d": [0.09, 0.01, -0.02, 0.04, -0.01, 0.02]}, index=idx),
+            "C": pd.DataFrame({"f": 3.0, "target_return_5d": [0.11, 0.03, 0.00, 0.06, 0.01, 0.04]}, index=idx),
+        }
+
+    def test_rank_target_maps_each_date_to_minus_one_to_one(self):
+        out = apply_cross_sectional_target(self._panel(), "target_return_5d", "cross_sectional_rank")
+        wide = pd.DataFrame({t: f["target_return_5d"] for t, f in out.items()})
+
+        # C is the best name every day, B the worst: 2*rank/(N+1) - 1 for
+        # N=3 gives exactly -0.5 / 0.0 / +0.5.
+        assert np.allclose(wide["C"].values, 0.5)
+        assert np.allclose(wide["A"].values, 0.0)
+        assert np.allclose(wide["B"].values, -0.5)
+
+    def test_demeaned_target_removes_the_common_component(self):
+        out = apply_cross_sectional_target(self._panel(), "target_return_5d", "cross_sectional_demean")
+        wide = pd.DataFrame({t: f["target_return_5d"] for t, f in out.items()})
+
+        # A market-wide move is exactly what a demeaned target discards.
+        assert np.allclose(wide.sum(axis=1).values, 0.0, atol=1e-12)
+
+    def test_absolute_is_a_no_op_and_does_not_copy(self):
+        panel = self._panel()
+        assert apply_cross_sectional_target(panel, "target_return_5d", "absolute") is panel
+
+    def test_target_stays_the_last_column(self):
+        """create_dataloaders, the walk-forward splitter and the MLStrategy
+        metadata all read the target positionally."""
+        out = apply_cross_sectional_target(self._panel(), "target_return_5d", "cross_sectional_rank")
+        for frame in out.values():
+            assert frame.columns[-1] == "target_return_5d"
+
+    def test_unknown_method_is_rejected(self):
+        with pytest.raises(ValueError, match="Unknown target transform"):
+            apply_cross_sectional_target(self._panel(), "target_return_5d", "zscore")
+
+    def test_single_ticker_panel_is_left_alone(self):
+        panel = {"A": self._panel()["A"]}
+        assert apply_cross_sectional_target(panel, "target_return_5d", "cross_sectional_rank") is panel
 
 
 class TestLoadDataUsesRealDataByDefault:
