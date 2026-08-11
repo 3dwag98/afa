@@ -15,18 +15,73 @@ dependencies = [
     "pyarrow>=10.0.0",
     "pydantic>=2.0.0",
     "arch>=6.0.0",
+    "scipy>=1.10.0",
 ]
 
 [project.optional-dependencies]
+# CPU torch from PyPI. On Windows the PyPI wheel is CPU-only, so `--device cuda`
+# correctly falls back to CPU no matter what card is installed — which is why
+# the `cu126` extra below exists rather than this one being enough.
 gpu = [
     "torch>=2.0.0",
     "torchvision>=0.15.0",
+]
+# CUDA 12.6 torch, pulled from PyTorch's own wheel index rather than PyPI.
+#
+#     uv sync --extra hf --extra cu126
+#
+# This replaces the manual step of installing the CPU build and then force
+# reinstalling over it:
+#
+#     uv pip install --force-reinstall --index-url https://download.pytorch.org/whl/cu126 torch
+#
+# Pick the extra that matches your driver — `portfolio-agent gpu-check` reports
+# what the current install can actually use, and says so explicitly when it has
+# a CPU-only build on a CUDA-capable machine.
+cu126 = [
+    "torch>=2.6.0",
+    "torchvision>=0.21.0",
+]
+cu121 = [
+    "torch>=2.1.0",
+    "torchvision>=0.16.0",
 ]
 # Historical OHLCV from a versioned HuggingFace Hub dataset
 # (data.source: huggingface). Optional so an offline or yfinance-only install
 # stays lean.
 hf = [
     "huggingface_hub>=0.20.0",
+]
+
+# The CUDA extras and the plain `gpu` extra all name `torch`, and only one of
+# them can be installed at a time.
+[tool.uv]
+conflicts = [
+    [{ extra = "gpu" }, { extra = "cu126" }, { extra = "cu121" }],
+]
+
+# `explicit = true` keeps these indexes from being consulted for anything that
+# does not name them below. Without it, uv would search the PyTorch index for
+# every dependency in the project, which is slow and can resolve unrelated
+# packages to whatever happens to be mirrored there.
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu126", extra = "cu126" },
+    { index = "pytorch-cu121", extra = "cu121" },
+]
+torchvision = [
+    { index = "pytorch-cu126", extra = "cu126" },
+    { index = "pytorch-cu121", extra = "cu121" },
 ]
 
 [project.scripts]

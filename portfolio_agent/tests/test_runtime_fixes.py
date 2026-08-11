@@ -354,3 +354,151 @@ class TestUnloadableUmaMembers:
 
         assert "portfolio-agent train" in message
         assert "rule_based" in message
+
+
+class TestGapAwareStopFills:
+    """A stop is a resting order, not a guaranteed price.
+
+    Booking every stop at exactly `stop_price` assumes a fill that existed only
+    if the level was crossed during the session. When the market gaps through
+    it overnight the first available price is the open, and the fill is worse
+    by the whole gap — which on NSE, opening after both the US close and the
+    Asian session, is not a rare case.
+    """
+
+    @pytest.fixture
+    def synthetic_data(self, monkeypatch):
+        """Three tickers of clean OHLCV, patched into the engine's loader."""
+        rng = np.random.default_rng(7)
+        dates = pd.bdate_range(start="2023-01-02", periods=200)
+        tickers = ["SYNTH1.NS", "SYNTH2.NS", "SYNTH3.NS"]
+
+        frames = {}
+        for i, ticker in enumerate(tickers):
+            close = 100 + i * 50 + np.cumsum(rng.normal(0, 1, len(dates)))
+            frames[ticker] = pd.DataFrame({
+                "open": close + rng.normal(0, 0.2, len(dates)),
+                "high": close + np.abs(rng.normal(0, 0.5, len(dates))),
+                "low": close - np.abs(rng.normal(0, 0.5, len(dates))),
+                "close": close,
+                "volume": rng.integers(100_000, 1_000_000, len(dates)).astype(float),
+            }, index=dates)
+
+        def loader(ticker, start_date=None, end_date=None):
+            return frames[ticker].copy() if ticker in frames else None
+
+        monkeypatch.setattr("src.backtest_engine.load_ticker_data", loader)
+        return {"tickers": tickers, "frames": frames, "dates": dates}
+
+    def _engine(self, tickers, **kwargs):
+        from src.backtest_engine import BacktestEngine
+
+        params = dict(
+            start_date="2023-01-02", end_date="2023-06-30",
+            initial_capital=1_000_000.0, universe_tickers=tickers,
+        )
+        params.update(kwargs)
+        return BacktestEngine(**params)
+
+    def _position(self, engine, ticker, date, entry, stop, target):
+        engine.holdings[ticker] = 100
+        engine.stop_loss_levels[ticker] = stop
+        engine.take_profit_levels[ticker] = target
+        engine.trade_log.append({
+            "ticker": ticker, "entry_date": date, "entry_price": entry,
+            "quantity": 100, "exit_date": None, "net_pnl": 0.0,
+        })
+
+    def _bar(self, engine, ticker, date, open_, high, low, close):
+        frame = engine.ticker_data[ticker]
+        for column, value in (
+            ("open", open_), ("high", high), ("low", low), ("close", close)
+        ):
+            if column in frame.columns:
+                frame.loc[date, column] = value
+
+    def test_a_gap_through_the_stop_fills_at_the_open(self, synthetic_data):
+        engine = self._engine(synthetic_data["tickers"])
+        ticker = synthetic_data["tickers"][0]
+        date = engine.master_date_index[40]
+
+        # Yesterday's stop was 95; today opens at 88, already through it.
+        self._position(engine, ticker, engine.master_date_index[30], 100.0, 95.0, 110.0)
+        self._bar(engine, ticker, date, open_=88.0, high=89.0, low=86.0, close=87.0)
+
+        engine._check_stop_loss_take_profit(date)
+
+        exits = [t for t in engine.trade_log if t.get("exit_date") is not None]
+        assert len(exits) == 1
+        # The fill is the open (88), not the stop (95) that was never available.
+        assert exits[0]["exit_price"] == pytest.approx(88.0)
+
+    def test_an_intraday_touch_still_fills_at_the_stop(self, synthetic_data):
+        """The correction must not penalize the ordinary case: when the open is
+        above the stop and the session trades down through it, the resting
+        order fills where it rested."""
+        engine = self._engine(synthetic_data["tickers"])
+        ticker = synthetic_data["tickers"][0]
+        date = engine.master_date_index[40]
+
+        self._position(engine, ticker, engine.master_date_index[30], 100.0, 95.0, 110.0)
+        self._bar(engine, ticker, date, open_=99.0, high=100.0, low=93.0, close=96.0)
+
+        engine._check_stop_loss_take_profit(date)
+
+        exits = [t for t in engine.trade_log if t.get("exit_date") is not None]
+        assert exits[0]["exit_price"] == pytest.approx(95.0)
+
+    def test_a_gap_through_the_target_fills_at_the_open(self, synthetic_data):
+        """The same logic the other way: booking the target on a gap up
+        understates the gain."""
+        engine = self._engine(synthetic_data["tickers"])
+        ticker = synthetic_data["tickers"][0]
+        date = engine.master_date_index[40]
+
+        self._position(engine, ticker, engine.master_date_index[30], 100.0, 95.0, 110.0)
+        self._bar(engine, ticker, date, open_=118.0, high=120.0, low=117.0, close=119.0)
+
+        engine._check_stop_loss_take_profit(date)
+
+        exits = [t for t in engine.trade_log if t.get("exit_date") is not None]
+        assert exits[0]["exit_price"] == pytest.approx(118.0)
+
+    def test_a_session_touching_both_levels_is_charged_the_stop(self, synthetic_data):
+        """A bar whose range spans stop and target is ambiguous without
+        intraday data; charging the adverse one is the honest reading."""
+        engine = self._engine(synthetic_data["tickers"])
+        ticker = synthetic_data["tickers"][0]
+        date = engine.master_date_index[40]
+
+        self._position(engine, ticker, engine.master_date_index[30], 100.0, 95.0, 110.0)
+        self._bar(engine, ticker, date, open_=100.0, high=112.0, low=94.0, close=105.0)
+
+        engine._check_stop_loss_take_profit(date)
+
+        exits = [t for t in engine.trade_log if t.get("exit_date") is not None]
+        assert exits[0]["exit_reason"] in ("stop", "STOP_LOSS", "stop_loss")
+        assert exits[0]["exit_price"] == pytest.approx(95.0)
+
+    def test_the_gap_fill_reports_a_larger_loss(self, synthetic_data):
+        """The consequence: every gapped exit used to report a loss smaller
+        than the one actually taken."""
+        ticker = synthetic_data["tickers"][0]
+        entry_date_index, exit_date_index = 30, 40
+
+        losses = {}
+        for name, open_price in (("gapped", 88.0), ("clean", 99.0)):
+            engine = self._engine(synthetic_data["tickers"])
+            date = engine.master_date_index[exit_date_index]
+            self._position(
+                engine, ticker, engine.master_date_index[entry_date_index],
+                100.0, 95.0, 110.0,
+            )
+            self._bar(engine, ticker, date, open_=open_price, high=open_price + 1,
+                      low=86.0, close=open_price - 1)
+            engine._check_stop_loss_take_profit(date)
+            losses[name] = [
+                t for t in engine.trade_log if t.get("exit_date") is not None
+            ][0]["net_pnl"]
+
+        assert losses["gapped"] < losses["clean"]
