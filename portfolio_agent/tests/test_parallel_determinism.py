@@ -101,6 +101,7 @@ class TestParallelMatchesSerial:
             analytics = RiskAnalyzer(
                 daily_equity_curve=engine.daily_equity_curve,
                 trade_log=engine.trade_log,
+                risk_free_rate=0.065,
             ).generate_analytics_report()
 
             path = tmp_path / f"{name}.xlsx"

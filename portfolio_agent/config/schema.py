@@ -314,6 +314,17 @@ class RiskConfig(BaseModel):
     risk_per_trade_pct: float = Field(
         default=0.01, description="Risk per trade as a percentage"
     )
+    risk_free_rate: float = Field(
+        default=0.065,
+        ge=0.0,
+        description="Annualized risk-free rate subtracted from strategy returns before the "
+        "Sharpe and Sortino ratios (decimal, so 0.065 is 6.5%). Stated here rather than defaulted "
+        "inside RiskAnalyzer so that whatever rate a reported Sharpe was computed against is "
+        "visible in the config a reviewer reads. This is a constant over the whole backtest "
+        "window, which is wrong for any multi-year run — India's policy rate moved materially "
+        "over 2021-2025 — so prefer paths.risk_free_rate_csv, which overrides this with a dated "
+        "series.",
+    )
     max_single_position_pct: float = Field(
         default=0.03, description="Maximum allocation to a single position"
     )
@@ -634,6 +645,16 @@ class PathsConfig(BaseModel):
         "capital instead of sector concentration, leaving most of the portfolio in cash forever. "
         "A partial map gives each mapped sector max_sector_pct and the unmapped pool its own "
         "max_unknown_sector_pct.",
+    )
+    risk_free_rate_csv: str = Field(
+        default="data/risk_free_rate.csv",
+        description="Optional CSV of the dated risk-free rate — columns date,annualized_yield — "
+        "typically the 91-day T-bill. When the file exists it is aligned to the return index, "
+        "forward-filled across non-trading days and de-annualized, so the excess return is "
+        "computed day by day against the rate that actually prevailed. When it is absent, "
+        "risk.risk_free_rate is used as a constant across the whole window and the run logs that "
+        "it did so. Values may be given as decimals (0.068) or percent (6.8); both are read "
+        "correctly.",
     )
     trial_log: str = Field(
         default="output/trials.jsonl",

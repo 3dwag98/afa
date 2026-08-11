@@ -273,28 +273,28 @@ class TestAnalyticsReadRealPnl:
         return pd.Series(np.linspace(100_000, 110_000, len(dates)), index=dates)
 
     def test_win_rate_uses_net_pnl(self):
-        analyzer = RiskAnalyzer(self._curve(), self._engine_style_log())
+        analyzer = RiskAnalyzer(self._curve(), self._engine_style_log(), risk_free_rate=0.065)
         # 2 wins out of 3 closed trades; the open BUY leg is not a trade.
         assert analyzer.calculate_win_rate() == pytest.approx(2 / 3)
 
     def test_profit_factor_uses_net_pnl(self):
-        analyzer = RiskAnalyzer(self._curve(), self._engine_style_log())
+        analyzer = RiskAnalyzer(self._curve(), self._engine_style_log(), risk_free_rate=0.065)
         assert analyzer.calculate_profit_factor() == pytest.approx(330.0 / 120.0)
 
     def test_open_positions_are_not_counted_as_trades(self):
-        report = RiskAnalyzer(self._curve(), self._engine_style_log()).generate_analytics_report()
+        report = RiskAnalyzer(self._curve(), self._engine_style_log(), risk_free_rate=0.065).generate_analytics_report()
         assert report['total_trades'] == 3
         assert report['total_trade_records'] == 4
 
     def test_monte_carlo_sees_real_dispersion(self):
         """With real P&L the ruin simulation produces a spread, not a point."""
-        report = RiskAnalyzer(self._curve(), self._engine_style_log()).generate_analytics_report()
+        report = RiskAnalyzer(self._curve(), self._engine_style_log(), risk_free_rate=0.065).generate_analytics_report()
         assert report['mc_simulations_run'] > 0
         assert report['mc_percentile_95'] > report['mc_percentile_5']
 
     def test_plain_pnl_logs_still_work(self):
         """Simpler trade logs keyed on 'pnl' keep working."""
-        analyzer = RiskAnalyzer(self._curve(), [{'pnl': 100}, {'pnl': -50}, {'pnl': 25}])
+        analyzer = RiskAnalyzer(self._curve(), [{'pnl': 100}, {'pnl': -50}, {'pnl': 25}], risk_free_rate=0.065)
         assert analyzer.calculate_win_rate() == pytest.approx(2 / 3)
 
     def test_monte_carlo_block_is_reproducible(self):
@@ -306,8 +306,8 @@ class TestAnalyticsReadRealPnl:
         """
         log, curve = self._engine_style_log(), self._curve()
 
-        first = RiskAnalyzer(curve, log).generate_analytics_report()
-        second = RiskAnalyzer(curve, log).generate_analytics_report()
+        first = RiskAnalyzer(curve, log, risk_free_rate=0.065).generate_analytics_report()
+        second = RiskAnalyzer(curve, log, risk_free_rate=0.065).generate_analytics_report()
 
         for key in ('mc_probability_of_ruin', 'mc_percentile_5',
                     'mc_median_terminal_wealth', 'mc_percentile_95'):
@@ -319,7 +319,7 @@ class TestAnalyticsReadRealPnl:
         expected = np.random.rand()
 
         np.random.seed(1234)
-        RiskAnalyzer(self._curve(), self._engine_style_log()).generate_analytics_report()
+        RiskAnalyzer(self._curve(), self._engine_style_log(), risk_free_rate=0.065).generate_analytics_report()
         assert np.random.rand() == pytest.approx(expected)
 
 

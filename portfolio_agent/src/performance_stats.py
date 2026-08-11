@@ -35,6 +35,7 @@ Probability of Backtest Overfitting", Journal of Computational Finance.
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 import math
@@ -547,6 +548,10 @@ class Trial:
     parameters: Dict[str, Any] = field(default_factory=dict)
     metrics: Dict[str, float] = field(default_factory=dict)
     timestamp: str = ""
+    # Fingerprint of the *whole* resolved config, not just the parameters
+    # enumerated above — see config_hash() for why the enumeration is not
+    # enough on its own.
+    config_hash: str = ""
 
     def to_json(self) -> str:
         return json.dumps(
@@ -555,12 +560,78 @@ class Trial:
                 "sharpe": self.sharpe,
                 "parameters": self.parameters,
                 "metrics": self.metrics,
+                "config_hash": self.config_hash,
                 "timestamp": self.timestamp
                 or datetime.now(timezone.utc).isoformat(timespec="seconds"),
             },
             sort_keys=True,
             default=str,
         )
+
+
+def config_hash(payload: Any) -> str:
+    """Stable fingerprint of a resolved configuration.
+
+    Two runs are the same trial when they ran the same configuration, and the
+    only reliable way to say that is to hash all of it. The `parameters` dict
+    on a Trial is hand-enumerated at the call site, so it catches exactly the
+    knobs someone remembered to list: add a simulation option or change a
+    weight inside a strategy YAML and two materially different runs record as
+    the same trial, which corrupts N — and N is the entire input to the
+    deflation.
+
+    SHA-256 over canonical JSON rather than the builtin hash(). str.__hash__
+    is randomized per process unless PYTHONHASHSEED is pinned, so a log keyed
+    on it would treat every re-run as a fresh trial and over-deflate every
+    Sharpe the platform reports. Determinism is a repo-wide requirement and
+    this is one of the places it is easy to lose silently.
+
+    Args:
+        payload: Any JSON-serializable structure — typically an AppConfig
+            dumped to a dict. Non-serializable leaves fall back to their repr,
+            which is stable for the config primitives in use here.
+
+    Returns:
+        16 hex characters: 64 bits, which is far more than enough to keep a
+        few thousand research trials collision-free, and short enough to read
+        in a log.
+    """
+    canonical = json.dumps(payload, sort_keys=True, default=repr, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def distinct_trials(trials: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse repeat recordings of one configuration, oldest kept.
+
+    Re-running a configuration is not a new trial. The platform enforces
+    determinism, so a repeat produces the same Sharpe; counting it again
+    inflates N and deflates the reported Sharpe against a search that never
+    happened.
+
+    Identity falls back through three levels so a log with history in it does
+    not lose entries written before the hash existed: the config hash, then
+    the parameters dict, then nothing — and an entry with neither is kept as
+    its own trial, because the safe assumption about an unidentifiable run is
+    that it was a real one.
+    """
+    seen: set[str] = set()
+    unique: List[Dict[str, Any]] = []
+
+    for trial in trials:
+        fingerprint = str(trial.get("config_hash") or "")
+        if not fingerprint:
+            parameters = trial.get("parameters")
+            if parameters:
+                fingerprint = config_hash(parameters)
+        if not fingerprint:
+            unique.append(trial)
+            continue
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        unique.append(trial)
+
+    return unique
 
 
 def log_trial(path: str | Path, trial: Trial) -> None:

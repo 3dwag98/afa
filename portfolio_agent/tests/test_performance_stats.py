@@ -360,3 +360,179 @@ class TestTrialLog:
 
         assert deflated["dsr"] < undeflated["dsr"]
         assert deflated["deflation_threshold_sharpe"] > 0
+
+
+class TestConfigHashAndDistinctTrials:
+    """Task 2.1's remaining piece: identify a trial by its whole config.
+
+    The trial log already records an explicit `parameters` dict, but that dict
+    is hand-enumerated in agents/backtester.py. Any knob nobody thought to add
+    to it — a new simulation option, a strategy YAML weight, the drift-prior
+    switch — leaves two genuinely different configurations indistinguishable
+    in the log. N is then wrong, and N is the whole input to the deflation.
+    """
+
+    def test_hash_is_stable_across_calls(self):
+        from src.performance_stats import config_hash
+
+        payload = {"b": 2, "a": {"nested": [1, 2, 3]}}
+        assert config_hash(payload) == config_hash(payload)
+
+    def test_hash_does_not_depend_on_key_order(self):
+        """Two spellings of the same configuration are the same trial."""
+        from src.performance_stats import config_hash
+
+        assert config_hash({"a": 1, "b": 2}) == config_hash({"b": 2, "a": 1})
+
+    def test_hash_is_stable_across_processes(self):
+        """Not Python's hash().
+
+        str.__hash__ is salted per process (PYTHONHASHSEED), so a trial log
+        keyed on it would count the same configuration as a fresh trial on
+        every run — silently inflating N and over-deflating every Sharpe the
+        platform reports.
+        """
+        import subprocess
+        import sys
+
+        from src.performance_stats import config_hash
+
+        expected = config_hash({"strategy": "rule_based", "stop": 2.5})
+        program = (
+            "import sys; sys.path.insert(0, 'portfolio_agent');"
+            "from src.performance_stats import config_hash;"
+            "print(config_hash({'strategy': 'rule_based', 'stop': 2.5}))"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", program],
+            capture_output=True, text=True, check=True, cwd=".",
+        )
+        assert out.stdout.strip() == expected
+
+    def test_any_field_changes_the_hash_not_just_enumerated_ones(self):
+        """The defect the hash exists to close.
+
+        `use_empirical_drift_prior` is a real knob that changes every
+        probability-of-profit in the run, and it is not in backtester.py's
+        hand-written parameter list. Under the old scheme those two runs
+        recorded identical trials.
+        """
+        from src.performance_stats import config_hash
+
+        base = {"simulation": {"method": "gaussian", "use_empirical_drift_prior": True}}
+        changed = {"simulation": {"method": "gaussian", "use_empirical_drift_prior": False}}
+
+        assert config_hash(base) != config_hash(changed)
+
+    def test_trial_round_trips_its_config_hash(self, tmp_path):
+        from src.performance_stats import Trial, log_trial, read_trials
+
+        path = tmp_path / "trials.jsonl"
+        log_trial(path, Trial(label="a", sharpe=0.5, config_hash="deadbeef"))
+
+        assert read_trials(path)[0]["config_hash"] == "deadbeef"
+
+    def test_distinct_trials_collapses_repeat_runs_of_one_config(self):
+        """Re-running a configuration is not a new trial.
+
+        Determinism is enforced, so the same config produces the same Sharpe;
+        counting it twice inflates N and deflates the reported Sharpe against a
+        search that never happened.
+        """
+        from src.performance_stats import distinct_trials
+
+        trials = [
+            {"label": "a", "sharpe": 0.5, "config_hash": "aaa"},
+            {"label": "a", "sharpe": 0.5, "config_hash": "aaa"},
+            {"label": "b", "sharpe": 0.9, "config_hash": "bbb"},
+        ]
+        distinct = distinct_trials(trials)
+
+        assert [t["config_hash"] for t in distinct] == ["aaa", "bbb"]
+
+    def test_distinct_trials_keeps_unhashed_history(self):
+        """Trials written before the hash existed still count.
+
+        Dropping them would silently shrink N on any log with history in it,
+        which is the opposite of what the deflation is for. They fall back to
+        their parameters dict, and entries with neither are kept as distinct.
+        """
+        from src.performance_stats import distinct_trials
+
+        trials = [
+            {"label": "old", "sharpe": 0.4, "parameters": {"stop": 2.0}},
+            {"label": "old", "sharpe": 0.4, "parameters": {"stop": 2.0}},
+            {"label": "old", "sharpe": 0.6, "parameters": {"stop": 3.0}},
+            {"label": "ancient", "sharpe": 0.1},
+        ]
+        assert len(distinct_trials(trials)) == 3
+
+    def test_deflation_uses_the_distinct_count(self, tmp_path):
+        """End to end: a log with repeats must not out-deflate a log without.
+
+        Five recordings of two configurations is a two-trial search, and has to
+        deflate exactly as hard as two recordings of those same two.
+        """
+        from src.performance_stats import (
+            Trial, distinct_trials, log_trial, read_trials, trial_sharpe_variance,
+        )
+
+        path = tmp_path / "trials.jsonl"
+        for _ in range(3):
+            log_trial(path, Trial(label="a", sharpe=0.5, config_hash="aaa"))
+        for _ in range(2):
+            log_trial(path, Trial(label="b", sharpe=1.1, config_hash="bbb"))
+
+        raw_n, _ = trial_sharpe_variance(read_trials(path))
+        distinct_n, distinct_var = trial_sharpe_variance(
+            distinct_trials(read_trials(path))
+        )
+
+        assert raw_n == 5
+        assert distinct_n == 2
+        assert distinct_var == pytest.approx(np.var([0.5, 1.1], ddof=1))
+
+    def test_backtester_fingerprints_the_whole_resolved_config(self):
+        """The wiring, not just the hash function.
+
+        Pins the three properties the deduplication depends on: the same
+        configuration fingerprints the same way twice, the backtest window
+        (which arrives by CLI, not config) participates, and a knob absent from
+        backtester.py's hand-written parameter list still changes the result.
+        """
+        from portfolio_agent.agents.backtester import BacktesterAgent
+        from portfolio_agent.config.loader import load_config
+
+        config = load_config("config.yaml")
+        agent = BacktesterAgent(config)
+
+        stable = agent._config_fingerprint("2020-01-01", "2024-12-31")
+        assert stable == agent._config_fingerprint("2020-01-01", "2024-12-31")
+        assert stable != agent._config_fingerprint("2021-01-01", "2024-12-31")
+
+        other = load_config("config.yaml")
+        other.simulation.use_empirical_drift_prior = (
+            not other.simulation.use_empirical_drift_prior
+        )
+        assert stable != BacktesterAgent(other)._config_fingerprint(
+            "2020-01-01", "2024-12-31"
+        )
+
+    def test_report_path_alone_is_not_a_new_trial(self):
+        """Paths are excluded deliberately.
+
+        Writing the same backtest to a different filename is not a search step,
+        and timestamped output paths would otherwise make every single run
+        unique — which would defeat the deduplication entirely.
+        """
+        from portfolio_agent.agents.backtester import BacktesterAgent
+        from portfolio_agent.config.loader import load_config
+
+        config = load_config("config.yaml")
+        baseline = BacktesterAgent(config)._config_fingerprint("2020-01-01", "2024-12-31")
+
+        renamed = load_config("config.yaml")
+        renamed.paths.trial_log = "output/somewhere-else.jsonl"
+        assert BacktesterAgent(renamed)._config_fingerprint(
+            "2020-01-01", "2024-12-31"
+        ) == baseline

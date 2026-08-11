@@ -133,7 +133,7 @@ class TestRiskAnalyzer:
         equity_curve = pd.Series(values, index=dates)
         trade_log = []
         
-        analyzer = RiskAnalyzer(equity_curve, trade_log)
+        analyzer = RiskAnalyzer(equity_curve, trade_log, risk_free_rate=0.065)
         cagr = analyzer.calculate_cagr()
         
         # Should be approximately 100% (doubling in 1 year)
@@ -148,7 +148,7 @@ class TestRiskAnalyzer:
         cumulative = np.cumprod(1 + daily_returns)
         equity_curve = pd.Series(100000 * cumulative, index=dates)
         
-        analyzer = RiskAnalyzer(equity_curve, [])
+        analyzer = RiskAnalyzer(equity_curve, [], risk_free_rate=0.065)
         vol = analyzer.calculate_annualized_volatility()
         
         # Daily std was 0.02, annualized should be ~0.02 * sqrt(252) ≈ 0.317
@@ -206,7 +206,7 @@ class TestRiskAnalyzer:
         values[150:180] *= 0.95
         equity_curve = pd.Series(values, index=dates)
         
-        analyzer = RiskAnalyzer(equity_curve, [])
+        analyzer = RiskAnalyzer(equity_curve, [], risk_free_rate=0.065)
         calmar = analyzer.calculate_calmar_ratio()
         
         # Should be positive
@@ -222,7 +222,7 @@ class TestRiskAnalyzer:
             {'pnl': -500}
         ]
         
-        analyzer = RiskAnalyzer(pd.Series([100000]), trade_log)
+        analyzer = RiskAnalyzer(pd.Series([100000]), trade_log, risk_free_rate=0.065)
         pf = analyzer.calculate_profit_factor()
         
         # Gross profits = 6000, Gross losses = 2000
@@ -239,7 +239,7 @@ class TestRiskAnalyzer:
             {'pnl': 1500}
         ]
         
-        analyzer = RiskAnalyzer(pd.Series([100000]), trade_log)
+        analyzer = RiskAnalyzer(pd.Series([100000]), trade_log, risk_free_rate=0.065)
         win_rate = analyzer.calculate_win_rate()
         
         # 3 wins out of 5 trades = 60%
@@ -255,7 +255,7 @@ class TestRiskAnalyzer:
             {'pnl': 1500}
         ]
         
-        analyzer = RiskAnalyzer(pd.Series([100000]), trade_log)
+        analyzer = RiskAnalyzer(pd.Series([100000]), trade_log, risk_free_rate=0.065)
         expectancy = analyzer.calculate_expectancy()
         
         # Total PnL = 3700, 5 trades, Expectancy = 740
@@ -274,7 +274,7 @@ class TestRiskAnalyzer:
             seed=42
         )
         
-        analyzer = RiskAnalyzer(equity_curve, [])
+        analyzer = RiskAnalyzer(equity_curve, [], risk_free_rate=0.065)
         mdd = analyzer.calculate_max_drawdown()
         
         # Assert Max Drawdown is exactly 0.20 (with small tolerance for floating point)
@@ -289,7 +289,7 @@ class TestRiskAnalyzer:
                 seed=42
             )
             
-            analyzer = RiskAnalyzer(equity_curve, [])
+            analyzer = RiskAnalyzer(equity_curve, [], risk_free_rate=0.065)
             mdd = analyzer.calculate_max_drawdown()
             
             assert abs(mdd - dd_pct) < 0.005, f"Expected MDD of {dd_pct}, got {mdd}"
@@ -305,7 +305,7 @@ class TestRiskAnalyzer:
             seed=42
         )
         
-        analyzer = RiskAnalyzer(equity_curve, [])
+        analyzer = RiskAnalyzer(equity_curve, [], risk_free_rate=0.065)
         duration = analyzer.calculate_drawdown_duration()
         
         # Duration should be positive and reasonable
@@ -321,7 +321,7 @@ class TestRiskAnalyzer:
             seed=42
         )
         
-        analyzer = RiskAnalyzer(equity_curve, [])
+        analyzer = RiskAnalyzer(equity_curve, [], risk_free_rate=0.065)
         underwater = analyzer.get_underwater_equity_curve()
         
         # Underwater should be negative or zero
@@ -346,7 +346,7 @@ class TestRiskAnalyzer:
         )
         
         equity_curve = self._create_equity_curve(seed=42)
-        analyzer = RiskAnalyzer(equity_curve, trade_log)
+        analyzer = RiskAnalyzer(equity_curve, trade_log, risk_free_rate=0.065)
         
         mc_results = analyzer.run_monte_carlo_simulation(n_simulations=1000, seed=42)
         
@@ -367,7 +367,7 @@ class TestRiskAnalyzer:
         )
         
         equity_curve = self._create_equity_curve(seed=42)
-        analyzer = RiskAnalyzer(equity_curve, trade_log)
+        analyzer = RiskAnalyzer(equity_curve, trade_log, risk_free_rate=0.065)
         
         mc_results = analyzer.run_monte_carlo_simulation(n_simulations=5000, seed=42)
         
@@ -381,7 +381,7 @@ class TestRiskAnalyzer:
     def test_monte_carlo_empty_trade_log(self):
         """Test Monte Carlo with empty trade log."""
         equity_curve = self._create_equity_curve(seed=42)
-        analyzer = RiskAnalyzer(equity_curve, [])
+        analyzer = RiskAnalyzer(equity_curve, [], risk_free_rate=0.065)
         
         mc_results = analyzer.run_monte_carlo_simulation()
         
@@ -400,7 +400,7 @@ class TestRiskAnalyzer:
         )
         trade_log = self._create_trade_log(n_trades=50, seed=42)
         
-        analyzer = RiskAnalyzer(equity_curve, trade_log)
+        analyzer = RiskAnalyzer(equity_curve, trade_log, risk_free_rate=0.065)
         report = analyzer.generate_analytics_report()
         
         # Check all required keys exist
@@ -440,7 +440,7 @@ class TestRiskAnalyzer:
         # All winning trades
         trade_log = [{'pnl': 1000} for _ in range(10)]
         
-        analyzer = RiskAnalyzer(equity_curve, trade_log)
+        analyzer = RiskAnalyzer(equity_curve, trade_log, risk_free_rate=0.065)
         report = analyzer.generate_analytics_report()
         
         # Infinite values should be converted to large finite numbers
@@ -453,7 +453,7 @@ class TestRiskAnalyzer:
         equity_curve = self._create_equity_curve(seed=42)
         trade_log = self._create_trade_log(seed=42)
         
-        analyzer = RiskAnalyzer(equity_curve, trade_log)
+        analyzer = RiskAnalyzer(equity_curve, trade_log, risk_free_rate=0.065)
         report = analyzer.generate_analytics_report()
         
         # Remove non-serializable items for this check
@@ -476,7 +476,7 @@ class TestEdgeCases:
     def test_empty_equity_curve(self):
         """Test handling of empty equity curve."""
         equity_curve = pd.Series(dtype=float)
-        analyzer = RiskAnalyzer(equity_curve, [])
+        analyzer = RiskAnalyzer(equity_curve, [], risk_free_rate=0.065)
         
         assert analyzer.calculate_cagr() == 0.0
         assert analyzer.calculate_max_drawdown() == 0.0
@@ -484,7 +484,7 @@ class TestEdgeCases:
     def test_single_point_equity_curve(self):
         """Test handling of single-point equity curve."""
         equity_curve = pd.Series([100000], index=pd.to_datetime(['2020-01-01']))
-        analyzer = RiskAnalyzer(equity_curve, [])
+        analyzer = RiskAnalyzer(equity_curve, [], risk_free_rate=0.065)
         
         assert analyzer.calculate_cagr() == 0.0
         assert analyzer.calculate_annualized_volatility() == 0.0
@@ -493,7 +493,7 @@ class TestEdgeCases:
         """Test handling of empty trade log."""
         dates = pd.date_range(start='2020-01-01', periods=100, freq='B')
         equity_curve = pd.Series(np.linspace(100000, 110000, 100), index=dates)
-        analyzer = RiskAnalyzer(equity_curve, [])
+        analyzer = RiskAnalyzer(equity_curve, [], risk_free_rate=0.065)
         
         assert analyzer.calculate_profit_factor() == 1.0
         assert analyzer.calculate_win_rate() == 0.0
@@ -505,7 +505,7 @@ class TestEdgeCases:
         dates = pd.date_range(start='2020-01-01', periods=100, freq='B')
         equity_curve = pd.Series(np.linspace(100000, 110000, 100), index=dates)
         
-        analyzer = RiskAnalyzer(equity_curve, trade_log)
+        analyzer = RiskAnalyzer(equity_curve, trade_log, risk_free_rate=0.065)
         
         assert analyzer.calculate_win_rate() == 1.0
         pf = analyzer.calculate_profit_factor()
@@ -517,7 +517,7 @@ class TestEdgeCases:
         dates = pd.date_range(start='2020-01-01', periods=100, freq='B')
         equity_curve = pd.Series(np.linspace(100000, 95000, 100), index=dates)
         
-        analyzer = RiskAnalyzer(equity_curve, trade_log)
+        analyzer = RiskAnalyzer(equity_curve, trade_log, risk_free_rate=0.065)
         
         assert analyzer.calculate_win_rate() == 0.0
         pf = analyzer.calculate_profit_factor()
@@ -526,3 +526,95 @@ class TestEdgeCases:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestRiskFreeRateIsSuppliedNotAssumed:
+    """Task 2.2: stop hiding a 6.5% guess in a constructor default.
+
+    India's policy rate moved materially across 2021-2025, so a single constant
+    is wrong for any multi-year window — and a constant that lives in a default
+    argument is wrong *invisibly*, because no call site has to acknowledge it.
+    The backtester was constructing RiskAnalyzer without the argument at all.
+    """
+
+    @staticmethod
+    def _curve(days=500, seed=3):
+        rng = np.random.default_rng(seed)
+        index = pd.bdate_range("2022-01-03", periods=days)
+        return pd.Series(
+            100000.0 * np.cumprod(1.0 + rng.normal(0.0006, 0.011, days)), index=index
+        )
+
+    def test_constructor_has_no_default_risk_free_rate(self):
+        """The rate must be stated by whoever knows what window this is."""
+        with pytest.raises(TypeError):
+            RiskAnalyzer(self._curve(), [])
+
+    def test_reads_a_treasury_bill_series_from_csv(self, tmp_path):
+        from src.risk_analytics import load_risk_free_series
+
+        path = tmp_path / "tbill.csv"
+        path.write_text(
+            "date,annualized_yield\n"
+            "2022-01-01,0.0400\n"
+            "2023-01-01,0.0680\n"
+            "2024-01-01,0.0700\n",
+            encoding="utf-8",
+        )
+        series = load_risk_free_series(path)
+
+        assert isinstance(series, pd.Series)
+        assert isinstance(series.index, pd.DatetimeIndex)
+        assert series.loc["2023-01-01"] == pytest.approx(0.068)
+
+    def test_accepts_percent_units_and_normalizes_them(self, tmp_path):
+        """A T-bill series published as 6.8 rather than 0.068 is the common
+        case; reading it raw would report a 680% risk-free rate."""
+        from src.risk_analytics import load_risk_free_series
+
+        path = tmp_path / "tbill.csv"
+        path.write_text(
+            "date,annualized_yield\n2022-01-01,4.00\n2023-01-01,6.80\n",
+            encoding="utf-8",
+        )
+        series = load_risk_free_series(path)
+
+        assert series.loc["2023-01-01"] == pytest.approx(0.068)
+
+    def test_missing_file_returns_none_rather_than_raising(self, tmp_path):
+        from src.risk_analytics import load_risk_free_series
+
+        assert load_risk_free_series(tmp_path / "absent.csv") is None
+
+    def test_a_moving_rate_changes_the_sharpe_against_its_own_mean(self):
+        """The reason the series form exists.
+
+        A rate that rises across the window is not interchangeable with its
+        average, because the excess return is subtracted day by day and the
+        strategy's returns are not uniform across the window either.
+        """
+        curve = self._curve()
+        returns_index = curve.pct_change().dropna().index
+
+        rising = pd.Series(
+            np.linspace(0.03, 0.09, len(returns_index)), index=returns_index
+        )
+        constant = float(rising.mean())
+
+        varying_sharpe = RiskAnalyzer(
+            curve, [], risk_free_rate=rising
+        ).calculate_sharpe_ratio()
+        constant_sharpe = RiskAnalyzer(
+            curve, [], risk_free_rate=constant
+        ).calculate_sharpe_ratio()
+
+        assert varying_sharpe != pytest.approx(constant_sharpe, abs=1e-9)
+
+    def test_config_carries_the_rate_and_the_series_path(self):
+        """Whatever constant is used must be visible in config, not buried in
+        a signature where changing it is invisible to a reviewer."""
+        from portfolio_agent.config.loader import load_config
+
+        config = load_config("config.yaml")
+        assert isinstance(config.risk.risk_free_rate, float)
+        assert isinstance(config.paths.risk_free_rate_csv, str)
