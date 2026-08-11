@@ -182,6 +182,19 @@ class TrainingConfig(BaseModel):
         "small to rank. Note this changes what the model predicts, so a checkpoint trained under "
         "one setting should not be scored under another.",
     )
+    cost_adjusted_target: bool = Field(
+        default=True,
+        description="Charge modelled round-trip friction against the training label, so the "
+        "network learns the sign of the *net* move rather than the gross one "
+        "(agents/trainer.py::apply_cost_to_target). The statutory part — brokerage, STT on both "
+        "legs, exchange and SEBI charges, GST, stamp duty — is the same for every name and so is "
+        "a pure level shift, which cross-sectional demeaning subtracts back out and ranking is "
+        "invariant to. The part that survives, and the reason this is not a no-op under the "
+        "default target, is slippage: 0.5 * ATR / price, the same bid-ask proxy charged to "
+        "realized fills. A wide-spread micro cap has to move materially further than a liquid "
+        "large cap to deliver the same return to the portfolio, and a model ranking on gross "
+        "returns cannot see that. Set False to train on the gross forward return.",
+    )
     max_abs_target: float = Field(
         default=5.0,
         gt=0.0,
@@ -559,7 +572,21 @@ class SimulationConfig(BaseModel):
         "(src/volatility_models.py) instead of assuming a flat historical standard deviation. "
         "Falls back to the flat assumption automatically when there isn't enough history to fit "
         "GARCH reliably. Off by default since per-ticker GARCH fitting is much slower than the "
-        "closed-form flat-vol path.",
+        "closed-form flat-vol path — see garch_refit_interval_days, which is what makes it "
+        "affordable enough to turn on.",
+    )
+    garch_refit_interval_days: int = Field(
+        default=21,
+        ge=1,
+        description="Trading days between GJR-GARCH maximum-likelihood refits. The naive call "
+        "graph fits once per ticker per day: 3,612 tickers over 1,237 trading days is ~4.5 "
+        "million fits, or 62-248 hours of pure optimizer time, which is why use_garch_volatility "
+        "was off by default. Fitting is an optimization and the parameters move on the scale of "
+        "weeks; filtering and forecasting is the GJR recursion, which is arithmetic and runs "
+        "every day from the returns realized since the fit. So what goes stale between refits is "
+        "the parameter vintage, not the conditional variance. 21 (~one month) cuts the fit count "
+        "21-fold. Set to 1 to refit on every call, which reproduces the older behaviour at the "
+        "old cost.",
     )
     prior_annual_drift_std: float = Field(
         default=0.10,

@@ -1259,3 +1259,108 @@ class TestExitLevelsComeFromTheSignal:
         assert buy['stop_price'] == 91.0
         assert buy['target_price'] == 112.0
         assert buy['signal_entry_price'] == 100.0
+
+
+class TestGapAwareFills:
+    """A stop is a resting order, not a guaranteed price.
+
+    When the session opens through the level, the first price available is the
+    open and the position exits there. Filling at the level regardless never
+    overstates a loss — it only ever understates it, and it understates it most
+    on the gap days a drawdown breaker exists to catch. It also feeds back into
+    sizing: a recorded average loss smaller than the real one biases Kelly's
+    reward:risk estimate upward.
+    """
+
+    @staticmethod
+    def _engine_with_bar(monkeypatch, open_price, high, low, close):
+        """One ticker whose final bar is under the test's control."""
+        dates = pd.bdate_range(start="2023-01-02", periods=60)
+        frame = pd.DataFrame(
+            {
+                'open': np.full(len(dates), 100.0),
+                'high': np.full(len(dates), 101.0),
+                'low': np.full(len(dates), 99.0),
+                'close': np.full(len(dates), 100.0),
+                'volume': np.full(len(dates), 5_000_000.0),
+            },
+            index=dates,
+        )
+        frame.loc[dates[-1], ['open', 'high', 'low', 'close']] = [open_price, high, low, close]
+
+        monkeypatch.setattr(
+            "src.backtest_engine.load_ticker_data",
+            lambda ticker, start_date=None, end_date=None: frame.copy() if ticker == "GAP.NS" else None,
+        )
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-03-24",
+            initial_capital=500_000.0, universe_tickers=["GAP.NS"],
+        )
+        engine.holdings["GAP.NS"] = 100
+        engine._open_position("GAP.NS", 100, 100.0, engine.master_date_index[0])
+        return engine
+
+    def test_a_stop_reached_intraday_fills_at_the_stop(self, monkeypatch):
+        engine = self._engine_with_bar(monkeypatch, open_price=99.0, high=99.5, low=93.0, close=94.0)
+        engine.stop_loss_levels["GAP.NS"] = 95.0
+
+        trade = engine._check_stop_loss_take_profit(engine.master_date_index[-1])[0]
+
+        assert trade['exit_price'] == pytest.approx(95.0)
+
+    def test_a_stop_gapped_through_fills_at_the_open(self, monkeypatch):
+        """The session opened at 90 with the stop at 95: there was never a
+        moment at which 95 was available."""
+        engine = self._engine_with_bar(monkeypatch, open_price=90.0, high=91.0, low=88.0, close=89.0)
+        engine.stop_loss_levels["GAP.NS"] = 95.0
+
+        trade = engine._check_stop_loss_take_profit(engine.master_date_index[-1])[0]
+
+        assert trade['exit_price'] == pytest.approx(90.0)
+        assert trade['gross_pnl'] == pytest.approx(-1000.0), "the real loss, not the modelled one"
+
+    def test_the_gap_fill_is_never_better_than_the_stop(self, monkeypatch):
+        """An open *above* the stop means the level was reached later in the
+        session, at the level. The correction is one-sided by construction."""
+        engine = self._engine_with_bar(monkeypatch, open_price=99.0, high=99.0, low=90.0, close=91.0)
+        engine.stop_loss_levels["GAP.NS"] = 95.0
+
+        trade = engine._check_stop_loss_take_profit(engine.master_date_index[-1])[0]
+
+        assert trade['exit_price'] == pytest.approx(95.0)
+
+    def test_a_target_gapped_through_fills_at_the_open(self, monkeypatch):
+        """The same treatment on the profit leg, in the other direction.
+        Correcting only the loss leg would trade one bias for another."""
+        engine = self._engine_with_bar(monkeypatch, open_price=115.0, high=118.0, low=114.0, close=117.0)
+        engine.take_profit_levels["GAP.NS"] = 110.0
+
+        trade = engine._check_stop_loss_take_profit(engine.master_date_index[-1])[0]
+
+        assert trade['exit_price'] == pytest.approx(115.0)
+
+    def test_a_target_reached_intraday_fills_at_the_target(self, monkeypatch):
+        engine = self._engine_with_bar(monkeypatch, open_price=105.0, high=112.0, low=104.0, close=111.0)
+        engine.take_profit_levels["GAP.NS"] = 110.0
+
+        trade = engine._check_stop_loss_take_profit(engine.master_date_index[-1])[0]
+
+        assert trade['exit_price'] == pytest.approx(110.0)
+
+    def test_the_stop_leg_wins_when_a_bar_straddles_both_levels(self, monkeypatch):
+        """Daily bars cannot say which level was touched first, so the engine
+        assumes the adverse one. That precedence has to survive the gap fix."""
+        engine = self._engine_with_bar(monkeypatch, open_price=100.0, high=115.0, low=90.0, close=100.0)
+        engine.stop_loss_levels["GAP.NS"] = 95.0
+        engine.take_profit_levels["GAP.NS"] = 110.0
+
+        trade = engine._check_stop_loss_take_profit(engine.master_date_index[-1])[0]
+
+        assert trade['exit_reason'] == 'stop_loss'
+        assert trade['exit_price'] == pytest.approx(95.0)
+
+    def test_a_bar_with_no_open_falls_back_to_the_level(self):
+        """Cached bars without an open column must not silently fill at NaN."""
+        assert BacktestEngine._gap_aware_fill(95.0, None, 'STOP_LOSS') == 95.0
+        assert BacktestEngine._gap_aware_fill(95.0, float('nan'), 'STOP_LOSS') == 95.0
+        assert BacktestEngine._gap_aware_fill(95.0, 0.0, 'STOP_LOSS') == 95.0

@@ -758,6 +758,132 @@ That is a change of strategy rather than a defect fix, so `weighted_sum` remains
 
 ---
 
+## 27. Three costs the platform was not paying
+
+Phase 0's remaining items, grouped because they share a shape: each is a place
+where a modelled quantity was cheaper than the real one, and the gap always ran
+in the flattering direction.
+
+### 27.1 A model that cannot run is not an optional model
+
+The call graph is `backtest_engine._score_ticker` → `MonteCarloSettings.run()` →
+`run_monte_carlo_garch()` → `forecast_volatility()` → `arch_model(...).fit()`:
+**one GJR-GARCH maximum-likelihood fit per ticker per trading day.** For the
+documented backtest — 3,612 usable tickers over 1,237 trading days — that is
+4,468,044 fits. Measured here at ~81 ms each, ~101 hours of pure optimizer time
+before any simulation runs. `use_garch_volatility: false` was therefore not a
+considered default but the only setting under which the backtest terminated,
+and the most sophisticated component in the repository was dead code.
+
+The fix separates two things the original function conflated:
+
+| | what it is | how often it needs to run |
+|---|---|---|
+| **Fitting** ω, α, γ, β, ν | numerical optimization, 50–200 ms | GARCH parameters move on the scale of weeks |
+| **Filtering and forecasting** | the GJR recursion, arithmetic | every day — σ²ₜ moves daily |
+
+`fit_garch_parameters()` does the first and returns a stateless
+`GarchParameters`. `filter_conditional_variance()` pushes every return realized
+since that fit through the recursion, so the σ² the forecast starts from is
+conditioned on *today's* information even when the parameters are three weeks
+old. `forecast_from_parameters()` then projects:
+
+$$
+\sigma^2_{T+1} = \omega + \left(\alpha + \gamma\,\mathbb{1}[\varepsilon_T < 0]\right)\varepsilon_T^2 + \beta\sigma^2_T,
+\qquad
+\mathbb{E}\!\left[\sigma^2_{T+h}\right] = \omega + \left(\alpha + \tfrac{\gamma}{2} + \beta\right)\mathbb{E}\!\left[\sigma^2_{T+h-1}\right]
+$$
+
+The one-step variance is exact because yesterday's shock is observed; beyond
+that the shock's sign is unknown, so the leverage term contributes its
+expectation γ/2 and the path decays toward ω/(1 − persistence) at rate
+`persistence`. So what goes stale between refits is the *parameter vintage*,
+not the conditional variance — which is the right way round.
+
+Measured over 40 consecutive scoring days for one ticker: **16.9×** (81.4 →
+4.8 ms/day), extrapolating to ~101 h → ~5 h for the documented backtest, for
+volatility paths that differ by a median of 0.64% and at worst 1.3%.
+
+**The determinism constraint shaped the cache key.** The fit window is
+truncated to a multiple of the interval, `anchor = (n // interval) * interval`,
+so the cached parameters are a pure function of `(symbol, anchor)` rather than
+of which worker process happened to see the ticker first. Scoring is dispatched
+to a process pool and determinism is enforced by test
+(`test_parallel_determinism.py`); a cache keyed on call order would have passed
+every unit test and broken that one. Failed fits are cached too — otherwise a
+ticker whose window never converges pays the full optimizer cost every single
+day, concentrating the exact cost this exists to avoid on the worst names.
+
+This makes GARCH affordable. It is not evidence that enabling it improves
+anything, and `use_garch_volatility` stays `false`.
+
+### 27.2 A stop is a resting order, not a guaranteed price
+
+Every model in the stack assumes a printed price is a price at which a
+transaction could have occurred. For a stop-loss that assumption has a specific
+failure mode: the stop converts to a market order the moment the level trades,
+so the fill is the level *only if the level was reached during continuous
+trading*. When the session opens below the stop, the first price available is
+the open, and the position exits there — worse than the stop, by the size of
+the gap.
+
+§16 already established why this is not a marginal case on NSE: the exchange
+opens after both the US close and the Asian session, gap variance is a large
+fraction of total variance, and a stop is an intraday construct being asked to
+survive an overnight repricing. The error is systematically one-signed. It
+never overstates a loss; it only ever understates it, and it understates it
+most on precisely the days a drawdown breaker exists to catch.
+
+It also feeds back into sizing. §21's Kelly path estimates the payoff ratio
+`b = g/l` from realized trades, and a recorded average loss smaller than the
+real one biases `b` upward, which sizes the next position too large. A fill
+assumption is not only an accounting question.
+
+`fill = min(open, stop)` for longs. The take-profit leg gets the same treatment
+in the other direction — a session that gaps *above* the target fills at the
+open, which is better than the target — because correcting the loss leg alone
+would trade one bias for another. Where the daily bar straddles both levels the
+engine still assumes the adverse one fired first, since a daily bar cannot say
+which was touched first.
+
+**This makes reported returns worse, and that is the correct direction.**
+
+### 27.3 The label was a return the portfolio never receives
+
+The network was trained on the gross forward return. The portfolio receives
+that return minus brokerage, STT on both legs, exchange and SEBI charges, GST,
+stamp duty and the bid-ask spread. Buying at $P_0$ paying $c_b$ of turnover and
+selling at $P_1$ paying $c_s$:
+
+$$
+r_{\text{net}} = \frac{(1 + r_{\text{gross}})(1 - c_s)}{1 + c_b} - 1 \;\approx\; r_{\text{gross}} - c_b - c_s
+$$
+
+**The subtlety that decides whether this matters at all.** A *constant* cost is
+a level shift, and a level shift is invisible to two of the three targets §24
+supports: cross-sectional demeaning subtracts it back out, and ranking is
+invariant to any uniform monotone shift. Under the default
+`cross_sectional_rank`, charging a flat ~0.8% round trip against every label
+would change *precisely nothing*. A naive reading of the review's item — "subtract
+modelled round-trip friction from the label" — implemented with a constant is a
+no-op dressed as a fix.
+
+What survives ranking is the part that varies across names, which here is
+slippage: `0.5 × ATR / price`, the same bid-ask proxy `ExecutionSimulator`
+charges realized fills. That is the whole economic content of the adjustment
+for an alphabetically-sliced, micro-cap-tilted Indian universe. A wide-spread
+small cap has to move materially further than a liquid large cap to deliver the
+same return to the portfolio, and a model ranking on gross returns cannot see
+that difference — it will rank the two identically and the book will keep less
+from one of them. Cost-adjusting the label makes the network rank on the move
+it would actually keep, which is what a long-only book is choosing between.
+
+A test asserts the charge survives cross-sectional ranking, so the no-op case
+cannot reappear unnoticed. `training.cost_adjusted_target: false` restores the
+gross label.
+
+---
+
 ## Summary: what to combine into a UMA
 
 Given the above, a reasonable evidence-backed UMA blends the fully-implemented, roughly orthogonal signals. `config/strategies/uma_meta_orchestrator.yaml` is that configuration; `config/strategies/example_uma.yaml` is the minimal two-member version if you want to see the YAML mechanics alone.

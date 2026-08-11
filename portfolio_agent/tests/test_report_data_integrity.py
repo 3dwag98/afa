@@ -61,7 +61,11 @@ class TestTradeLogAccounting:
         engine.stop_loss_levels["UP.NS"] = 95.0
         engine.take_profit_levels["UP.NS"] = 110.0
 
-        exit_date = engine.master_date_index[40]
+        # Day 11 is the first day whose range straddles the 110 target
+        # (open 109.24, high 111.43), so the level is reached in continuous
+        # trading and fills at the level. Later days open *above* 110 and now
+        # fill at the open instead — see TestGapAwareFills.
+        exit_date = engine.master_date_index[11]
         trades = engine._check_stop_loss_take_profit(exit_date)
 
         assert len(trades) == 1
@@ -115,7 +119,9 @@ class TestTradeLogAccounting:
         engine.take_profit_levels["UP.NS"] = 110.0
         cash_before = engine.cash
 
-        trade = engine._check_stop_loss_take_profit(engine.master_date_index[40])[0]
+        # Day 11 straddles the target rather than gapping past it, so the fill
+        # is the target itself and the expected proceeds are exact.
+        trade = engine._check_stop_loss_take_profit(engine.master_date_index[11])[0]
 
         expected = cash_before + 100 * 110.0 - trade['transaction_costs'] - trade['taxes']
         assert engine.cash == pytest.approx(expected)

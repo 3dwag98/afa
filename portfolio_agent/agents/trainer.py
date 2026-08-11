@@ -342,6 +342,92 @@ def build_forward_return(close: pd.Series, target: str) -> pd.Series:
     return close.shift(-periods).pct_change(periods)
 
 
+def estimate_round_trip_cost(df: pd.DataFrame, atr_period: int = 14) -> pd.Series:
+    """Per-bar round-trip friction as a fraction of turnover, split by leg.
+
+    Returns a two-column frame's worth of information collapsed into the two
+    quantities apply_cost_to_target() needs: the buy-leg and sell-leg cost
+    fractions. Both are estimated the same way the platform already estimates
+    friction elsewhere, so the label agrees with the gate that will later be
+    applied to the signal:
+
+    - **Statutory** — brokerage, STT on both legs, exchange and SEBI charges,
+      GST on the fee base, and stamp duty on the buy leg. Fixed rates, from
+      execution_sim.cost_fraction_per_side.
+    - **Slippage** — 0.5 * ATR expressed as a fraction of price, which is the
+      same bid-ask proxy ExecutionSimulator charges realized fills. This is the
+      part that varies by name, and it is the reason a cost-adjusted label is
+      not a no-op: see apply_cost_to_target.
+
+    Args:
+        df: Raw OHLCV frame with high, low and close.
+        atr_period: ATR lookback, matching the platform's 14-day default.
+
+    Returns:
+        DataFrame with 'buy' and 'sell' columns, each a cost fraction of
+        turnover, indexed like `df`. NaN where ATR is not yet defined.
+    """
+    try:
+        from portfolio_agent.src.execution_sim import ExecutionSimulator, cost_fraction_per_side
+    except ImportError:  # pragma: no cover - direct-module execution fallback
+        from src.execution_sim import ExecutionSimulator, cost_fraction_per_side
+
+    from portfolio_agent.src.indicators import calculate_atr
+
+    # ATR as a fraction of the bar's own close, so a 3,000-rupee name and a
+    # 30-rupee name are on the same scale. Clipped: a bar whose ATR exceeds its
+    # price is a data error, not a 100%-spread stock.
+    atr_fraction = (calculate_atr(df, period=atr_period) / df['close']).clip(lower=0.0, upper=0.5)
+    slippage = ExecutionSimulator.SLIPPAGE_ATR_MULTIPLIER * atr_fraction
+
+    buy = cost_fraction_per_side('BUY', slippage_pct=0.0) + slippage
+    sell = cost_fraction_per_side('SELL', slippage_pct=0.0) + slippage
+    return pd.DataFrame({'buy': buy, 'sell': sell})
+
+
+def apply_cost_to_target(
+    gross_return: pd.Series,
+    costs: pd.DataFrame,
+) -> pd.Series:
+    """Restate a gross forward return as the return the portfolio would keep.
+
+    Buying at P0 and paying c_b of turnover puts P0*(1 + c_b) of capital out;
+    selling at P1 and paying c_s brings P1*(1 - c_s) back. So
+
+        r_net = (1 + r_gross) * (1 - c_s) / (1 + c_b) - 1
+
+    which to first order is r_gross - c_b - c_s.
+
+    **What this does and does not change.** A *constant* cost is a level shift,
+    and a level shift is invisible to two of the three targets this platform
+    supports: cross-sectional demeaning subtracts it back out, and ranking is
+    invariant to any monotone shift applied uniformly. Under the default
+    `cross_sectional_rank` target, subtracting a flat 0.8% round trip from
+    every label would change precisely nothing.
+
+    What survives is the part that varies across names, which here is the
+    slippage leg — 0.5 * ATR / price. That is not incidental; it is the whole
+    economic content of the adjustment for a micro-cap-tilted Indian universe.
+    A wide-spread small cap has to move materially further than a liquid large
+    cap to deliver the same return to the portfolio, and a model ranking on
+    gross returns cannot see that difference. Cost-adjusting the label makes
+    the network rank on the move it would actually keep, which is what the
+    long-only book is choosing between.
+
+    Args:
+        gross_return: Forward return as a decimal, from build_forward_return.
+        costs: 'buy' and 'sell' cost fractions, from estimate_round_trip_cost.
+
+    Returns:
+        The net forward return, aligned to `gross_return`'s index. Rows whose
+        cost is unknown come back NaN and are dropped downstream with the other
+        non-finite rows.
+    """
+    buy = costs['buy'].reindex(gross_return.index)
+    sell = costs['sell'].reindex(gross_return.index)
+    return (1.0 + gross_return) * (1.0 - sell) / (1.0 + buy) - 1.0
+
+
 # Below this many names on a date there is no cross-section to rank against, so
 # a relative target would mostly encode which handful of tickers happened to
 # have history that day. Those rows are dropped rather than mixed in on the
@@ -466,7 +552,17 @@ def prepare_features(df: pd.DataFrame, config: AppConfig, verbose: bool = True) 
     # column, so a feature of the same name (e.g. the trailing return_5d)
     # stays an input and never silently becomes the label.
     target_name = target_column_name(config.training.target)
-    feature_df[target_name] = build_forward_return(df['close'], config.training.target)
+    gross_target = build_forward_return(df['close'], config.training.target)
+
+    # The label the model learns is the return the portfolio keeps, not the
+    # return the price prints. Without this the network is trained to forecast
+    # a move that friction has already taken a bite out of — and the bite is
+    # not the same size for every name, which is what makes this more than a
+    # level shift (see apply_cost_to_target).
+    if config.training.cost_adjusted_target:
+        gross_target = apply_cost_to_target(gross_target, estimate_round_trip_cost(df))
+
+    feature_df[target_name] = gross_target
 
     # Drop rows that are not finite — NaN *or* infinite. dropna() alone leaves
     # the infinities behind, and every one of them turns into a NaN loss the
@@ -1182,6 +1278,7 @@ def run_walk_forward_validation(
         "embargo_days": horizon_days,
         "folds": fold_metrics,
         "target_transform": training.target_transform,
+        "cost_adjusted_target": training.cost_adjusted_target,
         "mean_mse": _mean("mse"),
         "mean_directional_accuracy": _mean("directional_accuracy"),
         "mean_rank_ic": _mean("rank_ic"),

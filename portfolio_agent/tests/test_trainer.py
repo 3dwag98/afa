@@ -12,8 +12,10 @@ import pandas as pd
 import pytest
 
 from portfolio_agent.agents.trainer import (
+    apply_cost_to_target,
     apply_cross_sectional_target,
     build_forward_return,
+    estimate_round_trip_cost,
     evaluate_predictions,
     load_data,
     prepare_features,
@@ -39,6 +41,13 @@ def _make_ohlcv(n_days: int = 300, seed: int = 1) -> pd.DataFrame:
     }, index=dates)
 
 
+def _with_flag(config: AppConfig, cost_adjusted: bool) -> AppConfig:
+    """A copy of `config` with the cost-adjusted-label flag set."""
+    updated = config.model_copy(deep=True)
+    updated.training.cost_adjusted_target = cost_adjusted
+    return updated
+
+
 class TestPrepareFeatures:
     def test_builds_features_and_target(self):
         config = AppConfig()
@@ -56,6 +65,7 @@ class TestPrepareFeatures:
 
     def test_target_is_a_forward_return_not_a_trailing_one(self):
         config = AppConfig()
+        config.training.cost_adjusted_target = False  # compare against the gross label
         df = _make_ohlcv()
         feature_df = prepare_features(df, config, verbose=False)
 
@@ -515,3 +525,109 @@ class TestCrossSectionalTarget:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestCostAdjustedTarget:
+    """The model should learn the sign of the move the portfolio keeps.
+
+    A gross forward return is a move the book never receives: brokerage, STT on
+    both legs, exchange and SEBI charges, GST, stamp duty and the bid-ask
+    spread all come out of it first.
+    """
+
+    def test_the_net_label_is_below_the_gross_one(self):
+        config = AppConfig()
+        df = _make_ohlcv()
+
+        gross = prepare_features(df, _with_flag(config, False), verbose=False)
+        net = prepare_features(df, _with_flag(config, True), verbose=False)
+
+        target_col = target_column_name(config.training.target)
+        shared = gross.index.intersection(net.index)
+        assert len(shared) > 0
+        assert (net.loc[shared, target_col] < gross.loc[shared, target_col]).all()
+
+    def test_the_charge_is_the_modelled_round_trip(self):
+        """Not an arbitrary haircut: the same rate schedule execution_sim
+        charges realized fills, applied to both legs."""
+        df = _make_ohlcv()
+        costs = estimate_round_trip_cost(df)
+        gross = build_forward_return(df['close'], "return_5d")
+
+        net = apply_cost_to_target(gross, costs)
+
+        expected = (1.0 + gross) * (1.0 - costs['sell']) / (1.0 + costs['buy']) - 1.0
+        pd.testing.assert_series_equal(net.dropna(), expected.dropna())
+
+    def test_both_legs_carry_statutory_costs_and_only_the_buy_leg_stamp_duty(self):
+        from portfolio_agent.src.execution_sim import ExecutionSimulator
+
+        df = _make_ohlcv()
+        costs = estimate_round_trip_cost(df).dropna()
+
+        assert (costs['buy'] > costs['sell']).all()
+        assert np.allclose(
+            (costs['buy'] - costs['sell']).to_numpy(),
+            ExecutionSimulator.STAMP_DUTY_RATE,
+        )
+
+    def test_slippage_scales_with_the_name_s_own_range(self):
+        """This is the part that survives a cross-sectional target. A constant
+        cost is a level shift, and demeaning subtracts it back out while
+        ranking is invariant to it — so if the charge did not vary by name,
+        cost-adjusting the label under the default transform would do nothing
+        at all."""
+        calm = _make_ohlcv(seed=3)
+        wild = calm.copy()
+        # Same closes, four times the intraday range.
+        wild['high'] = wild['close'] + (calm['high'] - calm['close']) * 4
+        wild['low'] = wild['close'] - (calm['close'] - calm['low']) * 4
+
+        calm_costs = estimate_round_trip_cost(calm)['buy'].dropna()
+        wild_costs = estimate_round_trip_cost(wild)['buy'].dropna()
+
+        assert (wild_costs > calm_costs.reindex(wild_costs.index)).all()
+
+    def test_a_cross_sectional_rank_target_still_moves(self):
+        """The end-to-end statement of the point above: after ranking within
+        each date, the cost-adjusted panel is not the gross panel."""
+        config = AppConfig()
+        target_col = target_column_name(config.training.target)
+
+        def _panel(cost_adjusted: bool):
+            frames = {}
+            for i, ticker in enumerate(["A.NS", "B.NS", "C.NS", "D.NS", "E.NS", "F.NS"]):
+                df = _make_ohlcv(seed=20 + i)
+                if i % 2:  # half the names are wide-spread
+                    df['high'] = df['close'] + (df['high'] - df['close']) * 6
+                    df['low'] = df['close'] - (df['close'] - df['low']) * 6
+                frames[ticker] = prepare_features(
+                    df, _with_flag(config, cost_adjusted), verbose=False
+                )
+            return apply_cross_sectional_target(frames, target_col, "cross_sectional_rank")
+
+        gross = _panel(False)
+        net = _panel(True)
+
+        differences = [
+            not np.allclose(
+                gross[t][target_col].reindex(net[t].index).dropna().to_numpy(),
+                net[t][target_col].reindex(gross[t].index).dropna().to_numpy(),
+            )
+            for t in gross
+            if t in net
+        ]
+        assert any(differences), "the cost charge must survive cross-sectional ranking"
+
+    def test_the_adjustment_can_be_switched_off(self):
+        config = AppConfig()
+        df = _make_ohlcv()
+        target_col = target_column_name(config.training.target)
+
+        feature_df = prepare_features(df, _with_flag(config, False), verbose=False)
+        expected = build_forward_return(df['close'], config.training.target)
+
+        assert np.allclose(
+            feature_df[target_col].to_numpy(),
+            expected.reindex(feature_df.index).to_numpy(),
+        )

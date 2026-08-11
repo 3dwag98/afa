@@ -690,6 +690,54 @@ class BacktestEngine:
         return max(0, (current_date - pd.Timestamp(position['entry_date'])).days)
 
 
+    @staticmethod
+    def _gap_aware_fill(
+        level: float,
+        open_price: Optional[float],
+        trigger_type: str,
+    ) -> float:
+        """Where a stop or target actually fills when the day gaps through it.
+
+        A stop-loss is a *resting order*, not a guaranteed price. It converts to
+        a market order the moment the level trades, so the fill is the level
+        only if the level was reached during continuous trading. When the
+        session opens below the stop, the first price available is the open,
+        and the position exits there — worse than the stop, by the size of the
+        gap.
+
+        Assuming otherwise is not a small approximation for a long-only Indian
+        book. NSE opens after both the US close and the Asian session, so gaps
+        are frequent, large and directionally informative, and a stop is an
+        intraday construct being asked to survive an overnight repricing. The
+        error is also systematically one-signed: it never overstates a loss, it
+        only ever understates it, and it understates it most on exactly the
+        days a drawdown breaker exists to catch. Worse, it feeds back into
+        sizing — the recorded average loss is smaller than the real one, which
+        biases Kelly's reward:risk estimate `b` upward and sizes the next
+        position too large.
+
+        The take-profit leg gets the same treatment in the other direction: a
+        session that gaps above the target fills at the open, which is *better*
+        than the target. Applying the correction to the loss leg alone would
+        trade one bias for another.
+
+        Args:
+            level: The resting stop or target price.
+            open_price: The session's opening price, or None when the cached
+                bar has no open column.
+            trigger_type: 'STOP_LOSS' or 'TAKE_PROFIT'.
+
+        Returns:
+            The fill price.
+        """
+        if open_price is None or not np.isfinite(open_price) or open_price <= 0:
+            return level
+        if trigger_type == 'STOP_LOSS':
+            # Gapped below the stop: the exit is the open, not the stop.
+            return min(float(open_price), level)
+        # Gapped above the target: the exit is the open, not the target.
+        return max(float(open_price), level)
+
     def _check_stop_loss_take_profit(self, current_date: pd.Timestamp) -> List[Dict[str, Any]]:
         """
         Check for stop-losses and take-profits based on current date's intraday High/Low.
@@ -716,10 +764,11 @@ class BacktestEngine:
                 continue
             
             row = df.loc[current_date]
-            
-            # Get high and low for the day
+
+            # Get high, low and open for the day
             high = None
             low = None
+            open_price = None
             for h_col in ['high', 'High']:
                 if h_col in row.index:
                     high = row[h_col]
@@ -728,10 +777,14 @@ class BacktestEngine:
                 if l_col in row.index:
                     low = row[l_col]
                     break
-            
+            for o_col in ['open', 'Open']:
+                if o_col in row.index:
+                    open_price = row[o_col]
+                    break
+
             if high is None or low is None:
                 continue
-            
+
             stop_price = self.stop_loss_levels.get(ticker)
             target_price = self.take_profit_levels.get(ticker)
             # The position's actual cost basis — NOT the previous close, which
@@ -743,19 +796,19 @@ class BacktestEngine:
             triggered = False
             trigger_price = None
             trigger_type = None
-            
+
             # Check stop-loss (price hit or went below stop)
             if stop_price is not None and low <= stop_price:
                 triggered = True
-                trigger_price = stop_price
+                trigger_price = self._gap_aware_fill(stop_price, open_price, 'STOP_LOSS')
                 trigger_type = 'STOP_LOSS'
-            
+
             # Check take-profit (price hit or went above target)
             elif target_price is not None and high >= target_price:
                 triggered = True
-                trigger_price = target_price
+                trigger_price = self._gap_aware_fill(target_price, open_price, 'TAKE_PROFIT')
                 trigger_type = 'TAKE_PROFIT'
-            
+
             if triggered:
                 # Exits pay the same friction as any other sale — brokerage,
                 # STT, exchange charges, GST and capital gains tax. Booking

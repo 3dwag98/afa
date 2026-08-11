@@ -97,6 +97,13 @@ training:
   # stocks. Rank is the default: on Indian data a circuit-limited print
   # dominates the cross-sectional mean but moves a ranking by one place.
   target_transform: cross_sectional_rank
+  # Charge modelled round-trip friction against the label, so the network
+  # learns the sign of the net move. The statutory part (brokerage, STT both
+  # legs, exchange/SEBI, GST, stamp duty) is the same for every name, so under
+  # a cross-sectional target it cancels; what survives is slippage, 0.5*ATR
+  # over price, which is exactly the difference between a wide-spread micro cap
+  # and a liquid large cap printing the same gross return.
+  cost_adjusted_target: true
   sequence_length: 60
   train_fraction: 0.8
   batch_size: 128
@@ -243,6 +250,14 @@ simulation:
   # Draw each path's drift from the posterior rather than sharing its mean, so
   # probability_profit accounts for the drift being estimated, not known.
   propagate_drift_uncertainty: true
+  # Trading days between GJR-GARCH maximum-likelihood refits. The naive path
+  # fits once per ticker per day — ~4.5 million fits for the documented
+  # backtest, 62-248 hours of optimizer time — which is why use_garch_volatility
+  # is off. Fitting is an optimization and the parameters move on the scale of
+  # weeks; the recursion that turns them into a volatility path is arithmetic
+  # and still runs daily, so between refits the parameter vintage goes stale
+  # and the conditional variance does not. Set to 1 to refit every call.
+  garch_refit_interval_days: 21
 
 # Trade compliance / eligibility checks
 compliance:

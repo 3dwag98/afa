@@ -164,6 +164,7 @@ class MonteCarloSettings:
     separate_overnight_gaps: bool = True
     prior_annual_drift_std: float = DEFAULT_PRIOR_ANNUAL_DRIFT_STD
     propagate_drift_uncertainty: bool = True
+    garch_refit_interval_days: int = 21
 
     @classmethod
     def from_simulation_config(cls, simulation) -> "MonteCarloSettings":
@@ -181,6 +182,7 @@ class MonteCarloSettings:
             separate_overnight_gaps=simulation.separate_overnight_gaps,
             prior_annual_drift_std=simulation.prior_annual_drift_std,
             propagate_drift_uncertainty=simulation.propagate_drift_uncertainty,
+            garch_refit_interval_days=simulation.garch_refit_interval_days,
         )
 
     def run(
@@ -240,6 +242,7 @@ class MonteCarloSettings:
             overnight_returns=overnight,
             prior_annual_drift_std=self.prior_annual_drift_std,
             propagate_drift_uncertainty=self.propagate_drift_uncertainty,
+            refit_interval_days=self.garch_refit_interval_days,
         )
 
 
@@ -569,6 +572,7 @@ def run_monte_carlo_garch(
     overnight_returns: Optional[list[float]] = None,
     prior_annual_drift_std: float = DEFAULT_PRIOR_ANNUAL_DRIFT_STD,
     propagate_drift_uncertainty: bool = True,
+    refit_interval_days: int = 1,
 ) -> MonteCarloResult:
     """Like run_monte_carlo(), but forecasts volatility with GJR-GARCH(1,1)
     (see volatility_models.py) instead of assuming a flat historical
@@ -590,21 +594,51 @@ def run_monte_carlo_garch(
     independent — a failed gap-aware fit drops to close-to-close GARCH, and a
     failed GARCH fit drops to constant volatility.
 
+    `refit_interval_days` controls how often the MLE fit is redone. At 1 every
+    call fits, which is what makes this path unaffordable at platform scale —
+    3,612 tickers over 1,237 trading days is ~4.5 million optimizer runs. Above
+    1 the parameters are fitted on a schedule and cached, while the recursion's
+    *state* is brought up to date from the returns realized since, so what goes
+    stale is the parameter vintage (weeks-scale) and not the conditional
+    variance (daily). See volatility_models.forecast_volatility_scheduled.
+
     Falls back to run_monte_carlo()'s constant-volatility path whenever
     there isn't enough history to fit GARCH reliably or the fit fails.
     """
     try:
-        from .volatility_models import forecast_volatility, forecast_volatility_gap_aware
+        from .volatility_models import (
+            forecast_volatility,
+            forecast_volatility_gap_aware,
+            forecast_volatility_gap_aware_scheduled,
+            forecast_volatility_scheduled,
+        )
     except ImportError:
-        from volatility_models import forecast_volatility, forecast_volatility_gap_aware
+        from volatility_models import (  # type: ignore[no-redef]
+            forecast_volatility,
+            forecast_volatility_gap_aware,
+            forecast_volatility_gap_aware_scheduled,
+            forecast_volatility_scheduled,
+        )
 
     forecast = None
     if intraday_returns is not None and overnight_returns is not None:
-        forecast = forecast_volatility_gap_aware(
-            intraday_returns, overnight_returns, horizon_days
-        )
+        if refit_interval_days > 1:
+            forecast = forecast_volatility_gap_aware_scheduled(
+                intraday_returns, overnight_returns, horizon_days,
+                symbol=symbol, refit_interval_days=refit_interval_days,
+            )
+        else:
+            forecast = forecast_volatility_gap_aware(
+                intraday_returns, overnight_returns, horizon_days
+            )
     if forecast is None:
-        forecast = forecast_volatility(daily_returns, horizon_days)
+        if refit_interval_days > 1:
+            forecast = forecast_volatility_scheduled(
+                daily_returns, horizon_days,
+                symbol=symbol, refit_interval_days=refit_interval_days,
+            )
+        else:
+            forecast = forecast_volatility(daily_returns, horizon_days)
     daily_vol_forecast = forecast.daily_sigma if forecast is not None else None
     # The fitted Student-t nu travels with the volatility path. Fitting
     # fat-tailed innovations and then simulating Gaussian shocks would discard
