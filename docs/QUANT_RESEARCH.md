@@ -28,6 +28,7 @@ This document is the mathematical/research foundation behind the platform's stra
 22. [Portfolio covariance and constrained allocation](#22-portfolio-covariance-and-constrained-allocation) — implemented (`src/portfolio.py`)
 23. [Measuring a Sharpe ratio that means something](#23-measuring-a-sharpe-ratio-that-means-something) — implemented (`src/performance_stats.py`)
 24. [Predicting the cross-section, not the market](#24-predicting-the-cross-section-not-the-market) — implemented (`agents/trainer.py::apply_cross_sectional_target`)
+25. [Regimes as estimated states, not hand-set thresholds](#25-regimes-as-estimated-states-not-hand-set-thresholds) — implemented (`src/markov_regime.py`)
 
 Closing: [what to combine into a UMA](#summary-what-to-combine-into-a-uma)
 
@@ -659,6 +660,59 @@ The rank form is the default (`training.target_transform`) and is the more robus
 **Sources:**
 - Gu, Kelly & Xiu (2020), "Empirical Asset Pricing via Machine Learning", *Review of Financial Studies*
 - Gu, Kelly & Xiu (2021), "Autoencoder Asset Pricing Models", *Journal of Econometrics*
+
+
+---
+
+## 25. Regimes as estimated states, not hand-set thresholds
+
+**What was there.** `src/regime.py` classifies the market with a deterministic if/elif cascade over three hand-thresholded statistics — distance from a 200-day moving average, 60-day realized volatility against a 20% target, and ADX-14 — and emits a hard string. The branch ordering is well reasoned and the fail-neutral behaviour is right, but as a statistical object it has four defects:
+
+1. **No state probability.** The output is a label, so everything downstream is a step function of a noisy continuous input. A benchmark oscillating around its 200-day average flips the entire sleeve-permission map day to day, with no hysteresis and no smoothing.
+2. **No persistence model.** Real regimes are strongly persistent — empirical daily self-transition probabilities for equity volatility states run 0.95–0.99. A threshold rule's implicit persistence is whatever the autocorrelation of its inputs happens to be, which is neither the same thing nor estimable.
+3. **The thresholds are free parameters** (200 days, 1.5×, ADX 20, ±2%), never fitted or tested — four researcher degrees of freedom inflating every backtest run through them.
+4. **The states are defined, not discovered.** Model selection over the number of states is not even expressible in that formulation.
+
+**Formulation.** A K-state Gaussian hidden Markov model on benchmark returns:
+
+$$
+r_t = \mu_{S_t} + \sigma_{S_t} z_t, \qquad \Pr(S_t = j \mid S_{t-1} = i) = p_{ij}, \qquad \sum_j p_{ij} = 1
+$$
+
+estimated by Baum–Welch (EM) with a scaled forward–backward recursion, and \(K\) chosen by BIC over candidates rather than fixed at four by hand. Every defect above has a direct answer: a filtered probability vector instead of a label, an estimated transition matrix instead of implicit persistence, maximum-likelihood parameters instead of thresholds, and states discovered rather than named.
+
+| Property | Threshold cascade | This model |
+|---|---|---|
+| Output | hard label | filtered probability `P(S_t \| F_t)` |
+| Persistence | implicit, unestimable | transition matrix, estimated |
+| Hysteresis | none — flips on crossing | built into the forward filter |
+| Number of states | fixed at 4 by hand | selected by BIC |
+| Forecasting | none | `P(S_{t+h}) = pi_t P^h` |
+| Uncertainty | none | full distribution over states |
+
+**Two look-ahead distinctions, both enforced by test.**
+
+*Filtered vs. smoothed.* The forward recursion gives \(P(S_t \mid \mathcal{F}_t)\) — what an observer standing at \(t\) would have believed — and is the only state estimate a trading decision may use. The smoothed \(P(S_t \mid \mathcal{F}_T)\) conditions on the whole sample, produces a visibly cleaner state sequence, and is unusable: a backtest wired to it looks excellent and is worthless. Both are provided, named to make the difference obvious, and a test asserts that corrupting every observation after date \(t\) leaves every filtered row up to \(t\) bit-identical while the smoothed rows move.
+
+*Parameters vs. filtering.* A model fitted on the full sample has seen the test period even though the recursion has not — a subtler leak, and just as real. `assess_markov_regime` therefore fits on the leading `train_fraction` of history and filters the whole series forward from those frozen parameters; a test corrupts everything past the training window and asserts the fitted volatilities and transition probabilities do not move.
+
+**Identifiability.** HMM states are exchangeable: relabelling them permutes the parameters without changing the likelihood. States are therefore always ordered by ascending fitted volatility, and EM is initialized deterministically from quantiles of \(|r|\) — otherwise two runs on identical data could produce the same model with the labels swapped, and which sleeves may trade would not be reproducible.
+
+**Consuming probabilities instead of labels.** `sleeve_weights` computes
+
+$$
+w_{\text{sleeve},t} = \sum_k \pi_{t,k}\, a_{\text{sleeve},k}
+$$
+
+with \(a\) a sleeve-by-state affinity matrix. Because \(\pi_t\) varies smoothly, the permission map does too — which removes the day-to-day flipping entirely while preserving the existing "mute, don't veto" semantics, a good design that should survive. The practical gain is visible in one number: `expected_volatility` is the probability-weighted average across states, so a 60/40 split between calm and crisis reads as materially riskier than a confident calm, where a hard label reports both as "calm".
+
+**Validation.** On a simulated two-state process with 0.985 persistence, the fit recovers per-state volatilities within 15%, self-transition probabilities of 0.983/0.985, BIC selection of \(K = 2\) over {1,2,3,4}, and filtered state identification agreeing with the true hidden state on more than 85% of days.
+
+**Not yet done.** Time-varying transition probabilities (\(p_{ij,t}\) as a softmax over India VIX, FII flow and trend distance) and MS-GARCH — a regime-dependent conditional variance, which would subsume the existing GJR-GARCH rather than sit beside it and would address the per-ticker fitting cost as a side effect. Both need the Phase 2 data that is not cached here.
+
+**Sources:**
+- Hamilton (1989), "A New Approach to the Economic Analysis of Nonstationary Time Series and the Business Cycle", *Econometrica*
+- Baum, Petrie, Soules & Weiss (1970), the forward–backward / EM algorithm for HMMs
 
 
 ---

@@ -727,6 +727,9 @@ portfolio_agent/
     ├── trigger_engine.py   signal arbitration: conflict penalty, vetoes,
     │                       firing modes, position-size multiplier
     ├── regime.py           market regime classification + volatility targeting
+    ├── markov_regime.py    K-state Gaussian HMM on the benchmark: Baum-Welch
+    │                       fit, BIC state selection, filtered (never
+    │                       smoothed) state probabilities, sleeve weighting
     ├── calibration.py      isotonic (PAVA) score -> probability calibration
     ├── liquidity.py        circuit-lock (1/2/5/10/20% bands), operator-trap
     │                       and illiquidity / zombie screening
