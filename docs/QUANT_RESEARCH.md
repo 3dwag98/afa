@@ -24,6 +24,10 @@ This document is the mathematical/research foundation behind the platform's stra
 18. [Making the walk-forward measurement honest](#18-making-the-walk-forward-measurement-honest) — implemented (`agents/trainer.py`)
 19. [Combining models: arbitration, not averaging](#19-combining-models-arbitration-not-averaging) — implemented (`src/trigger_engine.py`)
 20. [Forecasting a distribution instead of a point](#20-forecasting-a-distribution-instead-of-a-point) — implemented (`models/pytorch_models.py`, `src/calibration.py`)
+21. [The drift is the noisiest input in the simulation](#21-the-drift-is-the-noisiest-input-in-the-simulation) — implemented (`src/monte_carlo.py::shrink_drift`)
+22. [Portfolio covariance and constrained allocation](#22-portfolio-covariance-and-constrained-allocation) — implemented (`src/portfolio.py`)
+23. [Measuring a Sharpe ratio that means something](#23-measuring-a-sharpe-ratio-that-means-something) — implemented (`src/performance_stats.py`)
+24. [Predicting the cross-section, not the market](#24-predicting-the-cross-section-not-the-market) — implemented (`agents/trainer.py::apply_cross_sectional_target`)
 
 Closing: [what to combine into a UMA](#summary-what-to-combine-into-a-uma)
 
@@ -107,15 +111,29 @@ Note what it does *not* currently drive: the volatility-targeting scalar in §12
 
 **Evidence.** The Kelly criterion (Kelly, 1956) gives the capital fraction that maximizes long-run logarithmic (compound) growth for a repeated bet with known win probability and payoff ratio. Universally used in quantitative position sizing, but **full Kelly is not used in practice** — win probability and payoff ratio are estimated with error, and full Kelly is extremely sensitive to that error (and to return skewness). The standard mitigation, per both practitioner sources and the platform's own risk posture (paper trading, capped positions), is fractional Kelly: quant funds commonly use 1/4 to 1/2 Kelly; half-Kelly captures roughly 75% of the theoretical growth rate at meaningfully lower drawdown risk, quarter-Kelly roughly 50% of growth at even lower volatility.
 
-**Formulation.** For a strategy with realized win probability \(p\) and reward:risk ratio \(b\) (average win ÷ average loss, in the same units as this platform's existing `reward_risk` field):
+**Formulation, and the measurement space it lives in.** The familiar Kelly result, for realized win probability \(p\) and reward:risk ratio \(b\) (average win ÷ average loss):
 
 $$
-f^{*} = p - \frac{1-p}{b}
+f = p - \frac{1-p}{b}
 $$
 
-Position size uses a fractional Kelly \(f = \kappa f^{*}\). \(\kappa\) is configurable through `risk.kelly_fraction` but **hard-capped at 0.25 (quarter-Kelly) at the point of use**, so no config, environment override or test fixture can size above it. The result is clamped to \([0, \text{max\_single\_position\_pct}]\) so Kelly can never exceed the platform's existing hard position cap, and clamped to \(\ge 0\) — a negative \(f^*\) (an unprofitable edge) falls back to fixed-fractional sizing rather than sizing a "negative" position, since this platform never shorts.
+is the growth-optimal **stake** fraction for a *binary, all-or-nothing bet* — one that returns \(b\) times the stake with probability \(p\) and loses the **entire** stake otherwise. A stop-loss equity trade is not that bet. A loser gives back the distance from entry to stop, a few percent of the position, not the position.
 
-\(p\) and \(b\) are estimated from realized trade history, gated by a 50-trade floor and with \(p\) shrunk toward 0.5 by a Beta prior (§12 of this section's rationale applies: over-betting off a noisy estimate costs far more long-run growth than under-betting). With too few realized trades, Kelly sizing falls back to the existing ATR/fixed-fractional sizing (`src/risk.py::calculate_quantity`).
+For a position that gains a fraction \(g\) of its value with probability \(p\) and loses a fraction \(l\) otherwise, the growth-optimal **allocation** — the fraction of *wealth* to commit — is:
+
+$$
+f^{*}_{\text{alloc}} = \frac{p\,g - (1-p)\,l}{g\,l} = \frac{p - (1-p)/b}{l}, \qquad b = g/l
+$$
+
+The binary form is that expression with \(l = 1\). Using it as an allocation therefore under-allocates by a factor of \(1/l\): at \(p = 0.55\), \(b = 1.8\) and a 6% loss-given-stop it returns 0.30 where the allocation is 5.0, a factor of 16.7. The error is also **signal-dependent rather than a constant shrink** — \(l\) varies per trade, so a wide-stop signal that should receive a *smaller* allocation received the same one, which is why no adjustment to \(\kappa\) could have recovered it. `src/risk.py::kelly_allocation_fraction` does the conversion; `calculate_kelly_fraction` retains the binary form, which is the correct quantity in its own right and the numerator here.
+
+**The constraint stack, and what actually binds.** Position size applies \(\kappa f^{*}_{\text{alloc}}\), then an explicit unlevered-cash-book leverage limit, then `max_single_position_pct`. \(\kappa\) is configurable through `risk.kelly_fraction` but **hard-capped at 0.25 (quarter-Kelly) at the point of use**, so no config, environment override or test fixture can size above it.
+
+Worth stating plainly, because it follows from the corrected arithmetic rather than from any choice: with the units right, \(f^{*}_{\text{alloc}}\) for any trade with a real edge is of order 1–10, so the leverage and concentration limits bind almost always and **the concentration cap, not Kelly, is what sizes a position**. Kelly still binds where it matters — as the edge approaches zero, \(f^{*}_{\text{alloc}}\) collapses continuously to 0 and sizes the position down. The consequence is that growth-optimal sizing across a book is a portfolio-level problem, not something a per-trade formula can solve; see §26.
+
+**Kelly is applied as a ceiling, not a licence.** `calculate_position_quantity` takes the *smaller* of the Kelly allocation and the fixed-fractional risk budget. The budget is priced off this trade's own stop distance, which is known exactly, while Kelly's \(l\) is a historical average across trades with different stops — where they disagree, the known quantity wins. It also means correcting the units could not land as a silent 17× increase in position size across the whole book. Enabling Kelly can therefore only size *down*: it de-risks as the estimated edge approaches zero and is otherwise inactive.
+
+\(p\), \(g\) and \(l\) are estimated from realized trade history, gated by a 50-trade floor and with \(p\) shrunk toward 0.5 by a Beta prior (§12 of this section's rationale applies: over-betting off a noisy estimate costs far more long-run growth than under-betting). The magnitudes travel alongside the ratio deliberately — a caller handed only \(b = g/l\) cannot recover \(l\), which is exactly how the allocation lost its \(1/l\) factor. With too few realized trades, Kelly sizing falls back to the existing ATR/fixed-fractional sizing (`src/risk.py::calculate_quantity`).
 
 **Both inputs are measured net of friction, on both paths.** Stored trade logs are deliberately gross — `return_pct` is the price move, which is what a report should show — and that is the wrong input here for two reasons that both push the same way:
 
@@ -509,6 +527,135 @@ Monotonicity is the whole trick: it preserves the model's *ranking*, which is wh
 - Koenker & Bassett, "Regression Quantiles", *Econometrica* 46(1), 1978 (the pinball loss)
 - Zadrozny & Elkan, ["Transforming Classifier Scores into Accurate Multiclass Probability Estimates"](https://dl.acm.org/doi/10.1145/775047.775151), KDD 2002 (isotonic calibration)
 - Guo, Pleiss, Sun & Weinberger, ["On Calibration of Modern Neural Networks"](https://arxiv.org/abs/1706.04599), ICML 2017
+
+---
+
+## 21. The drift is the noisiest input in the simulation
+
+**The problem.** The forward Monte Carlo estimated each ticker's drift as the in-sample mean log return over its whole history and propagated it forward as if it were known. The sample mean of daily returns is the noisiest statistic in finance: its standard error is \(\sigma/\sqrt{T}\), which for a 2%/day Indian mid-cap over five years is about 0.057%/day — roughly **14% a year**. The 20-day probability of profit is essentially \(\Phi(\hat\mu\sqrt{H}/\sigma)\), so it inherits that noise directly.
+
+Measured: simulating tickers whose true drift is *exactly zero*, 5.2% of them cleared the 0.55 `compliance.target_prob_profit` gate on estimation error alone. On a 3,800-name universe that is hundreds of zero-edge tickers passing the gate every day.
+
+The bias is also not independent of the rest of the platform. \(\hat\mu\) is largest precisely for stocks that have already run, so an unshrunk drift makes the Monte Carlo gate a noisy restatement of the momentum signal it is supposed to corroborate — it adds no independent information while appearing to confirm.
+
+**Formulation.** Under a \(\text{Normal}(\mu_0, \tau^2)\) prior on the true daily drift and a sample mean with variance \(\sigma^2/T\):
+
+$$
+\mu_{\text{post}} = \frac{\tau^2\hat\mu + (\sigma^2/T)\mu_0}{\tau^2 + \sigma^2/T}, \qquad
+\text{Var}_{\text{post}} = \frac{\tau^2 \cdot \sigma^2/T}{\tau^2 + \sigma^2/T}
+$$
+
+An annual drift is 252 daily drifts, so a prior dispersion stated per year converts as \(\tau = \tau_{\text{annual}}/252\). `simulation.prior_annual_drift_std` defaults to 10%, which is deliberately generous — it says a genuinely exceptional name might compound 20% a year faster than the market. Method-of-moments estimates of this quantity on daily equity panels typically come out at or below zero, because the observed spread of sample means is almost entirely estimation noise.
+
+**Posterior predictive, not plug-in.** Each simulated path draws its own drift from the posterior rather than sharing the posterior mean (`simulation.propagate_drift_uncertainty`), so `probability_profit` is the probability *accounting for the drift being estimated*. That is the quantity the compliance gate should read, and it widens the tails the VaR/CVaR cells report rather than leaving the simulation confident about the one input it has least right. Under both changes, the same zero-drift experiment passes **0.0%** of tickers.
+
+---
+
+## 22. Portfolio covariance and constrained allocation
+
+**The gap.** Every position was sized independently: a signal scored, a stop set, a quantity derived from that trade's own risk, no reference to what else was in the book. For a long-only portfolio of 20–40 Indian equities that is the largest misstatement of risk in the platform, because the dominant term in realized portfolio volatility is the covariance:
+
+$$
+\sigma_p^2 = \sum_i \sum_j w_i w_j \sigma_i \sigma_j \rho_{ij}
+$$
+
+At twenty 3% positions and 30% single-name annualized volatility:
+
+| Average pairwise correlation | Portfolio volatility | vs. independence |
+|---|---|---|
+| 0.00 | 4.02% | ×1.00 |
+| 0.35 | 11.13% | ×2.77 |
+| 0.60 | 14.17% | ×3.52 |
+| 0.85 | 16.67% | ×4.14 |
+
+Indian equity pairwise correlation sits around 0.3–0.4 in calm markets and rises toward 0.6–0.85 in exactly the panic states the drawdown breaker (§12) exists to survive. **The risk model was most wrong precisely when being wrong cost most.** `max_sector_pct` was the only concentration control, and it requires a `ticker,sector` CSV the repository does not ship — with no map, the cap is inactive.
+
+This also explains an observation already recorded in the README: a meta-orchestrator that underperformed its own momentum sleeve. Four sleeves ranking one universe on correlated signals produce a book far less diversified than "four sleeves" suggests, so the extra sleeves added correlated risk without adding independent return — and nothing in the stack could measure it.
+
+**Covariance estimation.** With \(N\) names and \(T\) days, the sample covariance needs \(T > N\) even to be invertible, and its largest eigenvalues are biased up and smallest biased down — exactly the distortion a mean-variance optimizer amplifies. `ledoit_wolf_covariance` shrinks toward a constant-correlation target \(F_{ij} = \bar{r}\sqrt{s_{ii}s_{jj}}\) with the analytically optimal intensity \(\delta = \max(0, \min(1, (\pi - \rho)/\gamma/T))\). That target is wrong in detail but right about what matters — that the names move together — and on a panel where it is well specified, shrinkage cuts estimation error by roughly 30% at the sample sizes this platform has. `exponentially_weighted_covariance` adds a half-life so the matrix responds to a correlation regime shift instead of averaging across one; `single_factor_covariance` estimates \(2N\) parameters instead of \(N(N+1)/2\) and is positive-definite by construction on a wide universe.
+
+**Allocation.** `optimize_long_only` solves
+
+$$
+\max_w \; w^\top\mu - \frac{\lambda}{2}w^\top\Sigma w - c^\top|w - w_{\text{prev}}|
+\quad \text{s.t.} \quad \mathbf{1}^\top w \le 1, \; 0 \le w_i \le w_{\max}, \; \sqrt{w^\top\Sigma w} \le \sigma_{\text{tgt}}
+$$
+
+by projected subgradient ascent over a capped simplex, so every constraint holds by construction rather than by tolerance. **The turnover penalty is load-bearing, not decoration.** Expected returns are estimated with enormous error (§21), so an unpenalized optimizer re-solves to a materially different book every day and hands the entire Indian friction stack (§13) the edge it was trying to capture.
+
+`hierarchical_risk_parity` is the allocation to use when \(\mu\) is not trustworthy — which, given §21, is most of the time. It clusters the correlation matrix and recursively bisects, splitting capital by inverse variance, so it uses the covariance structure without ever inverting it and without needing expected returns at all.
+
+**Sources:**
+- Ledoit & Wolf (2003), "Honey, I Shrunk the Sample Covariance Matrix", *Journal of Portfolio Management*
+- López de Prado (2016), "Building Diversified Portfolios that Outperform Out-of-Sample", *Journal of Portfolio Management*
+
+---
+
+## 23. Measuring a Sharpe ratio that means something
+
+**Two problems, both in the measurement rather than the strategy.**
+
+**(a) The definition was mixed.** `(CAGR − r_f)/σ` divides a *geometric* mean by an *arithmetic* standard deviation. Since \(\text{CAGR} \approx \mu - \sigma^2/2\), that returns approximately
+
+$$
+\frac{\mu - r_f}{\sigma} - \frac{\sigma}{2}
+$$
+
+biased low by \(\sigma/2\) — a flat −0.10 at 20% annualized volatility, growing with volatility, so it charged volatile strategies twice and was not comparable to the conventional 1.2 target it was being read against. Sharpe and Sortino are now arithmetic on both sides, on per-period excess returns, with the risk-free rate compounded rather than divided by 252. The old figure is retained as `geometric_sharpe_ratio` so a report carrying both makes the gap visible.
+
+**(b) Nothing was adjusted for selection.** The platform searches: two stop multipliers, five strategies, three UMA combination methods, three simulation methods, two model architectures, and a regime map with four hand-set thresholds. Reporting the best result of that search reports the maximum of many draws — and the maximum of many draws from a zero-edge process is comfortably positive.
+
+`src/performance_stats.py` implements the statistics that price that in. The Probabilistic Sharpe Ratio,
+
+$$
+\text{PSR}(SR^*) = \Phi\!\left(\frac{(\widehat{SR} - SR^*)\sqrt{n-1}}{\sqrt{1 - \gamma_3\widehat{SR} + \frac{\gamma_4 - 1}{4}\widehat{SR}^2}}\right)
+$$
+
+whose denominator is the point: negative skew and fat tails — endemic to equity strategies and to Indian small caps especially — inflate the standard error of a Sharpe estimate, so the same headline number is weaker evidence than a Gaussian assumption implies. The Deflated Sharpe Ratio evaluates PSR against the Sharpe the *best of N trials* would show by luck alone,
+
+$$
+SR^*_0 = \sqrt{V[\widehat{SR}]}\left[(1-\gamma)\Phi^{-1}\!\left(1 - \tfrac{1}{N}\right) + \gamma\,\Phi^{-1}\!\left(1 - \tfrac{1}{Ne}\right)\right]
+$$
+
+with \(\gamma\) the Euler–Mascheroni constant. DSR is undefined without \(N\), which is exactly the quantity a research process forgets — hence the append-only trial log, a change with more scientific value than any model in the repository.
+
+Also implemented: **PBO** by combinatorially-symmetric cross-validation, which asks not "is this strategy good" but "is my selection procedure predictive" (PBO > 0.5 means the configuration that looked best in sample is more likely than not to be *below* average out of sample); **cross-sectional rank IC and ICIR**, which is the right primary metric for a ranking system and separates signal quality from portfolio construction; and a **Newey–West standard error** for the overlapping labels a daily-sampled \(H\)-day target always has — adjacent observations share \(H-1\) days, and treating them as independent understates the standard error by roughly \(\sqrt{H}\), in the direction that manufactures significance.
+
+One calibrating result from the tests: five years of daily data showing an annualized Sharpe of −0.4 still leaves roughly a **one-in-five chance the true Sharpe is positive**. A backtest is a small sample even when it covers a long calendar.
+
+**Sources:**
+- Bailey & López de Prado (2014), "The Deflated Sharpe Ratio", *Journal of Portfolio Management* 40(5)
+- Bailey, Borwein, López de Prado & Zhu (2016), "The Probability of Backtest Overfitting", *Journal of Computational Finance*
+- Harvey, Liu & Zhu (2016), "…and the Cross-Section of Expected Returns" — the \(t > 3.0\) hurdle
+
+---
+
+## 24. Predicting the cross-section, not the market
+
+**The problem.** The neural stack was trained to predict each stock's *absolute* forward return. In an equity panel the overwhelming majority of the variance of a 5-day return is the common market factor — a typical Indian mid-cap runs an \(R^2\) against the Nifty of 0.35–0.55 at daily frequency, and the common component dominates further over a week.
+
+So the network spent most of its capacity learning to forecast the market, which is (a) nearly unforecastable and (b) not what this system needs, because it cannot act on a market view at all: long-only, no shorting, no index hedge (§17). The residual, idiosyncratic component — the only part the platform monetizes, by choosing *between* stocks — was a minority of the training signal.
+
+**Formulation.** The convention in empirical asset pricing since Gu, Kelly & Xiu is a cross-sectionally demeaned or rank-transformed target:
+
+$$
+y_{i,t} = r_{i,t\to t+H} - \frac{1}{N_t}\sum_{j \in \mathcal{U}_t} r_{j,t\to t+H}
+\qquad\text{or}\qquad
+y_{i,t} = \frac{2\,\text{rank}_t(r_{i,t\to t+H})}{N_t + 1} - 1
+$$
+
+The rank form is the default (`training.target_transform`) and is the more robust of the two on Indian data: a circuit-limited +20% print dominates the cross-sectional mean and drags every other name's label with it, while moving a ranking by exactly one place.
+
+**This adds no look-ahead.** The transform mixes only labels dated at the same decision point \(t\), each of which is already realized at \(t+H\); it introduces no information the raw forward return did not already contain. Nothing about inference changes either — the model still scores one ticker at a time, and its output was always consumed as a relative score.
+
+**The evaluation had to follow.** A rank is not a return: +0.4 is a position in the ordering, not 40%, so a Sharpe computed on ranks is a confident number about the wrong quantity. Under a relative target the walk-forward folds report **rank IC and its information ratio** instead — which is the better metric regardless, being far less noisy than backtested P&L and free of any confounding with position sizing, costs or the covariance of the book.
+
+**What is deliberately not included.** Cross-sectional *feature* normalization (z-scoring or ranking each feature within each trading day) is the natural companion change, and `features/scaling.py` still standardizes globally. It is not a one-function change here: the fitted scaler ships inside the model checkpoint and is applied per ticker at inference, where no cross-section is available. PatchTST's per-window instance normalization partially compensates within a window; the plain LSTM path has nothing.
+
+**Sources:**
+- Gu, Kelly & Xiu (2020), "Empirical Asset Pricing via Machine Learning", *Review of Financial Studies*
+- Gu, Kelly & Xiu (2021), "Autoencoder Asset Pricing Models", *Journal of Econometrics*
+
 
 ---
 

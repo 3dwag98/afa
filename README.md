@@ -232,9 +232,14 @@ Notes:
 
 - Cross-sectional momentum and the low-volatility anomaly (`strategies/cross_sectional.py`)
 - GJR-GARCH(1,1) conditional volatility with Student-t innovations, used as an optional drop-in replacement for the Monte Carlo simulation's flat historical-volatility assumption (`src/volatility_models.py`; enable via `simulation.use_garch_volatility: true`)
-- Fractional-Kelly position sizing, estimated from realized trade history (`src/risk.py::calculate_kelly_quantity`; enable via `risk.use_kelly_sizing: true`)
+- Fractional-Kelly position sizing in *allocation* units — the fraction of wealth a stop-loss trade justifies, which is the binary-bet Kelly fraction divided by the loss-given-stop (`src/risk.py::kelly_allocation_fraction`; enable via `risk.use_kelly_sizing: true`)
+- Portfolio covariance estimation and constrained long-only allocation: Ledoit-Wolf shrinkage, a turnover-penalized mean-variance optimizer, and hierarchical risk parity for when expected returns are not trustworthy (`src/portfolio.py`)
+- Selection-bias-aware performance statistics — probabilistic and deflated Sharpe, probability of backtest overfitting, cross-sectional rank IC, and the Newey-West correction for overlapping labels (`src/performance_stats.py`)
+- Bayesian shrinkage of the simulated drift, whose standard error over five years of daily data is roughly 14% a year (`src/monte_carlo.py::shrink_drift`)
 - The original trend/breakout/volume/Monte-Carlo rule-based strategy
 - Researched-but-not-implemented strategy families (cointegration pairs trading, Fama-French factors, quality/QMJ, FII/DII flows, calendar anomalies) and exactly why each is scoped out (architectural gap vs. data gap vs. weak evidence)
+
+Four of these were added in response to a quantitative review; §21–24 of the research doc set out what each was measuring wrongly and what the corrected version measures instead.
 
 ## Training
 

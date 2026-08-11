@@ -69,6 +69,15 @@ training:
   # cannot fit spurious cross-feature relationships.
   model: lstm
   target: return_5d
+  # absolute | cross_sectional_demean | cross_sectional_rank. Most of the
+  # variance of an absolute 5-day return is the market factor, which a
+  # long-only book with no index hedge cannot act on — so the network spent
+  # its capacity on the one component it cannot trade. The cross-sectional
+  # forms measure each name against the rest of the universe on the same date,
+  # leaving the idiosyncratic part the platform monetizes by choosing between
+  # stocks. Rank is the default: on Indian data a circuit-limited print
+  # dominates the cross-sectional mean but moves a ranking by one place.
+  target_transform: cross_sectional_rank
   sequence_length: 60
   train_fraction: 0.8
   batch_size: 128
@@ -166,6 +175,15 @@ risk:
 learning:
   learning_rate: 0.15
   min_trades_for_learning: 5
+  # Weight adaptation is a closed feedback loop — weights change which trades
+  # are taken, which changes the outcomes the next adaptation sees — so an
+  # unshrunk win rate at a 5-trade floor (standard error ~22 percentage
+  # points) made noise self-reinforcing. A component's weight now moves only
+  # on its own sample, shrunk by the same Beta prior the Kelly path uses, and
+  # only when an exact binomial test can distinguish it from a coin flip.
+  min_trades_per_component: 30
+  shrinkage_strength: 20.0
+  significance_level: 0.05
 
 # Per-symbol Monte Carlo forward simulation (feeds strategy scoring)
 simulation:
@@ -186,6 +204,16 @@ simulation:
   # NSE opens after the US close, so gaps are frequent and destabilize a
   # close-to-close fit.
   separate_overnight_gaps: true
+  # The sample mean of daily returns has a standard error of sigma/sqrt(T) —
+  # about 14% a year for a 2%/day name over five years — so propagating it
+  # forward unshrunk made probability-of-profit mostly estimation noise:
+  # 5.2% of tickers with exactly zero true drift cleared the 0.55 gate below
+  # on noise alone. This is the prior dispersion of *true* annual drifts used
+  # to shrink each estimate toward zero; raising it recovers the raw mean.
+  prior_annual_drift_std: 0.10
+  # Draw each path's drift from the posterior rather than sharing its mean, so
+  # probability_profit accounts for the drift being estimated, not known.
+  propagate_drift_uncertainty: true
 
 # Trade compliance / eligibility checks
 compliance:
