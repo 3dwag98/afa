@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from portfolio_agent.config.schema import TrainingConfig
 from portfolio_agent.utils.device import resolve_device
+from portfolio_agent.utils.workers import resolve_dataloader_workers
 
 
 class TimeSeriesDataset(Dataset):
@@ -113,7 +114,9 @@ def create_dataloaders(
 
     # One resolved worker count, used consistently for every DataLoader knob:
     # persistent_workers/prefetch_factor are only valid when workers > 0.
-    num_workers = max(0, min(config.num_workers, 2))
+    # Zero on Windows: a DataLoader worker there is a spawned interpreter
+    # that re-imports torch *and* receives a copy of the dataset tensors.
+    num_workers = resolve_dataloader_workers(config.num_workers)
     worker_kwargs = (
         {"persistent_workers": True, "prefetch_factor": 2} if num_workers > 0 else {}
     )

@@ -86,7 +86,7 @@ class TestLoadDataUsesRealDataByDefault:
         call into the real data store rather than fabricating data."""
         calls = []
 
-        def fake_resolve_backtest_universe(max_tickers=None):
+        def fake_resolve_backtest_universe(max_tickers=None, **kwargs):
             calls.append(max_tickers)
             return ["FAKE1.NS", "FAKE2.NS"]
 
@@ -108,7 +108,7 @@ class TestLoadDataUsesRealDataByDefault:
         assert target_column_name(config.training.target) in df.columns
 
     def test_raises_when_no_cached_tickers_available(self, monkeypatch):
-        monkeypatch.setattr("portfolio_agent.agents.trainer.resolve_backtest_universe", lambda max_tickers=None: [])
+        monkeypatch.setattr("portfolio_agent.agents.trainer.resolve_backtest_universe", lambda max_tickers=None, **kwargs: [])
 
         config = AppConfig.model_validate({"training": {"use_synthetic_data": False}})
 
@@ -124,7 +124,7 @@ class TestParallelDataLoading:
         build an equivalent panel (same tickers contribute, same row count)
         as the serial path."""
 
-        def fake_resolve_backtest_universe(max_tickers=None):
+        def fake_resolve_backtest_universe(max_tickers=None, **kwargs):
             return ["FAKE1.NS", "FAKE2.NS", "FAKE3.NS"]
 
         def fake_load_ticker_data(ticker, start_date=None, end_date=None):

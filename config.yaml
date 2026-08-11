@@ -22,6 +22,15 @@ data:
   benchmark_symbol: "^NSEI"
   # Years of history kept, applied to both sources.
   default_history_years: 5
+  # alphabetical | random. The cache is scanned in sorted filename order, so
+  # 'alphabetical' returns whatever sits at the front of the alphabet — the
+  # same names every run, for training and backtesting alike, which means a
+  # model is evaluated on the very tickers it was fitted on. 'random' draws a
+  # seeded sample and offsets the seed by purpose, so train and backtest get
+  # different names. Seeded, not truly random: one config must reproduce one
+  # universe. Does NOT fix survivorship bias (see docs/REVIEW_STATUS.md, D9).
+  universe_selection: random
+  universe_seed: 42
   universe_size: 4000
   tickers: []
   min_history_days: 250
@@ -69,6 +78,16 @@ training:
   # cannot fit spurious cross-feature relationships.
   model: lstm
   target: return_5d
+  # Largest |forward return| accepted as a label; rows above it are dropped.
+  # Features are standardized and clipped before training but the target never
+  # was, and one bad cached bar is enough to poison a whole run: a close
+  # printed at 0.001 turns a 5-day forward return into 111,300, and one
+  # gradient step against a loss that size leaves every later batch NaN. This
+  # is why NaN losses outlived the mixed-precision fix and still appeared on
+  # CPU — the cause was the label, not fp16. 5.0 admits any reachable move
+  # (five 20% upper circuits compound to +149%) and rejects only arithmetic
+  # that cannot be a price.
+  max_abs_target: 5.0
   # absolute | cross_sectional_demean | cross_sectional_rank. Most of the
   # variance of an absolute 5-day return is the market factor, which a
   # long-only book with no index hedge cannot act on — so the network spent

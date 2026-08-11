@@ -28,6 +28,9 @@ from portfolio_agent.src.data_store import load_ticker_data
 from portfolio_agent.src.performance_stats import newey_west_standard_error
 from portfolio_agent.src.universe import resolve_backtest_universe
 from portfolio_agent.utils.device import get_device, mixed_precision_support
+from portfolio_agent.utils.workers import (
+    describe_worker_plan, resolve_dataloader_workers, resolve_process_workers,
+)
 
 TRAINING_FEATURE_NAMES = [
     'sma_20', 'sma_50', 'rsi_14', 'macd',
@@ -171,7 +174,16 @@ def load_panel_by_ticker(config: AppConfig) -> Dict[str, pd.DataFrame]:
     if config.training.use_synthetic_data:
         return {"SYNTHETIC": prepare_features(_generate_synthetic_ohlcv(), config, verbose=False)}
 
-    tickers = resolve_backtest_universe(max_tickers=config.data.universe_size)
+    # purpose="train" offsets the sampling seed, so the training universe is a
+    # different draw from the cache than the backtest universe. Evaluating a
+    # model on the very names it was fitted on is not out-of-sample in the
+    # cross-sectional dimension, however carefully the dates are split.
+    tickers = resolve_backtest_universe(
+        max_tickers=config.data.universe_size,
+        selection=config.data.universe_selection,
+        seed=config.data.universe_seed,
+        purpose="train",
+    )
     if not tickers:
         raise RuntimeError(
             "No cached tickers found to build a training panel. Run "
@@ -188,8 +200,17 @@ def load_panel_by_ticker(config: AppConfig) -> Dict[str, pd.DataFrame]:
     show_progress = len(tickers) > 20
     failures = 0
 
+    # Capped for the platform: on Windows each worker is a spawned interpreter
+    # that re-imports torch and pandas, so "one per CPU" is how a 16 GB machine
+    # ends up in the page file with a run that looks hung rather than failed.
+    process_workers = resolve_process_workers(config.training.data_load_workers)
     if config.training.parallel_data_loading and len(tickers) > 1:
-        with ProcessPoolExecutor(max_workers=config.training.data_load_workers) as executor:
+        print(describe_worker_plan(
+            process_workers, resolve_dataloader_workers(config.training.num_workers)
+        ))
+
+    if config.training.parallel_data_loading and len(tickers) > 1:
+        with ProcessPoolExecutor(max_workers=process_workers) as executor:
             futures = {executor.submit(_load_ticker_features, t, config): t for t in tickers}
             iterator = as_completed(futures)
             if show_progress:
@@ -455,6 +476,32 @@ def prepare_features(df: pd.DataFrame, config: AppConfig, verbose: bool = True) 
     # band width), and a cached bar with a zero price or a zero-volume week
     # makes the denominator zero. So does the forward-return target itself.
     feature_df = feature_df.replace([np.inf, -np.inf], np.nan).dropna()
+
+    # Finite is not the same as usable. Input features are standardized and
+    # clipped to +/-10 sigma before training, but the *target* was passed
+    # through untouched, and a single bad cached bar is enough to poison a run:
+    # one close printed at 0.001 turns a 5-day forward return into 111,300
+    # (eleven million percent), and one gradient step against a loss that size
+    # moves the weights somewhere every subsequent batch evaluates to NaN.
+    #
+    # This is why NaN losses survived the mixed-precision fix and still appear
+    # on CPU — the cause was never fp16, it was the label.
+    #
+    # Rows are dropped rather than clipped: a clip would pile a spike of
+    # samples at the bound and teach the model that the bound is a common
+    # outcome. The default admits any genuinely reachable move — five
+    # consecutive 20% upper circuits compound to +149% — and rejects only
+    # arithmetic that cannot be a price.
+    target_values = feature_df[target_name]
+    absurd = target_values.abs() > config.training.max_abs_target
+    if absurd.any():
+        if verbose:
+            print(
+                f"Dropped {int(absurd.sum())} row(s) whose |{target_name}| exceeded "
+                f"{config.training.max_abs_target:g} "
+                f"(max was {target_values.abs().max():.4g}) — almost certainly bad cached bars"
+            )
+        feature_df = feature_df[~absurd]
 
     if verbose:
         print(f"Built feature matrix with {len(feature_df)} samples and {len(feature_df.columns)} columns")

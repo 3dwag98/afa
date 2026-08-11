@@ -27,6 +27,34 @@ from portfolio_agent.src.risk_analytics import RiskAnalyzer
 logger = logging.getLogger(__name__)
 
 
+def _load_failure_message(strategy, config) -> str:
+    """Say which member failed and what to run, not just that something did.
+
+    "Strategy 'ensemble' failed to load (missing trained model checkpoint?)" is
+    an accurate sentence that leaves the reader no better off: a UMA has
+    several sleeves, usually only one of them needs a checkpoint, and the
+    message named none of them. This names the members that failed, the model
+    path that was looked for, and the two ways forward.
+    """
+    failed = list(getattr(strategy, "unloadable_members", []) or [])
+    model_path = getattr(config.backtest, "model_path", "the configured model path")
+
+    if not failed:
+        return (
+            f"Strategy '{strategy.name}' failed to load. It expects a trained checkpoint at "
+            f"{model_path}; run `portfolio-agent train` first, or pick a strategy that needs "
+            f"no model (`--strategy rule_based`, `momentum`, `low_volatility`)."
+        )
+
+    return (
+        f"UMA '{strategy.name}' could not load {len(failed)} member(s): {', '.join(failed)}. "
+        f"Those members expect a trained checkpoint at {model_path}.\n"
+        f"  - Train it:            portfolio-agent train\n"
+        f"  - Or run without it:   add `drop_unavailable_members: true` to the UMA's YAML to "
+        f"run the remaining members (note that this is no longer the strategy you configured)."
+    )
+
+
 class BacktesterAgent:
     """Runs a backtest for a configured strategy and exports the Excel report."""
 
@@ -93,11 +121,8 @@ class BacktesterAgent:
             Dictionary with backtest results and metrics.
         """
         strategy = load_strategy(self.strategy_config)
-        if hasattr(strategy, "load"):
-            if not strategy.load():
-                raise RuntimeError(
-                    f"Strategy '{strategy.name}' failed to load (missing trained model checkpoint?)"
-                )
+        if hasattr(strategy, "load") and not strategy.load():
+            raise RuntimeError(_load_failure_message(strategy, self.config))
 
         risk_params = RiskParams.from_app_config(self.config)
 
@@ -336,7 +361,10 @@ def run_backtest_cli(
     from portfolio_agent.src.universe import resolve_backtest_universe
     tickers = resolve_backtest_universe(
         force_full_download=False,
-        max_tickers=config.data.universe_size
+        max_tickers=config.data.universe_size,
+        selection=config.data.universe_selection,
+        seed=config.data.universe_seed,
+        purpose="backtest",
     )
 
     if not tickers:

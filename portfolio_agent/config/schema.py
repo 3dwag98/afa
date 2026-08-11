@@ -58,6 +58,24 @@ class DataConfig(BaseModel):
     universe_size: int = Field(
         default=10, description="Number of securities in the trading universe"
     )
+    universe_selection: Literal["alphabetical", "random"] = Field(
+        default="random",
+        description="How universe_size names are chosen from the parquet cache. The cache is "
+        "scanned in sorted filename order, so 'alphabetical' returns whatever sits at the front "
+        "of the alphabet — the same few hundred names every run, for training and backtesting "
+        "alike. That is a sample of the alphabet rather than of the market, and it means a model "
+        "is evaluated on the very tickers it was fitted on, however carefully the dates are "
+        "split. 'random' draws a seeded sample instead, and offsets the seed by purpose so the "
+        "training and backtest draws are different names. Seeded, not truly random: two runs of "
+        "one config must produce the same universe or nothing is reproducible. Note this does "
+        "not fix survivorship bias — a random sample of a cache is still not point-in-time index "
+        "membership (see docs/REVIEW_STATUS.md, D9).",
+    )
+    universe_seed: int = Field(
+        default=42,
+        description="Base seed for data.universe_selection='random'. Change it to draw a "
+        "different sample and re-run; keep it fixed to reproduce one.",
+    )
     tickers: List[str] = Field(
         default_factory=list,
         description="Explicit ticker override list for the live agent; empty means auto-discover from cache",
@@ -163,6 +181,19 @@ class TrainingConfig(BaseModel):
         "a rank by one place. Falls back to 'absolute' automatically when the universe is too "
         "small to rank. Note this changes what the model predicts, so a checkpoint trained under "
         "one setting should not be scored under another.",
+    )
+    max_abs_target: float = Field(
+        default=5.0,
+        gt=0.0,
+        description="Largest |forward return| accepted as a training label; rows above it are "
+        "dropped (agents/trainer.py::prepare_features). Input features are standardized and "
+        "clipped before training but the target never was, and a single bad cached bar is enough "
+        "to poison a whole run: one close printed at 0.001 turns a 5-day forward return into "
+        "111,300, and one gradient step against a loss that size moves the weights somewhere "
+        "every later batch evaluates to NaN. This is why NaN losses outlived the mixed-precision "
+        "fix and still appear on CPU — the cause was the label, not fp16. 5.0 (+500%) admits any "
+        "genuinely reachable move — five consecutive 20% upper circuits compound to +149% — and "
+        "rejects only arithmetic that cannot be a price.",
     )
     sequence_length: int = Field(
         default=60, description="Length of input sequences"

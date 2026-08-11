@@ -36,6 +36,7 @@ config/strategies/uma_meta_orchestrator.yaml.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -46,6 +47,8 @@ from .base import BaseStrategy
 from .types import ModelVerdict, StrategyContext, StrategySignal
 from portfolio_agent.config.schema import StrategyConfig
 from portfolio_agent.src.trigger_engine import TriggerConfig, TriggerEngine
+
+logger = logging.getLogger(__name__)
 
 _SIGNAL_STRENGTH = {
     "BUY": 1.0,
@@ -106,6 +109,18 @@ class EnsembleStrategy(BaseStrategy):
         # would create a circular import. By the time a UMA is actually
         # instantiated, the registry module has already finished executing.
         from .registry import load_strategy
+
+        # When a member cannot load (an ML sleeve with no checkpoint), drop it
+        # and run the rest rather than failing the whole UMA. Off by default:
+        # trading a different strategy than the one configured, silently, is
+        # worse than refusing to start.
+        self._drop_unavailable_members = bool(
+            config.params.get(
+                "drop_unavailable_members",
+                self._spec.get("drop_unavailable_members", False),
+            )
+        )
+        self.unloadable_members: List[str] = []
 
         self._members: List[BaseStrategy] = []
         self._weights: List[float] = []
@@ -188,12 +203,53 @@ class EnsembleStrategy(BaseStrategy):
         return self._spec.get("method", "weighted_blend")
 
     def load(self) -> bool:
-        """Load any member strategies that require it (e.g. ML members)."""
-        ok = True
+        """Load any member strategies that require it (e.g. ML members).
+
+        Records which members failed in `unloadable_members`, because "the
+        ensemble failed to load" is not an actionable message when a UMA has
+        four sleeves and only one of them needs a checkpoint. The caller reads
+        that list to say *which* member and *what to run*.
+
+        `drop_unavailable_members` (a YAML key on the ensemble) trades the
+        strategy for a runnable subset: the remaining members carry on and the
+        UMA reports success. Off by default — silently trading a different
+        strategy than the one configured is worse than refusing to start — but
+        it is the right setting for "three of my four sleeves need no model and
+        I want to see them run".
+        """
+        self.unloadable_members: List[str] = []
         for member in self._members:
-            if hasattr(member, "load"):
-                ok = member.load() and ok
-        return ok
+            if hasattr(member, "load") and not member.load():
+                self.unloadable_members.append(member.name)
+
+        if not self.unloadable_members:
+            return True
+
+        if self._drop_unavailable_members:
+            # Filter by position, not by name: _members, _weights and
+            # _member_names are three parallel lists, and _member_names is the
+            # UMA's own naming (which is deliberately allowed to differ from
+            # member.name — see __init__). Dropping them independently would
+            # silently re-pair every remaining member with the wrong weight.
+            failed = set(self.unloadable_members)
+            keep = [
+                index for index, member in enumerate(self._members)
+                if member.name not in failed
+            ]
+            if not keep:
+                return False
+
+            logger.warning(
+                "Dropping UMA member(s) that could not load: %s. The remaining "
+                "%d member(s) will run — this is NOT the configured strategy.",
+                ", ".join(self.unloadable_members), len(keep),
+            )
+            self._members = [self._members[i] for i in keep]
+            self._weights = [self._weights[i] for i in keep]
+            self._member_names = [self._member_names[i] for i in keep]
+            return True
+
+        return False
 
     def required_features(self) -> List[str]:
         names: List[str] = []

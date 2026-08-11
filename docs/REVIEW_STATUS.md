@@ -124,3 +124,25 @@ fixed, no cross-sectional backtest number from this repository should be
 believed in either direction** — including any number that improves because of
 the changes above. The measurement layer added in Phase 1 exists to make that
 judgeable rather than assumed; it cannot manufacture a clean sample.
+
+---
+
+## Appendix: defects found by running the platform
+
+Six issues reported from a real run — a Windows machine with a 6 GB GPU, a
+populated cache, and a UMA containing an untrained member. None came from the
+review; all are fixed.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| NaN training loss **on CPU**, surviving the earlier mixed-precision fix | Features were standardized and clipped to ±10σ; the *target* never was. One cached close printed at 0.001 turns a 5-day forward return into 111,300, and one gradient step against a loss that size leaves every later batch NaN. The cause was the label, not fp16 | `training.max_abs_target` (default 5.0) drops the poisoned rows — dropped, not clipped, since clipping piles a spike of samples at the bound |
+| Windows paging / apparent hang while training | `ProcessPoolExecutor(max_workers=None)` spawns one worker per CPU, and Windows has no `fork` — each is a fresh interpreter re-importing torch, pandas and pyarrow at 300–800 MB. Twelve of those pages a 16 GB machine. The 6 GB GPU is irrelevant; the exhausted resource is host RAM | `utils/workers.py` caps process pools (2 on Windows, 8 elsewhere) and uses in-process DataLoading on Windows, printing the plan at startup |
+| Re-downloads data already on disk | `sync_hf_to_cache` had no existence check and re-fetched all ~2,400 symbols every invocation | `skip_existing=True` by default via `DataStore.has_ticker_data`, which also rejects zero-byte files left by an interrupted write; `--force` restores the old behaviour |
+| Download is serial | One symbol at a time over the network | `ThreadPoolExecutor` (8 by default, `--workers` to change). Threads not processes: the work is network-bound, and processes would re-import pandas per worker — the same Windows problem again |
+| Training and backtesting use identical tickers | `tickers[:n]` on an alphabetically sorted cache | `data.universe_selection: random` with `universe_seed`, and the seed offset by purpose so train and backtest draw different names. Seeded so one config reproduces one universe |
+| `ensemble` fails with "missing trained model checkpoint?" | `EnsembleStrategy.load()` returned False if *any* member failed, and the message named none of them | The error now names the failing members, the path searched, and both remedies; `drop_unavailable_members: true` runs the loadable subset (with a warning that it is no longer the configured strategy) |
+
+Two of these are worth separating from the rest. The NaN was a **correctness**
+bug that silently defined which rows a model trained on, and the universe
+truncation meant every model was being evaluated on the exact names it was
+fitted on — neither is a usability complaint.
