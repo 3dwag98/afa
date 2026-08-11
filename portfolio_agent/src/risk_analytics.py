@@ -11,7 +11,7 @@ strategy *scoring* decisions during a run — not a backtest report metric.
 
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, List, Optional, Sequence, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 
 try:
     from .performance_stats import (
