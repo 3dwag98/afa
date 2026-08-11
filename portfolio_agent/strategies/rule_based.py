@@ -109,6 +109,24 @@ class RuleBasedStrategy(BaseStrategy):
         volume_ratio = _clean(latest.get("volume_ratio_20"))
         atr = _clean(latest.get("atr_14"))
 
+        # Two different reasons a component can be unmeasurable, and they must
+        # NOT be handled the same way:
+        #
+        # - **The pipeline did not compute it.** Inside a batched UMA the
+        #   caller builds one context for the whole round, so there is no
+        #   per-ticker Monte Carlo result. Nothing about the stock is different;
+        #   a different code path ran. Scoring that at 0 made the identical
+        #   stock on the identical day score ~12 points lower in an ensemble
+        #   than standalone — an artifact, and the weight is renormalized away.
+        #
+        # - **The stock does not have the history.** A missing SMA-200 means a
+        #   recent listing, and that *is* information about the stock. Dropping
+        #   the trend weight there would renormalize the remaining components up
+        #   and make the system score a young, illiquid name *higher* than a
+        #   seasoned one — least caution where an Indian micro-cap universe
+        #   warrants most. Those keep their conservative zero.
+        unavailable: List[str] = []
+
         # 1. Trend score
         if sma200 is None:
             trend_score = 0.0
@@ -130,9 +148,14 @@ class RuleBasedStrategy(BaseStrategy):
         # 3. Volume score
         volume_score = 0.0 if volume_ratio is None else min(volume_ratio / 2.0, 1.0)
 
-        # 4. Monte Carlo probability-of-profit score
-        prob_profit = context.mc_result.probability_profit if context.mc_result is not None else 0.0
-        mc_score = max(0.0, min(1.0, prob_profit))
+        # 4. Monte Carlo probability-of-profit score.
+        if context.mc_result is None:
+            prob_profit = 0.0
+            mc_score = 0.0
+            unavailable.append("MC_Prob")
+        else:
+            prob_profit = context.mc_result.probability_profit
+            mc_score = max(0.0, min(1.0, prob_profit))
 
         component_scores = {
             "Trend": trend_score,
@@ -140,7 +163,9 @@ class RuleBasedStrategy(BaseStrategy):
             "Volume": volume_score,
             "MC_Prob": mc_score,
         }
-        final_score, trigger = combine_weighted(component_scores, context.weights)
+        final_score, trigger = combine_weighted(
+            component_scores, context.weights, unavailable=unavailable
+        )
 
         # 5. Stop / target from ATR (YAML multipliers, falling back to context defaults)
         exit_rules = self.exit_rules()
@@ -173,14 +198,33 @@ class RuleBasedStrategy(BaseStrategy):
         passed_rr = reward_risk >= context.risk.min_reward_risk
         passed_price = close >= context.risk.min_price_inr
 
+        # An unavailable component reports as such rather than as a 0.00 that
+        # reads like a measurement. The probability gate is the one that
+        # matters most: with no Monte Carlo result it fails closed, so a
+        # rule-based member inside a batched UMA cannot issue BUY at all.
+        # That is the right default — a compliance gate with no evidence
+        # either way should refuse, not wave the trade through untested — but
+        # it is a real limitation of mixing an MC-dependent member into a
+        # batched ensemble, and it should be legible in the rationale rather
+        # than looking like the stock scored badly.
+        def _component(name: str, value: float, fmt: str = "{:.2f}") -> str:
+            return f"{name}=n/a" if name in unavailable else f"{name}={fmt.format(value)}"
+
+        probability_note = (
+            "prob(no MC result):FAIL"
+            if "MC_Prob" in unavailable
+            else f"prob({prob_profit:.2f})>={context.risk.target_prob_profit}:"
+                 f"{'PASS' if passed_prob else 'FAIL'}"
+        )
+
         rationale = "; ".join([
             f"Score={final_score:.1f}",
-            f"trend={trend_score:.1f}",
-            f"breakout={breakout_score:.1f}",
-            f"volume={volume_score:.2f}",
-            f"mc_prob={mc_score:.2f}",
+            _component("Trend", trend_score, "{:.1f}"),
+            _component("Breakout", breakout_score, "{:.1f}"),
+            _component("Volume", volume_score),
+            _component("MC_Prob", mc_score),
             f"score>=60:{'PASS' if passed_score else 'FAIL'}",
-            f"prob({prob_profit:.2f})>={context.risk.target_prob_profit}:{'PASS' if passed_prob else 'FAIL'}",
+            probability_note,
             f"rr({reward_risk:.2f})>={context.risk.min_reward_risk}:{'PASS' if passed_rr else 'FAIL'}",
             f"price({close:.2f})>={context.risk.min_price_inr}:{'PASS' if passed_price else 'FAIL'}",
             "stop<entry:VALID" if stop_valid else "stop>=entry:INVALID",

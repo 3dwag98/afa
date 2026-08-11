@@ -95,6 +95,112 @@ class TestRuleBasedStrategyMetadata:
         assert exit_rules["take_profit"]["multiplier"] == 3.0
 
 
+
+class TestUnavailableComponents:
+    """A component the pipeline could not compute is not a component that
+    scored badly, and the two must not be conflated — the BUY gate is an
+    absolute `score >= 60`, so the difference moves signals across it."""
+
+    _WEIGHTS = {"Trend": 25.0, "Breakout": 25.0, "Volume": 20.0, "MC_Prob": 30.0}
+
+    def _score(self, mc_result):
+        strategy = RuleBasedStrategy(_strategy_config())
+        context = StrategyContext(
+            risk=_risk_params(), weights=dict(self._WEIGHTS), mc_result=mc_result
+        )
+        return strategy.score("TEST", _features(), context)
+
+    def test_a_missing_monte_carlo_result_does_not_shift_the_score(self):
+        """The defect: the identical stock on the identical day scored ~12
+        points lower inside a batched UMA than standalone, because the ensemble
+        path builds one context for the round and there is no per-ticker MC
+        result to read. Nothing about the stock differs; a different code path
+        ran.
+        """
+        standalone = self._score(_mc_result(0.70))
+        in_ensemble = self._score(None)
+
+        # Trend/Breakout/Volume all score 1.0 on these features, so with
+        # MC_Prob's weight renormalized away the remaining components carry the
+        # full 100 rather than leaving a ~12-point hole.
+        assert standalone.score == pytest.approx(91.0)
+        assert in_ensemble.score == pytest.approx(100.0)
+        # What matters is that the shift is not a silent penalty on the stock:
+        # the components that *were* measured score identically.
+        for component in ("Trend", "Breakout", "Volume"):
+            assert standalone.component_scores[component] == pytest.approx(
+                in_ensemble.component_scores[component]
+            )
+
+    def test_an_unavailable_component_says_so_in_the_rationale(self):
+        """A 0.00 reads like a measurement. 'n/a' reads like what happened."""
+        signal = self._score(None)
+
+        assert "MC_Prob=n/a" in signal.rationale
+        assert "prob(no MC result):FAIL" in signal.rationale
+
+    def test_the_probability_gate_still_fails_closed_without_a_result(self):
+        """A compliance gate with no evidence either way must refuse, not wave
+        the trade through untested — so a rule-based member inside a batched
+        UMA cannot issue BUY, and that is deliberate."""
+        signal = self._score(None)
+
+        assert signal.signal != "BUY"
+        assert signal.probability_profit == 0.0
+
+    def test_a_stock_that_lacks_history_keeps_its_conservative_zero(self):
+        """The asymmetry that matters. A missing SMA-200 means a recent
+        listing, which *is* information about the stock. Renormalizing that
+        weight away would scale the other components up and score a young,
+        illiquid name higher than a seasoned one — least caution exactly where
+        an Indian micro-cap universe warrants most.
+        """
+        strategy = RuleBasedStrategy(_strategy_config())
+        context = StrategyContext(
+            risk=_risk_params(), weights=dict(self._WEIGHTS), mc_result=_mc_result(0.70)
+        )
+
+        seasoned = strategy.score("TEST", _features(), context)
+        young = strategy.score("TEST", _features(sma_200=float("nan")), context)
+
+        assert young.component_scores["Trend"] == 0.0
+        assert young.score < seasoned.score
+        # And it is still reported as a measured zero, not as unavailable.
+        assert "Trend=0.0" in young.rationale
+
+
+class TestCombineWeightedUnavailable:
+    """Unit-level behaviour of the renormalization."""
+
+    def test_renormalizes_over_the_measurable_components(self):
+        from portfolio_agent.strategies.weighting import combine_weighted
+
+        weights = {"A": 25.0, "B": 25.0, "C": 50.0}
+        scores = {"A": 1.0, "B": 1.0, "C": 0.0}
+
+        with_all, _ = combine_weighted(scores, weights)
+        without_c, _ = combine_weighted(scores, weights, unavailable=["C"])
+
+        assert with_all == pytest.approx(50.0)
+        assert without_c == pytest.approx(100.0)
+
+    def test_a_genuine_zero_still_counts_against_the_score(self):
+        """Only naming a component as unavailable excludes it; a component that
+        simply scored 0 is a real measurement and must still drag the total."""
+        from portfolio_agent.strategies.weighting import combine_weighted
+
+        score, _ = combine_weighted({"A": 1.0, "B": 0.0}, {"A": 50.0, "B": 50.0})
+        assert score == pytest.approx(50.0)
+
+    def test_everything_unavailable_scores_zero_rather_than_dividing_by_zero(self):
+        from portfolio_agent.strategies.weighting import combine_weighted
+
+        score, _ = combine_weighted(
+            {"A": 1.0, "B": 1.0}, {"A": 50.0, "B": 50.0}, unavailable=["A", "B"]
+        )
+        assert score == 0.0
+
+
 class TestRuleBasedStrategyScoring:
     """Regression-pin tests: these mirror the exact scenarios the old
     src.scoring.score_candidate() covered, to guarantee the consolidated

@@ -265,9 +265,16 @@ class EnsembleStrategy(BaseStrategy):
         One cost is worth naming: `context.mc_result` is per-ticker, and the
         callers that batch (the backtest engine's full-batch path) build a
         single context for the round. A rule-based member inside a batched UMA
-        therefore sees no Monte Carlo result and scores its MC_Prob component
-        at zero. Mixing an MC-dependent member with a cross-sectional one is a
-        real trade-off, not a free composition.
+        therefore sees no Monte Carlo result. Its MC_Prob weight is
+        renormalized away rather than scored at zero (see
+        weighting.py::combine_weighted), so the score no longer carries a
+        silent ~12-point penalty relative to the same member standalone — but
+        the probability-of-profit compliance gate still fails closed, because a
+        gate with no evidence either way should refuse rather than wave a trade
+        through untested. The practical consequence is that a rule-based member
+        cannot issue BUY inside a batched UMA at all. Mixing an MC-dependent
+        member with a cross-sectional one is a real trade-off, not a free
+        composition.
         """
         member_signals: List[Dict[str, StrategySignal]] = []
         for member in self._members:

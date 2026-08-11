@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
     from portfolio_agent.src.risk import shrink_win_probability
@@ -72,21 +72,62 @@ def normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
     return {k: (v / total) * 100.0 for k, v in weights.items()}
 
 
-def combine_weighted(component_scores: Dict[str, float], weights: Dict[str, float]) -> Tuple[float, str]:
+def combine_weighted(
+    component_scores: Dict[str, float],
+    weights: Dict[str, float],
+    unavailable: Optional[Iterable[str]] = None,
+) -> Tuple[float, str]:
     """Combine component scores (each 0.0-1.0) into a final 0-100 score.
+
+    **"Cannot compute" is not the same as "scores zero", and this is where the
+    difference has to be handled.** Every gate downstream reads the result as
+    an absolute number — the rule-based strategy buys at `score >= 60` and
+    watches at `>= 45` — so a component that silently contributes 0 because its
+    input was missing does not merely add no information, it moves the total
+    across fixed thresholds.
+
+The live instance: a rule-based member inside a batched UMA receives no
+    per-ticker Monte Carlo result, so `MC_Prob` scored 0 and the identical
+    stock on the identical day scored ~12 points lower inside an ensemble than
+    standalone. That is a silent, systematic level shift between two code paths
+    that are supposed to agree, and it has nothing to do with the stock.
+
+    Naming the unavailable components instead drops them from the weight
+    normalization, so the remaining components renormalize to 100 and the score
+    stays on a scale the thresholds still mean something on.
+
+    **This is only correct when the pipeline failed to compute a value, not
+    when the stock lacks the data.** Renormalizing away a component the *stock*
+    cannot support — a missing SMA-200, meaning a recent listing — would scale
+    the remaining components up and score a young, illiquid name higher than a
+    seasoned one, applying least caution exactly where an Indian micro-cap
+    universe warrants most. Callers must keep that case at its conservative
+    zero; see rule_based.py, which passes only `MC_Prob` here.
 
     Args:
         component_scores: Mapping of component name (e.g. "Trend", "Breakout",
             "Volume", "MC_Prob") to a 0.0-1.0 sub-score.
         weights: Raw (not necessarily normalized) weights per component.
+        unavailable: Components whose inputs were missing. These are excluded
+            from the weight normalization rather than scored as zero. A
+            component absent here but scored 0.0 is a genuine zero — a stock
+            that really is below its Donchian channel — and still counts.
 
     Returns:
         Tuple of (final_score 0-100, trigger name). The trigger is the highest
         scoring fully-satisfied (score == 1.0) component, falling back to the
         single highest-weighted-contribution component, or "None".
     """
-    normalized = normalize_weights(weights)
-    final_score = sum(normalized.get(name, 0.0) * score for name, score in component_scores.items())
+    missing = set(unavailable or ())
+    usable = {name: score for name, score in component_scores.items() if name not in missing}
+
+    # Renormalize over what could actually be measured. Weights for components
+    # that were never configured stay out of it either way.
+    effective_weights = {
+        name: value for name, value in weights.items() if name not in missing
+    }
+    normalized = normalize_weights(effective_weights)
+    final_score = sum(normalized.get(name, 0.0) * score for name, score in usable.items())
 
     # Trigger = first fully-satisfied component in priority order (matches the
     # historical Breakout > Trend > Volume precedence), else "None".

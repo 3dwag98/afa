@@ -29,6 +29,7 @@ This document is the mathematical/research foundation behind the platform's stra
 23. [Measuring a Sharpe ratio that means something](#23-measuring-a-sharpe-ratio-that-means-something) — implemented (`src/performance_stats.py`)
 24. [Predicting the cross-section, not the market](#24-predicting-the-cross-section-not-the-market) — implemented (`agents/trainer.py::apply_cross_sectional_target`)
 25. [Regimes as estimated states, not hand-set thresholds](#25-regimes-as-estimated-states-not-hand-set-thresholds) — implemented (`src/markov_regime.py`)
+26. ["Cannot compute" is not "scores zero"](#26-cannot-compute-is-not-scores-zero) — implemented (`strategies/weighting.py::combine_weighted`)
 
 Closing: [what to combine into a UMA](#summary-what-to-combine-into-a-uma)
 
@@ -713,6 +714,30 @@ with \(a\) a sleeve-by-state affinity matrix. Because \(\pi_t\) varies smoothly,
 **Sources:**
 - Hamilton (1989), "A New Approach to the Economic Analysis of Nonstationary Time Series and the Business Cycle", *Econometrica*
 - Baum, Petrie, Soules & Weiss (1970), the forward–backward / EM algorithm for HMMs
+
+
+---
+
+## 26. "Cannot compute" is not "scores zero"
+
+**The bug.** `strategies/rule_based.py` combines four components onto a 0–100 scale and gates on absolute thresholds — BUY at 60, WATCH at 45. A component whose input was missing scored 0, which does not merely add no information: it moves the total across those fixed thresholds for a reason unrelated to the stock.
+
+The live case is the one the README already noted. `context.mc_result` is per-ticker, and the callers that batch build a single context for the whole round, so a `rule_based` member inside a UMA sees no Monte Carlo result and scored `MC_Prob` at 0. The identical stock on the identical day therefore scored roughly 12 points lower inside an ensemble than standalone — a silent, systematic level shift between two code paths that are supposed to agree.
+
+`combine_weighted` now takes the names of unavailable components and renormalizes the remaining weights to 100, so the score stays on a scale the thresholds still mean something on.
+
+**The asymmetry that makes this subtle.** There are two reasons a component can be unmeasurable, and treating them alike introduces a worse bug than the one being fixed:
+
+| Reason | Example | Correct handling |
+|---|---|---|
+| The **pipeline** did not compute it | no `mc_result` in a batched UMA | renormalize the weight away — nothing about the stock differs |
+| The **stock** lacks the data | no SMA-200, i.e. a recent listing | keep the conservative zero — the absence *is* information |
+
+Renormalizing a missing SMA-200 away would scale the remaining components up and score a young, illiquid name *higher* than a seasoned one: least caution exactly where an alphabetically-sliced Indian micro-cap universe (§9 of the review's findings) warrants most. Only `MC_Prob` is passed as unavailable, and a test pins the distinction in both directions.
+
+**What deliberately did not change.** With no Monte Carlo result the probability-of-profit gate still fails closed, so a `rule_based` member cannot issue BUY inside a batched UMA. A compliance gate with no evidence either way should refuse rather than wave a trade through untested; the rationale now says `prob(no MC result):FAIL` instead of a `prob(0.00)` that reads like a measurement, so the limitation is legible rather than silent.
+
+**Still open.** The deeper point in the review's D10 stands: `MC_Prob` has a realized standard deviation of about 0.05, so it contributes a near-constant ~12 points and discriminates almost nothing, and weighted-summing an ordinal, a binary, a skewed continuous and a near-constant onto a shared scale is not a scoring function with a probabilistic interpretation. The principled replacement is a cross-sectional rank composite, which the `score_batch` interface can support. That is a change to what the flagship strategy *means*, interacting with the hard-coded 60/45 thresholds and every YAML that sets them, so it is left as a deliberate next step rather than folded into a defect fix.
 
 
 ---
