@@ -717,9 +717,12 @@ class BacktestEngine:
             
             row = df.loc[current_date]
             
-            # Get high and low for the day
+            # Get open, high and low for the day. The open matters as much as
+            # the range: it is the first price at which anything could have
+            # filled, so it bounds what a gapped stop or target could achieve.
             high = None
             low = None
+            open_price = None
             for h_col in ['high', 'High']:
                 if h_col in row.index:
                     high = row[h_col]
@@ -728,9 +731,18 @@ class BacktestEngine:
                 if l_col in row.index:
                     low = row[l_col]
                     break
-            
+            for o_col in ['open', 'Open']:
+                if o_col in row.index:
+                    open_price = row[o_col]
+                    break
+
             if high is None or low is None:
                 continue
+            # A missing or unusable open falls back to the level itself, which
+            # is the old behaviour — better to keep the optimistic fill than to
+            # invent a gap out of a NaN.
+            if open_price is None or pd.isna(open_price) or open_price <= 0:
+                open_price = None
             
             stop_price = self.stop_loss_levels.get(ticker)
             target_price = self.take_profit_levels.get(ticker)
@@ -743,17 +755,35 @@ class BacktestEngine:
             triggered = False
             trigger_price = None
             trigger_type = None
-            
-            # Check stop-loss (price hit or went below stop)
+
+            # **Gap-aware fills.** A stop is a resting order, not a guaranteed
+            # price: it becomes marketable when the price reaches it and fills
+            # at whatever is available then. Booking every stop at exactly
+            # `stop_price` assumes a fill that existed only if the level was
+            # crossed *during* the session.
+            #
+            # When the market gaps through the level overnight — the open is
+            # already past it — the first available price is the open, and the
+            # fill is worse than the stop by the whole gap. This engine booked
+            # the stop price regardless, so every gapped exit reported a loss
+            # smaller than the one actually taken, and the error is not rare
+            # here: NSE opens after both the US close and the Asian session,
+            # which is why the platform models overnight gap variance
+            # separately in the first place (volatility_models.py).
+            #
+            # The same logic runs the other way for a take-profit: a gap
+            # *through* the target fills at the open, above the target, so
+            # booking the target understates the gain. Both are corrected, and
+            # the stop is checked first so a session that touches both levels
+            # is charged the adverse one.
             if stop_price is not None and low <= stop_price:
                 triggered = True
-                trigger_price = stop_price
+                trigger_price = min(open_price, stop_price) if open_price else stop_price
                 trigger_type = 'STOP_LOSS'
-            
-            # Check take-profit (price hit or went above target)
+
             elif target_price is not None and high >= target_price:
                 triggered = True
-                trigger_price = target_price
+                trigger_price = max(open_price, target_price) if open_price else target_price
                 trigger_type = 'TAKE_PROFIT'
             
             if triggered:

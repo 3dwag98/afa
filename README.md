@@ -105,17 +105,30 @@ portfolio-agent gpu-check
 
 ## GPU / CUDA setup
 
-`uv sync --extra gpu` installs `torch` from PyPI. **On Windows that wheel is CPU-only**, so `--device cuda` will correctly fall back to CPU no matter how good your GPU is. Check what you actually have:
+`uv sync --extra gpu` installs `torch` from PyPI. **On Windows that wheel is CPU-only**, so `--device cuda` will correctly fall back to CPU no matter how good your GPU is.
+
+Use the CUDA extra instead, which pulls from PyTorch's own wheel index:
 
 ```bash
-portfolio-agent gpu-check
+# CUDA 12.6 (also: --extra cu121)
+uv sync --extra hf --extra cu126
+portfolio-agent gpu-check     # should report CUDA available: True
 ```
 
-If it reports a CPU-only build, install a CUDA build from the PyTorch index (pick the URL matching your driver at [pytorch.org/get-started/locally](https://pytorch.org/get-started/locally/)):
+Note `--extra` takes one value at a time, so each extra needs its own flag — `--extra hf --extra cu126`, not `--extra hf cu126`.
+
+This replaces the manual two-step of installing the CPU build and force-reinstalling over it. That still works if you need a CUDA version the extras do not cover — pick the URL matching your driver at [pytorch.org/get-started/locally](https://pytorch.org/get-started/locally/):
 
 ```bash
 uv pip install --force-reinstall --index-url https://download.pytorch.org/whl/cu126 torch
-portfolio-agent gpu-check     # should now report CUDA available: True
+```
+
+`gpu`, `cu126` and `cu121` all provide `torch` and are declared mutually exclusive, so uv will tell you if you ask for more than one rather than silently resolving to whichever it saw last.
+
+Check what you actually ended up with at any point:
+
+```bash
+portfolio-agent gpu-check
 ```
 
 Device selection resolves once, up front, and never returns an accelerator PyTorch cannot use. Requesting an unavailable device prints one warning explaining the cause and the fix, then runs on CPU — the resolved device is written back into the config so dataloaders, mixed precision and the saved checkpoint metadata all agree with what was printed.
