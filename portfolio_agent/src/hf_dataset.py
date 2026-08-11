@@ -301,6 +301,8 @@ def sync_hf_to_cache(
     min_rows: int = 2,
     max_symbols: Optional[int] = None,
     progress: bool = False,
+    skip_existing: bool = True,
+    workers: int = 8,
 ) -> List[str]:
     """Write Hub symbols into the platform's per-ticker parquet cache.
 
@@ -322,11 +324,25 @@ def sync_hf_to_cache(
             two-bar series is not worth a cache entry that later looks like a
             real ticker.
         max_symbols: Cap on symbols fetched (applied after listing).
-        progress: Print a progress line every 100 symbols.
+        progress: Print a progress line as symbols complete.
+        skip_existing: Skip symbols already present in the parquet cache. On by
+            default, because this used to re-fetch all ~2,400 files on every
+            invocation — a full re-download of data already on disk, which is
+            most of the wall-clock time of a "did that finish?" re-run. Pass
+            False (`--force` on the CLI) to refresh the cache.
+        workers: Thread pool size for fetching. Threads rather than processes:
+            this is network- and disk-bound, so the GIL is released for the
+            part that takes the time, and threads avoid re-importing pandas and
+            pyarrow per worker — which on Windows, where processes are spawned
+            rather than forked, is what turns a download into a paging storm.
 
     Returns:
-        Sorted list of tickers written, in the cache's .NS form.
+        Sorted list of tickers written, in the cache's .NS form. Includes
+        symbols that were already cached and therefore skipped, so the return
+        value describes the cache rather than this run's network activity.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     try:
         from .data_store import DATA_DIR, DataStore
     except ImportError:  # pragma: no cover - script-style import path
@@ -342,28 +358,63 @@ def sync_hf_to_cache(
         symbols = symbols[:max_symbols]
 
     store = DataStore(cache_dir=cache_dir or DATA_DIR)
-    written: List[str] = []
-    for i, symbol in enumerate(symbols, start=1):
-        df = load_hub_symbol(
-            symbol,
-            dataset_id=dataset_id,
-            revision=revision,
-            asset_dir=asset_dir,
-            adjust_prices=adjust_prices,
-            start_date=start_date,
-            end_date=end_date,
-        )
+
+    already_cached: List[str] = []
+    if skip_existing:
+        pending = []
+        for symbol in symbols:
+            ticker = normalize_ticker(symbol)
+            if store.has_ticker_data(ticker):
+                already_cached.append(ticker)
+            else:
+                pending.append(symbol)
+        if already_cached and progress:
+            print(
+                f"  {len(already_cached)} symbol(s) already cached, "
+                f"{len(pending)} to fetch (use --force to re-download)"
+            )
+        symbols = pending
+
+    def _fetch(symbol: str) -> Optional[tuple]:
+        """Fetch one symbol. Returns (ticker, frame) or None."""
+        try:
+            df = load_hub_symbol(
+                symbol,
+                dataset_id=dataset_id,
+                revision=revision,
+                asset_dir=asset_dir,
+                adjust_prices=adjust_prices,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        except Exception as error:  # one bad symbol must not abort the sync
+            logger.warning("Failed to fetch %s: %s", symbol, error)
+            return None
         if df is None or len(df) < min_rows:
-            continue
-        ticker = normalize_ticker(symbol)
-        store.save_ticker_data(ticker, df.copy())
-        written.append(ticker)
+            return None
+        return normalize_ticker(symbol), df
 
-        if progress and i % 100 == 0:
-            print(f"  {i}/{len(symbols)} symbols processed, {len(written)} cached")
+    written: List[str] = []
+    if symbols:
+        # Fetching is parallel; the parquet write is not. DataStore is not
+        # documented as thread-safe, and serializing the writes on this thread
+        # costs nothing next to the network round trip they are waiting on.
+        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as executor:
+            futures = {executor.submit(_fetch, symbol): symbol for symbol in symbols}
+            for done, future in enumerate(as_completed(futures), start=1):
+                result = future.result()
+                if result is not None:
+                    ticker, df = result
+                    store.save_ticker_data(ticker, df.copy())
+                    written.append(ticker)
+                if progress and done % 100 == 0:
+                    print(f"  {done}/{len(symbols)} fetched, {len(written)} cached")
 
-    logger.info("Cached %d/%d symbols from %s/%s", len(written), len(symbols), dataset_id, asset_dir)
-    return sorted(written)
+    logger.info(
+        "Cached %d newly fetched and %d already-present symbols from %s/%s",
+        len(written), len(already_cached), dataset_id, asset_dir,
+    )
+    return sorted(set(written) | set(already_cached))
 
 
 def load_benchmark_series(

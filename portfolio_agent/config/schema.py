@@ -58,6 +58,24 @@ class DataConfig(BaseModel):
     universe_size: int = Field(
         default=10, description="Number of securities in the trading universe"
     )
+    universe_selection: Literal["alphabetical", "random"] = Field(
+        default="random",
+        description="How universe_size names are chosen from the parquet cache. The cache is "
+        "scanned in sorted filename order, so 'alphabetical' returns whatever sits at the front "
+        "of the alphabet — the same few hundred names every run, for training and backtesting "
+        "alike. That is a sample of the alphabet rather than of the market, and it means a model "
+        "is evaluated on the very tickers it was fitted on, however carefully the dates are "
+        "split. 'random' draws a seeded sample instead, and offsets the seed by purpose so the "
+        "training and backtest draws are different names. Seeded, not truly random: two runs of "
+        "one config must produce the same universe or nothing is reproducible. Note this does "
+        "not fix survivorship bias — a random sample of a cache is still not point-in-time index "
+        "membership (see docs/REVIEW_STATUS.md, D9).",
+    )
+    universe_seed: int = Field(
+        default=42,
+        description="Base seed for data.universe_selection='random'. Change it to draw a "
+        "different sample and re-run; keep it fixed to reproduce one.",
+    )
     tickers: List[str] = Field(
         default_factory=list,
         description="Explicit ticker override list for the live agent; empty means auto-discover from cache",
@@ -146,6 +164,36 @@ class TrainingConfig(BaseModel):
     )
     target: str = Field(
         default="return_5d", description="Target variable for prediction"
+    )
+    target_transform: Literal[
+        "absolute", "cross_sectional_demean", "cross_sectional_rank"
+    ] = Field(
+        default="cross_sectional_rank",
+        description="How the forward-return label is measured before training "
+        "(agents/trainer.py::apply_cross_sectional_target). 'absolute' predicts the raw forward "
+        "return, most of whose variance in an equity panel is the common market factor — which "
+        "is both nearly unforecastable and unusable by a long-only book with no index hedge, so "
+        "the network spends its capacity on the one component it cannot act on. The two "
+        "cross-sectional forms measure each name against the rest of the universe on the same "
+        "date, leaving the idiosyncratic part the system actually monetizes by choosing between "
+        "stocks. 'cross_sectional_rank' maps to [-1, 1] and is the more robust of the two on "
+        "Indian data, where a circuit-limited print dominates the cross-sectional mean but moves "
+        "a rank by one place. Falls back to 'absolute' automatically when the universe is too "
+        "small to rank. Note this changes what the model predicts, so a checkpoint trained under "
+        "one setting should not be scored under another.",
+    )
+    max_abs_target: float = Field(
+        default=5.0,
+        gt=0.0,
+        description="Largest |forward return| accepted as a training label; rows above it are "
+        "dropped (agents/trainer.py::prepare_features). Input features are standardized and "
+        "clipped before training but the target never was, and a single bad cached bar is enough "
+        "to poison a whole run: one close printed at 0.001 turns a 5-day forward return into "
+        "111,300, and one gradient step against a loss that size moves the weights somewhere "
+        "every later batch evaluates to NaN. This is why NaN losses outlived the mixed-precision "
+        "fix and still appear on CPU — the cause was the label, not fp16. 5.0 (+500%) admits any "
+        "genuinely reachable move — five consecutive 20% upper circuits compound to +149% — and "
+        "rejects only arithmetic that cannot be a price.",
     )
     sequence_length: int = Field(
         default=60, description="Length of input sequences"
@@ -317,6 +365,28 @@ class RiskConfig(BaseModel):
         "toward 0.5 before it is fed to Kelly (see risk.py::shrink_win_probability). 20 means a "
         "coin-flip prior worth 20 trades of evidence; 0 disables shrinkage and uses the raw rate.",
     )
+    portfolio_volatility_target: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Annualized volatility ceiling for the whole book, enforced at order time "
+        "against a shrunk covariance estimate (src/portfolio.py). 0 disables the constraint but "
+        "NOT the measurement — book risk is reported either way. This is the only limit here that "
+        "is not per-position: risk-per-trade, max_single_position_pct and max_sector_pct are all "
+        "blind to the fact that twenty 3% positions correlated 0.6 carry ~3.5x the volatility of "
+        "twenty independent ones, and Indian equity correlations run to 0.6-0.85 in exactly the "
+        "drawdowns the circuit breaker exists to survive. Left off by default because choosing a "
+        "volatility target is a risk-policy decision, not a defect fix; 0.15-0.25 is the usual "
+        "range for a long-only equity book.",
+    )
+    covariance_lookback_days: int = Field(
+        default=252,
+        ge=60,
+        description="Trailing window, in trading days, used to estimate the covariance behind "
+        "portfolio_volatility_target. Only returns dated strictly before the decision date enter "
+        "it. One year balances responsiveness against the conditioning problem: over a shorter "
+        "window the covariance of 20-60 names is dominated by estimation noise, which is what the "
+        "Ledoit-Wolf shrinkage is there to contain.",
+    )
     max_sector_pct: float = Field(
         default=0.25,
         description="Maximum share of portfolio value allowed in any single sector "
@@ -411,6 +481,31 @@ class LearningConfig(BaseModel):
     min_trades_for_learning: int = Field(
         default=5, description="Minimum number of realized trades required before weights are adjusted"
     )
+    min_trades_per_component: int = Field(
+        default=30,
+        description="Minimum realized trades attributed to a single component before that "
+        "component's weight may move. The overall floor above is not a substitute: with only a "
+        "total-trade floor, a component credited with three trades could move on the strength of "
+        "a fifty-trade sample it barely contributed to. At 30 trades a win rate still carries a "
+        "~9 percentage point standard error, so this is a floor, not a comfort.",
+    )
+    shrinkage_strength: float = Field(
+        default=20.0,
+        description="Beta-prior strength (in pseudo-trades) used to shrink a component's realized "
+        "win rate toward 0.5 before it moves that component's weight — the same prior the Kelly "
+        "path applies in src/risk.py. Weight adaptation is a feedback loop (weights change which "
+        "trades are taken, which changes the outcomes the next adaptation sees), so an unshrunk "
+        "win rate makes noise self-reinforcing. 0 disables shrinkage.",
+    )
+    significance_level: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        description="One-sided alpha a component's win rate must clear, on an exact binomial test "
+        "against a coin flip, before its weight moves at all. Without it weights moved on every "
+        "evaluation whether or not the difference was distinguishable from zero. Set to 1.0 to "
+        "adapt on every evaluation regardless of significance.",
+    )
 
 
 class SimulationConfig(BaseModel):
@@ -466,6 +561,26 @@ class SimulationConfig(BaseModel):
         "GARCH reliably. Off by default since per-ticker GARCH fitting is much slower than the "
         "closed-form flat-vol path.",
     )
+    prior_annual_drift_std: float = Field(
+        default=0.10,
+        ge=0.0,
+        description="Prior standard deviation (annualized, in log-return terms) of the "
+        "cross-sectional spread of *true* drifts, used to shrink each ticker's estimated drift "
+        "toward zero before simulating (src/monte_carlo.py::shrink_drift). The sample mean of "
+        "daily returns has a standard error of sigma/sqrt(T) — roughly 14% a year for a 2%/day "
+        "name over five years — so an unshrunk drift makes probability-of-profit mostly "
+        "estimation noise: 8.5% of tickers with exactly zero true drift clear a 0.55 gate on "
+        "noise alone. Raise this toward infinity to recover the raw sample mean; set it to 0 to "
+        "credit no ticker with any drift edge at all.",
+    )
+    propagate_drift_uncertainty: bool = Field(
+        default=True,
+        description="If True, each simulated path draws its own drift from the posterior instead "
+        "of sharing the posterior mean, so probability_profit is the posterior *predictive* "
+        "probability — the one that accounts for the drift being estimated rather than known. "
+        "Set False to reproduce the older plug-in behaviour, which reports a confident number "
+        "about the least reliable input in the simulation.",
+    )
 
 
 class ComplianceConfig(BaseModel):
@@ -508,6 +623,15 @@ class PathsConfig(BaseModel):
         "capital instead of sector concentration, leaving most of the portfolio in cash forever. "
         "A partial map gives each mapped sector max_sector_pct and the unmapped pool its own "
         "max_unknown_sector_pct.",
+    )
+    trial_log: str = Field(
+        default="output/trials.jsonl",
+        description="Append-only JSONL log of every backtest configuration tried and the Sharpe "
+        "it produced (src/performance_stats.py). This is what makes the Deflated Sharpe Ratio "
+        "computable: DSR adjusts a reported Sharpe for the number of trials behind it, and N is "
+        "exactly the quantity a research process forgets. Search enough configurations of a "
+        "strategy with no edge and the best one still prints a respectable Sharpe; without the "
+        "count, there is no way to tell that from a real result.",
     )
     log_file: str = Field(default="logs/agent.log", description="Path to the log file")
     log_dir: str = Field(default="logs", description="Directory for log files")

@@ -32,6 +32,9 @@ try:
     from .regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
     from .execution_sim import ExecutionSimulator
     from .monte_carlo import MonteCarloSettings
+    from .portfolio import (
+        ledoit_wolf_covariance, portfolio_volatility, summarize_book_risk,
+    )
     from .risk import MAX_KELLY_FRACTION, calculate_kelly_quantity, estimate_kelly_inputs
     from .sectors import (
         load_sector_map, sector_cap_is_enforceable, sector_capacity_inr, sector_of,
@@ -43,6 +46,9 @@ except ImportError:
     from regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
     from execution_sim import ExecutionSimulator
     from monte_carlo import MonteCarloSettings
+    from portfolio import (
+        ledoit_wolf_covariance, portfolio_volatility, summarize_book_risk,
+    )
     from risk import MAX_KELLY_FRACTION, calculate_kelly_quantity, estimate_kelly_inputs
     from sectors import (
         load_sector_map, sector_cap_is_enforceable, sector_capacity_inr, sector_of,
@@ -166,6 +172,10 @@ class BacktestEngine:
         benchmark_symbol: Optional[str] = None,
         exit_on_lower_circuit_lock: bool = True,
         liquidate_on_drawdown_halt: bool = False,
+        portfolio_volatility_target: float = 0.0,
+        covariance_lookback_days: int = 252,
+        covariance_min_observations: int = 60,
+        covariance_max_candidates: int = 40,
         show_progress: bool = False,
     ):
         """
@@ -338,6 +348,18 @@ class BacktestEngine:
         self.exit_on_lower_circuit_lock = exit_on_lower_circuit_lock
         self.liquidate_on_drawdown_halt = liquidate_on_drawdown_halt
         self.exit_trigger_log: List[Dict[str, Any]] = []
+
+        # Portfolio-level risk. The *measurement* runs unconditionally — the
+        # gap between true and independence-assumed volatility is the finding,
+        # and a report that omits it is the state this platform was already in.
+        # The *constraint* is opt-in, because choosing a volatility target is a
+        # risk-policy decision rather than a bug fix.
+        self.portfolio_volatility_target = portfolio_volatility_target
+        self.covariance_lookback_days = covariance_lookback_days
+        self.covariance_min_observations = covariance_min_observations
+        self.covariance_max_candidates = covariance_max_candidates
+        self._returns_cache: Dict[str, Optional[pd.Series]] = {}
+        self.book_risk_log: List[Dict[str, Any]] = []
 
 
         # Track untradeable tickers (delisted or NaN issues) - initialize BEFORE loading data
@@ -1258,12 +1280,18 @@ class BacktestEngine:
             return 0.0
         return float(trade.get("net_pnl", 0.0)) / cost_basis * 100.0
 
-    def _kelly_quantity(self, entry_price: float) -> int:
+    def _kelly_quantity(self, entry_price: float, stop_price: Optional[float] = None) -> int:
         """Fractional-Kelly position size from this run's realized trade_log so far.
 
         Returns 0 (triggering the caller's fixed-fractional fallback) when
         there aren't yet enough realized trades to estimate Kelly inputs
         reliably (see risk.py::estimate_kelly_inputs).
+
+        Args:
+            entry_price: Entry price per share.
+            stop_price: This signal's stop, used to cap the Kelly size at the
+                per-trade risk budget. Omitted (None) leaves only the
+                concentration cap in force.
         """
         # Only *closed* round trips are realized outcomes. Open BUY legs carry
         # net_pnl = -transaction_costs, so counting them here classified every
@@ -1290,15 +1318,31 @@ class BacktestEngine:
         )
         if kelly_inputs is None:
             return 0
-        win_probability, reward_risk_ratio = kelly_inputs
-        return calculate_kelly_quantity(
+        kelly_quantity = calculate_kelly_quantity(
             entry_price=entry_price,
             portfolio_value_inr=self.portfolio_value,
             max_single_position_pct=self.risk_params.max_single_position_pct,
-            win_probability=win_probability,
-            reward_risk_ratio=reward_risk_ratio,
+            win_probability=kelly_inputs.win_probability,
+            avg_win_pct=kelly_inputs.avg_win_pct,
+            avg_loss_pct=kelly_inputs.avg_loss_pct,
             kelly_fraction=self.kelly_fraction,
         )
+
+        # Kelly is a ceiling, not a licence — the same contract as
+        # risk.py::calculate_position_quantity. With the allocation units
+        # corrected, f* is scaled up by 1/l (~17x at a 6% stop), so without the
+        # per-trade risk budget alongside it the fix would land as an
+        # across-the-board increase in position size. The budget is priced off
+        # this signal's own stop distance, which is known exactly, rather than
+        # Kelly's historical average loss.
+        if stop_price is not None and stop_price > 0:
+            risk_per_share = entry_price - stop_price
+            if risk_per_share <= 0:
+                return 0
+            risk_budget = self.portfolio_value * self.risk_params.risk_per_trade_pct
+            kelly_quantity = min(kelly_quantity, math.floor(risk_budget / risk_per_share))
+
+        return max(0, kelly_quantity)
 
     def _update_circuit_breaker(self, current_date: pd.Timestamp) -> None:
         """Track the equity peak and trip/re-arm the drawdown circuit breaker.
@@ -1454,6 +1498,163 @@ class BacktestEngine:
 
         return reasons
 
+    def _ticker_returns(self, ticker: str) -> Optional[pd.Series]:
+        """Daily simple returns for one ticker, computed once and cached.
+
+        Cached because the covariance estimate below is rebuilt on every
+        rebalance round; recomputing pct_change over a multi-year frame per
+        ticker per day is the difference between a covariance-aware backtest
+        that finishes and one that does not.
+        """
+        if ticker in self._returns_cache:
+            return self._returns_cache[ticker]
+
+        frame = self.ticker_data.get(ticker)
+        if frame is None or len(frame) < 2 or 'close' not in frame.columns:
+            self._returns_cache[ticker] = None
+            return None
+
+        returns = frame['close'].pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+        self._returns_cache[ticker] = returns
+        return returns
+
+    def _book_covariance(
+        self,
+        tickers: List[str],
+        current_date: pd.Timestamp,
+    ) -> Optional[pd.DataFrame]:
+        """Annualized covariance for a set of names, as of `current_date`.
+
+        **Strictly backward-looking.** Only returns dated *before* the decision
+        date are used — the whole point of a covariance-aware sizing decision
+        is lost if the matrix knows how the names co-moved during the period it
+        is sizing for.
+
+        Shrunk toward a constant-correlation target (Ledoit-Wolf): over a
+        `covariance_lookback_days` window the sample covariance of 20-60 names
+        is poorly conditioned, and its extreme eigenvalues — the ones an
+        optimizer or a volatility constraint leans on hardest — are mostly
+        estimation noise.
+
+        Returns None when too few names have enough overlapping history to say
+        anything, in which case the caller leaves sizing alone rather than
+        acting on a matrix it does not trust.
+        """
+        usable = {}
+        for ticker in tickers:
+            returns = self._ticker_returns(ticker)
+            if returns is None:
+                continue
+            window = returns[returns.index < current_date].tail(self.covariance_lookback_days)
+            if len(window) >= self.covariance_min_observations:
+                usable[ticker] = window
+
+        if len(usable) < 2:
+            return None
+
+        panel = pd.DataFrame(usable).dropna()
+        if len(panel) < self.covariance_min_observations or panel.shape[1] < 2:
+            return None
+
+        covariance, _ = ledoit_wolf_covariance(panel, annualize=True)
+        return covariance
+
+    def _book_risk_summary(
+        self,
+        position_values: Dict[str, float],
+        current_date: pd.Timestamp,
+    ) -> Optional[Dict[str, float]]:
+        """Portfolio-level risk of the current book, or None if unmeasurable.
+
+        Reported whether or not the volatility cap is enabled, because the
+        measurement is the point: the ratio between true portfolio volatility
+        and the volatility independent per-trade sizing implies is exactly the
+        factor by which the platform used to understate its own risk.
+        """
+        held = {t: v for t, v in position_values.items() if v > 0}
+        if len(held) < 2 or self.portfolio_value <= 0:
+            return None
+
+        covariance = self._book_covariance(sorted(held), current_date)
+        if covariance is None:
+            return None
+
+        names = [str(c) for c in covariance.columns]
+        weights = np.array([held.get(n, 0.0) / self.portfolio_value for n in names])
+        return summarize_book_risk(weights, covariance)
+
+    def _apply_portfolio_risk_cap(
+        self,
+        ticker: str,
+        quantity: int,
+        price: float,
+        position_values: Dict[str, float],
+        current_date: pd.Timestamp,
+        covariance: Optional[pd.DataFrame],
+    ) -> int:
+        """Trim a BUY so the whole book's forecast volatility stays under target.
+
+        This is the constraint the platform never had. Every other limit here
+        is per-position — risk per trade, the concentration cap, the sector cap
+        — and none of them can see that twenty 3% positions correlated 0.6 carry
+        3.5x the volatility twenty independent ones would.
+
+        Portfolio variance as a function of the candidate's value v is a
+        convex quadratic,
+
+            sigma^2(v) = sigma_ii v^2 + 2 v * cov(i, rest) + sigma^2(0)
+
+        so the feasible set {v : sigma(v) <= target} is an interval containing
+        v = 0 whenever the existing book is already inside the target. That
+        makes bisection on the upper endpoint exact rather than a heuristic —
+        and when the book is *already* over target, the honest answer is to add
+        nothing, which is what a zero here means.
+        """
+        if (
+            self.portfolio_volatility_target <= 0
+            or quantity <= 0
+            or price <= 0
+            or covariance is None
+            or self.portfolio_value <= 0
+        ):
+            return quantity
+
+        names = [str(c) for c in covariance.columns]
+        if ticker not in names:
+            # No usable history for this name, so its contribution to book
+            # volatility is unknown. Leave the per-position limits to govern
+            # rather than inventing a correlation for it.
+            return quantity
+
+        index = names.index(ticker)
+        base = np.array([position_values.get(n, 0.0) / self.portfolio_value for n in names])
+        candidate_weight = quantity * price / self.portfolio_value
+
+        def volatility_with(extra: float) -> float:
+            weights = base.copy()
+            weights[index] += extra
+            return portfolio_volatility(weights, covariance)
+
+        if volatility_with(candidate_weight) <= self.portfolio_volatility_target:
+            return quantity
+        if volatility_with(0.0) > self.portfolio_volatility_target:
+            logger.debug(
+                f"Portfolio vol cap: skipping BUY {ticker} — book already at "
+                f"{volatility_with(0.0):.1%} against a "
+                f"{self.portfolio_volatility_target:.1%} target"
+            )
+            return 0
+
+        low, high = 0.0, candidate_weight
+        for _ in range(60):
+            mid = 0.5 * (low + high)
+            if volatility_with(mid) <= self.portfolio_volatility_target:
+                low = mid
+            else:
+                high = mid
+
+        return max(0, int(low * self.portfolio_value / price))
+
     def _current_position_values(self, current_date: pd.Timestamp) -> Dict[str, float]:
         """Mark every open holding to T's close, for sector-exposure accounting."""
         values: Dict[str, float] = {}
@@ -1559,10 +1760,25 @@ class BacktestEngine:
         # the cap individually and blow straight through it together.
         position_values = self._current_position_values(current_date)
 
+        # One covariance estimate per rebalance round, over the names that
+        # could be in the book by the end of it, rather than one per candidate:
+        # the matrix does not change between candidates, and refitting it
+        # inside the loop is what would make this unaffordable. Candidates are
+        # capped because `buys` can run to hundreds on a wide universe while
+        # only the highest-scoring few ever clear the cash and sector limits.
+        covariance = None
+        if self.portfolio_volatility_target > 0:
+            covariance = self._book_covariance(
+                sorted(set(position_values) | set(buys[: self.covariance_max_candidates])),
+                current_date,
+            )
+
         for ticker in buys:
             sig = signals[ticker]
             price = sig.entry_price or 100
-            quantity = self._kelly_quantity(price) if self.use_kelly_sizing else 0
+            quantity = (
+                self._kelly_quantity(price, sig.stop_price) if self.use_kelly_sizing else 0
+            )
 
             if quantity <= 0:
                 # Default / Kelly-unavailable fallback: 10% of portfolio per position.
@@ -1571,6 +1787,9 @@ class BacktestEngine:
 
             quantity = self._apply_position_scale(quantity, sig)
             quantity = self._apply_sector_cap(ticker, quantity, price, position_values)
+            quantity = self._apply_portfolio_risk_cap(
+                ticker, quantity, price, position_values, current_date, covariance
+            )
 
             if quantity > 0:
                 position_values[ticker] = position_values.get(ticker, 0.0) + quantity * price
@@ -1703,12 +1922,23 @@ class BacktestEngine:
         return max(0, max_quantity)
 
 
-    def _evaluate_and_learn(self, learning_rate: float = 0.15, min_trades_for_learning: int = 3) -> None:
+    def _evaluate_and_learn(
+        self,
+        learning_rate: float = 0.15,
+        min_trades_for_learning: int = 3,
+        min_trades_per_component: int = 30,
+        shrinkage_strength: float = 20.0,
+        significance_level: float = 0.05,
+    ) -> None:
         """
         Trigger agent learning every N trading days.
 
         Uses the same pure weight-adaptation function (strategies/weighting.py)
         as the live orchestrator, so backtest and live learning stay identical.
+        That identity is the point of the shared function, and it extends to
+        the sample-size and significance guards: a backtest that adapted
+        weights on evidence the live path would refuse to act on would be
+        measuring a strategy the platform cannot run.
         """
         # Snapshot brain state before learning
         brain_snapshot = {
@@ -1724,6 +1954,9 @@ class BacktestEngine:
                 trade_history=self.agent_brain.trade_history,
                 learning_rate=learning_rate,
                 min_trades_for_learning=min_trades_for_learning,
+                min_trades_per_component=min_trades_per_component,
+                shrinkage_strength=shrinkage_strength,
+                significance_level=significance_level,
             )
             self.agent_brain.weights = new_weights
             if message is not None:
@@ -1944,6 +2177,7 @@ class BacktestEngine:
                 # Step G: Every 20 trading days, trigger evaluate_and_learn
                 if self.trading_day_count % 20 == 0:
                     self._evaluate_and_learn()
+                    self._record_book_risk(current_date)
 
                 # The date and equity are what tell an operator the run is
                 # progressing *and* whether it is going anywhere — a bar that
@@ -1983,6 +2217,58 @@ class BacktestEngine:
             'daily_activity_log': self.daily_activity_log,
             'circuit_breaker_log': self.circuit_breaker_log,
             'exit_trigger_log': self.exit_trigger_log,
+            'book_risk_log': self.book_risk_log,
+            'book_risk_summary': self.book_risk_statistics(),
+        }
+
+    def _record_book_risk(self, current_date: pd.Timestamp) -> None:
+        """Snapshot the book's portfolio-level risk, whether or not it is capped.
+
+        Sampled on the same 20-day cadence as weight learning rather than
+        daily: the covariance is estimated over a 252-day window and does not
+        meaningfully change between adjacent sessions, so a daily estimate
+        would cost twenty times as much to say the same thing.
+        """
+        summary = self._book_risk_summary(
+            self._current_position_values(current_date), current_date
+        )
+        if summary is None:
+            return
+        self.book_risk_log.append({
+            'date': current_date,
+            'trading_day': self.trading_day_count,
+            **summary,
+        })
+
+    def book_risk_statistics(self) -> Dict[str, float]:
+        """Aggregate the book-risk snapshots into report-ready figures.
+
+        `mean_correlation_risk_multiple` is the headline: it is how many times
+        larger the book's actual volatility was than independent per-trade
+        sizing implied. A value of 1 would mean correlation cost nothing; on a
+        long-only Indian equity book it does not.
+        """
+        if not self.book_risk_log:
+            return {}
+
+        def _mean(key: str) -> float:
+            values = [row[key] for row in self.book_risk_log if key in row]
+            return float(np.mean(values)) if values else 0.0
+
+        def _max(key: str) -> float:
+            values = [row[key] for row in self.book_risk_log if key in row]
+            return float(np.max(values)) if values else 0.0
+
+        return {
+            'observations': float(len(self.book_risk_log)),
+            'mean_portfolio_volatility': _mean('portfolio_volatility'),
+            'max_portfolio_volatility': _max('portfolio_volatility'),
+            'mean_independent_volatility': _mean('independent_volatility'),
+            'mean_correlation_risk_multiple': _mean('correlation_risk_multiple'),
+            'max_correlation_risk_multiple': _max('correlation_risk_multiple'),
+            'mean_diversification_ratio': _mean('diversification_ratio'),
+            'mean_max_risk_contribution': _mean('max_risk_contribution'),
+            'mean_positions': _mean('n_positions'),
         }
 
     def _position_value(self, ticker: str, current_date: pd.Timestamp) -> Optional[float]:

@@ -11,6 +11,7 @@ inputs.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -19,13 +20,37 @@ import yaml
 
 from .base import BaseStrategy
 from .types import StrategyContext, StrategySignal
-from .weighting import combine_weighted
+from .weighting import combine_weighted, select_trigger
 from portfolio_agent.config.schema import StrategyConfig
 
 try:
     from src.risk import calculate_stop_target, net_reward_risk
 except ImportError:
     from risk import calculate_stop_target, net_reward_risk
+
+
+# The four components, in the order they are reported. Named once so the
+# rank transform and the score both walk the same set.
+COMPONENT_NAMES = ("Trend", "Breakout", "Volume", "MC_Prob")
+
+SCORING_MODES = ("weighted_sum", "rank_composite")
+
+
+@dataclass
+class _ComponentRead:
+    """Raw component values for one ticker, before any combination.
+
+    Split out so weighted-sum and rank-composite scoring share one reading of
+    the indicators and one construction of the signal, differing only in what
+    the weights are applied to. Two code paths computing components separately
+    is how the standalone and ensemble scores drifted apart in the first place.
+    """
+
+    components: Dict[str, float]
+    unavailable: List[str] = field(default_factory=list)
+    close: float = 0.0
+    atr: Optional[float] = None
+    prob_profit: float = 0.0
 
 
 def _clean(value: Any) -> Optional[float]:
@@ -56,6 +81,22 @@ class RuleBasedStrategy(BaseStrategy):
         self._config = config
         self._yaml_path = config.params.get("yaml_path", config.config_path)
         self._rules = self._load_rules()
+
+        # "weighted_sum" (default) or "rank_composite". The strategy params
+        # win so a UMA member can override one shared YAML; otherwise it comes
+        # from `scoring.method` in the rules file, alongside the weights the
+        # method is applied to.
+        scoring_block = self._rules.get("scoring")
+        yaml_mode = (
+            scoring_block.get("method") if isinstance(scoring_block, dict) else None
+        )
+        scoring = config.params.get("scoring_mode") or yaml_mode or "weighted_sum"
+        if scoring not in SCORING_MODES:
+            raise ValueError(
+                f"unknown scoring mode {scoring!r} for {self._yaml_path}; "
+                f"expected one of {SCORING_MODES}"
+            )
+        self._scoring = scoring
 
     def _load_rules(self) -> Dict[str, Any]:
         """Load rules from the YAML configuration file."""
@@ -93,13 +134,128 @@ class RuleBasedStrategy(BaseStrategy):
         return self._rules.get("exit", {})
 
     def score(self, symbol: str, features: pd.DataFrame, context: StrategyContext) -> StrategySignal:
-        if features.empty:
-            return StrategySignal(
-                symbol=symbol, signal="AVOID", score=0.0, trigger="None",
-                entry_price=0.0, stop_price=0.0, target_price=0.0,
-                reward_risk=0.0, probability_profit=0.0,
-                component_scores={}, rationale="No feature data available",
+        """Score one ticker.
+
+        Under ``scoring: weighted_sum`` (the default) this is self-contained.
+        Under ``scoring: rank_composite`` a single ticker is a cross-section of
+        one, so every component ranks at the 100th percentile and the score is
+        meaningless — callers must use score_batch() with the full eligible
+        universe, which is what ``requires_full_batch`` tells them to do.
+        """
+        read = self._read_components(symbol, features, context)
+        if read is None:
+            return self._empty_signal(symbol)
+        return self._build_signal(symbol, read, read.components, context)
+
+    def score_batch(
+        self, features_by_symbol: Dict[str, pd.DataFrame], context: StrategyContext
+    ) -> Dict[str, StrategySignal]:
+        """Score many tickers, ranking their components against each other
+        when ``scoring: rank_composite`` is configured."""
+        if self._scoring != "rank_composite":
+            return super().score_batch(features_by_symbol, context)
+
+        reads = {
+            symbol: self._read_components(symbol, features, context)
+            for symbol, features in features_by_symbol.items()
+        }
+        usable = {symbol: read for symbol, read in reads.items() if read is not None}
+        if not usable:
+            return {symbol: self._empty_signal(symbol) for symbol in features_by_symbol}
+
+        ranked = self._rank_components(usable)
+
+        signals = {
+            symbol: self._empty_signal(symbol)
+            for symbol, read in reads.items() if read is None
+        }
+        for symbol, read in usable.items():
+            signals[symbol] = self._build_signal(symbol, read, ranked[symbol], context)
+        return signals
+
+    @property
+    def requires_full_batch(self) -> bool:
+        """Rank scoring is a statement about a cross-section, so a per-ticker
+        loop is semantically wrong rather than merely slow."""
+        return self._scoring == "rank_composite"
+
+    def _empty_signal(self, symbol: str) -> StrategySignal:
+        return StrategySignal(
+            symbol=symbol, signal="AVOID", score=0.0, trigger="None",
+            entry_price=0.0, stop_price=0.0, target_price=0.0,
+            reward_risk=0.0, probability_profit=0.0,
+            component_scores={}, rationale="No feature data available",
+        )
+
+    def _rank_components(self, reads: Dict[str, "_ComponentRead"]) -> Dict[str, Dict[str, float]]:
+        """Convert each component to its percentile rank within the batch.
+
+The weighted sum this replaces adds four incommensurable quantities: an
+        ordinal on three levels, a binary, a right-skewed continuous, and —
+        after the drift shrinkage of section 21 — a near-constant with a
+        standard deviation around 0.05. Percentile ranks make them commensurable
+        by construction and invariant to each component's marginal
+        distribution, so a component's influence no longer depends on the
+        accident of its units: whether Volume is expressed as a ratio, its
+        logarithm, or anything else monotone, the composite is unchanged.
+
+        **What this does not fix, despite being the review's proposed remedy
+        for it.** A component that is near-constant across the universe still
+        consumes its full share of the score budget. Ranking ties gives every
+        name the same percentile (0.6 for a five-name universe, whatever the
+        constant is), so MC_Prob contributes a flat number here exactly as it
+        did under the weighted sum — a different flat number, but still flat,
+        and still 30% of the budget spent on a component separating nobody.
+        Making influence track discrimination needs the weights themselves to
+        respond to realized dispersion or information coefficient, which is a
+        change to the weight learner rather than to the combination rule.
+        Lowering MC_Prob's configured weight is the blunt version available
+        today.
+
+        Percentile rather than the inverse-normal form: it keeps the composite
+        on 0-100, so the existing `score >= 60` / `>= 45` thresholds stay
+        syntactically valid and gain a clean reading — "60th percentile of the
+        weighted composite" — instead of requiring every YAML to be rewritten
+        against a z-scale.
+
+        Ties take the average rank, which matters here: Breakout is binary and
+        Trend has three levels, so ties are the common case rather than an edge
+        case, and a first-past-the-post rank would order tied names by
+        whatever the dict iteration produced.
+
+        An unavailable component is left at its raw value and excluded from the
+        combination by the caller — ranking a column no one has would hand
+        every ticker the same percentile, which is strictly worse than dropping
+        the weight: it spends the budget to say nothing.
+        """
+        symbols = list(reads)
+        ranked: Dict[str, Dict[str, float]] = {symbol: {} for symbol in symbols}
+
+        for component in COMPONENT_NAMES:
+            measurable = [s for s in symbols if component not in reads[s].unavailable]
+            if not measurable:
+                for symbol in symbols:
+                    ranked[symbol][component] = reads[symbol].components[component]
+                continue
+
+            values = pd.Series(
+                {s: reads[s].components[component] for s in measurable}, dtype=float
             )
+            percentiles = values.rank(method="average", pct=True)
+            for symbol in symbols:
+                ranked[symbol][component] = (
+                    float(percentiles[symbol]) if symbol in percentiles.index
+                    else reads[symbol].components[component]
+                )
+
+        return ranked
+
+    def _read_components(
+        self, symbol: str, features: pd.DataFrame, context: StrategyContext
+    ) -> Optional["_ComponentRead"]:
+        """Raw component values for one ticker, before any combination."""
+        if features.empty:
+            return None
 
         latest = features.iloc[-1]
         close = _clean(latest.get("close")) or 0.0
@@ -108,6 +264,24 @@ class RuleBasedStrategy(BaseStrategy):
         donchian_upper = _clean(latest.get("donchian_upper_20"))
         volume_ratio = _clean(latest.get("volume_ratio_20"))
         atr = _clean(latest.get("atr_14"))
+
+        # Two different reasons a component can be unmeasurable, and they must
+        # NOT be handled the same way:
+        #
+        # - **The pipeline did not compute it.** Inside a batched UMA the
+        #   caller builds one context for the whole round, so there is no
+        #   per-ticker Monte Carlo result. Nothing about the stock is different;
+        #   a different code path ran. Scoring that at 0 made the identical
+        #   stock on the identical day score ~12 points lower in an ensemble
+        #   than standalone — an artifact, and the weight is renormalized away.
+        #
+        # - **The stock does not have the history.** A missing SMA-200 means a
+        #   recent listing, and that *is* information about the stock. Dropping
+        #   the trend weight there would renormalize the remaining components up
+        #   and make the system score a young, illiquid name *higher* than a
+        #   seasoned one — least caution where an Indian micro-cap universe
+        #   warrants most. Those keep their conservative zero.
+        unavailable: List[str] = []
 
         # 1. Trend score
         if sma200 is None:
@@ -130,17 +304,52 @@ class RuleBasedStrategy(BaseStrategy):
         # 3. Volume score
         volume_score = 0.0 if volume_ratio is None else min(volume_ratio / 2.0, 1.0)
 
-        # 4. Monte Carlo probability-of-profit score
-        prob_profit = context.mc_result.probability_profit if context.mc_result is not None else 0.0
-        mc_score = max(0.0, min(1.0, prob_profit))
+        # 4. Monte Carlo probability-of-profit score.
+        if context.mc_result is None:
+            prob_profit = 0.0
+            mc_score = 0.0
+            unavailable.append("MC_Prob")
+        else:
+            prob_profit = context.mc_result.probability_profit
+            mc_score = max(0.0, min(1.0, prob_profit))
 
-        component_scores = {
-            "Trend": trend_score,
-            "Breakout": breakout_score,
-            "Volume": volume_score,
-            "MC_Prob": mc_score,
-        }
-        final_score, trigger = combine_weighted(component_scores, context.weights)
+        return _ComponentRead(
+            components={
+                "Trend": trend_score,
+                "Breakout": breakout_score,
+                "Volume": volume_score,
+                "MC_Prob": mc_score,
+            },
+            unavailable=unavailable,
+            close=close,
+            atr=atr,
+            prob_profit=prob_profit,
+        )
+
+    def _build_signal(
+        self,
+        symbol: str,
+        read: "_ComponentRead",
+        score_inputs: Dict[str, float],
+        context: StrategyContext,
+    ) -> StrategySignal:
+        """Turn component values into a signal.
+
+        `score_inputs` is what the weights are applied to — the raw components
+        under weighted-sum scoring, their within-batch percentile ranks under
+        rank-composite scoring. `read.components` stays the raw values
+        throughout, because the trigger, the reported component scores and the
+        rationale are all statements about the indicators themselves.
+        """
+        close, atr = read.close, read.atr
+        prob_profit = read.prob_profit
+        unavailable = read.unavailable
+        component_scores = read.components
+
+        final_score, _ = combine_weighted(
+            score_inputs, context.weights, unavailable=unavailable
+        )
+        trigger = select_trigger(component_scores)
 
         # 5. Stop / target from ATR (YAML multipliers, falling back to context defaults)
         exit_rules = self.exit_rules()
@@ -173,14 +382,33 @@ class RuleBasedStrategy(BaseStrategy):
         passed_rr = reward_risk >= context.risk.min_reward_risk
         passed_price = close >= context.risk.min_price_inr
 
+        # An unavailable component reports as such rather than as a 0.00 that
+        # reads like a measurement. The probability gate is the one that
+        # matters most: with no Monte Carlo result it fails closed, so a
+        # rule-based member inside a batched UMA cannot issue BUY at all.
+        # That is the right default — a compliance gate with no evidence
+        # either way should refuse, not wave the trade through untested — but
+        # it is a real limitation of mixing an MC-dependent member into a
+        # batched ensemble, and it should be legible in the rationale rather
+        # than looking like the stock scored badly.
+        def _component(name: str, value: float, fmt: str = "{:.2f}") -> str:
+            return f"{name}=n/a" if name in unavailable else f"{name}={fmt.format(value)}"
+
+        probability_note = (
+            "prob(no MC result):FAIL"
+            if "MC_Prob" in unavailable
+            else f"prob({prob_profit:.2f})>={context.risk.target_prob_profit}:"
+                 f"{'PASS' if passed_prob else 'FAIL'}"
+        )
+
         rationale = "; ".join([
             f"Score={final_score:.1f}",
-            f"trend={trend_score:.1f}",
-            f"breakout={breakout_score:.1f}",
-            f"volume={volume_score:.2f}",
-            f"mc_prob={mc_score:.2f}",
+            _component("Trend", component_scores["Trend"], "{:.1f}"),
+            _component("Breakout", component_scores["Breakout"], "{:.1f}"),
+            _component("Volume", component_scores["Volume"]),
+            _component("MC_Prob", component_scores["MC_Prob"]),
             f"score>=60:{'PASS' if passed_score else 'FAIL'}",
-            f"prob({prob_profit:.2f})>={context.risk.target_prob_profit}:{'PASS' if passed_prob else 'FAIL'}",
+            probability_note,
             f"rr({reward_risk:.2f})>={context.risk.min_reward_risk}:{'PASS' if passed_rr else 'FAIL'}",
             f"price({close:.2f})>={context.risk.min_price_inr}:{'PASS' if passed_price else 'FAIL'}",
             "stop<entry:VALID" if stop_valid else "stop>=entry:INVALID",

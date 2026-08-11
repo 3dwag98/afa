@@ -95,6 +95,305 @@ class TestRuleBasedStrategyMetadata:
         assert exit_rules["take_profit"]["multiplier"] == 3.0
 
 
+
+
+class TestRankCompositeScoring:
+    """D10's other half: the weighted sum adds four incommensurable quantities.
+
+    An ordinal on three levels, a binary, a right-skewed continuous, and — once
+    the drift is shrunk — a near-constant with a standard deviation around
+    0.05. Each component's share of the score budget is its configured weight
+    regardless of how much it discriminates, so MC_Prob held a quarter of the
+    weight while separating almost nothing.
+    """
+
+    _WEIGHTS = {"Trend": 25.0, "Breakout": 25.0, "Volume": 20.0, "MC_Prob": 30.0}
+
+    def _strategy(self, mode):
+        return RuleBasedStrategy(
+            StrategyConfig(
+                type="rule_based",
+                params={
+                    "yaml_path": "config/strategies/trend_breakout.yaml",
+                    "scoring_mode": mode,
+                },
+            )
+        )
+
+    def _context(self, mc=0.70):
+        return StrategyContext(
+            risk=_risk_params(), weights=dict(self._WEIGHTS),
+            mc_result=_mc_result(mc) if mc is not None else None,
+        )
+
+    def _universe(self):
+        """Five names spanning the range of each component."""
+        return {
+            "STRONG": _features(close=150.0, sma_50=140.0, sma_200=120.0,
+                                donchian_upper_20=145.0, volume_ratio_20=3.0),
+            "GOOD": _features(close=150.0, sma_50=140.0, sma_200=120.0,
+                              donchian_upper_20=155.0, volume_ratio_20=1.5),
+            "MIDDLING": _features(close=150.0, sma_50=160.0, sma_200=120.0,
+                                  donchian_upper_20=155.0, volume_ratio_20=1.0),
+            "WEAK": _features(close=100.0, sma_50=160.0, sma_200=120.0,
+                              donchian_upper_20=155.0, volume_ratio_20=0.5),
+            "WORST": _features(close=90.0, sma_50=160.0, sma_200=120.0,
+                               donchian_upper_20=155.0, volume_ratio_20=0.2),
+        }
+
+    def test_default_is_the_existing_weighted_sum(self):
+        """Switching scoring changes what the strategy means, so it must not
+        happen by accident."""
+        strategy = RuleBasedStrategy(_strategy_config())
+        assert strategy._scoring == "weighted_sum"
+        assert strategy.requires_full_batch is False
+
+    def test_rank_scoring_requires_the_full_batch(self):
+        """Ranking is a statement about a cross-section, so a per-ticker loop
+        is semantically wrong rather than merely slow."""
+        assert self._strategy("rank_composite").requires_full_batch is True
+
+    def test_rejects_an_unknown_mode(self):
+        with pytest.raises(ValueError, match="unknown scoring mode"):
+            self._strategy("percentile_ish")
+
+    def test_orders_the_universe_the_same_way_as_the_weighted_sum(self):
+        """Rank scoring changes the score's units, not its opinion: on a
+        universe where the components agree, the ordering must survive."""
+        universe = self._universe()
+
+        weighted = self._strategy("weighted_sum").score_batch(universe, self._context())
+        ranked = self._strategy("rank_composite").score_batch(universe, self._context())
+
+        by_weighted = sorted(universe, key=lambda t: -weighted[t].score)
+        by_ranked = sorted(universe, key=lambda t: -ranked[t].score)
+
+        assert by_weighted == by_ranked
+        assert by_ranked[0] == "STRONG"
+        assert by_ranked[-1] == "WORST"
+
+    def test_a_near_constant_component_still_consumes_its_budget(self):
+        """Stated as a test because it is the opposite of what the rank
+        composite is usually claimed to fix.
+
+        MC_Prob is identical for every name here, so it says nothing about
+        which to buy. Ranking ties hands all of them the same percentile, so it
+        contributes a flat number — a different flat number than the weighted
+        sum's, but still flat, and still 30% of the budget spent on a component
+        separating nobody. Making influence track discrimination needs
+        dispersion- or IC-weighted weights, not a different combination rule.
+        """
+        universe = self._universe()
+        ranked = self._strategy("rank_composite").score_batch(universe, self._context())
+
+        # Every name ties, so every name gets the same percentile: with five
+        # names the average rank is 3 and the percentile 0.6.
+        without_mc = self._strategy("rank_composite").score_batch(
+            universe, self._context(mc=None)
+        )
+        # Tolerance covers the 2dp rounding StrategySignal applies to score.
+        contributions = [
+            ranked[t].score - 0.70 * without_mc[t].score for t in universe
+        ]
+        assert contributions == pytest.approx([contributions[0]] * len(universe), abs=0.02)
+        assert contributions[0] == pytest.approx(0.30 * 60.0, abs=0.02)
+
+    def test_scores_are_invariant_to_a_monotone_rescaling(self):
+        """The property that actually makes the components commensurable:
+        express volume as a ratio or as 1.1x that ratio and the composite is
+        unchanged, while the weighted sum moves.
+
+        The rescaling has to stay inside the component's own range. Volume is
+        capped at `min(ratio/2, 1)`, so a large enough multiplier saturates
+        every name to 1.0 and destroys the ordering *before* the rank transform
+        ever sees it — a limit of the component's definition, not of ranking.
+        """
+        ratios = {"A": 1.8, "B": 1.4, "C": 1.0, "D": 0.6, "E": 0.2}
+        universe = {
+            name: _features(volume_ratio_20=ratio) for name, ratio in ratios.items()
+        }
+        rescaled = {
+            name: _features(volume_ratio_20=ratio * 1.1) for name, ratio in ratios.items()
+        }
+
+        ranked = self._strategy("rank_composite")
+        weighted = self._strategy("weighted_sum")
+
+        base = ranked.score_batch(universe, self._context())
+        scaled = ranked.score_batch(rescaled, self._context())
+        for name in ratios:
+            assert base[name].score == pytest.approx(scaled[name].score)
+
+        # The weighted sum is not invariant — that is the point of the change.
+        assert weighted.score_batch(universe, self._context())["A"].score != pytest.approx(
+            weighted.score_batch(rescaled, self._context())["A"].score
+        )
+
+    def test_reported_components_stay_raw_indicator_values(self):
+        """The score changes units; the component readout must not. An operator
+        reading `Breakout=1.0` is being told the close cleared its channel."""
+        universe = self._universe()
+        ranked = self._strategy("rank_composite").score_batch(universe, self._context())
+
+        assert ranked["STRONG"].component_scores["Breakout"] == 1.0
+        assert ranked["GOOD"].component_scores["Breakout"] == 0.0
+        assert ranked["STRONG"].component_scores["Trend"] == 1.0
+
+    def test_trigger_comes_from_the_raw_indicator_not_the_rank(self):
+        """The weight learner attributes realized outcomes by trigger name, so
+        renaming triggers to whichever component ranked highest would corrupt
+        it. `Breakout` means the close cleared its channel, ranked or not."""
+        universe = self._universe()
+        ranked = self._strategy("rank_composite").score_batch(universe, self._context())
+
+        assert ranked["STRONG"].trigger == "Breakout"
+        assert ranked["GOOD"].trigger == "Trend"
+
+    def test_ties_take_the_average_rank(self):
+        """Breakout is binary and Trend has three levels, so ties are the
+        common case here, not an edge case — a first-past-the-post rank would
+        order tied names by whatever the dict iteration produced."""
+        identical = {name: _features() for name in ("A", "B", "C", "D")}
+        ranked = self._strategy("rank_composite").score_batch(identical, self._context())
+
+        scores = [signal.score for signal in ranked.values()]
+        assert scores == pytest.approx([scores[0]] * 4)
+
+    def test_an_unmeasurable_component_is_still_renormalized_away(self):
+        """Rank scoring composes with the availability fix rather than
+        bypassing it: with no MC result there is nothing to rank, and its
+        weight is dropped rather than handing every name an identical
+        percentile that quietly reintroduces a constant."""
+        universe = self._universe()
+        ranked = self._strategy("rank_composite").score_batch(
+            universe, self._context(mc=None)
+        )
+
+        for signal in ranked.values():
+            assert "MC_Prob=n/a" in signal.rationale
+        # The weight is dropped, so the remaining three components carry the
+        # full 100 — rather than every name receiving an identical percentile,
+        # which would spend the budget to say nothing.
+        with_constant_mc = self._strategy("rank_composite").score_batch(
+            universe, self._context()
+        )
+        spread = lambda d: max(s.score for s in d.values()) - min(s.score for s in d.values())
+        assert spread(ranked) > spread(with_constant_mc)
+
+    def test_empty_features_still_yield_avoid(self):
+        universe = dict(self._universe(), BROKEN=pd.DataFrame())
+        ranked = self._strategy("rank_composite").score_batch(universe, self._context())
+
+        assert ranked["BROKEN"].signal == "AVOID"
+        assert ranked["BROKEN"].score == 0.0
+        assert len(ranked) == 6
+
+
+class TestUnavailableComponents:
+    """A component the pipeline could not compute is not a component that
+    scored badly, and the two must not be conflated — the BUY gate is an
+    absolute `score >= 60`, so the difference moves signals across it."""
+
+    _WEIGHTS = {"Trend": 25.0, "Breakout": 25.0, "Volume": 20.0, "MC_Prob": 30.0}
+
+    def _score(self, mc_result):
+        strategy = RuleBasedStrategy(_strategy_config())
+        context = StrategyContext(
+            risk=_risk_params(), weights=dict(self._WEIGHTS), mc_result=mc_result
+        )
+        return strategy.score("TEST", _features(), context)
+
+    def test_a_missing_monte_carlo_result_does_not_shift_the_score(self):
+        """The defect: the identical stock on the identical day scored ~12
+        points lower inside a batched UMA than standalone, because the ensemble
+        path builds one context for the round and there is no per-ticker MC
+        result to read. Nothing about the stock differs; a different code path
+        ran.
+        """
+        standalone = self._score(_mc_result(0.70))
+        in_ensemble = self._score(None)
+
+        # Trend/Breakout/Volume all score 1.0 on these features, so with
+        # MC_Prob's weight renormalized away the remaining components carry the
+        # full 100 rather than leaving a ~12-point hole.
+        assert standalone.score == pytest.approx(91.0)
+        assert in_ensemble.score == pytest.approx(100.0)
+        # What matters is that the shift is not a silent penalty on the stock:
+        # the components that *were* measured score identically.
+        for component in ("Trend", "Breakout", "Volume"):
+            assert standalone.component_scores[component] == pytest.approx(
+                in_ensemble.component_scores[component]
+            )
+
+    def test_an_unavailable_component_says_so_in_the_rationale(self):
+        """A 0.00 reads like a measurement. 'n/a' reads like what happened."""
+        signal = self._score(None)
+
+        assert "MC_Prob=n/a" in signal.rationale
+        assert "prob(no MC result):FAIL" in signal.rationale
+
+    def test_the_probability_gate_still_fails_closed_without_a_result(self):
+        """A compliance gate with no evidence either way must refuse, not wave
+        the trade through untested — so a rule-based member inside a batched
+        UMA cannot issue BUY, and that is deliberate."""
+        signal = self._score(None)
+
+        assert signal.signal != "BUY"
+        assert signal.probability_profit == 0.0
+
+    def test_a_stock_that_lacks_history_keeps_its_conservative_zero(self):
+        """The asymmetry that matters. A missing SMA-200 means a recent
+        listing, which *is* information about the stock. Renormalizing that
+        weight away would scale the other components up and score a young,
+        illiquid name higher than a seasoned one — least caution exactly where
+        an Indian micro-cap universe warrants most.
+        """
+        strategy = RuleBasedStrategy(_strategy_config())
+        context = StrategyContext(
+            risk=_risk_params(), weights=dict(self._WEIGHTS), mc_result=_mc_result(0.70)
+        )
+
+        seasoned = strategy.score("TEST", _features(), context)
+        young = strategy.score("TEST", _features(sma_200=float("nan")), context)
+
+        assert young.component_scores["Trend"] == 0.0
+        assert young.score < seasoned.score
+        # And it is still reported as a measured zero, not as unavailable.
+        assert "Trend=0.0" in young.rationale
+
+
+class TestCombineWeightedUnavailable:
+    """Unit-level behaviour of the renormalization."""
+
+    def test_renormalizes_over_the_measurable_components(self):
+        from portfolio_agent.strategies.weighting import combine_weighted
+
+        weights = {"A": 25.0, "B": 25.0, "C": 50.0}
+        scores = {"A": 1.0, "B": 1.0, "C": 0.0}
+
+        with_all, _ = combine_weighted(scores, weights)
+        without_c, _ = combine_weighted(scores, weights, unavailable=["C"])
+
+        assert with_all == pytest.approx(50.0)
+        assert without_c == pytest.approx(100.0)
+
+    def test_a_genuine_zero_still_counts_against_the_score(self):
+        """Only naming a component as unavailable excludes it; a component that
+        simply scored 0 is a real measurement and must still drag the total."""
+        from portfolio_agent.strategies.weighting import combine_weighted
+
+        score, _ = combine_weighted({"A": 1.0, "B": 0.0}, {"A": 50.0, "B": 50.0})
+        assert score == pytest.approx(50.0)
+
+    def test_everything_unavailable_scores_zero_rather_than_dividing_by_zero(self):
+        from portfolio_agent.strategies.weighting import combine_weighted
+
+        score, _ = combine_weighted(
+            {"A": 1.0, "B": 1.0}, {"A": 50.0, "B": 50.0}, unavailable=["A", "B"]
+        )
+        assert score == 0.0
+
+
 class TestRuleBasedStrategyScoring:
     """Regression-pin tests: these mirror the exact scenarios the old
     src.scoring.score_candidate() covered, to guarantee the consolidated

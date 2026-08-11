@@ -45,23 +45,93 @@ def discover_available_tickers(data_dir: str = "data/market_data") -> list[str]:
     return get_cached_tickers(Path(data_dir))
 
 
+def select_universe(
+    tickers: list[str],
+    max_tickers: int | None = None,
+    selection: str = "alphabetical",
+    seed: int = 42,
+    purpose: str = "backtest",
+) -> list[str]:
+    """Choose `max_tickers` from the available cache.
+
+    **Why this is not just `tickers[:n]`.** The cache is scanned in sorted
+    filename order, so an alphabetical truncation returns whatever happens to
+    sit at the front of the alphabet — the same few hundred names every time,
+    for training and for backtesting alike. Two consequences, both bad:
+
+    - It is not a sample of the market. It is a sample of the alphabet, and
+      every cross-sectional claim (momentum deciles, low-volatility ranks) is
+      then made about that slice rather than about Indian equities.
+    - Training and backtesting see the *identical* names, so a model is
+      evaluated on the very tickers it was fitted on. That is not out-of-sample
+      in the cross-sectional dimension, however carefully the dates are split.
+
+    `selection="random"` draws a seeded random sample instead, and `purpose`
+    offsets the seed so the training and backtest draws are different samples
+    of the same cache. Seeded rather than truly random: two runs of the same
+    config must produce the same universe or nothing is reproducible, and the
+    platform's determinism tests would fail immediately.
+
+    Note what this does *not* fix. A random sample of an alphabetical cache is
+    still not a point-in-time index membership — the names present are the
+    names that survived to be downloaded, so survivorship bias is untouched.
+    See docs/REVIEW_STATUS.md (D9); this makes the sample less arbitrary, not
+    correct.
+
+    Args:
+        tickers: Available tickers, in cache order.
+        max_tickers: How many to return. None or <= 0 returns all of them.
+        selection: "alphabetical" (the historical behaviour) or "random".
+        seed: Base seed for the random draw.
+        purpose: Offsets the seed so different consumers draw different
+            samples. "train" and "backtest" are the meaningful values.
+
+    Returns:
+        The selected tickers, always sorted, so downstream ordering is stable
+        regardless of how they were drawn.
+    """
+    if max_tickers is None or max_tickers <= 0 or max_tickers >= len(tickers):
+        return list(tickers)
+
+    if selection == "random":
+        import random
+
+        # zlib.crc32 rather than hash(): PYTHONHASHSEED randomizes str hashing
+        # per process, so hash(purpose) would draw a different universe on
+        # every invocation — the exact non-reproducibility this seeds against.
+        import zlib
+
+        offset = zlib.crc32(purpose.encode("utf-8"))
+        rng = random.Random((int(seed) + offset) & 0xFFFFFFFF)
+        return sorted(rng.sample(list(tickers), max_tickers))
+
+    return list(tickers[:max_tickers])
+
+
 def resolve_backtest_universe(
     force_full_download: bool = False,
-    max_tickers: int | None = None
+    max_tickers: int | None = None,
+    selection: str = "alphabetical",
+    seed: int = 42,
+    purpose: str = "backtest",
 ) -> list[str]:
     """
     Resolve the universe of tickers for backtesting.
-    
+
     This function:
     1. Discovers locally available tickers
     2. If none found or force_full_download=True, downloads data for all master tickers
-    3. Optionally truncates to max_tickers for quick tests
-    
+    3. Selects max_tickers of them (see select_universe)
+
     Args:
         force_full_download: If True, forces download of full master list.
-        max_tickers: Maximum number of tickers to return (for quick tests). 
+        max_tickers: Maximum number of tickers to return (for quick tests).
                      None means use ALL available.
-                     
+        selection: "alphabetical" or "random" — see select_universe.
+        seed: Base seed for a random draw.
+        purpose: "train" or "backtest"; offsets the seed so the two draw
+                 different samples of the same cache.
+
     Returns:
         List of ticker symbols with available data. Never returns None.
     """
@@ -99,13 +169,21 @@ def resolve_backtest_universe(
             # Fall back to whatever was discovered locally (may be empty)
             pass
     
-    # Step 3: Truncate if max_tickers is provided
-    if max_tickers is not None and max_tickers > 0:
-        tickers = tickers[:max_tickers]
-    
-    # Log the count
-    logger.info(f"Resolved universe: {len(tickers)} tickers with available data")
-    
+    # Step 3: Select from what is available
+    available = len(tickers)
+    tickers = select_universe(
+        tickers,
+        max_tickers=max_tickers,
+        selection=selection,
+        seed=seed,
+        purpose=purpose,
+    )
+
+    logger.info(
+        "Resolved universe: %d of %d cached tickers (%s selection, purpose=%s)",
+        len(tickers), available, selection, purpose,
+    )
+
     return tickers
 
 

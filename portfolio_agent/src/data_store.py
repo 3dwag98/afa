@@ -680,14 +680,32 @@ class DataStore:
         # Reverse the safe transformation
         return filename.replace('_NS', '.NS').replace('_', '.')
     
+    def has_ticker_data(self, ticker: str, min_bytes: int = 1) -> bool:
+        """Whether this ticker already has a non-empty parquet file cached.
+
+        Used to skip work that has already been done — most importantly by the
+        HuggingFace sync, which without it re-downloads every symbol on every
+        invocation.
+
+        `min_bytes` guards the case that makes a naive `exists()` check worse
+        than no check at all: a run interrupted mid-write leaves a zero-byte
+        file, and treating that as "cached" would permanently skip a ticker
+        that never actually downloaded.
+        """
+        path = self._get_ticker_path(ticker)
+        try:
+            return path.is_file() and path.stat().st_size >= max(1, int(min_bytes))
+        except OSError:
+            return False
+
     def save_ticker_data(self, ticker: str, df: pd.DataFrame) -> Path:
         """
         Save ticker DataFrame to parquet file.
-        
+
         Args:
             ticker: Ticker symbol.
             df: DataFrame with OHLCV data.
-            
+
         Returns:
             Path to saved parquet file.
         """

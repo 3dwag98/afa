@@ -53,6 +53,9 @@ def evaluate_and_learn(brain: AgentBrain, config: AppConfig, run_id: Optional[st
             trade_history=brain.trade_history,
             learning_rate=config.learning.learning_rate,
             min_trades_for_learning=config.learning.min_trades_for_learning,
+            min_trades_per_component=config.learning.min_trades_per_component,
+            shrinkage_strength=config.learning.shrinkage_strength,
+            significance_level=config.learning.significance_level,
         )
         brain.weights = new_weights
 

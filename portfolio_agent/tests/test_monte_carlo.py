@@ -409,3 +409,120 @@ class TestStudentTInnovations:
         )
 
         assert seen["innovation_df"] == pytest.approx(4.2)
+
+
+class TestDriftShrinkage:
+    """The drift is the noisiest input in the simulation and must be treated
+    as estimated rather than known (src/monte_carlo.py::shrink_drift)."""
+
+    def test_posterior_sits_between_the_sample_mean_and_the_prior(self):
+        from src.monte_carlo import shrink_drift
+
+        sample_mu = 0.001  # 0.1%/day, a very large drift for a daily series
+        posterior, sd = shrink_drift(sample_mu, sample_sigma=0.02, n_observations=1250)
+
+        assert 0.0 < posterior < sample_mu
+        assert sd > 0.0
+
+    def test_shrinks_harder_when_the_estimate_is_noisier(self):
+        """Weight on the sample mean is tau^2 / (tau^2 + sigma^2/T): more
+        history, or a quieter series, earns more credibility."""
+        from src.monte_carlo import shrink_drift
+
+        short, _ = shrink_drift(0.001, sample_sigma=0.02, n_observations=250)
+        long, _ = shrink_drift(0.001, sample_sigma=0.02, n_observations=2500)
+        noisy, _ = shrink_drift(0.001, sample_sigma=0.06, n_observations=1250)
+        quiet, _ = shrink_drift(0.001, sample_sigma=0.01, n_observations=1250)
+
+        assert short < long
+        assert noisy < quiet
+
+    def test_zero_prior_dispersion_credits_no_drift_edge(self):
+        from src.monte_carlo import shrink_drift
+
+        posterior, sd = shrink_drift(
+            0.001, sample_sigma=0.02, n_observations=1250, prior_annual_drift_std=0.0
+        )
+        assert posterior == 0.0
+        assert sd == 0.0
+
+    def test_a_wide_prior_recovers_the_raw_sample_mean(self):
+        """The old plug-in behaviour has to remain reachable, so the change is
+        a defensible default rather than an unremovable opinion."""
+        from src.monte_carlo import shrink_drift
+
+        posterior, _ = shrink_drift(
+            0.001, sample_sigma=0.02, n_observations=1250, prior_annual_drift_std=1e9
+        )
+        assert posterior == pytest.approx(0.001, rel=1e-6)
+
+    def test_pure_noise_tickers_stop_clearing_the_compliance_gate(self):
+        """The defect this exists to fix, measured.
+
+        Every ticker here has a true drift of exactly zero, so the honest
+        probability of profit is ~0.5 and none of them should clear the 0.55
+        gate. Propagating the unshrunk sample mean, a meaningful fraction do —
+        on a 3,800-name universe that is hundreds of zero-edge names passing
+        the gate on estimation error every day.
+        """
+        rng = np.random.default_rng(7)
+        histories = [list(rng.normal(0.0, 0.02, size=1250)) for _ in range(120)]
+
+        def share_clearing_gate(**kwargs):
+            probs = [
+                run_monte_carlo(
+                    symbol="X", daily_returns=h, horizon_days=20,
+                    simulations=1000, seed=1000 + i, **kwargs,
+                ).probability_profit
+                for i, h in enumerate(histories)
+            ]
+            return float(np.mean(np.array(probs) >= 0.55))
+
+        unshrunk = share_clearing_gate(
+            prior_annual_drift_std=1e9, propagate_drift_uncertainty=False
+        )
+        shrunk = share_clearing_gate()
+
+        assert unshrunk > 0.02
+        assert shrunk < unshrunk
+        assert shrunk == 0.0
+
+    def test_uncertainty_propagation_widens_the_distribution_of_outcomes(self):
+        """A posterior predictive is wider than a plug-in, always."""
+        rng = np.random.default_rng(11)
+        returns = list(rng.normal(0.0008, 0.02, size=1250))
+
+        plug_in = run_monte_carlo(
+            symbol="X", daily_returns=returns, horizon_days=20, simulations=8000,
+            seed=3, propagate_drift_uncertainty=False,
+        )
+        predictive = run_monte_carlo(
+            symbol="X", daily_returns=returns, horizon_days=20, simulations=8000,
+            seed=3, propagate_drift_uncertainty=True,
+        )
+
+        # Wider tails: the 5% VaR is further from zero once the drift's own
+        # uncertainty is carried into the paths.
+        assert predictive.var_95 < plug_in.var_95
+        # And the point estimate moves toward the honest 50/50.
+        assert abs(predictive.probability_profit - 0.5) <= abs(
+            plug_in.probability_profit - 0.5
+        )
+
+    def test_settings_carry_the_drift_prior_through_to_the_simulation(self):
+        from src.monte_carlo import MonteCarloSettings
+
+        returns = list(np.random.default_rng(5).normal(0.002, 0.02, size=1500))
+        # Guard the premise: shrinking toward zero only lowers the probability
+        # of profit when the realized sample mean was positive to begin with.
+        assert np.mean(np.log1p(returns)) > 0
+
+        wide = MonteCarloSettings(
+            horizon_days=20, simulations=2000, seed=9,
+            prior_annual_drift_std=1e9, propagate_drift_uncertainty=False,
+        ).run("X", returns)
+        tight = MonteCarloSettings(
+            horizon_days=20, simulations=2000, seed=9, prior_annual_drift_std=0.0
+        ).run("X", returns)
+
+        assert tight.probability_profit < wide.probability_profit

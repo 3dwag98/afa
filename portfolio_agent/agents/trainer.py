@@ -25,8 +25,12 @@ from portfolio_agent.models.pytorch_models import PointLoss, QuantileLoss, sorte
 from portfolio_agent.models.registry import get_model
 from portfolio_agent.src.calibration import IsotonicCalibrator, calibration_error
 from portfolio_agent.src.data_store import load_ticker_data
+from portfolio_agent.src.performance_stats import newey_west_standard_error
 from portfolio_agent.src.universe import resolve_backtest_universe
 from portfolio_agent.utils.device import get_device, mixed_precision_support
+from portfolio_agent.utils.workers import (
+    describe_worker_plan, resolve_dataloader_workers, resolve_process_workers,
+)
 
 TRAINING_FEATURE_NAMES = [
     'sma_20', 'sma_50', 'rsi_14', 'macd',
@@ -170,7 +174,16 @@ def load_panel_by_ticker(config: AppConfig) -> Dict[str, pd.DataFrame]:
     if config.training.use_synthetic_data:
         return {"SYNTHETIC": prepare_features(_generate_synthetic_ohlcv(), config, verbose=False)}
 
-    tickers = resolve_backtest_universe(max_tickers=config.data.universe_size)
+    # purpose="train" offsets the sampling seed, so the training universe is a
+    # different draw from the cache than the backtest universe. Evaluating a
+    # model on the very names it was fitted on is not out-of-sample in the
+    # cross-sectional dimension, however carefully the dates are split.
+    tickers = resolve_backtest_universe(
+        max_tickers=config.data.universe_size,
+        selection=config.data.universe_selection,
+        seed=config.data.universe_seed,
+        purpose="train",
+    )
     if not tickers:
         raise RuntimeError(
             "No cached tickers found to build a training panel. Run "
@@ -187,8 +200,17 @@ def load_panel_by_ticker(config: AppConfig) -> Dict[str, pd.DataFrame]:
     show_progress = len(tickers) > 20
     failures = 0
 
+    # Capped for the platform: on Windows each worker is a spawned interpreter
+    # that re-imports torch and pandas, so "one per CPU" is how a 16 GB machine
+    # ends up in the page file with a run that looks hung rather than failed.
+    process_workers = resolve_process_workers(config.training.data_load_workers)
     if config.training.parallel_data_loading and len(tickers) > 1:
-        with ProcessPoolExecutor(max_workers=config.training.data_load_workers) as executor:
+        print(describe_worker_plan(
+            process_workers, resolve_dataloader_workers(config.training.num_workers)
+        ))
+
+    if config.training.parallel_data_loading and len(tickers) > 1:
+        with ProcessPoolExecutor(max_workers=process_workers) as executor:
             futures = {executor.submit(_load_ticker_features, t, config): t for t in tickers}
             iterator = as_completed(futures)
             if show_progress:
@@ -226,6 +248,23 @@ def load_panel_by_ticker(config: AppConfig) -> Dict[str, pd.DataFrame]:
             "training panel. Run `portfolio-agent download-data` first, or set "
             "training.use_synthetic_data=true for offline testing."
         )
+
+    transform = config.training.target_transform
+    if transform != "absolute" and len(ordered) >= 2:
+        target_name = target_column_name(config.training.target)
+        before = sum(len(f) for f in ordered.values())
+        ordered = apply_cross_sectional_target(ordered, target_name, transform)
+        after = sum(len(f) for f in ordered.values())
+        print(
+            f"Target restated as {transform} across {len(ordered)} names "
+            f"({before - after} rows dropped for too thin a cross-section)"
+        )
+    elif transform != "absolute":
+        print(
+            f"Target transform {transform!r} needs at least 2 tickers; "
+            f"training on the absolute forward return instead"
+        )
+
     return ordered
 
 
@@ -303,6 +342,103 @@ def build_forward_return(close: pd.Series, target: str) -> pd.Series:
     return close.shift(-periods).pct_change(periods)
 
 
+# Below this many names on a date there is no cross-section to rank against, so
+# a relative target would mostly encode which handful of tickers happened to
+# have history that day. Those rows are dropped rather than mixed in on the
+# absolute scale, which would give the model two different label definitions.
+MIN_CROSS_SECTION_NAMES = 5
+
+
+def apply_cross_sectional_target(
+    panel_by_ticker: Dict[str, pd.DataFrame],
+    target_column: str,
+    method: str = "cross_sectional_rank",
+    min_names: int = MIN_CROSS_SECTION_NAMES,
+) -> Dict[str, pd.DataFrame]:
+    """Restate each ticker's label relative to the cross-section on its date.
+
+    The model was trained to predict the *absolute* forward return of a stock.
+    In an equity panel most of the variance of a 5-day return is the common
+    market factor — a typical Indian mid-cap runs an R^2 against the Nifty of
+    0.35-0.55 daily, and higher over a week — so the network spent most of its
+    capacity forecasting the market. That is both nearly unforecastable and
+    unusable: this platform is long-only with no index hedge, so it cannot act
+    on a market view at all. The only component it can monetize is the
+    idiosyncratic part, which is what choosing *between* stocks expresses, and
+    that was a minority of the training signal.
+
+    Two transforms, both the standard fix from the empirical asset pricing
+    literature (Gu, Kelly & Xiu):
+
+    - ``cross_sectional_demean``: y - mean(y over names on that date). Keeps
+      return units, so the label stays interpretable as an excess return.
+    - ``cross_sectional_rank``: 2*rank/(N+1) - 1, mapped to [-1, 1]. The more
+      robust of the two on Indian data, because a circuit-limited +20% print
+      dominates the cross-sectional mean but moves a rank by one place.
+
+    **This introduces no look-ahead.** The transform mixes only labels dated at
+    the same t, each of which is already realized at t+H; it adds no
+    information that the raw forward return did not already contain. It is a
+    label transform only, so nothing about inference changes: the model still
+    scores one ticker at a time and its output is a relative score, which is
+    what the ranking downstream of it always wanted.
+
+    Args:
+        panel_by_ticker: Featurized, date-indexed frames keyed by ticker. The
+            target must be the last column (the convention prepare_features
+            establishes).
+        target_column: Name of the target column.
+        method: "cross_sectional_rank", "cross_sectional_demean", or
+            "absolute" (returns the panel unchanged).
+        min_names: Minimum names on a date for its cross-section to be usable.
+
+    Returns:
+        A new dict of frames with the target restated. Dates with too thin a
+        cross-section are dropped. Falls back to the unchanged panel when there
+        are too few tickers for any relative target to mean anything.
+    """
+    if method == "absolute" or len(panel_by_ticker) < 2:
+        return panel_by_ticker
+    if method not in ("cross_sectional_rank", "cross_sectional_demean"):
+        raise ValueError(
+            f"unknown target transform {method!r}; expected 'absolute', "
+            f"'cross_sectional_demean' or 'cross_sectional_rank'"
+        )
+
+    # Wide (date x ticker) view of the labels only. Every ticker's frame keeps
+    # its own rows; this is purely a lookup for what the rest of the universe
+    # did on the same date.
+    wide = pd.DataFrame(
+        {ticker: frame[target_column] for ticker, frame in panel_by_ticker.items()}
+    )
+
+    usable = wide.notna().sum(axis=1) >= max(2, int(min_names))
+    wide = wide[usable]
+    if wide.empty:
+        return panel_by_ticker
+
+    if method == "cross_sectional_demean":
+        restated = wide.sub(wide.mean(axis=1), axis=0)
+    else:
+        ranks = wide.rank(axis=1)
+        counts = wide.notna().sum(axis=1)
+        restated = ranks.mul(2.0).div(counts + 1.0, axis=0).sub(1.0)
+
+    transformed: Dict[str, pd.DataFrame] = {}
+    for ticker, frame in panel_by_ticker.items():
+        if ticker not in restated.columns:
+            continue
+        labels = restated[ticker].dropna()
+        kept = frame.index.intersection(labels.index)
+        if kept.empty:
+            continue
+        updated = frame.loc[kept].copy()
+        updated[target_column] = labels.loc[kept].to_numpy()
+        transformed[ticker] = updated
+
+    return transformed or panel_by_ticker
+
+
 def prepare_features(df: pd.DataFrame, config: AppConfig, verbose: bool = True) -> pd.DataFrame:
     """Build feature matrix and forward-return target from raw OHLCV data.
 
@@ -341,6 +477,32 @@ def prepare_features(df: pd.DataFrame, config: AppConfig, verbose: bool = True) 
     # makes the denominator zero. So does the forward-return target itself.
     feature_df = feature_df.replace([np.inf, -np.inf], np.nan).dropna()
 
+    # Finite is not the same as usable. Input features are standardized and
+    # clipped to +/-10 sigma before training, but the *target* was passed
+    # through untouched, and a single bad cached bar is enough to poison a run:
+    # one close printed at 0.001 turns a 5-day forward return into 111,300
+    # (eleven million percent), and one gradient step against a loss that size
+    # moves the weights somewhere every subsequent batch evaluates to NaN.
+    #
+    # This is why NaN losses survived the mixed-precision fix and still appear
+    # on CPU — the cause was never fp16, it was the label.
+    #
+    # Rows are dropped rather than clipped: a clip would pile a spike of
+    # samples at the bound and teach the model that the bound is a common
+    # outcome. The default admits any genuinely reachable move — five
+    # consecutive 20% upper circuits compound to +149% — and rejects only
+    # arithmetic that cannot be a price.
+    target_values = feature_df[target_name]
+    absurd = target_values.abs() > config.training.max_abs_target
+    if absurd.any():
+        if verbose:
+            print(
+                f"Dropped {int(absurd.sum())} row(s) whose |{target_name}| exceeded "
+                f"{config.training.max_abs_target:g} "
+                f"(max was {target_values.abs().max():.4g}) — almost certainly bad cached bars"
+            )
+        feature_df = feature_df[~absurd]
+
     if verbose:
         print(f"Built feature matrix with {len(feature_df)} samples and {len(feature_df.columns)} columns")
         print(f"Features: {list(feature_df.columns[:-1])}")
@@ -366,6 +528,7 @@ def evaluate_predictions(
     predictions: np.ndarray,
     actuals: np.ndarray,
     horizon_days: int = 5,
+    relative_target: bool = False,
 ) -> Dict[str, float]:
     """Score out-of-sample predictions on the terms a trader cares about.
 
@@ -392,10 +555,27 @@ def evaluate_predictions(
     meaningful as a comparison between strategy and benchmark, both of which
     are computed on the identical overlapping sample.
 
+    - ``strategy_t_stat`` — t-statistic of the strategy's mean return with a
+      Newey-West standard error at lag H-1. Daily-sampled H-day targets overlap
+      by H-1 days, and treating them as independent understates the standard
+      error by roughly sqrt(H) — in the direction that manufactures
+      significance. The Sharpe is still the right point estimate; what the
+      naive error gets wrong is how much to believe it.
+    - ``rank_ic`` — Spearman correlation between the predicted and realized
+      ordering. This is the metric a ranking system should be judged on: it is
+      far less noisy than a backtested P&L and it does not confound signal
+      quality with position sizing, costs or the covariance of the book.
+
     Args:
         predictions: Model outputs, shape (n,).
         actuals: Realized target values, shape (n,).
         horizon_days: Forecast horizon in trading days, for annualization.
+        relative_target: True when the label is a cross-sectional excess or
+            rank rather than a return (see apply_cross_sectional_target). The
+            Sharpe figures assume the label is in return units — a rank of
+            +0.4 is not 40% — so they are reported as zero rather than as a
+            confident number about the wrong quantity, and rank IC carries the
+            evaluation instead.
 
     Returns:
         Dictionary of metrics; zeros when there is nothing to score.
@@ -406,6 +586,8 @@ def evaluate_predictions(
     empty = {
         "n_samples": 0, "mse": 0.0, "directional_accuracy": 0.0,
         "strategy_sharpe": 0.0, "benchmark_sharpe": 0.0, "excess_sharpe": 0.0,
+        "strategy_t_stat": 0.0, "rank_ic": 0.0,
+        "relative_target": float(relative_target),
     }
     if predictions.size == 0 or predictions.size != actuals.size:
         return empty
@@ -418,6 +600,13 @@ def evaluate_predictions(
     mse = float(np.mean((predictions - actuals) ** 2))
     directional_accuracy = float(np.mean(np.sign(predictions) == np.sign(actuals)))
 
+    rank_ic = 0.0
+    if predictions.size > 1:
+        predicted_rank = pd.Series(predictions).rank().to_numpy()
+        realized_rank = pd.Series(actuals).rank().to_numpy()
+        if np.std(predicted_rank) > 0 and np.std(realized_rank) > 0:
+            rank_ic = float(np.corrcoef(predicted_rank, realized_rank)[0, 1])
+
     annualization = math.sqrt(TRADING_DAYS_PER_YEAR / max(1, horizon_days))
 
     def _sharpe(returns: np.ndarray) -> float:
@@ -428,10 +617,26 @@ def evaluate_predictions(
             return 0.0
         return float(np.mean(returns) / sigma * annualization)
 
-    strategy_returns = np.where(predictions > 0, actuals, 0.0)
+    strategy_t_stat = 0.0
+    if relative_target:
+        strategy_sharpe = benchmark_sharpe = 0.0
+    else:
+        strategy_returns = np.where(predictions > 0, actuals, 0.0)
+        strategy_sharpe = _sharpe(strategy_returns)
+        benchmark_sharpe = _sharpe(actuals)
 
-    strategy_sharpe = _sharpe(strategy_returns)
-    benchmark_sharpe = _sharpe(actuals)
+        # Overlapping labels: a daily-sampled H-day return shares H-1 days with
+        # its neighbour, so treating the observations as independent understates
+        # the standard error by roughly sqrt(H) — in the direction that
+        # manufactures significance. The Sharpe above is still the right point
+        # estimate; what the naive standard error gets wrong is how much to
+        # believe it, so the correction is reported as a t-statistic rather than
+        # applied to the ratio.
+        standard_error = newey_west_standard_error(
+            strategy_returns, lags=max(0, horizon_days - 1)
+        )
+        if standard_error > 0:
+            strategy_t_stat = float(np.mean(strategy_returns) / standard_error)
 
     return {
         "n_samples": int(predictions.size),
@@ -440,6 +645,12 @@ def evaluate_predictions(
         "strategy_sharpe": strategy_sharpe,
         "benchmark_sharpe": benchmark_sharpe,
         "excess_sharpe": strategy_sharpe - benchmark_sharpe,
+        # Newey-West corrected, so it can be read against a conventional
+        # hurdle. Harvey, Liu & Zhu argue for t > 3.0 rather than 2.0 on
+        # anything drawn from a wide search, which this is.
+        "strategy_t_stat": strategy_t_stat,
+        "rank_ic": rank_ic,
+        "relative_target": float(relative_target),
     }
 
 
@@ -807,6 +1018,15 @@ def run_walk_forward_validation(
     target_col = sample.columns[-1]
     horizon_days = _target_horizon_days(target_col)
 
+    # A cross-sectional label is not in return units, so the Sharpe-style
+    # metrics below do not apply to it and rank IC carries the evaluation
+    # instead (see evaluate_predictions). The panel is only actually
+    # transformed when there were enough names to rank against, so this reads
+    # the same condition load_panel_by_ticker applied.
+    relative_target = (
+        training.target_transform != "absolute" and len(panel_by_ticker) >= 2
+    )
+
     # Fold boundaries come from the pooled distribution of dates, so each fold
     # holds a comparable number of observations even with ragged histories.
     all_dates = np.sort(np.concatenate([
@@ -923,7 +1143,9 @@ def run_walk_forward_validation(
         predictions, actuals = _predict(model, test_loader, device, median_index)
         oos_predictions.append(predictions)
         oos_actuals.append(actuals)
-        metrics = evaluate_predictions(predictions, actuals, horizon_days)
+        metrics = evaluate_predictions(
+            predictions, actuals, horizon_days, relative_target=relative_target
+        )
         metrics.update({
             "fold": fold + 1,
             "train_end": train_end_date.strftime("%Y-%m-%d"),
@@ -933,12 +1155,18 @@ def run_walk_forward_validation(
         })
         fold_metrics.append(metrics)
 
+        headline = (
+            f"rank_IC={metrics['rank_ic']:+.4f}" if relative_target
+            else (
+                f"Sharpe={metrics['strategy_sharpe']:.2f} vs benchmark "
+                f"{metrics['benchmark_sharpe']:.2f} (excess {metrics['excess_sharpe']:+.2f})"
+            )
+        )
         print(
             f"Fold {fold + 1}/{n_splits}: train<{metrics['train_end']} "
             f"test<{metrics['test_end']} ({metrics['test_rows']} rows) | "
             f"MSE={metrics['mse']:.6f} | dir_acc={metrics['directional_accuracy']:.3f} | "
-            f"Sharpe={metrics['strategy_sharpe']:.2f} vs benchmark "
-            f"{metrics['benchmark_sharpe']:.2f} (excess {metrics['excess_sharpe']:+.2f})"
+            f"{headline}"
         )
 
     if not fold_metrics:
@@ -953,13 +1181,33 @@ def run_walk_forward_validation(
         "horizon_days": horizon_days,
         "embargo_days": horizon_days,
         "folds": fold_metrics,
+        "target_transform": training.target_transform,
         "mean_mse": _mean("mse"),
         "mean_directional_accuracy": _mean("directional_accuracy"),
-        "mean_strategy_sharpe": _mean("strategy_sharpe"),
-        "mean_benchmark_sharpe": _mean("benchmark_sharpe"),
-        "mean_excess_sharpe": _mean("excess_sharpe"),
-        "folds_beating_benchmark": sum(1 for m in fold_metrics if m["excess_sharpe"] > 0),
+        "mean_rank_ic": _mean("rank_ic"),
+        # Information ratio of the fold ICs: a mean IC is only as good as its
+        # consistency across folds, and this is the ratio that says so.
+        "rank_icir": (
+            float(_mean("rank_ic") / np.std([m["rank_ic"] for m in fold_metrics], ddof=1))
+            if len(fold_metrics) > 1
+            and np.std([m["rank_ic"] for m in fold_metrics], ddof=1) > 0
+            else 0.0
+        ),
+        "folds_with_positive_ic": sum(1 for m in fold_metrics if m["rank_ic"] > 0),
     }
+
+    if not relative_target:
+        # Only meaningful when the label is in return units; a rank of +0.4 is
+        # not a 40% return, so a Sharpe computed on ranks is a confident number
+        # about the wrong quantity.
+        summary.update({
+            "mean_strategy_sharpe": _mean("strategy_sharpe"),
+            "mean_benchmark_sharpe": _mean("benchmark_sharpe"),
+            "mean_excess_sharpe": _mean("excess_sharpe"),
+            "folds_beating_benchmark": sum(
+                1 for m in fold_metrics if m["excess_sharpe"] > 0
+            ),
+        })
 
     if training.calibrate_confidence and oos_predictions:
         summary["calibration"] = _fit_confidence_calibration(
@@ -967,19 +1215,34 @@ def run_walk_forward_validation(
         )
 
     print("-" * 60)
-    print(
-        f"Mean across {summary['n_folds']} folds: "
-        f"dir_acc={summary['mean_directional_accuracy']:.3f} | "
-        f"Sharpe={summary['mean_strategy_sharpe']:.2f} vs benchmark "
-        f"{summary['mean_benchmark_sharpe']:.2f} | "
-        f"excess={summary['mean_excess_sharpe']:+.2f} | "
-        f"beat benchmark in {summary['folds_beating_benchmark']}/{summary['n_folds']} folds"
-    )
-    if summary["mean_excess_sharpe"] <= 0:
+    if relative_target:
         print(
-            "  WARNING: out-of-sample Sharpe does not beat always-long. The model is "
-            "adding turnover, not alpha — do not trade it without changing something."
+            f"Mean across {summary['n_folds']} folds: "
+            f"dir_acc={summary['mean_directional_accuracy']:.3f} | "
+            f"rank_IC={summary['mean_rank_ic']:+.4f} | "
+            f"ICIR={summary['rank_icir']:+.2f} | "
+            f"positive IC in {summary['folds_with_positive_ic']}/{summary['n_folds']} folds"
         )
+        if summary["mean_rank_ic"] <= 0:
+            print(
+                "  WARNING: out-of-sample rank IC is not positive. The model orders the "
+                "cross-section no better than chance — do not trade it without changing "
+                "something."
+            )
+    else:
+        print(
+            f"Mean across {summary['n_folds']} folds: "
+            f"dir_acc={summary['mean_directional_accuracy']:.3f} | "
+            f"Sharpe={summary['mean_strategy_sharpe']:.2f} vs benchmark "
+            f"{summary['mean_benchmark_sharpe']:.2f} | "
+            f"excess={summary['mean_excess_sharpe']:+.2f} | "
+            f"beat benchmark in {summary['folds_beating_benchmark']}/{summary['n_folds']} folds"
+        )
+        if summary["mean_excess_sharpe"] <= 0:
+            print(
+                "  WARNING: out-of-sample Sharpe does not beat always-long. The model is "
+                "adding turnover, not alpha — do not trade it without changing something."
+            )
     print("=" * 60)
 
     return summary

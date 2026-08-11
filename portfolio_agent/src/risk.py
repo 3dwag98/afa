@@ -3,7 +3,7 @@
 import math
 import pandas as pd
 import numpy as np
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from portfolio_agent.config.schema import AppConfig
 
@@ -254,12 +254,28 @@ def shrink_win_probability(
     return (wins + alpha) / (total + alpha + beta)
 
 
+class KellyInputs(NamedTuple):
+    """Everything Kelly needs about the realized payoff distribution.
+
+    The magnitudes travel alongside the ratio deliberately. `reward_risk_ratio`
+    alone (b = g/l) is enough for the *binary-bet* Kelly fraction, but a
+    stop-loss equity trade is not a binary bet, and sizing it needs the loss
+    magnitude `l` in its own right — see kelly_allocation_fraction() for why
+    dropping it understates the allocation by a factor of 1/l.
+    """
+
+    win_probability: float  # p, Beta-shrunk realized win rate
+    reward_risk_ratio: float  # b = avg_win_pct / avg_loss_pct
+    avg_win_pct: float  # g, mean magnitude of a winning trade, in percent
+    avg_loss_pct: float  # l, mean magnitude of a losing trade, in percent
+
+
 def estimate_kelly_inputs(
     trade_history: List[Dict[str, Any]],
     min_trades: int = 50,
     shrinkage_strength: float = 20.0,
-) -> Optional[Tuple[float, float]]:
-    """Estimate (win_probability, reward:risk ratio) from realized trade history.
+) -> Optional[KellyInputs]:
+    """Estimate the realized payoff distribution Kelly sizes from.
 
     Per docs/QUANT_RESEARCH.md section 4: p is the realized win rate and b is
     the average win magnitude divided by the average loss magnitude (in the
@@ -294,9 +310,9 @@ def estimate_kelly_inputs(
             the raw win rate.
 
     Returns:
-        (win_probability, reward_risk_ratio), or None when there isn't enough
-        realized history, or losses average to zero (b undefined) — callers
-        should fall back to fixed-fractional sizing in that case.
+        A KellyInputs, or None when there isn't enough realized history, or
+        losses average to zero (b undefined) — callers should fall back to
+        fixed-fractional sizing in that case.
     """
     realized = [t for t in trade_history if t.get("outcome") in ("WIN", "LOSS")]
     if len(realized) < min_trades:
@@ -315,8 +331,12 @@ def estimate_kelly_inputs(
     if avg_loss_pct <= 0:
         return None
 
-    reward_risk_ratio = avg_win_pct / avg_loss_pct
-    return win_probability, reward_risk_ratio
+    return KellyInputs(
+        win_probability=win_probability,
+        reward_risk_ratio=avg_win_pct / avg_loss_pct,
+        avg_win_pct=avg_win_pct,
+        avg_loss_pct=avg_loss_pct,
+    )
 
 
 # Hard ceiling on the fractional-Kelly multiplier kappa. Kelly assumes p and b
@@ -328,12 +348,31 @@ def estimate_kelly_inputs(
 MAX_KELLY_FRACTION = 0.25
 
 
-def calculate_kelly_fraction(win_probability: float, reward_risk_ratio: float) -> float:
-    """Full-Kelly capital fraction: f* = p - (1-p)/b.
+# This platform runs an unlevered long-only cash book: it never shorts and
+# never borrows, so no single position's *allocation* may exceed the whole
+# portfolio. Once the Kelly units are correct (see kelly_allocation_fraction)
+# f* routinely exceeds 1, and it needs a leverage constraint that says so
+# explicitly rather than a silent min(1.0, ...) buried in the formula.
+MAX_KELLY_ALLOCATION_FRACTION = 1.0
 
-    Clamped to [0, 1] — a negative f* (an unprofitable edge) becomes 0 so
-    callers fall back to fixed-fractional sizing rather than sizing a
-    "negative" position (this platform never shorts).
+
+def calculate_kelly_fraction(win_probability: float, reward_risk_ratio: float) -> float:
+    """Kelly *stake* fraction for a binary, all-or-nothing bet: f = p - (1-p)/b.
+
+    **This is not a position size.** It is the classical Kelly result for a bet
+    that returns b times the stake with probability p and loses the *entire*
+    stake with probability 1-p. A stop-loss equity trade is not that bet: a
+    loser gives back the distance from entry to stop (a few percent of the
+    position), not the position. Sizing a portfolio with this number allocates
+    roughly l times too little, where l is the loss-given-stop — see
+    kelly_allocation_fraction(), which is what position sizing calls.
+
+    Retained because it is the correct quantity in its own right and the
+    numerator of the allocation formula, and because reporting it alongside
+    the allocation makes the units visible rather than implicit.
+
+    Clamped to [0, 1] — the natural range for a stake fraction. A negative f
+    (an unprofitable edge) becomes 0.
     """
     if reward_risk_ratio <= 0:
         return 0.0
@@ -341,15 +380,89 @@ def calculate_kelly_fraction(win_probability: float, reward_risk_ratio: float) -
     return max(0.0, min(1.0, f_star))
 
 
+def kelly_allocation_fraction(
+    win_probability: float,
+    avg_win_pct: float,
+    avg_loss_pct: float,
+) -> float:
+    """Growth-optimal fraction of *wealth* to allocate to a stop-loss trade.
+
+    For a position that gains a fraction g of its value with probability p and
+    loses a fraction l with probability 1-p, the log-growth-maximizing
+    allocation is
+
+        f*_alloc = (p*g - (1-p)*l) / (g*l) = (p - (1-p)/b) / l,   b = g/l
+
+    The numerator is the per-rupee-of-position edge; dividing by g*l converts
+    it from "edge per rupee at risk" into "rupees of position per rupee of
+    wealth". The binary-bet form f = p - (1-p)/b is that expression with l = 1
+    — correct only when a loss wipes out the whole stake.
+
+    The distinction is not cosmetic. At p = 0.55, b = 1.8 and a 6%
+    loss-given-stop, the binary form returns 0.30 while the allocation is 5.0:
+    a factor of 1/l = 16.7. Applied as an allocation, the binary form runs the
+    book at ~6% of the quarter-Kelly it claims. Worse, the error is not a
+    constant rescaling — l varies per signal, so a wide-stop trade (which
+    *should* get a smaller allocation) is distorted differently from a tight
+    one, and no amount of raising kappa recovers it.
+
+    Deliberately unbounded above: an f* of 5.0 is a true statement about a
+    growth-optimal bet, and hiding it behind a min(1.0, ...) would make the
+    clamp — rather than the risk policy — the thing that sizes the book. The
+    leverage and concentration limits are applied explicitly by the caller
+    (see calculate_kelly_quantity).
+
+    Args:
+        win_probability: p, the (shrunk) probability the trade wins.
+        avg_win_pct: g, mean magnitude of a winning trade in percent.
+        avg_loss_pct: l, mean magnitude of a losing trade in percent. Measured
+            from realized history rather than the modelled stop distance
+            because a stop that gaps or locks at the lower circuit realizes
+            worse than it was set — history carries that, the stop does not.
+
+    Returns:
+        Growth-optimal allocation as a fraction of portfolio value, >= 0.
+        Zero when the edge is negative or either magnitude is unusable.
+    """
+    g = abs(float(avg_win_pct)) / 100.0
+    l = abs(float(avg_loss_pct)) / 100.0
+    if g <= 0.0 or l <= 0.0:
+        return 0.0
+
+    edge = win_probability * g - (1.0 - win_probability) * l
+    if edge <= 0.0:
+        return 0.0
+    return edge / (g * l)
+
+
 def calculate_kelly_quantity(
     entry_price: float,
     portfolio_value_inr: float,
     max_single_position_pct: float,
     win_probability: float,
-    reward_risk_ratio: float,
+    avg_win_pct: float,
+    avg_loss_pct: float,
     kelly_fraction: float = MAX_KELLY_FRACTION,
 ) -> int:
-    """Fractional-Kelly position sizing.
+    """Fractional-Kelly position sizing, in allocation units.
+
+    Constraints are applied in this order, each one explicit:
+
+    1. ``f*_alloc`` from kelly_allocation_fraction() — growth-optimal, unbounded.
+    2. ``kappa``, the fractional-Kelly multiplier, hard-capped at quarter-Kelly.
+    3. ``MAX_KELLY_ALLOCATION_FRACTION`` — the unlevered-cash-book constraint.
+    4. ``max_single_position_pct`` — the concentration cap.
+
+    A note on what this means in practice, because it is the honest reading of
+    the corrected arithmetic: with the units right, f*_alloc for any trade with
+    a real edge is large (order 1-10), so steps 3 and 4 bind almost always and
+    the concentration cap — not Kelly — is what sizes a position. That is not a
+    defect of this function; it is what fractional Kelly on a stop-loss book
+    actually implies, and it is why the missing piece is portfolio-level
+    (covariance-aware) construction rather than a better per-trade formula.
+    Kelly still binds where it matters most: as the edge approaches zero,
+    f*_alloc collapses continuously to 0 and sizes the position down, which the
+    binary-bet form also did but at 1/l of the correct scale.
 
     Args:
         entry_price: Entry price per share.
@@ -358,7 +471,8 @@ def calculate_kelly_quantity(
             portfolio value — Kelly sizing can never exceed this, matching
             the platform's existing fixed-fractional cap.
         win_probability: Realized win rate p (see estimate_kelly_inputs).
-        reward_risk_ratio: Realized average win:loss ratio b.
+        avg_win_pct: Realized average win magnitude g, in percent.
+        avg_loss_pct: Realized average loss magnitude l, in percent.
         kelly_fraction: Fractional-Kelly multiplier kappa, clamped to
             [0, MAX_KELLY_FRACTION]. The clamp is applied here rather than
             trusted to the caller, so no config, YAML or test fixture can
@@ -370,9 +484,9 @@ def calculate_kelly_quantity(
     if entry_price <= 0:
         return 0
 
-    f_star = calculate_kelly_fraction(win_probability, reward_risk_ratio)
+    f_star = kelly_allocation_fraction(win_probability, avg_win_pct, avg_loss_pct)
     kappa = max(0.0, min(MAX_KELLY_FRACTION, kelly_fraction))
-    position_fraction = f_star * kappa
+    position_fraction = min(f_star * kappa, MAX_KELLY_ALLOCATION_FRACTION)
 
     position_value = portfolio_value_inr * position_fraction
     max_position_value = portfolio_value_inr * max_single_position_pct
@@ -391,6 +505,25 @@ def calculate_position_quantity(
     switching to fractional-Kelly once config.risk.use_kelly_sizing is set
     and enough realized trade history exists to estimate it reliably.
 
+    **Kelly is applied as a ceiling, not a licence.** The size taken is the
+    smaller of the Kelly allocation and the fixed-fractional risk budget. Two
+    reasons, both a consequence of getting the Kelly units right:
+
+    - The risk budget is priced off *this* trade's stop distance, which is
+      known exactly, while Kelly's loss magnitude l is a historical average
+      across trades with different stops. Where they disagree, the known
+      quantity should win.
+    - Correcting the units (kelly_allocation_fraction) scales f* up by 1/l,
+      roughly 17x at a 6% stop. Without this ceiling that correction would
+      land as a silent increase in position size across the whole book —
+      turning a units bug fix into a leverage change nobody asked for.
+
+    So enabling Kelly can only ever size *down* relative to fixed-fractional:
+    it de-risks as the estimated edge approaches zero and is otherwise
+    inactive. That is the intended behaviour for an unlevered long-only cash
+    book; growth-optimal sizing across positions is a portfolio-level problem
+    (covariance-aware allocation), not something a per-trade formula can do.
+
     Args:
         entry_price: Entry price per share.
         stop_price: Stop loss price per share.
@@ -402,6 +535,8 @@ def calculate_position_quantity(
     Returns:
         Integer quantity >= 0.
     """
+    fixed_fractional = calculate_quantity(entry_price, stop_price, config)
+
     if config.risk.use_kelly_sizing and trade_history:
         kelly_inputs = estimate_kelly_inputs(
             trade_history,
@@ -409,17 +544,18 @@ def calculate_position_quantity(
             shrinkage_strength=config.risk.kelly_shrinkage_strength,
         )
         if kelly_inputs is not None:
-            win_probability, reward_risk_ratio = kelly_inputs
-            return calculate_kelly_quantity(
+            kelly_quantity = calculate_kelly_quantity(
                 entry_price=entry_price,
                 portfolio_value_inr=config.risk.portfolio_value_inr,
                 max_single_position_pct=config.risk.max_single_position_pct,
-                win_probability=win_probability,
-                reward_risk_ratio=reward_risk_ratio,
+                win_probability=kelly_inputs.win_probability,
+                avg_win_pct=kelly_inputs.avg_win_pct,
+                avg_loss_pct=kelly_inputs.avg_loss_pct,
                 kelly_fraction=config.risk.kelly_fraction,
             )
+            return min(kelly_quantity, fixed_fractional)
 
-    return calculate_quantity(entry_price, stop_price, config)
+    return fixed_fractional
 
 
 def calculate_max_loss(quantity: int, entry_price: float, stop_price: float) -> float:

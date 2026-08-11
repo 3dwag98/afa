@@ -511,7 +511,8 @@ flowchart TD
     RG --> H{"requires_full_batch<br/>or supports_gpu_batch?"}
     H -->|yes| I["score_batch(all tickers)"]
     H -->|no| J["score() per ticker with its own mc_result"]
-    I --> K["position sizing (fixed-fractional or fractional Kelly)"]
+    I --> K["position sizing (fixed-fractional or fractional Kelly)
+    then sector cap, then the portfolio volatility cap"]
     J --> K
     K --> L["compliance checks"]
     L --> M["rank by score, persist to SQLite"]
@@ -716,18 +717,29 @@ portfolio_agent/
     │                       filled order inherits from its signal
     ├── execution_sim.py    Indian market costs, slippage, STCG/LTCG,
     │                       plus the quantity-free round-trip cost estimator
-    ├── risk.py             position sizing incl. fractional Kelly (capped at
-    │                       quarter-Kelly), Beta-shrunk win rate, net-of-cost RR
+    ├── risk.py             position sizing incl. fractional Kelly in
+    │                       *allocation* units (capped at quarter-Kelly and
+    │                       applied as a ceiling on the fixed-fractional risk
+    │                       budget), Beta-shrunk win rate, net-of-cost RR
+    ├── portfolio.py        covariance estimation (Ledoit-Wolf shrinkage, EW,
+    │                       single-factor), portfolio risk measurement, the
+    │                       constrained long-only optimizer and HRP
     ├── trigger_engine.py   signal arbitration: conflict penalty, vetoes,
     │                       firing modes, position-size multiplier
     ├── regime.py           market regime classification + volatility targeting
+    ├── markov_regime.py    K-state Gaussian HMM on the benchmark: Baum-Welch
+    │                       fit, BIC state selection, filtered (never
+    │                       smoothed) state probabilities, sleeve weighting
     ├── calibration.py      isotonic (PAVA) score -> probability calibration
     ├── liquidity.py        circuit-lock (1/2/5/10/20% bands), operator-trap
     │                       and illiquidity / zombie screening
     ├── sectors.py          ticker->sector map and concentration caps
     ├── risk_analytics.py   CAGR/Sharpe/Sortino/drawdown, bootstrap MC
+    ├── performance_stats.py PSR / deflated Sharpe / PBO / rank IC, the
+    │                       Newey-West overlap correction and the trial log
     ├── monte_carlo.py      per-symbol forward simulation (scoring input):
-    │                       gaussian / block bootstrap / jump diffusion
+    │                       gaussian / block bootstrap / jump diffusion, with
+    │                       the drift shrunk and its uncertainty propagated
     ├── volatility_models.py GJR-GARCH(1,1), incl. the gap-aware fit
     ├── compliance.py       eligibility gates
     ├── indicators.py       ATR/RSI/MACD/ADX and the IndicatorSnapshot the

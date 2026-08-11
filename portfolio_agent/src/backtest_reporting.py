@@ -52,7 +52,24 @@ SUMMARY_COUNT = 'count'
 SUMMARY_METRICS = [
     ('CAGR (%)', 'cagr', SUMMARY_PERCENT),
     ('Sharpe Ratio', 'sharpe', SUMMARY_RATIO),
+    # A Sharpe ratio without the number of configurations behind it is the
+    # maximum of an unrecorded number of draws. PSR is the probability the true
+    # Sharpe clears zero given the sample's length, skew and kurtosis; DSR is
+    # the same probability measured against the Sharpe the best of N trials
+    # would show by luck alone. A DSR below 0.95 means the headline number is
+    # not distinguishable from what the search itself would produce on a
+    # strategy with no edge. See src/performance_stats.py.
+    ('Probabilistic Sharpe', 'probabilistic_sharpe', SUMMARY_RATIO),
+    ('Deflated Sharpe', 'deflated_sharpe', SUMMARY_RATIO),
+    ('Trials Deflated Against', 'n_trials', SUMMARY_COUNT),
     ('Sortino Ratio', 'sortino', SUMMARY_RATIO),
+    # Portfolio-level risk, which per-position sizing cannot see. The multiple
+    # is how many times larger the book's volatility actually was than sizing
+    # each position independently implied — 1.0 would mean correlation cost
+    # nothing, and on a long-only Indian equity book it does not.
+    ('Book Volatility (%)', 'book_volatility', SUMMARY_PERCENT),
+    ('Correlation Risk Multiple', 'correlation_risk_multiple', SUMMARY_RATIO),
+    ('Diversification Ratio', 'diversification_ratio', SUMMARY_RATIO),
     ('Max Drawdown (%)', 'max_drawdown', SUMMARY_PERCENT),
     ('Profit Factor', 'profit_factor', SUMMARY_RATIO),
     ('Probability of Ruin (%)', 'probability_of_ruin', SUMMARY_PERCENT),

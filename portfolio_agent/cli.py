@@ -63,6 +63,8 @@ def cmd_download_data(args) -> int:
                 end_date=end_date.strftime('%Y-%m-%d'),
                 max_symbols=args.universe_size,
                 progress=True,
+                skip_existing=not args.force,
+                workers=args.workers or 8,
             )
         except Exception as e:
             print(f"Error: HuggingFace ingest failed: {e}")
@@ -86,6 +88,7 @@ def cmd_download_data(args) -> int:
                 asset_dir="indices",
                 adjust_prices=config.data.hf_adjust_prices,
                 tickers=[benchmark],
+                skip_existing=not args.force,
                 start_date=start_date.strftime('%Y-%m-%d'),
                 end_date=end_date.strftime('%Y-%m-%d'),
             )
@@ -100,7 +103,10 @@ def cmd_download_data(args) -> int:
 
     tickers = resolve_backtest_universe(
         force_full_download=args.force,
-        max_tickers=args.universe_size or config.data.universe_size
+        max_tickers=args.universe_size or config.data.universe_size,
+        selection=config.data.universe_selection,
+        seed=config.data.universe_seed,
+        purpose="backtest",
     )
 
     if not tickers:
@@ -391,7 +397,9 @@ def create_parser() -> argparse.ArgumentParser:
     download_parser.add_argument(
         "--force",
         action="store_true",
-        help="Force re-download of all data"
+        help="Re-download data that is already cached. Off by default: a plain "
+             "re-run now skips symbols already on disk instead of fetching all "
+             "~2,400 of them again."
     )
     download_parser.add_argument(
         "--universe-size",
@@ -404,7 +412,8 @@ def create_parser() -> argparse.ArgumentParser:
         "--workers",
         type=int,
         default=None,
-        help="Concurrent chunk downloads (default: config.data.download_workers). "
+        help="Concurrent downloads (huggingface: threads, default 8; yfinance: "
+             "chunk workers, default config.data.download_workers). "
              "Use 1 if the data provider rate-limits you."
     )
     download_parser.set_defaults(func=cmd_download_data)
