@@ -573,6 +573,17 @@ class SimulationConfig(BaseModel):
         "noise alone. Raise this toward infinity to recover the raw sample mean; set it to 0 to "
         "credit no ticker with any drift edge at all.",
     )
+    use_empirical_drift_prior: bool = Field(
+        default=True,
+        description="If True, estimate the drift prior from the cross-section of the active "
+        "universe each scoring round (src/monte_carlo.py::estimate_cross_sectional_drift_prior) "
+        "instead of using the fixed prior_annual_drift_std, and shrink each ticker toward the "
+        "universe mean rather than toward zero. The method of moments splits the observed spread "
+        "of sample means into true dispersion and estimation noise — tau^2 = max(0, Var(mu_hat) - "
+        "mean(sigma_i^2/T_i)) — so the amount of shrinkage is measured rather than assumed. Falls "
+        "back to the fixed prior automatically when the usable cross-section is too thin to "
+        "estimate two moments from. Set False to restore the fixed-prior behaviour.",
+    )
     propagate_drift_uncertainty: bool = Field(
         default=True,
         description="If True, each simulated path draws its own drift from the posterior instead "

@@ -112,7 +112,19 @@ def _prepare_all_tickers(
     parallel path, so downstream scoring, ranking and the exported report do
     not depend on which worker finished first.
     """
-    args = (required_features, MonteCarloSettings.from_simulation_config(config.simulation))
+    # The drift prior is a property of the universe, not of any one ticker, so
+    # it is estimated once over the whole panel and shared by every worker.
+    # `data` is the live path's as-of-now history — the same series each ticker
+    # is about to be simulated from — so the prior sees nothing its tickers do
+    # not already see.
+    mc_settings = MonteCarloSettings.from_simulation_config(
+        config.simulation
+    ).with_drift_prior_from_panel(
+        df['close'].pct_change().dropna().to_numpy()
+        for df in data.values()
+        if 'close' in df.columns and not df.empty
+    )
+    args = (required_features, mc_settings)
 
     if not (config.data.parallel_ticker_prep and len(data) > 1):
         results = []
