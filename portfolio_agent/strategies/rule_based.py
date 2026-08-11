@@ -134,6 +134,17 @@ class RuleBasedStrategy(BaseStrategy):
         prob_profit = context.mc_result.probability_profit if context.mc_result is not None else 0.0
         mc_score = max(0.0, min(1.0, prob_profit))
 
+        # The gate reads the lower confidence bound, not the point estimate.
+        # probability_profit is Phi(mu_hat*sqrt(H)/sigma) to a first
+        # approximation, so it inherits the drift's standard error one-for-one
+        # and a ticker with no edge at all clears a 0.55 gate 8.5% of the time
+        # (src/monte_carlo.py::DriftPrior). Falls back to the point estimate
+        # when the simulation did not run, so a stub MonteCarloResult blocks
+        # the trade for the reason it always did rather than for a new one.
+        gate_prob = prob_profit
+        if context.risk.gate_on_probability_lower_bound and context.mc_result is not None:
+            gate_prob = context.mc_result.probability_profit_gate
+
         component_scores = {
             "Trend": trend_score,
             "Breakout": breakout_score,
@@ -169,7 +180,7 @@ class RuleBasedStrategy(BaseStrategy):
             gross_reward_risk = 0.0
 
         passed_score = final_score >= 60
-        passed_prob = prob_profit >= context.risk.target_prob_profit
+        passed_prob = gate_prob >= context.risk.target_prob_profit
         passed_rr = reward_risk >= context.risk.min_reward_risk
         passed_price = close >= context.risk.min_price_inr
 
@@ -180,7 +191,7 @@ class RuleBasedStrategy(BaseStrategy):
             f"volume={volume_score:.2f}",
             f"mc_prob={mc_score:.2f}",
             f"score>=60:{'PASS' if passed_score else 'FAIL'}",
-            f"prob({prob_profit:.2f})>={context.risk.target_prob_profit}:{'PASS' if passed_prob else 'FAIL'}",
+            f"prob({gate_prob:.2f})>={context.risk.target_prob_profit}:{'PASS' if passed_prob else 'FAIL'}",
             f"rr({reward_risk:.2f})>={context.risk.min_reward_risk}:{'PASS' if passed_rr else 'FAIL'}",
             f"price({close:.2f})>={context.risk.min_price_inr}:{'PASS' if passed_price else 'FAIL'}",
             "stop<entry:VALID" if stop_valid else "stop>=entry:INVALID",
@@ -208,6 +219,10 @@ class RuleBasedStrategy(BaseStrategy):
             component_scores=component_scores,
             rationale=rationale,
             extra={
+                "mc_prob_profit_lower": round(
+                    context.mc_result.probability_profit_gate, 6
+                ) if context.mc_result else 0.0,
+                "mc_drift_shrunk": bool(context.mc_result.drift_shrunk) if context.mc_result else False,
                 "mc_var_95_pct": round(context.mc_result.var_95, 6) if context.mc_result else 0.0,
                 "mc_cvar_95_pct": round(context.mc_result.cvar_95, 6) if context.mc_result else 0.0,
                 # Reported alongside the (net) reward_risk so the gap between

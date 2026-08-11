@@ -36,8 +36,8 @@ trade log to report risk-of-ruin as an output metric, not a scoring input.
 import math
 
 import numpy as np
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Optional
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Iterable, Literal, Optional, Sequence
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -52,6 +52,126 @@ MIN_INNOVATION_DF = 2.1
 
 SimulationMethod = Literal["gaussian", "block_bootstrap", "jump_diffusion"]
 
+# Tickers with less history than this contribute nothing usable to the
+# cross-sectional drift prior — their sample mean is almost pure noise and
+# would inflate the estimated dispersion of true drifts.
+MIN_PRIOR_OBSERVATIONS = 250
+
+# One-sided 95% normal quantile, used to turn the posterior standard deviation
+# of the drift into the lower confidence bound on probability-of-profit.
+_Z_95 = 1.6448536269514722
+
+
+@dataclass(frozen=True)
+class DriftPrior:
+    """Cross-sectional prior on the true daily log drift.
+
+    The sample mean of daily returns is the noisiest statistic in finance: its
+    standard error is sigma/sqrt(T), which over five years of a 2%/day Indian
+    mid-cap is about 0.057%/day — roughly 14% a year. Propagating that number
+    forward as if it were the truth is what makes probability-of-profit a
+    measurement of estimation error rather than of edge: simulating 20,000
+    tickers whose true drift is *exactly zero* puts 8.5% of them over a 0.55
+    probability gate, which on a 3,800-name universe is ~322 zero-edge names
+    clearing compliance every day. Worse, mu_hat is largest for stocks that
+    have already run, so the noise is positively correlated with the momentum
+    signal — it confirms rather than checks it.
+
+    The fix is the standard empirical-Bayes one. Treating each ticker's true
+    drift as a draw from Normal(mean, tau^2) and its estimate as
+    Normal(true, sigma^2/T), the posterior mean is a precision-weighted blend:
+
+        mu_tilde_i = (tau^2 * mu_hat_i + (sigma_i^2/T_i) * mean) / (tau^2 + sigma_i^2/T_i)
+
+    On daily equity data tau^2 << sigma^2/T, so this collapses almost entirely
+    onto the universe mean. That is not a failure of the method — it is the
+    honest statement that a single ticker's realized mean carries almost no
+    information about its forward drift.
+
+    Attributes:
+        mean: Universe mean daily log drift (mu_bar).
+        tau_squared: Cross-sectional variance of *true* drifts, net of
+            estimation noise. Zero means "no evidence that drifts differ at
+            all", which shrinks every ticker onto `mean`.
+    """
+
+    mean: float = 0.0
+    tau_squared: float = 0.0
+
+    def shrink(self, mu_hat: float, sigma: float, n_obs: int) -> float:
+        """Posterior-mean drift for one ticker."""
+        if n_obs <= 0 or sigma <= 0:
+            return self.mean
+        estimation_variance = (sigma * sigma) / n_obs
+        denominator = self.tau_squared + estimation_variance
+        if denominator <= 0:
+            return mu_hat
+        weight = self.tau_squared / denominator
+        return weight * mu_hat + (1.0 - weight) * self.mean
+
+    def posterior_sd(self, sigma: float, n_obs: int) -> float:
+        """Standard deviation of the shrunk drift, for the confidence bound.
+
+        Normal-Normal posterior variance is the harmonic-style combination
+        tau^2 * se^2 / (tau^2 + se^2), which is smaller than either input:
+        shrinkage buys precision by borrowing strength from the panel.
+        """
+        if n_obs <= 0 or sigma <= 0:
+            return 0.0
+        estimation_variance = (sigma * sigma) / n_obs
+        denominator = self.tau_squared + estimation_variance
+        if denominator <= 0:
+            return 0.0
+        return math.sqrt(self.tau_squared * estimation_variance / denominator)
+
+
+def estimate_drift_prior(
+    panel_log_returns: Iterable[Sequence[float]],
+    min_observations: int = MIN_PRIOR_OBSERVATIONS,
+) -> Optional[DriftPrior]:
+    """Estimate (mu_bar, tau^2) across a panel by method of moments.
+
+    The observed cross-sectional variance of the per-ticker sample means is
+    the variance of the true drifts *plus* the average estimation variance:
+
+        Var_i(mu_hat_i) = tau^2 + mean_i(sigma_i^2 / T_i)
+
+    so tau^2 is the first minus the second, floored at zero (a negative
+    estimate means the observed dispersion is entirely explained by noise,
+    which on daily data is the common case).
+
+    Args:
+        panel_log_returns: One sequence of daily log returns per ticker.
+        min_observations: Shortest history a ticker may contribute.
+
+    Returns:
+        A DriftPrior, or None when fewer than two tickers qualify — callers
+        should then leave the drift unshrunk rather than invent a prior from
+        a single name.
+    """
+    sample_means: list[float] = []
+    estimation_variances: list[float] = []
+
+    for series in panel_log_returns:
+        arr = np.asarray(series, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size < min_observations:
+            continue
+        variance = float(np.var(arr, ddof=1))
+        if not math.isfinite(variance) or variance <= 0:
+            continue
+        sample_means.append(float(np.mean(arr)))
+        estimation_variances.append(variance / arr.size)
+
+    if len(sample_means) < 2:
+        return None
+
+    observed_dispersion = float(np.var(np.asarray(sample_means), ddof=1))
+    average_noise = float(np.mean(np.asarray(estimation_variances)))
+    tau_squared = max(0.0, observed_dispersion - average_noise)
+
+    return DriftPrior(mean=float(np.mean(sample_means)), tau_squared=tau_squared)
+
 
 @dataclass
 class MonteCarloResult:
@@ -63,6 +183,29 @@ class MonteCarloResult:
     simulations_count: int = 0
     horizon_days: int = 0
     method: str = "gaussian"
+    # Probability-of-profit re-evaluated with the drift pushed to its one-sided
+    # 95% lower bound, on the same shock draws. This is the number a gate
+    # should read: the point estimate answers "how often does this ticker
+    # profit if my drift estimate is exactly right", which it never is.
+    #
+    # None means "no simulation produced one" — a hand-built or stub result.
+    # Read it through probability_profit_gate, never directly, so an absent
+    # bound degrades to the point estimate instead of to a hard zero that
+    # would silently block every trade.
+    probability_profit_lower: Optional[float] = None
+    # The drift actually simulated (daily log), after any shrinkage, and its
+    # posterior standard deviation. Reported so a run can be audited for how
+    # much of its probability came from the prior rather than the ticker.
+    drift_daily_log: float = 0.0
+    drift_posterior_sd: float = 0.0
+    drift_shrunk: bool = False
+
+    @property
+    def probability_profit_gate(self) -> float:
+        """Probability-of-profit as a compliance gate should read it."""
+        if self.probability_profit_lower is None:
+            return self.probability_profit
+        return self.probability_profit_lower
 
 
 @dataclass(frozen=True)
@@ -85,6 +228,16 @@ class MonteCarloSettings:
     jump_mean: float = -0.02
     jump_volatility: float = 0.05
     separate_overnight_gaps: bool = True
+    # Cross-sectional drift prior, estimated once per run over the whole
+    # universe (see estimate_drift_prior) and attached with
+    # dataclasses.replace. None leaves each ticker's raw sample mean in place,
+    # which is the pre-shrinkage behaviour and is only correct when there is
+    # no panel to borrow strength from.
+    drift_prior: Optional[DriftPrior] = None
+
+    def with_drift_prior(self, prior: Optional[DriftPrior]) -> "MonteCarloSettings":
+        """Copy carrying `prior`; the dataclass is frozen so workers can pickle it."""
+        return replace(self, drift_prior=prior)
 
     @classmethod
     def from_simulation_config(cls, simulation) -> "MonteCarloSettings":
@@ -130,6 +283,7 @@ class MonteCarloSettings:
                 jump_intensity_per_year=self.jump_intensity_per_year,
                 jump_mean=self.jump_mean,
                 jump_volatility=self.jump_volatility,
+                drift_prior=self.drift_prior,
             )
 
         intraday = overnight = None
@@ -155,6 +309,7 @@ class MonteCarloSettings:
             jump_volatility=self.jump_volatility,
             intraday_returns=intraday,
             overnight_returns=overnight,
+            drift_prior=self.drift_prior,
         )
 
 
@@ -298,6 +453,7 @@ def run_monte_carlo(
     jump_mean: float = -0.02,
     jump_volatility: float = 0.05,
     innovation_df: Optional[float] = None,
+    drift_prior: Optional[DriftPrior] = None,
 ) -> MonteCarloResult:
     """Run Monte Carlo simulation on historical returns using log returns.
 
@@ -325,6 +481,10 @@ def run_monte_carlo(
             the "gaussian" method and to jump_diffusion's diffusion leg;
             block_bootstrap already inherits the empirical tail shape by
             construction and ignores it.
+        drift_prior: Cross-sectional prior used to shrink this ticker's sample
+            mean drift toward the universe mean (see DriftPrior). None keeps
+            the raw sample mean, which propagates its own standard error
+            straight into probability_profit.
 
     Returns:
         MonteCarloResult with simulation statistics.
@@ -353,8 +513,21 @@ def run_monte_carlo(
     # log(1 + r) where r is simple return
     log_returns = np.log1p(returns_arr)
 
-    mu = np.mean(log_returns)
+    mu = float(np.mean(log_returns))
     sigma = float(np.std(log_returns, ddof=0))  # Population std
+
+    # Shrink the drift toward the cross-sectional prior before it is
+    # propagated over the horizon. Without this the H-day probability of
+    # profit is roughly Phi(mu_hat*sqrt(H)/sigma), which inherits the sample
+    # mean's standard error one-for-one — see DriftPrior for what that costs.
+    drift_posterior_sd = sigma / math.sqrt(len(log_returns)) if sigma > 0 else 0.0
+    if drift_prior is not None:
+        mu = drift_prior.shrink(mu, sigma, len(log_returns))
+        drift_posterior_sd = drift_prior.posterior_sd(sigma, len(log_returns))
+    # The one-sided 95% lower drift. Paths are re-scored against this on the
+    # *same* shocks, so the gap between the two probabilities is parameter
+    # uncertainty alone and carries no extra simulation noise.
+    mu_lower = mu - _Z_95 * drift_posterior_sd
 
     if daily_vol_forecast is not None:
         sigma_path = np.asarray(daily_vol_forecast, dtype=float)
@@ -408,6 +581,12 @@ def run_monte_carlo(
     # Probability profit = mean(cumulative_returns > 0)
     probability_profit = float(np.mean(cumulative_returns > 0))
 
+    # Drift enters every path additively, one mu per simulated day, so moving
+    # mu to its lower bound is exactly a parallel shift of the cumulative
+    # distribution — no re-simulation required.
+    drift_shift = (mu - mu_lower) * horizon_days
+    probability_profit_lower = float(np.mean((cumulative_returns - drift_shift) > 0))
+
     # Expected return pct = mean(exp(cumulative_returns) - 1)
     expected_return_pct = float(np.mean(np.exp(cumulative_returns) - 1))
 
@@ -429,6 +608,10 @@ def run_monte_carlo(
         simulations_count=simulations,
         horizon_days=horizon_days,
         method=effective_method,
+        probability_profit_lower=round(probability_profit_lower, 6),
+        drift_daily_log=round(mu, 8),
+        drift_posterior_sd=round(drift_posterior_sd, 8),
+        drift_shrunk=drift_prior is not None,
     )
 
 
@@ -445,6 +628,7 @@ def run_monte_carlo_garch(
     jump_volatility: float = 0.05,
     intraday_returns: Optional[list[float]] = None,
     overnight_returns: Optional[list[float]] = None,
+    drift_prior: Optional[DriftPrior] = None,
 ) -> MonteCarloResult:
     """Like run_monte_carlo(), but forecasts volatility with GJR-GARCH(1,1)
     (see volatility_models.py) instead of assuming a flat historical
@@ -500,4 +684,5 @@ def run_monte_carlo_garch(
         jump_mean=jump_mean,
         jump_volatility=jump_volatility,
         innovation_df=innovation_df,
+        drift_prior=drift_prior,
     )

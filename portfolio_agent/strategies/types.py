@@ -47,6 +47,12 @@ class RiskParams:
     # cost-aware without extra wiring.
     buy_cost_pct: float = field(default_factory=lambda: _default_cost_pct("BUY"))
     sell_cost_pct: float = field(default_factory=lambda: _default_cost_pct("SELL"))
+    # Screen probability-of-profit on its one-sided 95% lower bound rather than
+    # on the point estimate. The point estimate is a function of an estimated
+    # drift whose standard error is sigma/sqrt(T); gating on it lets pure
+    # estimation noise clear the gate (~8.5% of zero-edge tickers at the 0.55
+    # default). The lower bound is the same quantity asked honestly.
+    gate_on_probability_lower_bound: bool = True
 
     @classmethod
     def from_app_config(cls, config: "AppConfig") -> "RiskParams":
@@ -65,6 +71,9 @@ class RiskParams:
             atr_target_multiplier=config.risk.atr_target_multiplier,
             buy_cost_pct=cost_fraction_per_side("BUY", slippage),
             sell_cost_pct=cost_fraction_per_side("SELL", slippage),
+            gate_on_probability_lower_bound=(
+                config.compliance.gate_on_probability_lower_bound
+            ),
         )
 
 

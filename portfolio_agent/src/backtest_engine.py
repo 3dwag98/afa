@@ -31,7 +31,7 @@ try:
     from .models import AgentBrain
     from .regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
     from .execution_sim import ExecutionSimulator
-    from .monte_carlo import MonteCarloSettings
+    from .monte_carlo import DriftPrior, MonteCarloSettings, estimate_drift_prior
     from .risk import (
         MAX_KELLY_FRACTION,
         calculate_kelly_quantity,
@@ -47,7 +47,7 @@ except ImportError:
     from models import AgentBrain
     from regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
     from execution_sim import ExecutionSimulator
-    from monte_carlo import MonteCarloSettings
+    from monte_carlo import DriftPrior, MonteCarloSettings, estimate_drift_prior
     from risk import (
         MAX_KELLY_FRACTION,
         calculate_kelly_quantity,
@@ -125,13 +125,21 @@ def _score_one_ticker_in_worker(
     hist_data: pd.DataFrame,
     weights: Dict[str, float],
     regime_label: Optional[str] = None,
+    drift_prior: Optional["DriftPrior"] = None,
 ) -> Optional[StrategySignal]:
-    """Worker-side entry point: only the per-day varying arguments travel."""
+    """Worker-side entry point: only the per-day varying arguments travel.
+
+    The drift prior is one of those: it is re-estimated on a schedule from the
+    panel visible at T, so it cannot be pinned into the worker alongside the
+    genuinely run-constant inputs. It is a two-float frozen dataclass, so
+    shipping it per task costs nothing measurable.
+    """
     if _WORKER_STRATEGY is None or _WORKER_RISK is None:
         raise RuntimeError("Scoring worker was not initialized")
+    mc_settings = _WORKER_MC_SETTINGS.with_drift_prior(drift_prior)
     return _score_one_ticker(
         _WORKER_STRATEGY, ticker, hist_data, _WORKER_FEATURES,
-        _WORKER_RISK, weights, _WORKER_MC_SETTINGS, regime_label,
+        _WORKER_RISK, weights, mc_settings, regime_label,
     )
 
 
@@ -354,6 +362,11 @@ class BacktestEngine:
         self.untradeable_tickers: set = set()
         
         # Load all ticker data into memory
+        # Cross-sectional drift prior, re-estimated every
+        # DRIFT_PRIOR_REFRESH_ROUNDS scoring rounds (see _drift_prior_for_round).
+        self._drift_prior: Optional["DriftPrior"] = None
+        self._drift_prior_seen = False
+        self._drift_prior_rounds_left = 0
         self.ticker_data: Dict[str, pd.DataFrame] = {}
         self._load_all_data()
         
@@ -875,8 +888,15 @@ class BacktestEngine:
             eligible,
         )
 
+        # One cross-sectional drift prior per round, shared by every ticker,
+        # estimated only from history visible at T.
+        drift_prior = self._drift_prior_for_round(eligible)
+        mc_settings = self.mc_settings.with_drift_prior(drift_prior)
+
         if self.parallel and len(eligible) > 1:
-            parallel_signals = self._score_tickers_parallel(eligible, weights, regime_label)
+            parallel_signals = self._score_tickers_parallel(
+                eligible, weights, regime_label, drift_prior
+            )
             if parallel_signals is not None:
                 return parallel_signals
 
@@ -886,11 +906,46 @@ class BacktestEngine:
         for ticker, hist_data in eligible.items():
             result = _score_one_ticker(
                 self.strategy, ticker, hist_data, required_features,
-                self.risk_params, weights, self.mc_settings, regime_label,
+                self.risk_params, weights, mc_settings, regime_label,
             )
             if result is not None:
                 signals[ticker] = result
         return signals
+
+    # How many scoring rounds a cross-sectional drift prior is reused for.
+    # mu_bar and tau^2 are panel-level hyperparameters that move on the
+    # timescale of a market cycle, not a session, so re-estimating them every
+    # bar would cost ~21x more for an estimate that barely moves. Same
+    # reasoning as refitting GARCH parameters on a schedule rather than daily.
+    DRIFT_PRIOR_REFRESH_ROUNDS = 21
+
+    def _drift_prior_for_round(
+        self, eligible: Dict[str, pd.DataFrame]
+    ) -> Optional["DriftPrior"]:
+        """Cross-sectional drift prior for this scoring round.
+
+        Estimated from `eligible`, which is already trimmed to history strictly
+        before T, so the prior inherits the engine's look-ahead guarantee
+        rather than needing its own.
+
+        Returns None when the panel is too thin to support a prior (fewer than
+        two tickers with enough history), in which case each ticker's raw
+        sample mean is simulated as before — an honest degradation, since
+        there is nothing to borrow strength from.
+        """
+        if self._drift_prior_rounds_left > 0 and self._drift_prior_seen:
+            self._drift_prior_rounds_left -= 1
+            return self._drift_prior
+
+        panel = (
+            np.log1p(df['close'].pct_change().dropna().to_numpy(dtype=float))
+            for df in eligible.values()
+            if 'close' in df.columns
+        )
+        self._drift_prior = estimate_drift_prior(panel)
+        self._drift_prior_seen = True
+        self._drift_prior_rounds_left = self.DRIFT_PRIOR_REFRESH_ROUNDS
+        return self._drift_prior
 
     def _benchmark_up_to(self, current_date: pd.Timestamp) -> Optional[pd.Series]:
         """Benchmark closes strictly before `current_date`.
@@ -995,6 +1050,7 @@ class BacktestEngine:
         eligible: Dict[str, pd.DataFrame],
         weights: Dict[str, float],
         regime_label: Optional[str] = None,
+        drift_prior: Optional["DriftPrior"] = None,
     ) -> Optional[Dict[str, StrategySignal]]:
         """Score every eligible ticker across the run's CPU process pool.
 
@@ -1013,7 +1069,8 @@ class BacktestEngine:
             executor = self._get_scoring_executor()
             futures = {
                 ticker: executor.submit(
-                    _score_one_ticker_in_worker, ticker, hist_data, weights, regime_label
+                    _score_one_ticker_in_worker,
+                    ticker, hist_data, weights, regime_label, drift_prior,
                 )
                 for ticker, hist_data in eligible.items()
             }

@@ -2,7 +2,13 @@
 
 import pytest
 import numpy as np
-from src.monte_carlo import run_monte_carlo, MonteCarloResult
+from src.monte_carlo import (
+    DriftPrior,
+    MonteCarloResult,
+    MonteCarloSettings,
+    estimate_drift_prior,
+    run_monte_carlo,
+)
 
 
 class TestMonteCarlo:
@@ -409,3 +415,109 @@ class TestStudentTInnovations:
         )
 
         assert seen["innovation_df"] == pytest.approx(4.2)
+
+
+class TestDriftShrinkage:
+    """The sample mean of daily returns is the noisiest statistic in finance.
+    Propagating it forward unshrunk turns probability-of-profit into a
+    measurement of estimation error (src/monte_carlo.py::DriftPrior)."""
+
+    @staticmethod
+    def _zero_drift_panel(n_tickers=200, n_obs=1250, sigma=0.02, seed=7):
+        rng = np.random.default_rng(seed)
+        return [rng.normal(0.0, sigma, n_obs) for _ in range(n_tickers)]
+
+    def test_prior_recovers_near_zero_dispersion_on_a_zero_drift_panel(self):
+        """Every ticker here has a TRUE drift of exactly zero, so the observed
+        dispersion of sample means is entirely estimation noise and tau^2 must
+        come out at (or very near) its zero floor."""
+        panel = [np.log1p(r) for r in self._zero_drift_panel()]
+        prior = estimate_drift_prior(panel)
+
+        assert prior is not None
+        assert abs(prior.mean) < 1e-3
+        # What matters is the shrinkage weight tau^2 / (tau^2 + sigma^2/T),
+        # i.e. how much of a ticker's own sample mean survives. sigma^2/T is
+        # ~3.2e-7 here, and the residual tau^2 is the method-of-moments
+        # estimator's own sampling error, so almost nothing should survive.
+        estimation_variance = 0.02 ** 2 / 1250
+        weight = prior.tau_squared / (prior.tau_squared + estimation_variance)
+        assert weight < 0.15
+
+    def test_shrinkage_collapses_the_spread_of_probability_of_profit(self):
+        """The headline D2 number: pure-noise tickers must stop clearing the
+        compliance gate."""
+        panel = self._zero_drift_panel(n_tickers=120)
+        prior = estimate_drift_prior([np.log1p(r) for r in panel])
+
+        def probabilities(drift_prior, field):
+            return np.array([
+                getattr(
+                    run_monte_carlo(
+                        "T", list(r), horizon_days=20, simulations=400,
+                        seed=1000 + i, drift_prior=drift_prior,
+                    ),
+                    field,
+                )
+                for i, r in enumerate(panel)
+            ])
+
+        unshrunk = probabilities(None, "probability_profit")
+        shrunk = probabilities(prior, "probability_profit")
+        bounded = probabilities(prior, "probability_profit_lower")
+
+        # Shrinkage removes the drift-estimation component of the spread; what
+        # is left is simulation noise at 400 paths.
+        assert shrunk.std() < unshrunk.std() / 1.5
+        # And the false-positive rate at the default 0.55 gate goes to zero.
+        # (The rate scales with sigma*sqrt(H)/sigma_of_mean; the plan's 8.5%
+        # figure is a wider process than this fixture, so the assertion is on
+        # the direction and the floor, not the magnitude.)
+        assert (unshrunk >= 0.55).mean() > 0.01
+        assert (shrunk >= 0.55).mean() == 0.0
+        assert (bounded >= 0.55).mean() == 0.0
+
+    def test_prior_needs_at_least_two_usable_tickers(self):
+        assert estimate_drift_prior([]) is None
+        assert estimate_drift_prior([np.zeros(1000)]) is None
+        # Too little history to contribute.
+        assert estimate_drift_prior([np.ones(10) * 0.001, np.ones(10) * 0.002]) is None
+
+    def test_zero_tau_shrinks_every_ticker_onto_the_prior_mean(self):
+        prior = DriftPrior(mean=0.0004, tau_squared=0.0)
+        assert prior.shrink(0.01, sigma=0.02, n_obs=1250) == pytest.approx(0.0004)
+        assert prior.shrink(-0.01, sigma=0.02, n_obs=1250) == pytest.approx(0.0004)
+        # A point-mass prior leaves no posterior uncertainty in the drift.
+        assert prior.posterior_sd(sigma=0.02, n_obs=1250) == 0.0
+
+    def test_shrinkage_weight_rises_with_evidence(self):
+        """More history means a tighter sample mean, so less is borrowed."""
+        prior = DriftPrior(mean=0.0, tau_squared=1e-7)
+        short = prior.shrink(0.001, sigma=0.02, n_obs=100)
+        long = prior.shrink(0.001, sigma=0.02, n_obs=5000)
+        assert 0.0 < short < long < 0.001
+
+    def test_lower_bound_never_exceeds_the_point_estimate(self):
+        rng = np.random.default_rng(3)
+        returns = list(rng.normal(0.0015, 0.02, 800))
+        result = run_monte_carlo("T", returns, horizon_days=20, simulations=2000, seed=5)
+
+        assert result.probability_profit_lower <= result.probability_profit
+        assert result.drift_shrunk is False
+
+    def test_settings_carry_the_prior_into_the_simulation(self):
+        prior = DriftPrior(mean=0.0, tau_squared=0.0)
+        settings = MonteCarloSettings(horizon_days=10, simulations=200, seed=1)
+        rng = np.random.default_rng(11)
+        returns = list(rng.normal(0.003, 0.02, 600))  # a strong in-sample run-up
+
+        raw = settings.run("T", returns)
+        shrunk = settings.with_drift_prior(prior).run("T", returns)
+
+        assert raw.drift_shrunk is False and shrunk.drift_shrunk is True
+        # The prior is a point mass at zero drift, so the simulated drift is
+        # zero and the run-up stops being extrapolated.
+        assert shrunk.drift_daily_log == pytest.approx(0.0, abs=1e-12)
+        assert shrunk.probability_profit < raw.probability_profit
+        # with_drift_prior copies rather than mutates -- workers pickle these.
+        assert settings.drift_prior is None

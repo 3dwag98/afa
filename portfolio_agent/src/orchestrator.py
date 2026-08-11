@@ -7,6 +7,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 
 from portfolio_agent.config.schema import AppConfig
@@ -24,7 +25,7 @@ try:
     )
     from .data_store import load_or_fetch_data, load_ticker_data
     from .indicators import calculate_indicators
-    from .monte_carlo import MonteCarloResult, MonteCarloSettings
+    from .monte_carlo import MonteCarloResult, MonteCarloSettings, estimate_drift_prior
     from .risk import calculate_position_quantity, to_net_realized_trades
     from .execution_sim import cost_fraction_per_side
     from .compliance import run_compliance_checks
@@ -45,7 +46,7 @@ except ImportError:
     )
     from data_store import load_or_fetch_data, load_ticker_data
     from indicators import calculate_indicators
-    from monte_carlo import MonteCarloResult, MonteCarloSettings
+    from monte_carlo import MonteCarloResult, MonteCarloSettings, estimate_drift_prior
     from risk import calculate_position_quantity, to_net_realized_trades
     from execution_sim import cost_fraction_per_side
     from compliance import run_compliance_checks
@@ -112,7 +113,28 @@ def _prepare_all_tickers(
     parallel path, so downstream scoring, ranking and the exported report do
     not depend on which worker finished first.
     """
-    args = (required_features, MonteCarloSettings.from_simulation_config(config.simulation))
+    # One cross-sectional drift prior for the whole universe, estimated once
+    # per run. Each ticker's own sample mean drift carries a standard error of
+    # sigma/sqrt(T) -- large enough that propagating it forward makes
+    # probability-of-profit a measurement of estimation error. See
+    # monte_carlo.DriftPrior.
+    mc_settings = MonteCarloSettings.from_simulation_config(config.simulation)
+    drift_prior = estimate_drift_prior(
+        np.log1p(df['close'].pct_change().dropna().to_numpy(dtype=float))
+        for df in data.values()
+        if 'close' in df.columns
+    )
+    if drift_prior is None:
+        logger.info(
+            "Universe too thin for a cross-sectional drift prior; "
+            "simulating each ticker's raw sample mean drift"
+        )
+    else:
+        logger.info(
+            "Drift prior: mean=%.6f/day, tau^2=%.3g (shrinking %d tickers)",
+            drift_prior.mean, drift_prior.tau_squared, len(data),
+        )
+    args = (required_features, mc_settings.with_drift_prior(drift_prior))
 
     if not (config.data.parallel_ticker_prep and len(data) > 1):
         results = []

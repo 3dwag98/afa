@@ -483,6 +483,16 @@ class ComplianceConfig(BaseModel):
         "gross ratio once ~0.79% of round-trip cost is charged against an ATR-scale move, so "
         "the old threshold was unreachable for any ATR-derived stop/target.",
     )
+    gate_on_probability_lower_bound: bool = Field(
+        default=True,
+        description="Screen target_prob_profit against the one-sided 95% LOWER BOUND of the "
+        "Monte Carlo probability-of-profit rather than its point estimate. The point estimate "
+        "is roughly Phi(mu_hat*sqrt(H)/sigma) and so inherits the drift's standard error "
+        "(sigma/sqrt(T)) one-for-one: with a 2%/day mid-cap and five years of history, 8.5% of "
+        "tickers whose TRUE drift is exactly zero clear a 0.55 gate on estimation noise alone — "
+        "~322 names a day on a 3,800-name universe, and correlated with the momentum signal "
+        "rather than independent of it. Set False to restore point-estimate gating.",
+    )
     paper_trading_mode: bool = Field(
         default=True, description="Must remain True; this system never places real trades"
     )
