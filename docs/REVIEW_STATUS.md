@@ -146,3 +146,28 @@ Two of these are worth separating from the rest. The NaN was a **correctness**
 bug that silently defined which rows a model trained on, and the universe
 truncation meant every model was being evaluated on the exact names it was
 fitted on — neither is a usability complaint.
+
+---
+
+## Appendix: reinforcement learning
+
+Added on request, and scoped deliberately. `src/rl.py` applies RL to the
+*exposure* decision — how much of the book to deploy given the regime — not to
+stock selection.
+
+The reason is that RL's unit of learning is a trajectory, and the market has
+produced exactly one. A price-level policy with thousands of parameters
+memorises that path; a linear-softmax policy with under 40 parameters over a
+five-action space is estimable from it. Reward charges turnover and penalizes
+variance, because a naive cumulative-return reward makes "always fully
+invested" optimal — a beta exposure rather than a strategy.
+
+Validated on a synthetic two-regime path, fitted on the leading 60% and
+evaluated frozen on the rest: Sharpe +1.25 against an always-invested +0.88,
+with 2.8 total turnover over 599 steps. That demonstrates the machinery learns.
+It is **not** evidence RL works on markets — the regime is handed to the agent
+noiselessly, and no real regime estimate is.
+
+Treat any result from it as one trial in a search: run it through
+`src/performance_stats.py` and log it. And D9 still applies — without a
+point-in-time universe, a good backtest is not evidence of anything.

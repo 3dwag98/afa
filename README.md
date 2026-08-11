@@ -249,6 +249,8 @@ Notes:
 - Portfolio covariance estimation and constrained long-only allocation: Ledoit-Wolf shrinkage, a turnover-penalized mean-variance optimizer, and hierarchical risk parity for when expected returns are not trustworthy (`src/portfolio.py`)
 - Selection-bias-aware performance statistics — probabilistic and deflated Sharpe, probability of backtest overfitting, cross-sectional rank IC, and the Newey-West correction for overlapping labels (`src/performance_stats.py`)
 - Bayesian shrinkage of the simulated drift, whose standard error over five years of daily data is roughly 14% a year (`src/monte_carlo.py::shrink_drift`)
+- A Markov-switching regime model — a K-state Gaussian HMM by Baum-Welch with K chosen by BIC, emitting filtered state probabilities rather than a hard label (`src/markov_regime.py`)
+- Reinforcement learning for the *exposure* decision, scoped to what a single market trajectory can actually support — see §27 for why the obvious deep-RL-over-prices version does not (`src/rl.py`)
 - The original trend/breakout/volume/Monte-Carlo rule-based strategy
 - Researched-but-not-implemented strategy families (cointegration pairs trading, Fama-French factors, quality/QMJ, FII/DII flows, calendar anomalies) and exactly why each is scoped out (architectural gap vs. data gap vs. weak evidence)
 

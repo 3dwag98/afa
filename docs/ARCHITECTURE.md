@@ -727,6 +727,8 @@ portfolio_agent/
     ├── trigger_engine.py   signal arbitration: conflict penalty, vetoes,
     │                       firing modes, position-size multiplier
     ├── regime.py           market regime classification + volatility targeting
+    ├── rl.py               RL exposure policy: environment, linear-softmax
+    │                       policy, REINFORCE, walk-forward evaluation
     ├── markov_regime.py    K-state Gaussian HMM on the benchmark: Baum-Welch
     │                       fit, BIC state selection, filtered (never
     │                       smoothed) state probabilities, sleeve weighting

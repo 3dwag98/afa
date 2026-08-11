@@ -30,6 +30,7 @@ This document is the mathematical/research foundation behind the platform's stra
 24. [Predicting the cross-section, not the market](#24-predicting-the-cross-section-not-the-market) — implemented (`agents/trainer.py::apply_cross_sectional_target`)
 25. [Regimes as estimated states, not hand-set thresholds](#25-regimes-as-estimated-states-not-hand-set-thresholds) — implemented (`src/markov_regime.py`)
 26. ["Cannot compute" is not "scores zero"](#26-cannot-compute-is-not-scores-zero) — implemented (`strategies/weighting.py::combine_weighted`)
+27. [Reinforcement learning, scoped to what one trajectory supports](#27-reinforcement-learning-scoped-to-what-one-trajectory-supports) — implemented (`src/rl.py`)
 
 Closing: [what to combine into a UMA](#summary-what-to-combine-into-a-uma)
 
@@ -754,6 +755,88 @@ Percentile rather than the review's \(\Phi^{-1}(\text{rank}/(N_t+1))\) form, del
 **What it changes about the strategy's meaning.** Under `weighted_sum`, `score >= 60` is an absolute quality bar that nothing need clear on a bad day. Under `rank_composite` it is a percentile, so a roughly fixed share of the universe clears it whatever the market is doing: the score stops being a quality filter and becomes a ranker, leaving the absolute gates — probability of profit, net reward:risk, minimum price, and the regime layer — as what remains to say "not today". On a worked five-name example the two agree on ordering exactly while the scores compress from a 23–90 range to 42–86, and a name sitting exactly on the 60 threshold moves to 69.
 
 That is a change of strategy rather than a defect fix, so `weighted_sum` remains the default and `rank_composite` is one YAML line away. `requires_full_batch` becomes True under rank scoring, since ranking a universe of one is not a degraded answer but a meaningless one.
+
+
+---
+
+## 27. Reinforcement learning, scoped to what one trajectory supports
+
+**Why the obvious version does not work.** The instinct is a deep network that
+observes prices and emits buy/sell. On this data it will produce a spectacular
+backtest and no edge, for a reason that is arithmetic rather than pessimism:
+
+- **There is one episode.** Supervised learning here has ~1,250 daily
+  observations per ticker, already thin. RL's unit of learning is a
+  *trajectory*, and the market has produced exactly one — 2021 to 2025 happened
+  once. An agent with a few thousand parameters memorises that single path.
+  Atari agents train on millions of episodes because the environment can be
+  re-run; the market cannot.
+- **Naive rewards learn leverage.** Reward cumulative return and the optimal
+  policy is "hold the maximum position always" — a beta exposure with extra
+  steps, not a strategy.
+- **The reward is measured through the same instruments.** If costs are
+  understated, the agent finds and exploits exactly that gap, because that is
+  what RL does.
+
+**What is actually estimable.** Rather than *what* to hold, RL is applied to
+*how much*:
+
+> Given the regime probabilities and how the book is currently positioned, what
+> fraction of capital should be deployed today?
+
+A small discrete action space over a low-dimensional state, which one
+trajectory can support in a way a price-level policy cannot. It is also the
+formulation the literature supports — regime states from a hidden Markov model
+(§25) with an allocation policy on top.
+
+**Formulation.** State at \(t\) is the filtered regime probability vector, the
+current exposure, trailing volatility and a bias — all strictly backward-looking.
+Action is a target exposure from \(\{0, 0.25, 0.5, 0.75, 1\}\). The reward
+uses the return the market *subsequently* delivered:
+
+$$
+R_t = w_t r_{t+1} - c\,|w_t - w_{t-1}| - \frac{\lambda}{2}\left(w_t r_{t+1}\right)^2
+$$
+
+The turnover charge \(c\) and the quadratic risk term \(\lambda\) are both on
+by default, because they are what decide whether the agent learns a strategy or
+learns leverage. Filtered probabilities only — smoothed ones condition on the
+whole sample and would hand the agent the future inside its own state vector.
+
+**Policy.** Linear softmax, `n_features × n_actions` parameters — typically
+under 40 — trained by REINFORCE with a standardized return-to-go baseline and
+an entropy bonus. Deliberately tiny: a neural policy here would not be more
+capable, it would be more confident. The baseline matters more than usual
+because daily rewards are noisy and near zero-mean; without it the gradient is
+dominated by whatever the market happened to do rather than by the action's
+contribution.
+
+**Validation.** On a synthetic two-regime path where the regime is observable,
+fitted on the leading 60% and evaluated frozen and greedy on the held-out 40%:
+
+| | Sharpe | Return | Turnover |
+|---|---|---|---|
+| RL policy | **+1.25** | +43.7% | 2.8 over 599 steps |
+| Always invested | +0.88 | +55.0% | — |
+
+Lower return, materially better risk-adjusted return, almost no churn — which
+is the shape a working exposure policy should have. **This demonstrates the
+machinery learns, not that RL works on markets**: the regime is handed to the
+agent noiselessly, which no real regime estimate is.
+
+The score function is checked against a numerical gradient in the tests. A sign
+error there trains the policy to do the opposite of what works, which presents
+as "RL does not work on finance" rather than as a bug.
+
+**How to treat a result.** As one trial in a search, not as a finding. Feed it
+to `src/performance_stats.py` and log it: an RL agent that beat the baseline on
+one split of one trajectory is exactly what the deflated Sharpe ratio exists to
+discount. And nothing here has a point-in-time universe yet (D9), so a good
+backtest remains not evidence.
+
+**Sources:**
+- Sutton & Barto, *Reinforcement Learning: An Introduction* — REINFORCE and baselines
+- *Regime-Based Portfolio Allocation Using Hidden Markov Models and Reinforcement Learning*, arXiv:2605.27848
 
 
 ---
