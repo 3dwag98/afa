@@ -885,6 +885,62 @@ def _fit_confidence_calibration(
     return result
 
 
+def purge_and_embargo(
+    frame: pd.DataFrame,
+    test_start: pd.Timestamp,
+    test_end: pd.Timestamp,
+    horizon_days: int,
+    embargo_days: int = 0,
+) -> pd.DataFrame:
+    """Drop training rows whose information overlaps a test window.
+
+    Two distinct mechanisms, routinely conflated:
+
+    - **Purge.** A row dated t carries a label computed from prices at
+      t + horizon. If [t, t + horizon] intersects the test window, that label
+      already encodes moves the model is about to be scored on. Rows dated
+      inside the test window are excluded for the obvious reason; rows dated
+      up to `horizon` *before* it are excluded for this one. Rows dated after
+      the test window are also purged when their own labels reach back into
+      it, which is what makes this correct for a non-contiguous (K-fold) split
+      as well as an expanding one -- the previous implementation handled only
+      the left boundary, and would have leaked on the right.
+    - **Embargo.** Even a label that does not overlap can be contaminated by
+      serial correlation immediately after the test window. `embargo_days`
+      additionally drops rows starting within that many days of the test end.
+
+    Args:
+        frame: Date-indexed rows for one ticker.
+        test_start: First date of the test window (inclusive).
+        test_end: Last date of the test window (exclusive).
+        horizon_days: Label horizon in trading days. Approximated in calendar
+            days below, deliberately generously -- over-purging costs training
+            rows, under-purging costs the validity of the measurement.
+        embargo_days: Extra calendar days purged after the test window.
+
+    Returns:
+        The subset of `frame` safe to train on. Never mutates the input.
+    """
+    if frame.empty:
+        return frame
+
+    # Trading days to calendar days: 7/5 plus a day of slack, so a horizon
+    # that straddles a weekend or a market holiday is still fully covered.
+    horizon_span = pd.Timedelta(days=int(math.ceil(horizon_days * 7 / 5)) + 1)
+
+    label_end = frame.index + horizon_span
+    overlaps = (label_end >= test_start) & (frame.index < test_end)
+    inside = (frame.index >= test_start) & (frame.index < test_end)
+    embargoed = (
+        (frame.index >= test_end)
+        & (frame.index < test_end + pd.Timedelta(days=int(embargo_days)))
+        if embargo_days > 0
+        else np.zeros(len(frame), dtype=bool)
+    )
+
+    return frame[~(overlaps | inside | embargoed)]
+
+
 def run_walk_forward_validation(
     panel_by_ticker: Dict[str, pd.DataFrame],
     config: AppConfig,
@@ -913,11 +969,17 @@ def run_walk_forward_validation(
     (as the sequence windows require) while guaranteeing no training row is
     dated at or after its fold's test period.
 
-    **Embargo.** The target is a *forward* return over `horizon_days`, so the
-    last few training rows before a boundary carry labels computed from prices
-    inside the test period. Those rows are dropped, or the model would be
-    fitted against labels that already encode the moves it is about to be
-    scored on.
+    **Purge and embargo.** The target is a *forward* return over
+    `horizon_days`, so the last few training rows before a boundary carry
+    labels computed from prices inside the test period. Those rows are
+    dropped, or the model would be fitted against labels that already encode
+    the moves it is about to be scored on. `purge_and_embargo` applies this on
+    *both* sides of the test window rather than only before it, and
+    `training.walk_forward_embargo_days` adds a further gap after it for
+    serial correlation the label horizon alone does not cover. The same purge
+    is applied between each fold's inner training block and the inner
+    validation block that drives its early stopping — a selection set leaks
+    exactly as a test set does.
 
     Each fold holds back the tail of its own training window for early
     stopping, so the test period is never seen during fitting. Folds train
@@ -947,6 +1009,7 @@ def run_walk_forward_validation(
     feature_cols = sample.columns[:-1].tolist()
     target_col = sample.columns[-1]
     horizon_days = _target_horizon_days(target_col)
+    embargo_days = getattr(training, "walk_forward_embargo_days", 0)
 
     # Fold boundaries come from the pooled distribution of dates, so each fold
     # holds a comparable number of observations even with ragged histories.
@@ -992,11 +1055,14 @@ def run_walk_forward_validation(
         test_blocks: List[pd.DataFrame] = []
 
         for frame in panel_by_ticker.values():
-            history = frame[frame.index < train_end_date]
-            # Embargo: labels of the final `horizon_days` training rows are
-            # computed from prices inside the test period.
-            if horizon_days > 0:
-                history = history.iloc[:-horizon_days] if len(history) > horizon_days else history.iloc[:0]
+            # Purge every row whose label window touches the test period, on
+            # either side -- see purge_and_embargo. This subsumes the previous
+            # "drop the last horizon_days rows" rule and is correct for a
+            # non-contiguous split too.
+            history = purge_and_embargo(
+                frame, train_end_date, test_end_date, horizon_days, embargo_days
+            )
+            history = history[history.index < train_end_date]
             if len(history) <= training.sequence_length:
                 continue
 
@@ -1005,8 +1071,22 @@ def run_walk_forward_validation(
             if inner_train_end <= training.sequence_length:
                 continue
 
-            train_blocks.append(history.iloc[:inner_train_end])
-            val_blocks.append(history.iloc[inner_train_end:])
+            inner_val = history.iloc[inner_train_end:]
+            # The inner validation block drives early stopping, so it is a
+            # selection set and needs the same protection the test set gets:
+            # without this purge the final training rows carry labels computed
+            # from prices inside the block that decides when to stop.
+            inner_train = purge_and_embargo(
+                history.iloc[:inner_train_end],
+                inner_val.index[0],
+                inner_val.index[-1] + pd.Timedelta(days=1),
+                horizon_days,
+            )
+            if len(inner_train) <= training.sequence_length:
+                continue
+
+            train_blocks.append(inner_train)
+            val_blocks.append(inner_val)
 
             test = frame[(frame.index >= train_end_date) & (frame.index < test_end_date)]
             if len(test) > training.sequence_length:

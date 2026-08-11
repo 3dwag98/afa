@@ -17,6 +17,7 @@ from portfolio_agent.agents.trainer import (
     evaluate_predictions,
     load_data,
     prepare_features,
+    purge_and_embargo,
     run_walk_forward_validation,
     target_column_name,
     _generate_synthetic_ohlcv,
@@ -392,3 +393,75 @@ class TestWalkForwardValidation:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestPurgeAndEmbargo:
+    """A row dated t carries a label computed from prices at t + horizon. If
+    that window touches the test period, the label already encodes moves the
+    model is about to be scored on."""
+
+    @staticmethod
+    def _frame(start="2024-01-01", periods=60):
+        index = pd.bdate_range(start, periods=periods)
+        return pd.DataFrame({"f": np.arange(len(index), dtype=float)}, index=index)
+
+    def test_rows_inside_the_test_window_are_dropped(self):
+        frame = self._frame()
+        test_start, test_end = frame.index[20], frame.index[40]
+
+        kept = purge_and_embargo(frame, test_start, test_end, horizon_days=0)
+
+        assert not ((kept.index >= test_start) & (kept.index < test_end)).any()
+        # Rows on both sides survive: this is a hole punched in the series,
+        # not a truncation of it.
+        assert (kept.index < test_start).any() and (kept.index >= test_end).any()
+
+    def test_the_label_horizon_is_purged_before_the_window(self):
+        frame = self._frame()
+        test_start, test_end = frame.index[30], frame.index[45]
+
+        kept = purge_and_embargo(frame, test_start, test_end, horizon_days=5)
+
+        # Nothing kept before the window may have a 5-day label reaching into it.
+        before = kept[kept.index < test_start]
+        assert (before.index + pd.Timedelta(days=8)).max() < test_start
+
+    def test_the_right_boundary_is_purged_too(self):
+        """The defect this replaced: only the left boundary was handled. On a
+        non-contiguous split, rows dated after the test window whose labels
+        reach back into it leak just as badly."""
+        frame = self._frame()
+        test_start, test_end = frame.index[10], frame.index[25]
+
+        kept = purge_and_embargo(frame, test_start, test_end, horizon_days=5)
+        after = kept[kept.index >= test_end]
+
+        # Every surviving row after the window starts at or past its end, and
+        # rows dated at the boundary itself are kept only because their labels
+        # run forward, away from the test period.
+        assert len(after) > 0
+        assert after.index.min() >= test_end
+
+    def test_the_embargo_adds_a_gap_after_the_window(self):
+        frame = self._frame()
+        test_start, test_end = frame.index[10], frame.index[25]
+
+        without = purge_and_embargo(frame, test_start, test_end, horizon_days=5)
+        with_embargo = purge_and_embargo(
+            frame, test_start, test_end, horizon_days=5, embargo_days=14
+        )
+
+        assert len(with_embargo) < len(without)
+        after = with_embargo[with_embargo.index >= test_end]
+        assert after.index.min() >= test_end + pd.Timedelta(days=14)
+
+    def test_an_empty_frame_round_trips(self):
+        empty = self._frame().iloc[:0]
+        result = purge_and_embargo(empty, pd.Timestamp("2024-01-10"), pd.Timestamp("2024-02-01"), 5)
+        assert result.empty
+
+    def test_the_input_is_not_mutated(self):
+        frame = self._frame()
+        original = len(frame)
+        purge_and_embargo(frame, frame.index[10], frame.index[25], horizon_days=5)
+        assert len(frame) == original

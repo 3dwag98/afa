@@ -69,6 +69,20 @@ training:
   # cannot fit spurious cross-feature relationships.
   model: lstm
   target: return_5d
+  # absolute | cross_sectional_demean | cross_sectional_rank.
+  # Most of the variance of a 5-day equity return is the common market factor,
+  # which this platform can neither forecast nor act on (long-only, no index
+  # hedge) — so an 'absolute' target spends most of the network's capacity on
+  # the part of the move it cannot monetize. Only the cross-sectional part
+  # supports choosing BETWEEN stocks. 'cross_sectional_rank' additionally
+  # survives the circuit-limit outliers that dominate raw cross-sectional
+  # moments on Indian data.
+  target_transform: cross_sectional_rank
+  # Subtract modelled round-trip friction from the label, so the network
+  # learns the sign of the return the portfolio actually keeps. Note this is a
+  # level shift the cross-sectional transforms above are invariant to; it
+  # changes the label only under target_transform: absolute.
+  target_net_of_costs: true
   sequence_length: 60
   train_fraction: 0.8
   batch_size: 128
@@ -191,6 +205,13 @@ simulation:
 compliance:
   min_price_inr: 20.0
   target_prob_profit: 0.55
+  # Screen target_prob_profit against the one-sided 95% LOWER BOUND of the
+  # Monte Carlo probability, not its point estimate. The point estimate is
+  # roughly Phi(mu_hat*sqrt(H)/sigma) and inherits the drift's standard error
+  # (sigma/sqrt(T)) one-for-one, so tickers with no edge at all clear a 0.55
+  # gate on estimation noise — and do so in correlation with the momentum
+  # signal rather than independently of it. See src/monte_carlo.py::DriftPrior.
+  gate_on_probability_lower_bound: true
   # Applied to reward:risk measured NET of round-trip friction (~0.79% of
   # turnover), which is a materially harder test than the gross ratio this
   # threshold used to compare against. With the rule-based strategy's 1.5x/3.0x

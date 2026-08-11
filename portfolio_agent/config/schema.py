@@ -248,6 +248,14 @@ class TrainingConfig(BaseModel):
         "invariant to. It changes the label only under target_transform='absolute' -- which is "
         "itself an argument for the cross-sectional target.",
     )
+    walk_forward_embargo_days: int = Field(
+        default=0,
+        description="Extra CALENDAR days of training data purged immediately after each "
+        "walk-forward test window, on top of the label-horizon purge that agents/trainer.py"
+        "::purge_and_embargo always applies. The horizon purge removes rows whose labels "
+        "literally overlap the test period; this removes rows close enough afterwards that "
+        "serial correlation still links them to it. Zero reproduces horizon-only purging.",
+    )
     walk_forward_min_train_fraction: float = Field(
         default=0.4,
         description="Fraction of the panel used to train the first walk-forward fold. Subsequent "
