@@ -737,7 +737,23 @@ Renormalizing a missing SMA-200 away would scale the remaining components up and
 
 **What deliberately did not change.** With no Monte Carlo result the probability-of-profit gate still fails closed, so a `rule_based` member cannot issue BUY inside a batched UMA. A compliance gate with no evidence either way should refuse rather than wave a trade through untested; the rationale now says `prob(no MC result):FAIL` instead of a `prob(0.00)` that reads like a measurement, so the limitation is legible rather than silent.
 
-**Still open.** The deeper point in the review's D10 stands: `MC_Prob` has a realized standard deviation of about 0.05, so it contributes a near-constant ~12 points and discriminates almost nothing, and weighted-summing an ordinal, a binary, a skewed continuous and a near-constant onto a shared scale is not a scoring function with a probabilistic interpretation. The principled replacement is a cross-sectional rank composite, which the `score_batch` interface can support. That is a change to what the flagship strategy *means*, interacting with the hard-coded 60/45 thresholds and every YAML that sets them, so it is left as a deliberate next step rather than folded into a defect fix.
+### The rank composite
+
+The second half of D10: weighted-summing an ordinal (trend, three levels), a binary (breakout), a right-skewed continuous (volume) and a near-constant (`MC_Prob`, standard deviation ≈ 0.05 once the drift is shrunk) onto a shared 0–100 scale is not a scoring function with a probabilistic interpretation. `scoring.method: rank_composite` converts each component to its percentile rank across the eligible universe on that date before weighting:
+
+$$
+S_{i,t} = \sum_k w_k \cdot \text{pct-rank}_t\!\left(c_{k,i,t}\right)
+$$
+
+Percentile rather than the review's \(\Phi^{-1}(\text{rank}/(N_t+1))\) form, deliberately: it keeps the composite on 0–100, so the existing `score >= 60` and `>= 45` gates stay syntactically valid and gain a clean reading — "60th percentile of the weighted composite" — instead of requiring every YAML to be rewritten against a z-scale. Ties take the average rank, which is the common case here rather than an edge case, since breakout is binary and trend has three levels.
+
+**What it fixes.** Commensurability, and invariance to each component's marginal distribution. Express volume as a ratio or as any monotone transform of one and the composite is unchanged; under the weighted sum it moves. A component's influence stops depending on the accident of its units.
+
+**What it does not fix, despite being the proposed remedy for it.** A component that is near-constant across the universe still consumes its full share of the budget. Ranking ties hands every name the *same* percentile — 0.6 in a five-name universe, whatever the constant is — so `MC_Prob` contributes a flat number under rank scoring exactly as it did under the weighted sum. A different flat number, but still flat, and still 30% of the budget spent on a component that separates nobody. Making influence track discrimination requires the *weights* to respond to realized dispersion or information coefficient, which is a change to the weight learner (§ D8's path) rather than to the combination rule. Lowering `model_probability`'s configured weight is the blunt version available today. A test asserts this non-property directly, so the limitation cannot quietly be forgotten.
+
+**What it changes about the strategy's meaning.** Under `weighted_sum`, `score >= 60` is an absolute quality bar that nothing need clear on a bad day. Under `rank_composite` it is a percentile, so a roughly fixed share of the universe clears it whatever the market is doing: the score stops being a quality filter and becomes a ranker, leaving the absolute gates — probability of profit, net reward:risk, minimum price, and the regime layer — as what remains to say "not today". On a worked five-name example the two agree on ordering exactly while the scores compress from a 23–90 range to 42–86, and a name sitting exactly on the 60 threshold moves to 69.
+
+That is a change of strategy rather than a defect fix, so `weighted_sum` remains the default and `rank_composite` is one YAML line away. `requires_full_batch` becomes True under rank scoring, since ranking a universe of one is not a degraded answer but a meaningless one.
 
 
 ---

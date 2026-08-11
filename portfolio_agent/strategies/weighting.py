@@ -129,18 +129,30 @@ The live instance: a rule-based member inside a batched UMA receives no
     normalized = normalize_weights(effective_weights)
     final_score = sum(normalized.get(name, 0.0) * score for name, score in usable.items())
 
-    # Trigger = first fully-satisfied component in priority order (matches the
-    # historical Breakout > Trend > Volume precedence), else "None".
-    trigger = "None"
+    return final_score, select_trigger(component_scores)
+
+
+def select_trigger(component_scores: Dict[str, float]) -> str:
+    """Name the component that fired, in Breakout > Trend > Volume precedence.
+
+    Separated from the score because the two answer different questions and,
+    under rank-composite scoring, read different inputs. "Breakout fired" is a
+    statement about the raw indicator — the close cleared its Donchian channel
+    — and stays true whether or not that clearing ranks well against the rest
+    of the universe today. Feeding percentile ranks in here would rename the
+    trigger to whichever component happened to rank highest, which is a
+    different and much less useful claim, and it would corrupt the weight
+    learner: `evaluate_and_learn` attributes realized outcomes by trigger name.
+
+    Returns the first fully-satisfied (1.0) component in precedence order, then
+    a near-satisfied Volume, else "None".
+    """
     for name in ("Breakout", "Trend", "Volume"):
         if component_scores.get(name, 0.0) >= 1.0:
-            trigger = name
-            break
-    else:
-        if component_scores.get("Volume", 0.0) >= 0.75:
-            trigger = "Volume"
-
-    return final_score, trigger
+            return name
+    if component_scores.get("Volume", 0.0) >= 0.75:
+        return "Volume"
+    return "None"
 
 
 def evaluate_and_learn(
