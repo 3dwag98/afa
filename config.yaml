@@ -147,6 +147,16 @@ risk:
   # and therefore f* — is biased upward.
   kelly_fraction: 0.25
   # Portfolio-level concentration and drawdown guardrails.
+  # Annualized volatility ceiling for the WHOLE book, enforced at order time
+  # against a shrunk covariance estimate. 0 disables the constraint but not the
+  # measurement — book risk is reported either way. Every other limit here is
+  # per-position and therefore blind to correlation: twenty 3% positions
+  # correlated 0.6 carry ~3.5x the volatility of twenty independent ones, and
+  # Indian correlations run to 0.6-0.85 in exactly the drawdowns the circuit
+  # breaker exists to survive. Off by default because picking a target is a
+  # risk-policy decision, not a defect fix; 0.15-0.25 is the usual range.
+  portfolio_volatility_target: 0.0
+  covariance_lookback_days: 252
   max_sector_pct: 0.25            # max share of portfolio in any one sector
   # Aggregate budget for tickers missing from the sector map, so an incomplete
   # map cannot become a route around the cap. Inactive when no map is loaded.
@@ -230,6 +240,12 @@ compliance:
 
 # File/directory locations
 paths:
+  # Append-only record of every backtest configuration tried and the Sharpe it
+  # produced. This is what makes the Deflated Sharpe Ratio computable: DSR
+  # adjusts a reported Sharpe for the number of trials behind it, and N is
+  # exactly what a research process forgets. Search enough configurations of a
+  # strategy with no edge and the best still prints a respectable Sharpe.
+  trial_log: output/trials.jsonl
   brain_file: data/agent_brain.json
   sqlite_path: data/portfolio_agent.db
   excel_output: output/Agent_Orchestrator_Output.xlsx

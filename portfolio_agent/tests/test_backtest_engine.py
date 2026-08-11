@@ -276,6 +276,166 @@ def _signal(ticker, signal="BUY", score=90.0, entry_price=100.0, extra=None):
     )
 
 
+class TestPortfolioRiskCap:
+    """The only limit in the engine that is not per-position.
+
+    Risk-per-trade, max_single_position_pct and max_sector_pct are all blind
+    to correlation: twenty 3% positions correlated 0.6 carry roughly 3.5x the
+    volatility of twenty independent ones, and nothing upstream could see it.
+    """
+
+    def _engine(self, tickers, **kwargs):
+        params = dict(
+            start_date="2023-01-02", end_date="2023-12-29",
+            initial_capital=1_000_000.0, universe_tickers=tickers,
+        )
+        params.update(kwargs)
+        return BacktestEngine(**params)
+
+    def test_measurement_runs_even_with_the_constraint_disabled(self, synthetic_data):
+        """The gap between true and independence-assumed risk is the finding;
+        a report that omits it is the state the platform was already in."""
+        engine = self._engine(synthetic_data['tickers'], portfolio_volatility_target=0.0)
+        date = pd.Timestamp("2023-12-01")
+        engine.holdings = {t: 100 for t in synthetic_data['tickers']}
+
+        summary = engine._book_risk_summary(
+            engine._current_position_values(date), date
+        )
+
+        assert summary is not None
+        assert summary['portfolio_volatility'] > 0
+        assert summary['independent_volatility'] > 0
+        assert summary['n_positions'] == 3
+
+    def test_covariance_uses_only_returns_before_the_decision_date(self, synthetic_data):
+        """A covariance that knows how the names co-moved during the period it
+        is sizing for is not a risk model, it is a memory."""
+        engine = self._engine(synthetic_data['tickers'])
+        cutoff = pd.Timestamp("2023-06-01")
+
+        covariance = engine._book_covariance(synthetic_data['tickers'], cutoff)
+        assert covariance is not None
+
+        # Corrupt every observation on and after the cutoff; the estimate must
+        # be byte-identical, because none of it should have been read.
+        for ticker in synthetic_data['tickers']:
+            frame = engine.ticker_data[ticker]
+            frame.loc[frame.index >= cutoff, 'close'] *= 100.0
+        engine._returns_cache.clear()
+
+        assert np.asarray(engine._book_covariance(synthetic_data['tickers'], cutoff)) == pytest.approx(
+            np.asarray(covariance)
+        )
+
+    def test_trims_a_buy_that_would_breach_the_volatility_target(self, synthetic_data):
+        engine = self._engine(synthetic_data['tickers'], portfolio_volatility_target=0.05)
+        date = pd.Timestamp("2023-12-01")
+        ticker = synthetic_data['tickers'][0]
+        covariance = engine._book_covariance(synthetic_data['tickers'], date)
+        assert covariance is not None
+
+        uncapped = 5000
+        capped = engine._apply_portfolio_risk_cap(
+            ticker, uncapped, 100.0, {}, date, covariance
+        )
+
+        assert 0 <= capped < uncapped
+        # And the trimmed size actually satisfies the constraint it was
+        # trimmed to, rather than merely being smaller.
+        names = [str(c) for c in covariance.columns]
+        weights = np.array([
+            (capped * 100.0 / engine.portfolio_value) if n == ticker else 0.0
+            for n in names
+        ])
+        from src.portfolio import portfolio_volatility
+        assert portfolio_volatility(weights, covariance) <= 0.05 + 1e-9
+
+    def test_leaves_a_buy_alone_when_the_book_stays_inside_the_target(self, synthetic_data):
+        engine = self._engine(synthetic_data['tickers'], portfolio_volatility_target=5.0)
+        date = pd.Timestamp("2023-12-01")
+        covariance = engine._book_covariance(synthetic_data['tickers'], date)
+
+        assert engine._apply_portfolio_risk_cap(
+            synthetic_data['tickers'][0], 500, 100.0, {}, date, covariance
+        ) == 500
+
+    def test_refuses_to_add_when_the_book_is_already_over_target(self, synthetic_data):
+        engine = self._engine(synthetic_data['tickers'], portfolio_volatility_target=0.001)
+        date = pd.Timestamp("2023-12-01")
+        ticker = synthetic_data['tickers'][0]
+        covariance = engine._book_covariance(synthetic_data['tickers'], date)
+
+        existing = {t: 300_000.0 for t in synthetic_data['tickers']}
+
+        assert engine._apply_portfolio_risk_cap(
+            ticker, 500, 100.0, existing, date, covariance
+        ) == 0
+
+    def test_a_disabled_target_never_trims(self, synthetic_data):
+        engine = self._engine(synthetic_data['tickers'], portfolio_volatility_target=0.0)
+        date = pd.Timestamp("2023-12-01")
+        covariance = engine._book_covariance(synthetic_data['tickers'], date)
+
+        assert engine._apply_portfolio_risk_cap(
+            synthetic_data['tickers'][0], 9999, 100.0, {}, date, covariance
+        ) == 9999
+
+    def test_a_name_with_no_usable_history_is_left_to_the_per_position_limits(
+        self, synthetic_data
+    ):
+        """Inventing a correlation for an unknown name would be worse than
+        deferring to the limits that do not need one."""
+        engine = self._engine(synthetic_data['tickers'], portfolio_volatility_target=0.05)
+        date = pd.Timestamp("2023-12-01")
+        covariance = engine._book_covariance(synthetic_data['tickers'], date)
+
+        assert engine._apply_portfolio_risk_cap(
+            "NOT_IN_UNIVERSE.NS", 5000, 100.0, {}, date, covariance
+        ) == 5000
+
+    def test_too_little_history_yields_no_covariance_rather_than_a_guess(
+        self, synthetic_data
+    ):
+        engine = self._engine(synthetic_data['tickers'])
+        # Only a handful of sessions exist before this date.
+        assert engine._book_covariance(
+            synthetic_data['tickers'], pd.Timestamp("2023-01-10")
+        ) is None
+
+    def test_book_risk_statistics_aggregate_the_snapshots(self, synthetic_data):
+        engine = self._engine(synthetic_data['tickers'])
+        engine.holdings = {t: 100 for t in synthetic_data['tickers']}
+        for day, date in enumerate(pd.bdate_range("2023-11-01", periods=3), start=1):
+            engine.trading_day_count = day
+            engine._record_book_risk(date)
+
+        statistics = engine.book_risk_statistics()
+
+        assert statistics['observations'] == 3
+        assert statistics['mean_portfolio_volatility'] > 0
+        assert statistics['mean_independent_volatility'] > 0
+        assert statistics['mean_positions'] == 3
+        # The multiple is the ratio of the two volatilities, whichever way it
+        # falls. It exceeds 1 when names are positively correlated — the case
+        # that matters, pinned exactly against a known correlation structure in
+        # test_portfolio.py — but these three synthetic series are near
+        # independent, so asserting > 1 here would be asserting a property of
+        # the fixture rather than of the code.
+        per_snapshot = [
+            row['correlation_risk_multiple'] / (
+                row['portfolio_volatility'] / row['independent_volatility']
+            )
+            for row in engine.book_risk_log
+        ]
+        assert per_snapshot == pytest.approx([1.0] * 3)
+
+    def test_statistics_are_empty_rather_than_fabricated_without_snapshots(
+        self, synthetic_data
+    ):
+        assert self._engine(synthetic_data['tickers']).book_risk_statistics() == {}
+
+
 class TestPositionScaling:
     """Signals that measure their own risk environment publish a
     position_scale; sizing must honour it wherever the quantity came from."""

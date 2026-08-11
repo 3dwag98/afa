@@ -511,7 +511,8 @@ flowchart TD
     RG --> H{"requires_full_batch<br/>or supports_gpu_batch?"}
     H -->|yes| I["score_batch(all tickers)"]
     H -->|no| J["score() per ticker with its own mc_result"]
-    I --> K["position sizing (fixed-fractional or fractional Kelly)"]
+    I --> K["position sizing (fixed-fractional or fractional Kelly)
+    then sector cap, then the portfolio volatility cap"]
     J --> K
     K --> L["compliance checks"]
     L --> M["rank by score, persist to SQLite"]

@@ -583,6 +583,10 @@ $$
 
 by projected subgradient ascent over a capped simplex, so every constraint holds by construction rather than by tolerance. **The turnover penalty is load-bearing, not decoration.** Expected returns are estimated with enormous error (§21), so an unpenalized optimizer re-solves to a materially different book every day and hands the entire Indian friction stack (§13) the edge it was trying to capture.
 
+**Where this reaches a decision.** `BacktestEngine` estimates the covariance once per rebalance round over the names that could be in the book by the end of it — strictly from returns dated *before* the decision date — and applies `risk.portfolio_volatility_target` as a final trim after the position, sector and risk-per-trade limits. Portfolio variance in the candidate's size is a convex quadratic, so the feasible set is an interval containing zero and bisection on its upper endpoint is exact rather than a heuristic; when the book is already over target the answer is to add nothing.
+
+The **measurement runs unconditionally, the constraint is opt-in**. `portfolio_volatility_target` defaults to 0 because choosing a volatility ceiling is a risk-policy decision rather than a defect fix, but the book's volatility, its independence-assumed volatility, the ratio between them, the diversification ratio and the largest single risk contribution are sampled every 20 sessions and reported regardless. That ratio is the finding: a report that omits it is the state the platform was already in. Note also that the largest *risk contribution* routinely exceeds the largest *weight*, which is why a concentration cap is not a risk cap.
+
 `hierarchical_risk_parity` is the allocation to use when \(\mu\) is not trustworthy — which, given §21, is most of the time. It clusters the correlation matrix and recursively bisects, splitting capital by inverse variance, so it uses the covariance structure without ever inverting it and without needing expected returns at all.
 
 **Sources:**

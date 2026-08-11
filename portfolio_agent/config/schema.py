@@ -334,6 +334,28 @@ class RiskConfig(BaseModel):
         "toward 0.5 before it is fed to Kelly (see risk.py::shrink_win_probability). 20 means a "
         "coin-flip prior worth 20 trades of evidence; 0 disables shrinkage and uses the raw rate.",
     )
+    portfolio_volatility_target: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Annualized volatility ceiling for the whole book, enforced at order time "
+        "against a shrunk covariance estimate (src/portfolio.py). 0 disables the constraint but "
+        "NOT the measurement — book risk is reported either way. This is the only limit here that "
+        "is not per-position: risk-per-trade, max_single_position_pct and max_sector_pct are all "
+        "blind to the fact that twenty 3% positions correlated 0.6 carry ~3.5x the volatility of "
+        "twenty independent ones, and Indian equity correlations run to 0.6-0.85 in exactly the "
+        "drawdowns the circuit breaker exists to survive. Left off by default because choosing a "
+        "volatility target is a risk-policy decision, not a defect fix; 0.15-0.25 is the usual "
+        "range for a long-only equity book.",
+    )
+    covariance_lookback_days: int = Field(
+        default=252,
+        ge=60,
+        description="Trailing window, in trading days, used to estimate the covariance behind "
+        "portfolio_volatility_target. Only returns dated strictly before the decision date enter "
+        "it. One year balances responsiveness against the conditioning problem: over a shorter "
+        "window the covariance of 20-60 names is dominated by estimation noise, which is what the "
+        "Ledoit-Wolf shrinkage is there to contain.",
+    )
     max_sector_pct: float = Field(
         default=0.25,
         description="Maximum share of portfolio value allowed in any single sector "
@@ -570,6 +592,15 @@ class PathsConfig(BaseModel):
         "capital instead of sector concentration, leaving most of the portfolio in cash forever. "
         "A partial map gives each mapped sector max_sector_pct and the unmapped pool its own "
         "max_unknown_sector_pct.",
+    )
+    trial_log: str = Field(
+        default="output/trials.jsonl",
+        description="Append-only JSONL log of every backtest configuration tried and the Sharpe "
+        "it produced (src/performance_stats.py). This is what makes the Deflated Sharpe Ratio "
+        "computable: DSR adjusts a reported Sharpe for the number of trials behind it, and N is "
+        "exactly the quantity a research process forgets. Search enough configurations of a "
+        "strategy with no edge and the best one still prints a respectable Sharpe; without the "
+        "count, there is no way to tell that from a real result.",
     )
     log_file: str = Field(default="logs/agent.log", description="Path to the log file")
     log_dir: str = Field(default="logs", description="Directory for log files")

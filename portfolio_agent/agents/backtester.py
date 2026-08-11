@@ -19,6 +19,9 @@ from portfolio_agent.strategies.registry import load_strategy
 from portfolio_agent.strategies.types import RiskParams
 from portfolio_agent.src.backtest_engine import BacktestEngine
 from portfolio_agent.src.backtest_reporting import export_backtest_excel
+from portfolio_agent.src.performance_stats import (
+    Trial, log_trial, read_trials, trial_sharpe_variance,
+)
 from portfolio_agent.src.risk_analytics import RiskAnalyzer
 
 logger = logging.getLogger(__name__)
@@ -129,6 +132,8 @@ class BacktesterAgent:
             benchmark_symbol=self.config.data.benchmark_symbol,
             exit_on_lower_circuit_lock=self.config.risk.exit_on_lower_circuit_lock,
             liquidate_on_drawdown_halt=self.config.risk.liquidate_on_drawdown_halt,
+            portfolio_volatility_target=self.config.risk.portfolio_volatility_target,
+            covariance_lookback_days=self.config.risk.covariance_lookback_days,
             show_progress=self.show_progress,
         )
 
@@ -151,7 +156,17 @@ class BacktesterAgent:
             trade_log=engine.trade_log,
             random_seed=self.config.simulation.random_seed,
         )
-        analytics_report = analyzer.generate_analytics_report()
+        # The trial count comes from the log, not from memory: DSR is undefined
+        # without N, and N is exactly the quantity a research process forgets.
+        # Absent a log this is a single pre-registered run (N = 1, no
+        # deflation), which is the honest default rather than a flattering one.
+        trials = read_trials(self.config.paths.trial_log)
+        n_trials, sharpe_variance = trial_sharpe_variance(trials)
+        analytics_report = analyzer.generate_analytics_report(
+            n_trials=max(1, n_trials),
+            sharpe_variance=sharpe_variance if n_trials > 1 else None,
+        )
+        book_risk = engine.book_risk_statistics()
 
         # Percentage metrics are handed to the exporter in PERCENT units
         # (18.5 == 18.5%) — the contract documented in
@@ -161,7 +176,13 @@ class BacktesterAgent:
         analytics_for_export = {
             'cagr': analytics_report.get('cagr_pct', 0),
             'sharpe': analytics_report.get('sharpe_ratio', 0),
+            'probabilistic_sharpe': analytics_report.get('probabilistic_sharpe_ratio', 0),
+            'deflated_sharpe': analytics_report.get('deflated_sharpe_ratio', 0),
+            'n_trials': analytics_report.get('n_trials', 1),
             'sortino': analytics_report.get('sortino_ratio', 0),
+            'book_volatility': book_risk.get('mean_portfolio_volatility', 0) * 100,
+            'correlation_risk_multiple': book_risk.get('mean_correlation_risk_multiple', 0),
+            'diversification_ratio': book_risk.get('mean_diversification_ratio', 0),
             # Negated: RiskAnalyzer reports drawdown as a positive magnitude,
             # but a drawdown reads as a loss in the report (and the sheet's
             # "worse than -20%" conditional formatting can only fire on a
@@ -183,6 +204,12 @@ class BacktesterAgent:
             'model_used': strategy.name != 'rule_based',
             'model_name': strategy.name,
         }
+
+        # Record this run *after* reading the log, so a result is never
+        # deflated against itself. The next run sees it, which is the point:
+        # the count accumulates across a research session instead of being
+        # reconstructed from memory at the end of one.
+        self._record_trial(strategy, analytics_report, start_date, end_date)
 
         if self.show_progress:
             print(f"Writing report to {output_file}...")
@@ -219,7 +246,52 @@ class BacktesterAgent:
             'strategy': strategy.name,
             'circuit_breaker_log': engine.circuit_breaker_log,
             'exit_trigger_log': engine.exit_trigger_log,
+            'book_risk': book_risk,
         }
+
+    def _record_trial(
+        self,
+        strategy,
+        analytics_report: Dict[str, Any],
+        start_date: str,
+        end_date: str,
+    ) -> None:
+        """Append this configuration and its Sharpe to the trial log.
+
+        The parameters recorded are the ones a research session actually varies
+        — they are what makes two runs different trials rather than the same
+        trial twice. Failures are swallowed deliberately: a research log that
+        cannot be written is a reason to lose the count, not the backtest.
+        """
+        risk = self.config.risk
+        try:
+            log_trial(
+                self.config.paths.trial_log,
+                Trial(
+                    label=f"{self.strategy_config.type}:{strategy.name}",
+                    sharpe=float(analytics_report.get('sharpe_ratio', 0.0)),
+                    parameters={
+                        'strategy': self.strategy_config.type,
+                        'strategy_config': self.strategy_config.config_path,
+                        'start_date': start_date,
+                        'end_date': end_date,
+                        'atr_stop_multiplier': risk.atr_stop_multiplier,
+                        'atr_target_multiplier': risk.atr_target_multiplier,
+                        'use_kelly_sizing': risk.use_kelly_sizing,
+                        'portfolio_volatility_target': risk.portfolio_volatility_target,
+                        'simulation_method': self.config.simulation.method,
+                        'use_garch_volatility': self.config.simulation.use_garch_volatility,
+                        'target_transform': self.config.training.target_transform,
+                    },
+                    metrics={
+                        'cagr': float(analytics_report.get('cagr', 0.0)),
+                        'max_drawdown': float(analytics_report.get('max_drawdown', 0.0)),
+                        'total_trades': float(analytics_report.get('total_trades', 0)),
+                    },
+                ),
+            )
+        except OSError as error:
+            logger.warning(f"Could not append to the trial log: {error}")
 
 
 def run_backtest_cli(
