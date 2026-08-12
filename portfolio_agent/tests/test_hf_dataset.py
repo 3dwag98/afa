@@ -107,16 +107,35 @@ class TestNormalizeFrame:
     def test_maps_the_datasets_own_schema(self):
         out = normalize_frame(_hub_rows())
 
-        assert list(out.columns) == ["open", "high", "low", "close", "volume"]
+        # OHLCV still leads the frame, so nothing downstream moves.
+        assert list(out.columns[:5]) == ["open", "high", "low", "close", "volume"]
         assert isinstance(out.index, pd.DatetimeIndex)
         assert out.index.name == "date"
         assert out.index.tz is None
 
-    def test_drops_the_non_ohlcv_columns(self):
+    def test_keeps_the_adjustment_provenance(self):
+        """This test used to assert the opposite, and the opposite was a bug.
+
+        `adj_close`, `dividends` and `stock_splits` are the source's own record
+        of every corporate action, and dropping them meant the platform threw
+        away data it had already downloaded. Two things became impossible as a
+        result: recovering the price that actually traded (needed for anything
+        band- or level-related, since a back-adjusted price is not a price any
+        exchange saw), and knowing that a large return was a split rather than
+        a move. The second is the worse one — an unexplained 90% gap was
+        silently discarded by the label filter instead of being recognised.
+
+        `symbol` is still dropped: the ticker is the filename, and carrying it
+        per row only invites the two to disagree.
+        """
         out = normalize_frame(_hub_rows())
 
-        for dropped in ("adj_close", "dividends", "stock_splits", "symbol"):
-            assert dropped not in out.columns
+        for kept in ("adj_close", "adj_factor", "dividends", "stock_splits"):
+            assert kept in out.columns
+        for raw_leg in ("open_raw", "high_raw", "low_raw", "close_raw"):
+            assert raw_leg in out.columns
+
+        assert "symbol" not in out.columns
 
     def test_back_adjusts_a_split_out_of_the_return_series(self):
         """Unadjusted, a 1:10 split prints as a -90% day, which cross-sectional
@@ -435,15 +454,30 @@ class TestFetchAndCacheSourceSelection:
 
 
 class TestDefaults:
-    def test_config_points_at_the_indian_market_dataset_with_five_years(self):
+    def test_config_points_at_the_indian_market_dataset(self):
         data = AppConfig().data
 
         assert data.source == "huggingface"
         assert data.hf_dataset_id == DEFAULT_HF_DATASET_ID
         assert data.hf_asset_dir == "stocks"
         assert data.hf_adjust_prices is True
-        assert data.default_history_years == 5
         assert data.benchmark_symbol == "^NSEI"
+
+    def test_history_window_is_long_enough_to_contain_a_crisis(self):
+        """The window was five years, and the cost was invisible.
+
+        Every cached file spanned exactly five years, so the sample began
+        *after* the COVID crash: one bull run, one rate-hike correction, no
+        crisis. Every tail estimate, regime model and drawdown forecast was
+        fitted on data containing no crash. The source is trimmed to whatever
+        it actually holds, so asking for more than exists costs nothing — which
+        makes a short window pure downside.
+
+        The bound below is deliberately loose. It pins the intent (long enough
+        to reach more than one regime) without pinning a number someone would
+        have to update to raise it further.
+        """
+        assert AppConfig().data.default_history_years >= 15
 
 
 class TestBenchmarkCacheRoundTrip:
