@@ -14,6 +14,7 @@ module scope — a rule-based screen can be evaluated on an install that has
 neither.
 """
 
+from .decay import DecayCurve, DecayPoint, decay_curve, decay_from_panel
 from .harness import (
     ForecastEvaluation,
     FoldEvaluation,
@@ -22,6 +23,16 @@ from .harness import (
     evaluate_forecast,
     evaluate_panel,
     forward_return,
+)
+from .neutralize import (
+    SIZE_PROXY_NOTE,
+    NeutralizationResult,
+    add_exposures,
+    evaluate_neutralized,
+    neutralize_panel,
+    neutralized_ic,
+    residualize,
+    rolling_beta,
 )
 from .metrics import (
     BucketAnalysis,
@@ -39,6 +50,18 @@ from .metrics import (
 
 __all__ = [
     "BucketAnalysis",
+    "DecayCurve",
+    "DecayPoint",
+    "NeutralizationResult",
+    "SIZE_PROXY_NOTE",
+    "add_exposures",
+    "decay_curve",
+    "decay_from_panel",
+    "evaluate_neutralized",
+    "neutralize_panel",
+    "neutralized_ic",
+    "residualize",
+    "rolling_beta",
     "ErrorSummary",
     "ForecastEvaluation",
     "FoldEvaluation",
