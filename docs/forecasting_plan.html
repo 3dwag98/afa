@@ -1,0 +1,455 @@
+<title>The Forecasting Pivot</title>
+<style>
+  :root {
+    --ground: #FBFBFD; --surface: #FFFFFF; --surface-2: #F4F5F9;
+    --ink: #1A1D26; --ink-2: #4A4F5E; --ink-3: #757B8C;
+    --rule: #DDE0E8; --rule-strong: #C3C8D4;
+    --accent: #2B4C7E; --accent-soft: #E8EDF6;
+    --critical: #B4322A; --critical-soft: #FAEDEC;
+    --warning: #A96A18; --warning-soft: #FBF2E4;
+    --ok: #2E7D5B; --ok-soft: #E7F3ED;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #14161C; --surface: #1B1E26; --surface-2: #21252F;
+      --ink: #E8EAF0; --ink-2: #B4BAC8; --ink-3: #838A9B;
+      --rule: #2A2E3A; --rule-strong: #3B4150;
+      --accent: #7BA3D9; --accent-soft: #1E2734;
+      --critical: #E0736A; --critical-soft: #2C1E1E;
+      --warning: #D9A055; --warning-soft: #2B2318;
+      --ok: #63B892; --ok-soft: #17271F;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #14161C; --surface: #1B1E26; --surface-2: #21252F;
+    --ink: #E8EAF0; --ink-2: #B4BAC8; --ink-3: #838A9B;
+    --rule: #2A2E3A; --rule-strong: #3B4150;
+    --accent: #7BA3D9; --accent-soft: #1E2734;
+    --critical: #E0736A; --critical-soft: #2C1E1E;
+    --warning: #D9A055; --warning-soft: #2B2318;
+    --ok: #63B892; --ok-soft: #17271F;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--ground); color: var(--ink); font-family: var(--sans);
+    font-size: 16px; line-height: 1.65; margin: 0; padding: 0 1.25rem 6rem;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 62rem; margin: 0 auto; }
+  .col { max-width: 42rem; }
+
+  header.masthead { padding: 4rem 0 2rem; border-bottom: 2px solid var(--ink); margin-bottom: 3rem; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 0.7rem; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--ink-3); margin: 0 0 1rem;
+  }
+  h1 {
+    font-family: var(--serif); font-size: clamp(2.1rem, 5.5vw, 3.1rem); line-height: 1.1;
+    font-weight: 600; margin: 0 0 1rem; text-wrap: balance; letter-spacing: -0.01em;
+  }
+  .standfirst { font-size: 1.08rem; color: var(--ink-2); max-width: 40rem; margin: 0; }
+
+  h2 {
+    font-family: var(--serif); font-size: 1.75rem; font-weight: 600; line-height: 1.2;
+    margin: 4rem 0 0.5rem; padding-top: 1.5rem;
+    border-top: 1px solid var(--rule-strong); text-wrap: balance;
+  }
+  h2 .num {
+    font-family: var(--mono); font-size: 0.75rem; color: var(--accent); display: block;
+    letter-spacing: 0.1em; margin-bottom: 0.4rem; font-weight: 400;
+  }
+  h3 { font-family: var(--sans); font-size: 1.02rem; font-weight: 650; margin: 2.25rem 0 0.5rem; }
+  h4 {
+    font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--ink-3); font-weight: 500; margin: 2rem 0 0.7rem;
+  }
+  p { margin: 0 0 1rem; max-width: 42rem; }
+  .lede { font-size: 1.05rem; color: var(--ink-2); }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+  code {
+    font-family: var(--mono); font-size: 0.855em; background: var(--surface-2);
+    padding: 0.1em 0.35em; border-radius: 3px; color: var(--ink);
+  }
+  ul, ol { max-width: 42rem; padding-left: 1.15rem; margin: 0 0 1rem; }
+  li { margin-bottom: 0.45rem; }
+  strong { font-weight: 650; }
+
+  .twrap { overflow-x: auto; margin: 0 0 1.5rem; border: 1px solid var(--rule); }
+  table { border-collapse: collapse; width: 100%; font-size: 0.87rem; min-width: 38rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  thead th {
+    background: var(--surface-2); font-family: var(--mono); font-size: 0.65rem;
+    letter-spacing: 0.09em; text-transform: uppercase; color: var(--ink-3);
+    font-weight: 500; white-space: nowrap;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  .mono-cell { font-family: var(--mono); font-size: 0.79rem; }
+  td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+
+  .pill {
+    font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.07em; text-transform: uppercase;
+    padding: 0.15rem 0.45rem; border-radius: 2px; white-space: nowrap;
+  }
+  .p-new { background: var(--accent-soft); color: var(--accent); }
+  .p-keep { background: var(--ok-soft); color: var(--ok); }
+  .p-change { background: var(--warning-soft); color: var(--warning); }
+  .p-freeze { background: var(--critical-soft); color: var(--critical); }
+
+  .callout {
+    background: var(--accent-soft); border-left: 3px solid var(--accent);
+    padding: 1rem 1.25rem; margin: 1.5rem 0; max-width: 44rem;
+  }
+  .callout.win { background: var(--ok-soft); border-left-color: var(--ok); }
+  .callout.win .label { color: var(--ok); }
+  .callout.warn { background: var(--warning-soft); border-left-color: var(--warning); }
+  .callout.warn .label { color: var(--warning); }
+  .callout p:last-child { margin-bottom: 0; }
+  .callout .label {
+    font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--accent); margin: 0 0 0.4rem;
+  }
+
+  pre {
+    font-family: var(--mono); font-size: 0.78rem; line-height: 1.6;
+    background: var(--surface-2); border: 1px solid var(--rule);
+    padding: 0.9rem 1rem; overflow-x: auto; margin: 0 0 1.4rem; color: var(--ink-2);
+  }
+  pre b { color: var(--ink); font-weight: 600; }
+
+  .feature {
+    background: var(--surface); border: 1px solid var(--rule);
+    border-left: 4px solid var(--accent); padding: 1.1rem 1.3rem; margin: 0 0 0.9rem;
+  }
+  .feature h3 { margin: 0 0 0.5rem; font-size: 1rem; display: flex; gap: 0.6rem; align-items: baseline; flex-wrap: wrap; }
+  .feature .why { font-size: 0.94rem; color: var(--ink-2); margin-bottom: 0.5rem; max-width: 46rem; }
+  .feature .why:last-child { margin-bottom: 0; }
+  .effort {
+    font-family: var(--mono); font-size: 0.6rem; letter-spacing: 0.09em; text-transform: uppercase;
+    padding: 0.18rem 0.45rem; border-radius: 2px; background: var(--surface-2); color: var(--ink-3);
+    white-space: nowrap;
+  }
+
+  .phase {
+    display: grid; grid-template-columns: 6rem 1fr; gap: 1.25rem;
+    padding: 1.3rem 0; border-bottom: 1px solid var(--rule); max-width: 47rem;
+  }
+  .phase:last-child { border-bottom: none; }
+  .phase-tag { font-family: var(--mono); font-size: 0.7rem; color: var(--ink-3); letter-spacing: 0.05em; padding-top: 0.2rem; }
+  .phase h3 { margin: 0 0 0.35rem; }
+  .phase p { margin: 0 0 0.4rem; font-size: 0.94rem; color: var(--ink-2); }
+  .phase ul { margin: 0.4rem 0 0; font-size: 0.92rem; color: var(--ink-2); }
+
+  footer {
+    margin-top: 4rem; padding-top: 1.5rem; border-top: 2px solid var(--ink);
+    font-size: 0.85rem; color: var(--ink-3); max-width: 44rem;
+  }
+  @media (max-width: 40rem) {
+    .phase { grid-template-columns: 1fr; gap: 0.3rem; }
+    header.masthead { padding-top: 2.5rem; }
+  }
+</style>
+
+<div class="wrap">
+
+<header class="masthead">
+  <p class="eyebrow">Plan · third in the series with the Architecture Register and the Data Layer</p>
+  <h1>The forecasting pivot</h1>
+  <p class="standfirst">The platform stops being a trading system that reports forecasts and becomes a forecasting system that can optionally simulate a book. What changes, what stays exactly as it is, what gets frozen, and the features worth adding once the primary artifact is a measurement rather than an equity curve.</p>
+</header>
+
+<div class="col">
+<h2><span class="num">Premise</span>One decision reorganizes the whole platform</h2>
+
+<p class="lede">No trades will happen. Tracking error is acceptable. The deliverable is forecast skill on historical data, established mathematically.</p>
+
+<p>That single constraint changes what "correct" means. An execution model that is wrong by 30 basis points no longer matters. A cross-validation scheme that leaks four days of overlapping label still matters completely — more than before, because the forecast metric <em>is</em> the product, and a corrupted metric is not a degraded result but a meaningless one.</p>
+
+<p>So the work splits cleanly. Everything about <em>getting filled</em> can be frozen. Everything about <em>measuring skill honestly</em> becomes central and needs to be better than it currently is.</p>
+
+<div class="callout win">
+  <p class="label">The cheapest large win, found while measuring</p>
+  <p>Every cached file starts on <strong>2021-08-09</strong> and ends 2026-08-07 — precisely five years, because <code>default_history_years: 5</code> flows into <code>start_date = end_date − years×365</code>. <strong>That window is a configuration choice, not a limit of the source.</strong></p>
+  <p>The consequence is severe for a forecasting platform: the sample begins <em>after</em> the COVID crash. It holds one bull run, one rate-hike correction, and no crisis. Every tail estimate, regime model and drawdown forecast is fitted on data containing no crash.</p>
+  <p>Widening the window costs one config value and a re-download.</p>
+</div>
+</div>
+
+<h2><span class="num">Part 1 · Changes</span>What changes</h2>
+
+<h4>Data layer</h4>
+<div class="twrap">
+<table>
+  <thead><tr><th>Change</th><th>Today</th><th>After</th><th>Effort</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>Widen history</strong></td>
+      <td class="mono-cell">5 years, no crash in sample</td>
+      <td>As far back as the source goes. 2008 and 2020 both in-sample</td>
+      <td class="num">1 config + refetch</td>
+    </tr>
+    <tr>
+      <td><strong>Stop discarding adjustment data</strong></td>
+      <td class="mono-cell">normalize_frame drops adj_close;<br>dividends and stock_splits never read</td>
+      <td>Store raw <em>and</em> adjusted prices, plus the corporate-action events already present in the source</td>
+      <td class="num">~10 lines</td>
+    </tr>
+    <tr>
+      <td><strong>Invariant tests on ingest</strong></td>
+      <td class="mono-cell">Cleaning only</td>
+      <td><code>high ≥ max(o,c)</code>, <code>low ≤ min(o,c)</code>, sessions vs calendar, return outliers flagged. Fails loudly</td>
+      <td class="num">1 day</td>
+    </tr>
+    <tr>
+      <td><strong>Listing-date aware universe</strong></td>
+      <td class="mono-cell">Today's symbol list applied to all history</td>
+      <td>A name enters the universe when it starts trading. Removes the look-ahead half of the selection bias even without point-in-time membership</td>
+      <td class="num">2 days</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h4>Evaluation layer — the new centre of gravity</h4>
+<div class="twrap">
+<table>
+  <thead><tr><th>Change</th><th>Today</th><th>After</th><th>Effort</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>Forecast harness becomes primary</strong></td>
+      <td class="mono-cell">Equity curve is the artifact;<br>BacktestEngine required to produce anything</td>
+      <td>Rank IC, ICIR, decile spread, signal decay, error distributions. No order router involved</td>
+      <td class="num">1 week</td>
+    </tr>
+    <tr>
+      <td><strong>Purged & embargoed CV</strong></td>
+      <td class="mono-cell">Walk-forward, no purge</td>
+      <td>Overlap removed around each test fold. 5-day labels from daily data share four days of outcome — standard CV reports skill that is not there</td>
+      <td class="num">3 days</td>
+    </tr>
+    <tr>
+      <td><strong>Neutralized IC</strong></td>
+      <td class="mono-cell">Raw cross-sectional IC</td>
+      <td>IC after removing sector and beta. Answers whether a signal is real or a sector tilt wearing a signal's clothes</td>
+      <td class="num">2 days</td>
+    </tr>
+    <tr>
+      <td><strong>Backtest demoted</strong></td>
+      <td class="mono-cell">The only evaluation path</td>
+      <td>Secondary sanity check, run when a signal has already earned it</td>
+      <td class="num">config only</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout">
+  <p class="label">Why this resolves A3 without decomposing anything</p>
+  <p>The architecture register flagged <code>BacktestEngine</code> — 2,412 lines, 47 methods, nine responsibilities — as critical, and proposed extracting collaborators over several PRs. Under the forecasting premise there is a cheaper answer: <strong>route around it</strong>. Order creation, fills, tax lots, circuit breakers, Kelly sizing and sector caps are machinery for a book that will never trade. Building the forecast harness beside the engine rather than inside it delivers the same benefit — testable evaluation, no god class in the critical path — for a fraction of the work, and leaves the engine intact for the day a portfolio question is actually asked.</p>
+</div>
+
+<h4>Platform</h4>
+<div class="twrap">
+<table>
+  <thead><tr><th>Change</th><th>Why it still matters without trading</th><th>Effort</th></tr></thead>
+  <tbody>
+    <tr><td><strong>A1 — importable package</strong></td><td>Notebooks, external experiments and any collaborator all need the package to import outside the repo root. Currently no strategy loads from an installed copy</td><td class="num">1 day</td></tr>
+    <tr><td><strong>A2 — package config.yaml</strong></td><td>An installed copy silently runs on schema defaults, <code>universe_size: 10</code> against the repo's 4000, and still produces normal-looking output</td><td class="num">half day</td></tr>
+    <tr><td><strong>A4 — CLI smoke tests</strong></td><td>873 lines, zero tests, and it is the only surface anyone touches</td><td class="num">1 day</td></tr>
+    <tr><td><strong>A9 — run manifests</strong></td><td>Much smaller under this premise: a forecast run is <code>(features, labels, model, split) → metrics</code>. Config hash, universe fingerprint, code revision, results</td><td class="num">2 days</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2><span class="num">Part 2 · Unchanged</span>What stays exactly as it is</h2>
+
+<p class="col lede">Most of the platform. The parts that were built carefully are the parts a forecasting system needs most, and several become more important rather than less.</p>
+
+<div class="twrap">
+<table>
+  <thead><tr><th>Component</th><th>Status</th><th>Note</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Four registries</strong><br><span class="mono-cell">features, models, strategies, trainers</span></td><td><span class="pill p-keep">Unchanged</span></td><td>The platform's best structural asset. One idiom, four seams. The forecast harness plugs into the same pattern</td></tr>
+    <tr><td><strong><code>BaseStrategy</code> contract</strong></td><td><span class="pill p-keep">Unchanged</span></td><td>A signal generator is exactly what a forecast harness consumes. <code>requires_full_batch</code> already captures the cross-sectional distinction correctly</td></tr>
+    <tr><td><strong>Risk math corrections</strong><br><span class="mono-cell">D1–D8</span></td><td><span class="pill p-keep">Unchanged</span></td><td>Kelly space, drift shrinkage, arithmetic Sharpe, covariance layer. Reviewed and correct; leave them</td></tr>
+    <tr><td><strong>Measurement layer</strong><br><span class="mono-cell">PSR, DSR, PBO, trial log, Newey–West</span></td><td><span class="pill p-keep">More central</span></td><td>Built for exactly this. Under a forecasting premise it moves from supporting cast to lead — multiple-testing control is what separates a finding from a coincidence</td></tr>
+    <tr><td><strong>Cross-sectional target & feature normalization</strong></td><td><span class="pill p-keep">Unchanged</span></td><td>Ranking each name against the universe on the same date is the right target for a forecasting model, and the pipeline already travels in the checkpoint</td></tr>
+    <tr><td><strong>Monte Carlo, GARCH, Markov regime</strong></td><td><span class="pill p-keep">Repurposed</span></td><td>Same code, different consumer: they become <em>feature generators and conditioning variables</em> rather than sizing inputs. Resolves part of <code>A5</code> by giving the dormant modules a job</td></tr>
+    <tr><td><strong>Determinism guarantees</strong></td><td><span class="pill p-keep">Unchanged</span></td><td>Seeded samplers, order-independent reassembly, <code>test_parallel_determinism</code>. Reproducibility is the whole basis of a research claim</td></tr>
+    <tr><td><strong>HuggingFace as the source</strong></td><td><span class="pill p-keep">Unchanged</span></td><td>Versioned and pinnable. Keep <code>hf_revision</code> as the reproducibility anchor</td></tr>
+    <tr><td><strong>Training layer</strong><br><span class="mono-cell">registry, per-trainer schemas, universes</span></td><td><span class="pill p-keep">Unchanged</span></td><td>Already built for this. New model types register alongside supervised and SAC without touching anything</td></tr>
+    <tr><td><strong>Standalone notebooks</strong></td><td><span class="pill p-keep">Unchanged</span></td><td>They already teach the mechanism end to end. Add a forecasting notebook rather than reworking them</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2><span class="num">Part 3 · Frozen</span>What stops being maintained</h2>
+
+<p class="col">Not deleted — frozen, moved behind a clear boundary, and excluded from the supported surface. This is where <code>A5</code>'s "built but never switched on" problem gets resolved by decision rather than deferral.</p>
+
+<div class="twrap">
+<table>
+  <thead><tr><th>Component</th><th>Disposition</th><th>Reason</th></tr></thead>
+  <tbody>
+    <tr><td class="mono-cell">Order creation, fills, tax lots</td><td><span class="pill p-freeze">Frozen</span></td><td>No fills to model</td></tr>
+    <tr><td class="mono-cell">Kelly sizing, circuit breaker, sector cap</td><td><span class="pill p-freeze">Secondary sim only</td><td>Portfolio-construction questions, not forecast questions</td></tr>
+    <tr><td class="mono-cell">Live orchestrator, storage, reporting, outcomes</td><td><span class="pill p-freeze">Frozen</span></td><td>Live path. Also the modules with the broken flat imports from <code>A1</code> — freezing them shrinks that fix</td></tr>
+    <tr><td class="mono-cell">Execution simulation, liquidity screens</td><td><span class="pill p-freeze">Frozen</span></td><td>Keep the liquidity <em>features</em>; drop the tradability gate</td></tr>
+    <tr><td class="mono-cell">Excel report writer</td><td><span class="pill p-change">Demoted</span></td><td>956 lines, 3 test mentions. A forecast run wants a metrics table and charts, not a workbook</td></tr>
+    <tr><td class="mono-cell">Circuit bands, ASM/GSM, F&amp;O ban, series</td><td><span class="pill p-change">Data validation only</td><td>No longer tradability constraints. Still useful to flag impossible bars</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout warn">
+  <p class="label">Freeze, do not delete</p>
+  <p>Deleting is tempting and wrong. The value in the order path is the accumulated correctness — gap-aware stop fills, holiday handling, the delisting logic — none of which is cheap to rebuild. Move it to an <code>execution/</code> namespace with a README stating it is not maintained under the current premise, exclude it from CI's required checks, and leave it working.</p>
+</div>
+
+<h2><span class="num">Part 4 · Additions</span>Features worth adding</h2>
+
+<p class="col lede">Ordered by return on effort for a mathematics-and-financial-analysis platform. The first four are the ones that make the difference between a forecast number and a defensible one.</p>
+
+<div class="feature">
+  <h3>Purged &amp; embargoed cross-validation <span class="effort">3 days · essential</span></h3>
+  <p class="why">Predicting a 5-day return from daily observations means consecutive samples share four days of outcome. Standard CV trains on data overlapping its own test fold and reports skill that does not exist. Purging removes the overlapping samples; embargoing adds a gap so serial correlation cannot bridge the boundary.</p>
+  <p class="why">Everything else on this page is measured <em>through</em> this. Without it, every other number is optimistic by an amount nobody can bound.</p>
+</div>
+
+<div class="feature">
+  <h3>Forecast evaluation harness <span class="effort">1 week · essential</span></h3>
+  <p class="why">Rank IC and ICIR by horizon; decile spread and monotonicity; hit rate; forecast error distributions. Monotonicity across deciles is the check that catches a signal driven entirely by its extreme tail — a common and expensive illusion.</p>
+  <p class="why">This is the artifact that replaces the equity curve, and it is what lets the backtest engine leave the critical path.</p>
+</div>
+
+<div class="feature">
+  <h3>Signal decay curves <span class="effort">2 days · high value</span></h3>
+  <p class="why">IC as a function of forecast horizon — 1, 2, 3, 5, 10, 21 days. Answers how long the edge persists, which determines rebalancing frequency and therefore whether an edge survives costs at all. It also distinguishes a genuine slow signal from a fast one that is mostly microstructure noise.</p>
+</div>
+
+<div class="feature">
+  <h3>Neutralized IC — sector, beta, size <span class="effort">2 days · high value</span></h3>
+  <p class="why">Compute IC after regressing out sector, market beta and size. The gap between raw and neutralized IC is the share of the signal that is a factor tilt rather than stock selection. Indian momentum concentrates hard by sector, so this is where a supposed alpha most often turns out to be an IT or PSU-bank bet.</p>
+</div>
+
+<div class="feature">
+  <h3>Fama–MacBeth cross-sectional regressions <span class="effort">3 days · high value</span></h3>
+  <p class="why">The classical financial-econometrics answer to "does this characteristic price". Cross-sectional regression each date, then time-series inference on the coefficient series. You already have Newey–West standard errors in <code>risk_analytics.py</code>, which is the harder half — the autocorrelation correction is exactly what overlapping windows require.</p>
+  <p class="why">This gives a t-statistic on a factor premium rather than a backtest, which is a far stronger form of evidence and much harder to overfit.</p>
+</div>
+
+<div class="feature">
+  <h3>Gradient-boosted trees as the baseline model <span class="effort">2 days · high value</span></h3>
+  <p class="why">On tabular panel data at this sample size, GBMs typically beat sequence networks, train in seconds rather than minutes, and give honest feature importances. The LSTM is the more interesting model and the less appropriate default; make boosting the thing every new idea must beat.</p>
+  <p class="why">Registers as a trainer alongside <code>supervised</code> and <code>sac</code> with no framework changes.</p>
+</div>
+
+<div class="feature">
+  <h3>Seed ensembling <span class="effort">1 day · cheap</span></h3>
+  <p class="why">Average five seeds of one model. Reliably buys more out-of-sample stability than finding a better architecture, and costs only compute. It also gives a free estimate of how much of a result is initialization luck — which on this sample size is more than people expect.</p>
+</div>
+
+<div class="feature">
+  <h3>Regime-conditional evaluation <span class="effort">3 days · high value</span></h3>
+  <p class="why">IC split by volatility regime, market direction and dispersion. A signal that works only in one regime is a different product from one that works throughout, and the aggregate number hides which you have. This is where the dormant Markov regime module earns its place.</p>
+</div>
+
+<div class="feature">
+  <h3>Conformal prediction intervals <span class="effort">4 days · differentiating</span></h3>
+  <p class="why">Isotonic calibration gives a calibrated point probability. Conformal gives an interval with finite-sample coverage guarantees that hold without distributional assumptions — which matters because financial returns violate every distributional assumption normally made. For a forecasting platform the interval is the more honest output.</p>
+</div>
+
+<div class="feature">
+  <h3>Combinatorial purged CV <span class="effort">1 week · advanced</span></h3>
+  <p class="why">Multiple train/test path combinations rather than one, giving a <em>distribution</em> of out-of-sample outcomes instead of a single number. Feeds PBO directly, and PBO is already built. The right upgrade once purged CV is in place and the basics are trusted.</p>
+</div>
+
+<div class="feature">
+  <h3>Auto-generated research notes <span class="effort">3 days · quality of life</span></h3>
+  <p class="why">Each run manifest renders to a short HTML page: config, universe fingerprint, metrics, decay curve, IC by regime. Makes results comparable across weeks and stops the accumulation of undocumented experiments that no one can reproduce.</p>
+</div>
+
+<h2><span class="num">Part 5 · Sequence</span>Order of work</h2>
+
+<div class="phase">
+  <div class="phase-tag">Week 1</div>
+  <div>
+    <h3>Data, cheap and high-leverage</h3>
+    <p>Widen the history window and refetch. Stop discarding <code>adj_close</code>, <code>dividends</code>, <code>stock_splits</code>. Add ingest invariants.</p>
+    <p><strong>Checkpoint:</strong> report the new span, and how many corporate actions per year the recovered columns reveal. If the source only holds five years, that finding changes the plan and is worth knowing on day two rather than month two.</p>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-tag">Week 2</div>
+  <div>
+    <h3>Purged CV and the forecast harness</h3>
+    <p>These land together because neither is meaningful alone. First measurement to produce: rank IC of the existing LSTM under purged CV, against the same model under the current walk-forward.</p>
+    <p><strong>Checkpoint:</strong> the gap between those two numbers is the leakage you have been reporting as skill. Expect it to be uncomfortable.</p>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-tag">Week 3</div>
+  <div>
+    <h3>Decay, neutralization, boosting baseline</h3>
+    <p>Signal decay curves, sector/beta/size-neutralized IC, and gradient boosting as the model every idea must beat.</p>
+    <p><strong>Checkpoint:</strong> raw versus neutralized IC for each existing strategy. This tells you which of the six are stock selection and which are factor tilts.</p>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-tag">Week 4</div>
+  <div>
+    <h3>Platform hygiene</h3>
+    <p><code>A1</code>, <code>A2</code>, CLI smoke tests, run manifests. Freeze the execution namespace with its README. Small, mechanical, and it makes everything after this portable and reproducible.</p>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-tag">Month 2+</div>
+  <div>
+    <h3>Depth</h3>
+    <ul>
+      <li>Fama–MacBeth with Newey–West inference</li>
+      <li>Regime-conditional evaluation, wiring the Markov module in as a conditioning variable</li>
+      <li>Seed ensembling, conformal intervals</li>
+      <li>Combinatorial purged CV feeding the existing PBO</li>
+      <li>Point-in-time membership, if survivorship is still the limiting uncertainty by then</li>
+    </ul>
+  </div>
+</div>
+
+<h2><span class="num">Part 6 · Honesty</span>What this plan does not fix</h2>
+
+<div class="col">
+<p>Stated plainly, because a plan that implies otherwise is worse than no plan.</p>
+
+<ul>
+  <li><strong>Survivorship remains until point-in-time membership exists.</strong> Widening history helps the sample size and adds crises; it does not remove the bias. Under a forecasting premise you can at least <em>measure around</em> it — report IC within the available universe and state the bias direction — but a cross-sectional return claim stays unsafe.</li>
+  <li><strong>Delisted price history is a separate acquisition</strong> from membership, and easy to conflate with it. Membership tells you a name was in the index; you still need its prices to evaluate a forecast that included it.</li>
+  <li><strong>Indian data before roughly 2010 is thin and of uneven quality.</strong> Widening the window will not give you thirty clean years, and the earliest part of whatever you get deserves scepticism.</li>
+  <li><strong>One market, one country.</strong> Every conclusion is a single realization of Indian equities. Cross-market validation is the only real answer and it is out of scope.</li>
+</ul>
+
+<h3>What success looks like</h3>
+<p>Concretely, so it is checkable rather than aspirational. By the end of week 3 you should be able to state, for every one of the six strategies:</p>
+<ul>
+  <li>Rank IC and ICIR under purged CV, with a Newey–West t-statistic</li>
+  <li>How much of it survives sector and beta neutralization</li>
+  <li>How fast it decays with horizon</li>
+  <li>Whether it holds in more than one volatility regime</li>
+  <li>How it compares to a gradient-boosting baseline on identical features and splits</li>
+</ul>
+<p>None of those five numbers requires a single simulated trade — and together they are a far stronger statement about forecasting skill than any equity curve this platform has produced.</p>
+</div>
+
+<footer>
+  <p>Third in a series with <code>docs/architecture_review.html</code> (findings <code>A1–A9</code>) and <code>docs/data_architecture.html</code>. Quantitative findings <code>D1–D10</code> and the phase roadmap live in <code>docs/REVIEW_STATUS.md</code>, which remains the authority on model correctness. Data measurements taken on the 2,397 committed parquet files at commit <code>0647b8a</code>; effort estimates assume one developer and are relative, not contractual.</p>
+</footer>
+
+</div>
