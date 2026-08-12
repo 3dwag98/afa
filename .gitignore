@@ -44,3 +44,9 @@ htmlcov/
 
 # Build artifacts
 *.egg-info/
+
+# Notebook run artifacts. The standalone notebooks download parquet into
+# data_cache/ next to wherever they are run, and Jupyter writes checkpoints.
+.ipynb_checkpoints/
+notebooks/**/data_cache/
+data_cache/
