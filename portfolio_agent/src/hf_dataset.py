@@ -66,9 +66,29 @@ _COLUMN_ALIASES = {
     "close": ("close", "close_price", "c"),
     "adj_close": ("adj_close", "adjclose", "adj close", "adjusted_close"),
     "volume": ("volume", "vol", "v", "quantity", "traded_quantity"),
+    "dividends": ("dividends", "dividend", "div"),
+    "stock_splits": ("stock_splits", "stock split", "splits", "split_ratio"),
 }
 
 OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
+
+# The price legs, kept unadjusted alongside the adjusted ones.
+#
+# Both are needed and they answer different questions. Returns must come from
+# adjusted prices or a split reads as a crash. Anything about the *price level*
+# must come from raw: a circuit band applies to the number that actually
+# traded, so checking a band against a back-adjusted price compares against a
+# price no exchange ever saw. Keeping only one of the two — which is what this
+# module did until now — makes one of those two classes of question
+# unanswerable, and silently wrong rather than absent.
+RAW_PRICE_COLUMNS = ("open_raw", "high_raw", "low_raw", "close_raw")
+
+# Corporate-action provenance. `adj_factor` is derived (adj_close / close);
+# `dividends` and `stock_splits` are stated by the source. Keeping both lets
+# them be cross-checked — where a stated split and the derived factor disagree,
+# one of the two is wrong, and that is worth surfacing rather than resolving
+# silently behind whichever happens to be read first.
+ADJUSTMENT_COLUMNS = ("adj_close", "adj_factor", "dividends", "stock_splits")
 
 
 class SchemaError(ValueError):
@@ -156,25 +176,34 @@ def normalize_frame(df: pd.DataFrame, adjust_prices: bool = True) -> pd.DataFram
     if "close" not in out.columns:
         out["close"] = out["adj_close"]
 
-    if adjust_prices and "adj_close" in out.columns:
-        # Back-adjust every price leg by the same per-row factor. Scaling all
-        # four together is what keeps intraday relationships intact: a locked
-        # session (high == low) stays locked, and ATR keeps its proportion to
-        # price. Volume is left as reported — the liquidity screen reads only
-        # the trailing 60 sessions, where the adjustment factor is ~1.
-        factor = (out["adj_close"] / out["close"]).replace([float("inf"), float("-inf")], pd.NA)
-        factor = factor.fillna(1.0)
-        for leg in ("open", "high", "low", "close"):
-            if leg in out.columns:
-                out[leg] = out[leg] * factor
-
-    out = out.drop(columns=[c for c in ("adj_close",) if c in out.columns])
-
     # A file with only a close is still usable for every close-based signal;
-    # keeping the column set uniform matters more than the missing legs.
+    # keeping the column set uniform matters more than the missing legs. Done
+    # before the raw legs are captured so they are uniform too.
     for leg in ("open", "high", "low"):
         if leg not in out.columns:
             out[leg] = out["close"]
+
+    # Capture the traded prices before any adjustment touches them.
+    for leg in ("open", "high", "low", "close"):
+        out[f"{leg}_raw"] = out[leg]
+
+    if "adj_close" in out.columns:
+        # One factor per row, applied to all four legs together. Scaling them
+        # as a set is what keeps intraday relationships intact: a locked
+        # session (high == low) stays locked, and ATR keeps its proportion to
+        # price. Volume is left as reported — the liquidity screen reads only
+        # the trailing 60 sessions, where the factor is ~1.
+        factor = (out["adj_close"] / out["close"]).replace(
+            [float("inf"), float("-inf")], pd.NA
+        )
+        out["adj_factor"] = factor.fillna(1.0)
+        if adjust_prices:
+            for leg in ("open", "high", "low", "close"):
+                out[leg] = out[leg] * out["adj_factor"]
+    else:
+        # Recorded as an explicit 1.0 rather than omitted, so a reader can tell
+        # "no adjustment was needed" apart from "no adjustment was attempted".
+        out["adj_factor"] = 1.0
     # Volume defaults to 0, never to a fabricated number: the liquidity screen
     # reads it, and an invented volume would defeat the screen entirely.
     if "volume" not in out.columns:
@@ -190,7 +219,90 @@ def normalize_frame(df: pd.DataFrame, adjust_prices: bool = True) -> pd.DataFram
         raise SchemaError("every row had an unparseable date or a missing close")
 
     out = out[~out.index.duplicated(keep="last")]
-    return out[list(OHLCV_COLUMNS)].sort_index()
+
+    # OHLCV first, so the frame reads the same as it always has and positional
+    # access anywhere downstream still lands where it used to. The provenance
+    # columns follow, and are optional by contract: a cache written before this
+    # change simply lacks them, which every reader must tolerate.
+    ordered = list(OHLCV_COLUMNS)
+    ordered += [c for c in RAW_PRICE_COLUMNS if c in out.columns]
+    ordered += [c for c in ADJUSTMENT_COLUMNS if c in out.columns]
+    return out[ordered].sort_index()
+
+
+def corporate_actions_from_frame(
+    frame: pd.DataFrame, factor_tolerance: float = 0.005
+) -> pd.DataFrame:
+    """Extract corporate actions from a normalized frame.
+
+    Two independent views of the same events, deliberately not merged:
+
+    - **Stated** — the `dividends` and `stock_splits` columns the source
+      publishes.
+    - **Derived** — a change in `adj_factor` between consecutive sessions,
+      which is what the adjustment actually applied.
+
+    Where the two disagree, one of them is wrong, and which one matters. A
+    split the source states but never adjusted for leaves a genuine 90% gap in
+    the returns; an adjustment with no stated cause is usually a demerger or a
+    rights issue, neither of which a naive split factor handles correctly. Both
+    are reported rather than reconciled, because reconciling them here would
+    hide exactly the cases worth looking at.
+
+    Args:
+        frame: Output of `normalize_frame`.
+        factor_tolerance: Relative change in `adj_factor` treated as noise.
+
+    Returns:
+        A frame indexed by date with columns `kind`, `stated_value`,
+        `factor_ratio` and `agrees`. Empty when the input carries no
+        provenance columns, which is the case for caches written before these
+        were preserved.
+    """
+    events = []
+
+    if "stock_splits" in frame.columns:
+        splits = frame["stock_splits"]
+        for date, value in splits[splits.fillna(0) != 0].items():
+            events.append({"date": date, "kind": "split", "stated_value": float(value)})
+
+    if "dividends" in frame.columns:
+        dividends = frame["dividends"]
+        for date, value in dividends[dividends.fillna(0) != 0].items():
+            events.append({"date": date, "kind": "dividend", "stated_value": float(value)})
+
+    if not events and "adj_factor" not in frame.columns:
+        return pd.DataFrame(columns=["kind", "stated_value", "factor_ratio", "agrees"])
+
+    # The factor moves on every ex-date; a step between consecutive sessions is
+    # the adjustment being applied, whatever caused it.
+    ratios = pd.Series(dtype=float)
+    if "adj_factor" in frame.columns:
+        factor = frame["adj_factor"].astype(float)
+        ratios = (factor / factor.shift(1)).replace([float("inf"), float("-inf")], pd.NA)
+        moved = ratios[(ratios - 1.0).abs() > factor_tolerance].dropna()
+        stated_dates = {e["date"] for e in events}
+        for date, ratio in moved.items():
+            if date not in stated_dates:
+                events.append({
+                    "date": date, "kind": "unexplained_adjustment", "stated_value": float("nan"),
+                })
+
+    if not events:
+        return pd.DataFrame(columns=["kind", "stated_value", "factor_ratio", "agrees"])
+
+    table = pd.DataFrame(events).set_index("date").sort_index()
+    table["factor_ratio"] = [
+        float(ratios.get(date, float("nan"))) if len(ratios) else float("nan")
+        for date in table.index
+    ]
+    # A stated event the factor never moved for is the expensive case: the
+    # source says a split happened and the prices were never adjusted for it.
+    table["agrees"] = [
+        bool(abs(r - 1.0) > factor_tolerance) if pd.notna(r) else False
+        for r in table["factor_ratio"]
+    ]
+    return table
 
 
 def _require_hub():
@@ -395,6 +507,14 @@ def sync_hf_to_cache(
         return normalize_ticker(symbol), df
 
     written: List[str] = []
+    # Span and corporate-action counts, accumulated as symbols arrive. Reported
+    # at the end because the history window is a configuration choice whose
+    # effect is otherwise invisible: a five-year window looks identical to a
+    # source that only holds five years, and the difference decides whether a
+    # regime model has ever seen a crash.
+    spans: List[pd.Timestamp] = []
+    action_count = 0
+
     if symbols:
         # Fetching is parallel; the parquet write is not. DataStore is not
         # documented as thread-safe, and serializing the writes on this thread
@@ -407,6 +527,12 @@ def sync_hf_to_cache(
                     ticker, df = result
                     store.save_ticker_data(ticker, df.copy())
                     written.append(ticker)
+                    if len(df):
+                        spans.extend([df.index.min(), df.index.max()])
+                    try:
+                        action_count += len(corporate_actions_from_frame(df))
+                    except Exception:  # provenance is a nicety, never a failure
+                        pass
                 if progress and done % 100 == 0:
                     print(f"  {done}/{len(symbols)} fetched, {len(written)} cached")
 
@@ -414,6 +540,20 @@ def sync_hf_to_cache(
         "Cached %d newly fetched and %d already-present symbols from %s/%s",
         len(written), len(already_cached), dataset_id, asset_dir,
     )
+    if spans:
+        earliest, latest = min(spans), max(spans)
+        years = (latest - earliest).days / 365.25
+        logger.info(
+            "History obtained: %s to %s (%.1f years), %d corporate actions recorded. "
+            "If this is shorter than expected, raise data.default_history_years — the "
+            "source is trimmed to that window on ingest.",
+            earliest.date(), latest.date(), years, action_count,
+        )
+        if progress:
+            print(
+                f"  history {earliest.date()} -> {latest.date()} "
+                f"({years:.1f} years), {action_count} corporate actions"
+            )
     return sorted(set(written) | set(already_cached))
 
 

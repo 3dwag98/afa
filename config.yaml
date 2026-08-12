@@ -21,7 +21,14 @@ data:
   # composite of the traded universe.
   benchmark_symbol: "^NSEI"
   # Years of history kept, applied to both sources.
-  default_history_years: 5
+  #
+  # This was 5, and the consequence was invisible until someone measured the
+  # cache: every file spanned exactly five years, so the sample began *after*
+  # the COVID crash — one bull run, one rate-hike correction, no crisis. Every
+  # tail estimate, regime model and drawdown forecast was fitted on data with
+  # no crash in it. The source is trimmed to whatever it holds, so asking for
+  # more than exists costs nothing; a low value is pure downside.
+  default_history_years: 20
   # alphabetical | random. The cache is scanned in sorted filename order, so
   # 'alphabetical' returns whatever sits at the front of the alphabet — the
   # same names every run, for training and backtesting alike, which means a

@@ -51,9 +51,16 @@ class DataConfig(BaseModel):
         "otherwise it falls back to an equal-weighted composite of the traded universe.",
     )
     default_history_years: int = Field(
-        default=5,
+        default=20,
         description="Years of historical data to keep. Applied to both sources: the Hub dataset "
-        "is trimmed to this window on ingest rather than cached in full.",
+        "is trimmed to this window on ingest rather than cached in full. "
+        "This was 5, and the consequence was not obvious: every cached file spanned exactly "
+        "five years, so the sample began *after* the COVID crash and contained one bull run, "
+        "one rate-hike correction, and no crisis. Every tail estimate, regime model and "
+        "drawdown forecast was therefore fitted on data with no crash in it. The source is "
+        "trimmed to whatever it actually holds, so a value larger than the available history "
+        "costs nothing — which makes a low value pure downside. Raise it further rather than "
+        "lower it; the ingest reports the span it actually obtained.",
     )
     universe_size: int = Field(
         default=10, description="Number of securities in the trading universe"
