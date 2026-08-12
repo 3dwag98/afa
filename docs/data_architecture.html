@@ -1,0 +1,491 @@
+<title>The Data Layer, Rebuilt</title>
+<style>
+  :root {
+    --ground: #FBFBFD;
+    --surface: #FFFFFF;
+    --surface-2: #F4F5F9;
+    --ink: #1A1D26;
+    --ink-2: #4A4F5E;
+    --ink-3: #757B8C;
+    --rule: #DDE0E8;
+    --rule-strong: #C3C8D4;
+    --accent: #2B4C7E;
+    --accent-soft: #E8EDF6;
+    --critical: #B4322A;
+    --critical-soft: #FAEDEC;
+    --warning: #A96A18;
+    --warning-soft: #FBF2E4;
+    --ok: #2E7D5B;
+    --ok-soft: #E7F3ED;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #14161C; --surface: #1B1E26; --surface-2: #21252F;
+      --ink: #E8EAF0; --ink-2: #B4BAC8; --ink-3: #838A9B;
+      --rule: #2A2E3A; --rule-strong: #3B4150;
+      --accent: #7BA3D9; --accent-soft: #1E2734;
+      --critical: #E0736A; --critical-soft: #2C1E1E;
+      --warning: #D9A055; --warning-soft: #2B2318;
+      --ok: #63B892; --ok-soft: #17271F;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #14161C; --surface: #1B1E26; --surface-2: #21252F;
+    --ink: #E8EAF0; --ink-2: #B4BAC8; --ink-3: #838A9B;
+    --rule: #2A2E3A; --rule-strong: #3B4150;
+    --accent: #7BA3D9; --accent-soft: #1E2734;
+    --critical: #E0736A; --critical-soft: #2C1E1E;
+    --warning: #D9A055; --warning-soft: #2B2318;
+    --ok: #63B892; --ok-soft: #17271F;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--ground); color: var(--ink);
+    font-family: var(--sans); font-size: 16px; line-height: 1.65;
+    margin: 0; padding: 0 1.25rem 6rem; -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 62rem; margin: 0 auto; }
+  .col { max-width: 42rem; }
+
+  header.masthead {
+    padding: 4rem 0 2rem; border-bottom: 2px solid var(--ink); margin-bottom: 3rem;
+  }
+  .eyebrow {
+    font-family: var(--mono); font-size: 0.7rem; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--ink-3); margin: 0 0 1rem;
+  }
+  h1 {
+    font-family: var(--serif); font-size: clamp(2.1rem, 5.5vw, 3.1rem);
+    line-height: 1.1; font-weight: 600; margin: 0 0 1rem;
+    text-wrap: balance; letter-spacing: -0.01em;
+  }
+  .standfirst { font-size: 1.08rem; color: var(--ink-2); max-width: 40rem; margin: 0; }
+
+  h2 {
+    font-family: var(--serif); font-size: 1.75rem; font-weight: 600; line-height: 1.2;
+    margin: 4rem 0 0.5rem; padding-top: 1.5rem;
+    border-top: 1px solid var(--rule-strong); text-wrap: balance;
+  }
+  h2 .num {
+    font-family: var(--mono); font-size: 0.75rem; color: var(--accent);
+    display: block; letter-spacing: 0.1em; margin-bottom: 0.4rem; font-weight: 400;
+  }
+  h3 {
+    font-family: var(--sans); font-size: 1.02rem; font-weight: 650;
+    margin: 2.25rem 0 0.5rem; letter-spacing: -0.005em;
+  }
+  h4 {
+    font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--ink-3); font-weight: 500;
+    margin: 1.75rem 0 0.6rem;
+  }
+  p { margin: 0 0 1rem; max-width: 42rem; }
+  .lede { font-size: 1.05rem; color: var(--ink-2); }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+  code {
+    font-family: var(--mono); font-size: 0.855em; background: var(--surface-2);
+    padding: 0.1em 0.35em; border-radius: 3px; color: var(--ink);
+  }
+  ul, ol { max-width: 42rem; padding-left: 1.15rem; margin: 0 0 1rem; }
+  li { margin-bottom: 0.45rem; }
+  strong { font-weight: 650; }
+
+  .twrap { overflow-x: auto; margin: 0 0 1.5rem; border: 1px solid var(--rule); }
+  table { border-collapse: collapse; width: 100%; font-size: 0.87rem; min-width: 38rem; }
+  th, td {
+    text-align: left; padding: 0.6rem 0.8rem;
+    border-bottom: 1px solid var(--rule); vertical-align: top;
+  }
+  thead th {
+    background: var(--surface-2); font-family: var(--mono); font-size: 0.65rem;
+    letter-spacing: 0.09em; text-transform: uppercase; color: var(--ink-3);
+    font-weight: 500; white-space: nowrap;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  .mono-cell { font-family: var(--mono); font-size: 0.8rem; }
+  td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+
+  .pill {
+    font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.07em;
+    text-transform: uppercase; padding: 0.15rem 0.45rem; border-radius: 2px; white-space: nowrap;
+  }
+  .p-free { background: var(--ok-soft); color: var(--ok); }
+  .p-paid { background: var(--warning-soft); color: var(--warning); }
+  .p-hard { background: var(--critical-soft); color: var(--critical); }
+
+  .callout {
+    background: var(--accent-soft); border-left: 3px solid var(--accent);
+    padding: 1rem 1.25rem; margin: 1.5rem 0; max-width: 44rem;
+  }
+  .callout.alarm { background: var(--critical-soft); border-left-color: var(--critical); }
+  .callout.alarm .label { color: var(--critical); }
+  .callout p:last-child { margin-bottom: 0; }
+  .callout .label {
+    font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--accent); margin: 0 0 0.4rem;
+  }
+
+  pre {
+    font-family: var(--mono); font-size: 0.78rem; line-height: 1.6;
+    background: var(--surface-2); border: 1px solid var(--rule);
+    padding: 0.9rem 1rem; overflow-x: auto; margin: 0 0 1.4rem; color: var(--ink-2);
+  }
+  pre b { color: var(--ink); font-weight: 600; }
+
+  .check {
+    background: var(--surface); border: 1px solid var(--rule);
+    border-left: 4px solid var(--sev, var(--rule-strong));
+    padding: 1.1rem 1.3rem; margin: 0 0 0.9rem;
+  }
+  .check.wrong { --sev: var(--critical); }
+  .check.gap { --sev: var(--warning); }
+  .check.right { --sev: var(--ok); }
+  .check h3 { margin: 0 0 0.5rem; font-size: 1rem; display: flex; gap: 0.6rem; align-items: baseline; flex-wrap: wrap; }
+  .verdict {
+    font-family: var(--mono); font-size: 0.6rem; letter-spacing: 0.1em;
+    text-transform: uppercase; padding: 0.18rem 0.45rem; border-radius: 2px; white-space: nowrap;
+  }
+  .wrong .verdict { background: var(--critical-soft); color: var(--critical); }
+  .gap .verdict { background: var(--warning-soft); color: var(--warning); }
+  .right .verdict { background: var(--ok-soft); color: var(--ok); }
+  .check p { margin-bottom: 0.6rem; font-size: 0.94rem; max-width: 46rem; }
+  .check p:last-child { margin-bottom: 0; }
+
+  .phase {
+    display: grid; grid-template-columns: 5rem 1fr; gap: 1.25rem;
+    padding: 1.1rem 0; border-bottom: 1px solid var(--rule); max-width: 46rem;
+  }
+  .phase:last-child { border-bottom: none; }
+  .phase-tag {
+    font-family: var(--mono); font-size: 0.7rem; color: var(--ink-3);
+    letter-spacing: 0.06em; padding-top: 0.2rem;
+  }
+  .phase h3 { margin: 0 0 0.35rem; }
+  .phase p { margin: 0 0 0.4rem; font-size: 0.94rem; color: var(--ink-2); }
+
+  footer {
+    margin-top: 4rem; padding-top: 1.5rem; border-top: 2px solid var(--ink);
+    font-size: 0.85rem; color: var(--ink-3); max-width: 44rem;
+  }
+  footer ol { font-size: 0.82rem; padding-left: 1.2rem; }
+  footer li { margin-bottom: 0.3rem; }
+
+  @media (max-width: 40rem) {
+    .phase { grid-template-columns: 1fr; gap: 0.3rem; }
+    header.masthead { padding-top: 2.5rem; }
+  }
+</style>
+
+<div class="wrap">
+
+<header class="masthead">
+  <p class="eyebrow">Companion to the Architecture Register · 3dwag98/afa</p>
+  <h1>The data layer, rebuilt</h1>
+  <p class="standfirst">Where every required input actually comes from, how to store it so look-ahead is structurally impossible, and eleven places where the platform's current model of the Indian market is wrong rather than merely incomplete.</p>
+</header>
+
+<div class="col">
+<h2><span class="num">Start here</span>The finding that reorders everything else</h2>
+
+<p class="lede">The platform keys everything on the trading symbol. In Indian equities the symbol is not stable — companies rename, and the exchange reissues the ticker. <strong>ISIN is the identifier that persists.</strong></p>
+
+<p>This is not a detail to tidy up later. Keying on symbol means a rename appears in your data as a delisting plus a new listing: the old series ends, a new one begins with no history, and every lookback feature on that name silently restarts. Cross-sectional rankings then compare a name with 250 days of history against one that appears to have 12. The eod2 project — a working local NSE store — handles this explicitly, tracking ISIN through symbol changes.<sup>[8]</sup></p>
+
+<p>Every schema below is keyed on ISIN with symbol demoted to a time-ranged attribute. Fixing this after the store is populated means rebuilding it.</p>
+
+<div class="callout alarm">
+  <p class="label">Two pieces of guidance that are now stale</p>
+  <p><strong>The CSV bhavcopy is gone.</strong> NSE discontinued <code>cm&lt;DD&gt;&lt;MON&gt;&lt;YYYY&gt;bhav.csv.zip</code> on 8 July 2024 (circular 62424, 12 June 2024). The replacement is <strong>UDiFF</strong> — a SEBI-mandated Unified Distilled File Format covering cash, F&amp;O, currency, EGR and commodities.<sup>[1][2]</sup> Any ingestion code or tutorial predating mid-2024 targets a dead URL.</p>
+  <p><strong>The obvious index-membership file is abandoned.</strong> <code>archives.nseindia.com/content/indices/IndexInclExcl.xls</code> stops at 31 July 2020.<sup>[4]</sup> Building point-in-time membership from it gives you five stale years and no warning.</p>
+</div>
+</div>
+
+<h2><span class="num">Part 1 · Sources</span>Where each input actually comes from</h2>
+
+<p class="col">Ranked by what it unlocks. Everything in the first block is free and official, which is the good news: the binding constraint on this platform is not budget, it is that nobody has written the ingestion.</p>
+
+<h4>Tier 1 — free, official, unblocks the most</h4>
+<div class="twrap">
+<table>
+  <thead><tr><th>Input</th><th>Source</th><th>Cost</th><th>Notes that matter</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>Daily OHLCV + delivery</strong></td>
+      <td class="mono-cell">NSE UDiFF CM bhavcopy<br>+ <code>sec_bhavdata_full</code></td>
+      <td><span class="pill p-free">Free</span></td>
+      <td><code>DELIV_QTY</code> / <code>DELIV_PER</code> live here.<sup>[2]</sup> Delivery percentage is the single most valuable free field the platform currently ignores — it separates genuine accumulation from intraday churn, and it has no equivalent in most markets.</td>
+    </tr>
+    <tr>
+      <td><strong>Point-in-time index membership</strong></td>
+      <td class="mono-cell">niftyindices.com →<br>Archives of D/M Reports →<br>Indices Market Capitalization</td>
+      <td><span class="pill p-free">Free</span></td>
+      <td>Monthly constituent snapshots. Reconstructing membership from a sequence of these is the practical route now that <code>IndexInclExcl.xls</code> is stale.<sup>[4]</sup> This is the fix for <code>D9</code> — the finding that currently invalidates every cross-sectional backtest.</td>
+    </tr>
+    <tr>
+      <td><strong>Corporate actions</strong></td>
+      <td class="mono-cell">NSE corporate actions +<br>NSE Clearing CA adjustments</td>
+      <td><span class="pill p-free">Free</span></td>
+      <td>Bonus, split, rights, dividend, merger, demerger, buyback, OFS. NSE does not publish adjustment data before 2005<sup>[8]</sup> — treat pre-2005 series as unadjusted and unusable for returns.</td>
+    </tr>
+    <tr>
+      <td><strong>Price bands & surveillance</strong></td>
+      <td class="mono-cell">NSE daily price-band file;<br>ASM / GSM / ESM lists</td>
+      <td><span class="pill p-free">Free</span></td>
+      <td>The band is <em>published</em>, not inferred. Surveillance stages impose 5% or 2% bands, trade-to-trade settlement, 100% margin and periodic call auctions.<sup>[6]</sup> A name under ESM is barely tradeable and the platform has no idea.</td>
+    </tr>
+    <tr>
+      <td><strong>F&amp;O bhavcopy, OI, ban list</strong></td>
+      <td class="mono-cell">NSE F&amp;O UDiFF;<br>participant-wise OI;<br>daily MWPL ban list</td>
+      <td><span class="pill p-free">Free</span></td>
+      <td>Ban triggers at OI ≥ 95% of MWPL and lifts below 80%.<sup>[5]</sup> MWPL is the lesser of 20% of free-float or 30× prior-month average volume. A banned stock cannot take fresh derivative positions — and the ban itself is a crowding signal.</td>
+    </tr>
+    <tr>
+      <td><strong>FII / DII flows</strong></td>
+      <td class="mono-cell">NSE participant-wise OI;<br>daily cash-segment flows</td>
+      <td><span class="pill p-free">Free</span></td>
+      <td>EOD OI split by FII / DII / Client / Pro.<sup>[5]</sup> A well-documented driver of Indian index returns and a direct input to regime classification.</td>
+    </tr>
+    <tr>
+      <td><strong>Trading & settlement calendar</strong></td>
+      <td class="mono-cell">NSE holiday master</td>
+      <td><span class="pill p-free">Free</span></td>
+      <td>Trading holidays and settlement holidays are different lists. Muhurat sessions exist. Deriving the calendar from observed prints — what the platform does now — bakes in every data gap as a holiday.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h4>Tier 2 — needs work or money</h4>
+<div class="twrap">
+<table>
+  <thead><tr><th>Input</th><th>Source</th><th>Cost</th><th>Notes that matter</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>Fundamentals</strong><br><span class="mono-cell">results, shares outstanding, book value</span></td>
+      <td class="mono-cell">BSE/NSE XBRL filings (raw);<br>commercial APIs (parsed)</td>
+      <td><span class="pill p-paid">Free but hard</span></td>
+      <td>BSE was first to implement XBRL and both exchanges now publish it.<sup>[7]</sup> Raw XBRL is free and genuinely painful — taxonomy changes, restatements, inconsistent tagging. Buying parsed fundamentals is the rational call unless this becomes the product.</td>
+    </tr>
+    <tr>
+      <td><strong>Sector / industry classification</strong></td>
+      <td class="mono-cell">NSE sector indices;<br>BSE industry classification</td>
+      <td><span class="pill p-free">Free</span></td>
+      <td>Derivable from sector-index membership. Needed to make the concentration cap (<code>A8</code>) work at all — it is currently inert because no map ships.</td>
+    </tr>
+    <tr>
+      <td><strong>Shareholding & pledging</strong></td>
+      <td class="mono-cell">Quarterly XBRL shareholding pattern</td>
+      <td><span class="pill p-paid">Free but hard</span></td>
+      <td>Promoter pledge percentage is a real India-specific risk signal — pledged promoter holdings force selling in a drawdown, which is exactly when a momentum book is already hurting.</td>
+    </tr>
+    <tr>
+      <td><strong>Intraday bars</strong></td>
+      <td class="mono-cell">Broker APIs (Kite, Upstox, Dhan)</td>
+      <td><span class="pill p-paid">Sub / account</td>
+      <td>Required for any honest execution model. Most brokers cap historical depth at 60–90 days, so this must be accumulated forward from the day you start — another reason to start early even if unused.</td>
+    </tr>
+    <tr>
+      <td><strong>Tick / order book</strong></td>
+      <td class="mono-cell">NSE data products</td>
+      <td><span class="pill p-hard">Expensive</span></td>
+      <td>Only worth it for genuine microstructure work. Not needed for a daily-horizon book.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Access reality</h3>
+<p>NSE endpoints require a browser-like session — cookies obtained from a homepage visit, correct headers, and rate limiting — and they break periodically. Do not write this from scratch: <code>jugaad-data</code> and <code>nselib</code> both target the current NSE site and handle session and caching, and <code>jugaad-data</code> explicitly warns that libraries built on the old site are dead.<sup>[3]</sup> <code>eod2</code><sup>[8]</sup> is worth reading before designing anything, since it already solves the ISIN-tracking and adjustment problems locally.</p>
+
+<div class="callout">
+  <p class="label">Keep the HuggingFace dataset</p>
+  <p><code>vishnun0027/indian-market-historical-ohlcv</code> is versioned and pinnable — properties NSE scraping does not have. Use it as the reproducible baseline for price history and layer the NSE-sourced facts on top. Two sources that agree are also the cheapest data-quality check available.</p>
+</div>
+
+<h2><span class="num">Part 2 · Storage</span>How to store it so leakage is structurally impossible</h2>
+
+<p class="col lede">One rule drives the whole design: <strong>every fact carries two dates</strong> — the date it describes, and the date it became knowable. Any query is then "as of" a point in time, and a leak requires actively passing the wrong argument rather than merely forgetting something.</p>
+
+<p class="col">A quarterly result published on 15 May describing the quarter to 31 March must be invisible to a query dated 14 May. Without <code>knowledge_date</code>, that class of leak is undetectable by inspection — the data looks completely normal — and it inflates precisely the factors people most want to add.</p>
+
+<h3>Engine: DuckDB over parquet</h3>
+<p class="col">Given no local ingestion constraints, this is the right shape for a single-machine research platform: columnar parquet on disk as the durable format, DuckDB as the query engine over it. Real SQL with window functions and as-of joins, no server to run, no separate storage format, and the parquet files stay readable by pandas and by anything else you point at them. A client–server database earns its keep with concurrent writers; a research store has one.</p>
+
+<h3>Layout</h3>
+<pre>data/
+├── <b>reference/</b>                 # slowly-changing dimensions, the spine
+│   ├── security.parquet         # ISIN -&gt; identity, one row per ISIN
+│   ├── symbol_history.parquet   # ISIN x [valid_from, valid_to) -&gt; symbol, series
+│   ├── index_membership.parquet # index x ISIN x [from, to)   <b>&lt;- fixes D9</b>
+│   ├── sector.parquet           # ISIN x [from, to) -&gt; sector, industry
+│   └── calendar.parquet         # date -&gt; trading, settlement, muhurat
+│
+├── <b>market/</b>                    # observed facts, partitioned by year
+│   ├── eod/year=2024/*.parquet  # OHLCV raw + adjusted, delivery, series, band
+│   ├── fno/year=2024/*.parquet  # futures/options OHLC, OI, lot size
+│   └── index/year=2024/*.parquet
+│
+├── <b>events/</b>                    # point events with knowledge dates
+│   ├── corporate_actions.parquet
+│   ├── surveillance.parquet     # ASM/GSM/ESM stage x [from, to)
+│   ├── fno_ban.parquet
+│   └── flows.parquet            # FII/DII, participant-wise OI
+│
+└── <b>fundamentals/</b>              # bitemporal, restatements kept
+    ├── results.parquet          # ISIN x period_end x knowledge_date
+    └── shareholding.parquet</pre>
+
+<h3>The three columns that do the work</h3>
+<div class="twrap">
+<table>
+  <thead><tr><th>Column</th><th>Meaning</th><th>What it prevents</th></tr></thead>
+  <tbody>
+    <tr><td class="mono-cell">isin</td><td>Stable security identity</td><td>A rename appearing as delisting + new listing, restarting every lookback feature</td></tr>
+    <tr><td class="mono-cell">effective_date</td><td>The date the fact <em>describes</em></td><td>—</td></tr>
+    <tr><td class="mono-cell">knowledge_date</td><td>The date the fact <em>became knowable</em></td><td>Look-ahead on anything published later than it describes: results, restatements, index changes, surveillance actions</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p class="col">Reference tables use half-open intervals <code>[valid_from, valid_to)</code> with <code>valid_to = NULL</code> for current. Membership then becomes a join rather than a filter, and "what was in the NIFTY 50 on 2021-03-15" is a query rather than an assumption.</p>
+
+<h3>The access rule</h3>
+<p class="col">One function, and nothing bypasses it:</p>
+<pre>panel = store.as_of(
+    date="2023-06-30",        # <b>nothing with knowledge_date &gt; this is visible</b>
+    universe="NIFTY500",      # resolved from index_membership at that date
+    fields=["close_adj", "deliv_per", "sector"],
+)</pre>
+<p class="col">Enforce it in one place and leakage stops being a discipline every strategy author must maintain. This also makes the conformance test from the architecture review trivial to write: request a panel as of date <em>t</em>, assert no returned row carries a <code>knowledge_date</code> after <em>t</em>.</p>
+
+<h3>Scale</h3>
+<p class="col">Roughly 2,400 symbols × ~250 sessions × 30 years is on the order of 18 million rows — a few gigabytes of parquet. F&amp;O with full option chains is the only part that gets genuinely large, and it partitions cleanly by year and expiry. This is a laptop-scale problem; do not over-engineer it.</p>
+
+<h2><span class="num">Part 3 · Correctness</span>Is the model right for Indian markets?</h2>
+
+<p class="col lede">Eleven checks against how the market actually works. Four are wrong today in ways that produce plausible, incorrect numbers; five are missing; two the platform already gets right and should keep.</p>
+
+<div class="check wrong">
+  <h3>Symbol as the primary key <span class="verdict">Wrong</span></h3>
+  <p>Symbols are reissued after renames. Keying on them fragments history at exactly the names that had a corporate event — which is a biased subset, not a random one. ISIN is stable and every exchange file carries it.</p>
+</div>
+
+<div class="check wrong">
+  <h3>Only adjusted prices are kept <span class="verdict">Wrong</span></h3>
+  <p>The ingestion back-adjusts OHLC by <code>adj_close/close</code> and discards the raw prices. That is correct for computing returns and <strong>wrong for everything band-related</strong>: a circuit limit applies to the actual traded price, so a circuit check run against a back-adjusted series is comparing the wrong number to the band. Store both.</p>
+</div>
+
+<div class="check wrong">
+  <h3>Series is not modelled at all <span class="verdict">Wrong</span></h3>
+  <p>NSE series matters enormously and appears nowhere. <code>EQ</code> permits intraday netting; <code>BE</code> and <code>BZ</code> are <strong>trade-to-trade</strong> — every trade settles by compulsory delivery, so an intraday exit is not merely expensive but impossible. Surveillance moves names into T2T.<sup>[6]</sup> A backtest that assumes it can exit a <code>BE</code> position the same day is simulating a trade the exchange would not permit.</p>
+</div>
+
+<div class="check wrong">
+  <h3>Circuit limits are inferred from price behaviour <span class="verdict">Wrong</span></h3>
+  <p>The platform detects circuit locks by looking for suspicious price action. The bands are published daily per security and change — including as a surveillance consequence. Inference produces both false positives (a genuine 20% move on an unbanded stock) and false negatives (a 5% band the code never considered).</p>
+</div>
+
+<div class="check gap">
+  <h3>Delivery percentage <span class="verdict">Missing</span></h3>
+  <p>Free, daily, in the file already being downloaded, and one of the few genuinely India-specific signals available. High price move on low delivery is churn; the same move on high delivery is accumulation.</p>
+</div>
+
+<div class="check gap">
+  <h3>F&amp;O ban periods <span class="verdict">Missing</span></h3>
+  <p>A stock in ban permits no fresh derivative positions.<sup>[5]</sup> Two uses: as a tradability constraint, and as a crowding indicator — entering ban means positioning has reached 95% of the market-wide limit.</p>
+</div>
+
+<div class="check gap">
+  <h3>ASM / GSM / ESM surveillance state <span class="verdict">Missing</span></h3>
+  <p>Surveillance brings tighter bands, T2T settlement, 100% margin and periodic call auctions.<sup>[6]</sup> A name under ESM is barely tradeable at size. This is a hard exclusion filter the platform does not have, and SEBI's framework was re-consolidated as recently as the May 2026 master circular.<sup>[6]</sup></p>
+</div>
+
+<div class="check gap">
+  <h3>Free-float vs total market cap <span class="verdict">Missing</span></h3>
+  <p>Indian indices weight by free float, and promoter holdings are frequently 50–75%. Any size factor or capacity estimate built on total market cap is wrong by a large and name-specific multiple.</p>
+</div>
+
+<div class="check gap">
+  <h3>Settlement cycle and expiry effects <span class="verdict">Missing</span></h3>
+  <p>India moved to T+1 in January 2023 and runs an optional T+0 for a growing list of scrips.<sup>[6]</sup> A backtest spanning the transition uses one settlement assumption across a boundary where it changed. Separately, weekly index-option expiries produce systematic patterns a daily model will absorb as noise.</p>
+</div>
+
+<div class="check right">
+  <h3>Back-adjustment by <code>adj_close/close</code>, all four legs together <span class="verdict">Correct</span></h3>
+  <p>Scaling open, high, low and close by the same per-row factor preserves intraday relationships — a locked session with <code>high == low</code> stays locked, and ATR keeps its proportion to price. Leaving volume unadjusted is also right for a 60-day liquidity screen. This part is well done and the reasoning is written down where the code is.</p>
+</div>
+
+<div class="check right">
+  <h3>Pinning a versioned dataset revision <span class="verdict">Correct</span></h3>
+  <p><code>hf_revision</code> makes a run byte-reproducible. Extend the same idea to NSE-sourced data by storing the raw downloaded file alongside the parsed table — re-deriving beats re-downloading when a parser turns out to be wrong.</p>
+</div>
+
+<h2><span class="num">Part 4 · Sequence</span>Build order</h2>
+
+<div class="phase">
+  <div class="phase-tag">Week 1</div>
+  <div>
+    <h3>The spine</h3>
+    <p><code>security</code>, <code>symbol_history</code>, <code>calendar</code>. Backfill ISINs onto the existing parquet cache and confirm how many names have had a symbol change — that number is the size of the problem you have been carrying silently.</p>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-tag">Week 2</div>
+  <div>
+    <h3>Point-in-time membership</h3>
+    <p>Monthly constituent snapshots from niftyindices, converted to <code>[from, to)</code> intervals. <strong>This is the one that changes what your backtests mean.</strong> Re-run one existing backtest before and after; the difference is the survivorship bias you have been reporting as edge.</p>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-tag">Week 3</div>
+  <div>
+    <h3>Daily facts</h3>
+    <p>UDiFF bhavcopy and <code>sec_bhavdata_full</code>: raw and adjusted OHLCV, delivery, series, price band. Sector map from sector-index membership, which turns the dormant concentration cap back on.</p>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-tag">Week 4</div>
+  <div>
+    <h3>Events and the as-of gate</h3>
+    <p>Corporate actions, surveillance state, F&amp;O ban, flows — all with knowledge dates. Then <code>store.as_of()</code> as the only read path, and the leakage conformance test that asserts it.</p>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-tag">Later</div>
+  <div>
+    <h3>Fundamentals, intraday, F&amp;O chains</h3>
+    <p>Once the bitemporal store exists to hold them honestly. Start accumulating intraday bars early even if unused — broker history is capped at 60–90 days, so it can only be gathered forward.</p>
+  </div>
+</div>
+
+<div class="callout">
+  <p class="label">The one measurement that justifies the whole exercise</p>
+  <p>After week 2, re-run an existing cross-sectional backtest against point-in-time membership and put the two equity curves side by side. That single chart converts <code>D9</code> from a caveat everyone nods at into a number, and it is the most useful thing this entire data effort will produce.</p>
+</div>
+
+<footer>
+  <p>Companion to <code>docs/architecture_review.html</code>. Findings referenced as <code>A8</code>, <code>D9</code> are from that document and <code>docs/REVIEW_STATUS.md</code> respectively. Source access was verified by web research rather than by direct request — NSE and BSE hosts are unreachable from the development container, so URL patterns should be confirmed on first ingestion run.</p>
+  <p><strong>Sources</strong></p>
+  <ol>
+    <li><a href="https://tradingqna.com/t/has-nse-changed-bhavcopy-location/169551">Zerodha Trading Q&amp;A — bhavcopy location change (CSV discontinued 8 Jul 2024, circular 62424)</a></li>
+    <li><a href="https://www.nseclearing.in/udiff">NSE Clearing — UDiFF format</a> and <a href="https://www.nseindia.com/all-reports">NSE All Reports</a></li>
+    <li><a href="https://github.com/jugaad-py/jugaad-data">jugaad-data</a>, <a href="https://pypi.org/project/nselib/">nselib</a>, <a href="https://pypi.org/project/nsepython/">nsepython</a></li>
+    <li><a href="https://kite.trade/forum/discussion/7379/historical-constituents-of-nse-indices">Kite Connect forum — historical index constituents</a>; <a href="https://niftyhistory.in/">niftyhistory.in</a></li>
+    <li><a href="https://www.stockezee.com/participant-wise-open-interest">Participant-wise OI</a>; <a href="https://www.niftytrader.in/ban-list">F&amp;O ban list / MWPL</a></li>
+    <li><a href="https://www.corplawupdates.in/updates/sebi-master-circular-on-surveillance-of-securities-market-2026-key-changes-impact-and-compliance-updates">SEBI Master Circular on Surveillance 2026</a>; <a href="https://www.nseindia.com/static/products-services/t0-settlement-cycle">NSE T+0 settlement</a>; <a href="https://www.5paisa.com/stock-market-guide/stock-share-market/exchange-surveillance-measures">ASM/GSM/ESM overview</a></li>
+    <li><a href="https://www.bseindia.com/static/about/xbrl_info.aspx">BSE XBRL</a>; <a href="https://www.nseindia.com/static/companies-listing/xbrl-information">NSE XBRL filing information</a></li>
+    <li><a href="https://github.com/BennyThadikaran/eod2">eod2 — local NSE EOD store with ISIN tracking and split/bonus adjustment</a></li>
+  </ol>
+</footer>
+
+</div>
