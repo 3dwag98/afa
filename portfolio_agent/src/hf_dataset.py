@@ -46,6 +46,8 @@ from typing import Dict, Iterable, List, Optional, Sequence
 
 import pandas as pd
 
+from portfolio_agent.data_quality.invariants import IngestRejected, assert_writable
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_HF_DATASET_ID = "vishnun0027/indian-market-historical-ohlcv"
@@ -514,6 +516,10 @@ def sync_hf_to_cache(
     # regime model has ever seen a crash.
     spans: List[pd.Timestamp] = []
     action_count = 0
+    # Symbols the structural gate refused. Counted rather than raised: one
+    # corrupt series out of 2,400 should be skipped and named, not abort a
+    # download that is otherwise fine.
+    rejected: List[str] = []
 
     if symbols:
         # Fetching is parallel; the parquet write is not. DataStore is not
@@ -525,6 +531,17 @@ def sync_hf_to_cache(
                 result = future.result()
                 if result is not None:
                     ticker, df = result
+                    try:
+                        # The gate. A frame whose high is below its close is not
+                        # a price series, and caching it is worse than not
+                        # caching it — every feature downstream consumes it
+                        # silently, and the resulting NaN loss surfaces hundreds
+                        # of training steps away from the cause.
+                        assert_writable(df, ticker)
+                    except IngestRejected as rejection:
+                        logger.warning("%s", rejection)
+                        rejected.append(ticker)
+                        continue
                     store.save_ticker_data(ticker, df.copy())
                     written.append(ticker)
                     if len(df):
@@ -540,6 +557,18 @@ def sync_hf_to_cache(
         "Cached %d newly fetched and %d already-present symbols from %s/%s",
         len(written), len(already_cached), dataset_id, asset_dir,
     )
+    if rejected:
+        logger.warning(
+            "Refused to cache %d symbol(s) that failed a structural check: %s%s. "
+            "Run `portfolio-agent data validate` for the detail.",
+            len(rejected), ", ".join(rejected[:5]),
+            " ..." if len(rejected) > 5 else "",
+        )
+        if progress:
+            print(
+                f"  {len(rejected)} symbol(s) refused as structurally invalid "
+                f"(see `portfolio-agent data validate`)"
+            )
     if spans:
         earliest, latest = min(spans), max(spans)
         years = (latest - earliest).days / 365.25

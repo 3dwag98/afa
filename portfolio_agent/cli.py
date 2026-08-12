@@ -9,6 +9,8 @@ Commands:
     run-agent: Run the daily portfolio agent
     list-strategies: List registered strategies (rule-based, ML, UMA ensembles)
     list-trainers: List registered training procedures and their settings
+    data status: Report span, coverage and gaps in the cached market data
+    data validate: Check data invariants; non-zero exit on a structural failure
     gpu-check: Report which compute devices this install can actually use
 """
 
@@ -501,6 +503,101 @@ def cmd_list_strategies(args) -> int:
     return 0
 
 
+def _load_store_for_cli(args):
+    """Read the cache the CLI was pointed at, or explain why it is empty."""
+    from portfolio_agent.data_quality import load_store
+
+    symbols = (
+        [s.strip() for s in args.symbols.split(",") if s.strip()]
+        if getattr(args, "symbols", None)
+        else None
+    )
+    frames, unreadable = load_store(
+        cache_dir=getattr(args, "cache_dir", None),
+        symbols=symbols,
+        limit=getattr(args, "limit", None),
+    )
+    if not frames:
+        print("No readable data in the cache.")
+        print("Run `portfolio-agent download-data` first.")
+        if unreadable:
+            print(f"({len(unreadable)} file(s) were present but unreadable.)")
+    return frames, unreadable
+
+
+def cmd_data_status(args) -> int:
+    """Report what is actually in the store.
+
+    Exists because the five-year window was a config default nobody had
+    measured: every cached series began after the COVID crash, an entire regime
+    was missing from every backtest, and it took counting parquet rows by hand
+    to notice. This is that count, as a command.
+    """
+    import json
+
+    from portfolio_agent.data_quality import collect_status
+
+    frames, unreadable = _load_store_for_cli(args)
+    if not frames:
+        return 1
+
+    status = collect_status(
+        frames,
+        cache_dir=str(getattr(args, "cache_dir", None) or "data/market_data"),
+        min_sessions=args.min_sessions,
+        unreadable=unreadable,
+    )
+
+    if args.json:
+        document = status.to_dict()
+        if args.per_symbol:
+            document["per_symbol"] = [s.to_dict() for s in status.symbols]
+        print(json.dumps(document, indent=2, default=str))
+        return 0
+
+    print(status.render())
+    if args.per_symbol:
+        print()
+        print(status.to_frame().to_string(index=False))
+    return 0
+
+
+def cmd_data_validate(args) -> int:
+    """Check every invariant, exiting non-zero on a structural violation.
+
+    Non-zero on structural only. An advisory finding — a 30% circuit day, a
+    short listing — describes a correct store, and failing a build on one is
+    how a gate becomes something people switch off.
+    """
+    import json
+
+    from portfolio_agent.data_quality import validate_store
+
+    frames, _ = _load_store_for_cli(args)
+    if not frames:
+        return 1
+
+    report = validate_store(
+        frames,
+        extreme_return=args.extreme_return,
+        min_sessions=args.min_sessions,
+        use_calendar=not args.no_calendar,
+    )
+
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, default=str))
+    else:
+        print(report.render())
+
+    if args.strict and report.advisories:
+        print(
+            f"\n--strict: failing on {len(report.advisories)} advisory finding(s) "
+            f"that would not normally fail the gate."
+        )
+        return 1
+    return report.exit_code
+
+
 def cmd_gpu_check(args) -> int:
     """Report what compute devices this install can actually use."""
     try:
@@ -846,6 +943,65 @@ def create_parser() -> argparse.ArgumentParser:
         help="Strategy YAML to load when using --name (e.g. a UMA ensemble file)"
     )
     list_strategies_parser.set_defaults(func=cmd_list_strategies)
+
+    # data command group: status and validate
+    data_parser = subparsers.add_parser(
+        "data",
+        help="Inspect and validate the cached market-data store",
+    )
+    data_sub = data_parser.add_subparsers(dest="data_command")
+
+    def _add_shared_data_args(sub):
+        sub.add_argument(
+            "--cache-dir", type=str, default=None,
+            help="Parquet cache to read (default: the configured data store)",
+        )
+        sub.add_argument(
+            "--symbols", type=str, default=None,
+            help="Comma-separated tickers to inspect (default: everything cached)",
+        )
+        sub.add_argument(
+            "--limit", type=int, default=None,
+            help="Read at most this many symbols, for a quick look at a large store",
+        )
+        sub.add_argument(
+            "--min-sessions", type=int, default=252,
+            help="Sessions a symbol needs to be usable for training (default: 252)",
+        )
+        sub.add_argument("--json", action="store_true", help="Emit JSON instead of a report")
+
+    status_parser = data_sub.add_parser(
+        "status", help="Span, coverage, gaps and corporate actions in the cache"
+    )
+    _add_shared_data_args(status_parser)
+    status_parser.add_argument(
+        "--per-symbol", action="store_true",
+        help="Also print the per-symbol table",
+    )
+    status_parser.set_defaults(func=cmd_data_status)
+
+    validate_parser = data_sub.add_parser(
+        "validate",
+        help="Check data invariants; exits non-zero on a structural violation",
+    )
+    _add_shared_data_args(validate_parser)
+    validate_parser.add_argument(
+        "--extreme-return", type=float, default=0.25,
+        help="One-day move above which a bar is flagged, never dropped (default: 0.25)",
+    )
+    validate_parser.add_argument(
+        "--no-calendar", action="store_true",
+        help="Skip the missing-session check, which needs a cross-section to "
+             "infer a trading calendar from",
+    )
+    validate_parser.add_argument(
+        "--strict", action="store_true",
+        help="Also fail on advisory findings. Off by default: a store with real "
+             "circuit days in it is a correct store, and failing on those is how "
+             "a gate becomes something people disable.",
+    )
+    validate_parser.set_defaults(func=cmd_data_validate)
+    data_parser.set_defaults(func=lambda a: (data_parser.print_help(), 1)[1])
 
     # gpu-check command
     gpu_check_parser = subparsers.add_parser(
