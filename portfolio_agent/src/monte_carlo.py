@@ -56,9 +56,11 @@ TRADING_DAYS_PER_YEAR = 252
 # the prior standard deviation tau used to shrink each ticker's estimated
 # drift (see shrink_drift). 10% a year is deliberately generous: it says a
 # genuinely exceptional name might compound 20% a year faster than the market
-# and a genuinely poor one 20% slower. Method-of-moments estimates of this
-# quantity on daily equity panels typically come out at or below zero, because
-# the observed spread of sample means is almost entirely estimation noise.
+# and a genuinely poor one 20% slower. This is the *fallback*: when
+# use_empirical_drift_prior is on, tau is measured off the cross-section
+# instead (see estimate_cross_sectional_drift_prior). Measured on 66 cached NSE
+# names it comes out near 5%/year — about half this — so the fixed value
+# under-shrinks on that panel.
 DEFAULT_PRIOR_ANNUAL_DRIFT_STD = 0.10
 
 SimulationMethod = Literal["gaussian", "block_bootstrap", "jump_diffusion"]
@@ -97,10 +99,15 @@ class CrossSectionalDriftPrior(NamedTuple):
     The subtraction is the whole idea. The observed spread of sample means is
     the sum of the true spread and the estimation noise, and the second term is
     exactly the average noise contribution — so what survives is the dispersion
-    the panel actually evidences. On daily equity panels it very often comes out
-    at or below zero, which is a finding rather than a failure: it says the
-    cross-section of realized mean returns is indistinguishable from noise, and
-    the floor at zero shrinks every name to mu_bar accordingly.
+    the panel actually evidences.
+
+    What that comes to in practice, on 66 cached NSE names: tau^2 = 4.15e-8
+    (tau ~ 5.1%/year), against a noise floor of 7.91e-7 — so the panel does
+    evidence a real spread of true drifts, but a small one, and 95% of the
+    observed spread in sample means is estimation noise. On a synthetic panel
+    where every true drift is identical the difference lands within a rounding
+    error of zero and the max(0, .) floor takes it there, shrinking every name
+    to mu_bar. Both outcomes are findings rather than failures.
     """
 
     prior_mean_log_return: float  # mu_bar, daily log-return units
@@ -217,9 +224,11 @@ def shrink_drift(
     five years is ~0.057%/day — about 14% a year. Propagating that number
     forward as if it were known is what makes probability-of-profit an
     expensive random number generator: simulating tickers whose true drift is
-    exactly zero, 8.5% of them clear a 0.55 probability gate on estimation
-    error alone. On a 3,800-name universe that is ~322 zero-edge tickers
-    passing the gate every day.
+    exactly zero, 8.9% of them clear a 0.55 probability gate on estimation
+    error alone (at T=1250, sigma=2%/day, 20-day horizon — the rate is set
+    entirely by those three, ranging from 2.8% to 14.8% across plausible
+    values; see docs/QUANT_RESEARCH.md section 21). On a 3,800-name universe
+    that is ~340 zero-edge tickers passing the gate every day.
 
     Worse, the error is not independent of the rest of the platform. mu_hat is
     large precisely for stocks that have already risen, so an unshrunk drift

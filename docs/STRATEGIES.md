@@ -870,6 +870,32 @@ Anything in `config.yaml` can be overridden by environment variable using the
 AFA_STRATEGY__TYPE=mean_reversion portfolio-agent run-agent
 ```
 
+### The built-in `rule_based` scoring modes
+
+`rule_based` reads `scoring.method` from its YAML (or `scoring_mode` from
+`params`, which wins, so one shared YAML can serve several UMA members):
+
+```yaml
+scoring:
+  method: weighted_sum        # weighted_sum | rank_composite | probit_composite
+weights:
+  Trend: 25.0
+  Breakout: 25.0
+  Volume: 20.0
+  MC_Prob: 30.0
+```
+
+The three differ in what the 0–100 score *means* — absolute quality bar,
+percentile, or a standardized cross-sectional z mapped back through Φ. The
+choice matters if you are writing a strategy that consumes another's score, and
+the two cross-sectional modes set `requires_full_batch`, which changes how your
+strategy may be combined. See
+[Scoring modes](../README.md#scoring-modes) for the comparison and
+[REVIEW_STATUS.md](REVIEW_STATUS.md) for what each does and does not fix.
+
+An unknown mode raises at construction rather than falling back to a default —
+a silently-wrong scoring rule is far more expensive than a failed startup.
+
 ## Checklists
 
 **Creating**

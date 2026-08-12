@@ -17,7 +17,7 @@ not.
 | D1 | Kelly `f*` is a binary-bet stake fraction used as an allocation | **Done** | `src/risk.py::kelly_allocation_fraction` |
 | D2 | MC `probability_profit` dominated by drift-estimation noise | **Done**; prior now measured, not assumed | `src/monte_carlo.py::shrink_drift`, `::estimate_cross_sectional_drift_prior` |
 | D3 | No portfolio covariance anywhere | **Done**, wired into sizing; group constraints added | `src/portfolio.py`, `src/portfolio_optimizer.py`, `BacktestEngine._apply_portfolio_risk_cap` |
-| D4 | Neural target is absolute, not cross-sectional | **Done** — target and feature normalization | `agents/trainer.py::apply_cross_sectional_target`, `features/scaling.py::apply_cross_sectional_scaling` |
+| D4 | Neural target is absolute, not cross-sectional | **Done** — target and feature normalization, with the pipeline recorded in the checkpoint so inference reproduces it | `agents/trainer.py::apply_cross_sectional_target`, `features/scaling.py::apply_cross_sectional_scaling`, `strategies/ml_strategy.py::feature_normalization` |
 | D5 | GJR-GARCH unusable at platform scale | **Not done** | — |
 | D6 | No Markov chains / regime-switching models | **Done** as a module; not switched on | `src/markov_regime.py` |
 | D7 | Sharpe mis-specified; no PSR/DSR/PBO | **Done** | `src/performance_stats.py` |

@@ -706,7 +706,7 @@ class TestCrossSectionalDriftPrior:
 
         Every ticker's true drift is zero, so no ticker has an edge and the
         honest pass rate through a 0.55 probability gate is zero. Propagating
-        the raw sample mean, ~8.5% clear it on estimation error alone: with
+        the raw sample mean, ~8.9% clear it on estimation error alone: with
         T=1250 and sigma=2%/day the standard error of mu_hat is 5.7bp/day, and
         a name needs only 7.6bp/day of *spurious* drift to look like a 55%
         proposition over 20 days. On a 3,800-name universe that is ~320 false
