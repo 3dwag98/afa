@@ -7,13 +7,55 @@ Example: AFA_TRAINING__DEVICE="cuda" overrides training.device
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import yaml
 
 from .schema import AppConfig
+
+logger = logging.getLogger(__name__)
+
+#: Shipped inside the wheel so an installed copy has a real configuration
+#: rather than silently falling back to schema defaults. Kept as a copy of the
+#: project's `config.yaml` rather than a stripped-down file, so what an
+#: installed package does matches what the repository does.
+PACKAGED_DEFAULT = Path(__file__).resolve().parent / "default_config.yaml"
+
+
+def resolve_config_path(path: str = "config.yaml") -> Optional[Path]:
+    """Find the configuration file to load, or None if there is none.
+
+    Search order, most specific first:
+
+    1. The path as given, relative to the working directory — so `--config`
+       and a project-local `config.yaml` both work.
+    2. The same path relative to the project root, which is what makes running
+       from a subdirectory of a checkout behave.
+    3. The packaged default, which is the only one an installed copy has.
+
+    Returned rather than logged-and-loaded so callers can report *which* file a
+    run used. "Which config am I on" was previously unanswerable, and that is
+    what let an install run on settings nobody chose.
+    """
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate if candidate.exists() else None
+
+    if candidate.exists():
+        return candidate
+
+    project_root = Path(__file__).resolve().parent.parent.parent
+    from_root = project_root / path
+    if from_root.exists():
+        return from_root
+
+    if PACKAGED_DEFAULT.exists():
+        return PACKAGED_DEFAULT
+
+    return None
 
 
 def _flatten_dict(d: Dict[str, Any], parent_key: str = "", sep: str = "__") -> Dict[str, Any]:
@@ -86,21 +128,28 @@ def load_config(path: str = "config.yaml") -> AppConfig:
             - AFA_RISK__PORTFOLIO_VALUE_INR=500000 overrides risk.portfolio_value_inr
             - AFA_DATA__DATA_DIR="/custom/path" overrides data.data_dir
     """
-    # Resolve path relative to project root if not absolute
-    config_path = Path(path)
-    if not config_path.is_absolute():
-        # Try relative to current directory first
-        if not config_path.exists():
-            # Try relative to workspace root
-            workspace_root = Path(__file__).parent.parent.parent
-            config_path = workspace_root / path
-    
+    config_path = resolve_config_path(path)
+
     # Load base configuration from YAML
     base_config: Dict[str, Any] = {}
-    if config_path.exists():
+    if config_path is not None:
         with open(config_path, "r") as f:
             base_config = yaml.safe_load(f) or {}
-    
+        logger.info("Loaded configuration from %s", config_path)
+    else:
+        # Every value falls back to its schema default. Previously this was
+        # silent, and the result was a run that looked entirely normal while
+        # using settings nobody chose — an installed copy resolved
+        # universe_size to the schema's 10 rather than the project's 4000, and
+        # still produced results, charts and a report.
+        logger.warning(
+            "No configuration file found (looked for %r relative to the working "
+            "directory, the project root, and the packaged default). Every setting "
+            "is falling back to its schema default, which is almost certainly not "
+            "what you want — pass --config PATH to select one explicitly.",
+            path,
+        )
+
     # Get environment variable overrides
     env_prefix = "AFA_"
     env_overrides: Dict[str, Any] = {}
