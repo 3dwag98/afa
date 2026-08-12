@@ -4,6 +4,7 @@
 Commands:
     download-data: Download market data for the configured universe
     train: Train the ML model on historical data
+    train-sac: Train Soft Actor-Critic model for IndiaSAC strategy
     backtest: Run backtesting simulation
     run-agent: Run the daily portfolio agent
     list-strategies: List registered strategies (rule-based, ML, UMA ensembles)
@@ -431,6 +432,70 @@ def create_parser() -> argparse.ArgumentParser:
         help="Device for training (default: auto)"
     )
     train_parser.set_defaults(func=cmd_train)
+    
+    # train-sac command
+    train_sac_parser = subparsers.add_parser(
+        "train-sac",
+        help="Train Soft Actor-Critic model for IndiaSAC strategy"
+    )
+    train_sac_parser.add_argument(
+        "--epochs",
+        type=int,
+        default=100,
+        help="Number of training epochs (default: 100)"
+    )
+    train_sac_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=256,
+        help="Mini-batch size (default: 256)"
+    )
+    train_sac_parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=256,
+        help="Hidden layer dimension (default: 256)"
+    )
+    train_sac_parser.add_argument(
+        "--lr",
+        type=float,
+        default=3e-4,
+        help="Learning rate (default: 3e-4)"
+    )
+    train_sac_parser.add_argument(
+        "--buffer-size",
+        type=int,
+        default=100000,
+        help="Replay buffer capacity (default: 100000)"
+    )
+    train_sac_parser.add_argument(
+        "--entropy-coef",
+        type=float,
+        default=0.1,
+        help="Entropy regularization coefficient (default: 0.1)"
+    )
+    train_sac_parser.add_argument(
+        "--device",
+        type=str,
+        choices=["auto", "cuda", "mps", "cpu"],
+        default=None,
+        help="Device for training (default: auto)"
+    )
+    train_sac_parser.add_argument(
+        "--models-dir",
+        type=str,
+        default="models",
+        help="Directory to save checkpoints (default: models)"
+    )
+    train_sac_parser.add_argument(
+        "--model-name",
+        type=str,
+        default="india_sac",
+        help="Name for the saved model (default: india_sac)"
+    )
+    train_sac_parser.set_defaults(func=lambda args: __import__(
+        'portfolio_agent.agents.sac_trainer', fromlist=['run_sac_training_cli']
+    ).run_sac_training_cli(args))
     
     # backtest command
     backtest_parser = subparsers.add_parser(
