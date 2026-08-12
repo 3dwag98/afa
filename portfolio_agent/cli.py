@@ -6,7 +6,6 @@ Commands:
     train: Train a strategy through its registered trainer
     train-bulk: Train several strategies, or sweep settings, on one universe
     backtest: Run backtesting simulation
-    run-agent: Run the daily portfolio agent
     list-strategies: List registered strategies (rule-based, ML, UMA ensembles)
     list-trainers: List registered training procedures and their settings
     gpu-check: Report which compute devices this install can actually use
@@ -432,28 +431,6 @@ def cmd_backtest(args) -> int:
         return 1
 
 
-def cmd_run_agent(args) -> int:
-    """Run the daily portfolio agent."""
-    from portfolio_agent.src.orchestrator import run_orchestrator
-
-    config = get_config()
-
-    print("Running orchestrator...")
-    try:
-        excel_path = run_orchestrator(
-            force_refresh=args.force_refresh,
-            simulate_outcome=args.simulate_outcome,
-            update_outcomes=args.update_outcomes,
-            config=config,
-        )
-        print(f"Done. Report saved to: {excel_path}")
-        return 0
-    except Exception as e:
-        print(f"Error during execution: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
-
 
 def cmd_list_strategies(args) -> int:
     """List registered strategies, and optionally describe one in detail."""
@@ -806,27 +783,6 @@ def create_parser() -> argparse.ArgumentParser:
     )
     backtest_parser.set_defaults(func=cmd_backtest)
     
-    # run-agent command
-    agent_parser = subparsers.add_parser(
-        "run-agent",
-        help="Run the daily portfolio agent"
-    )
-    agent_parser.add_argument(
-        "--force-refresh",
-        action="store_true",
-        help="Force refresh of market data"
-    )
-    agent_parser.add_argument(
-        "--simulate-outcome",
-        action="store_true",
-        help="Simulate outcome for top recommendation"
-    )
-    agent_parser.add_argument(
-        "--update-outcomes",
-        action="store_true",
-        help="Update outcomes from market data"
-    )
-    agent_parser.set_defaults(func=cmd_run_agent)
 
     # list-strategies command
     list_strategies_parser = subparsers.add_parser(

@@ -7,8 +7,8 @@ from typing import Optional
 
 import pandas as pd
 
-from src.models import Recommendation, TradeOutcome
-from src.storage import init_db, save_trade_outcome, get_open_trades
+from portfolio_agent.src.models import Recommendation, TradeOutcome
+from .storage import init_db, save_trade_outcome, get_open_trades
 
 
 def simulate_outcome(
