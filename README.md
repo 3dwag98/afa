@@ -12,6 +12,7 @@ A lightweight, CLI-first platform for training and backtesting trading strategie
 |---|---|
 | **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | How the platform works, with diagrams — the strategy/model layer in detail, the backtest day loop, the concurrency map, device selection, and report data lineage |
 | **[docs/STRATEGIES.md](docs/STRATEGIES.md)** | Plug-and-play guide to **creating, updating and deleting** strategies, with worked examples for each kind, plus adding features and model architectures |
+| **[docs/CUSTOM_TRAINING.md](docs/CUSTOM_TRAINING.md)** | Pluggable **training procedures**: registering a trainer, per-strategy training configs, pinned universes so runs are comparable, bulk training and hyperparameter sweeps, and the checkpoint contract |
 | **[docs/QUANT_RESEARCH.md](docs/QUANT_RESEARCH.md)** | The academic basis for every strategy and risk model |
 | **[docs/REVIEW_STATUS.md](docs/REVIEW_STATUS.md)** | Item-by-item status against the quantitative review: what is done, what is not, and what each gap is blocked on. Every "done" names the code and the test that pins it |
 
@@ -25,6 +26,7 @@ A lightweight, CLI-first platform for training and backtesting trading strategie
 - [UMAs — combining strategies](#umas--combining-strategies)
 - [Quant research basis](#quant-research-basis)
 - [Training](#training)
+  - [Custom trainers (pluggable)](#custom-trainers-pluggable)
 - [Parallelism](#parallelism)
 - [Configuration](#configuration)
 - [Scheduling (cron / Task Scheduler)](#scheduling-cron--task-scheduler)
@@ -76,10 +78,40 @@ portfolio-agent download-data
     yfinance fetches per ticker in concurrent chunks; use --workers 1 if
     the provider rate-limits you.
 
-portfolio-agent train [--device auto|cuda|mps|cpu]
+portfolio-agent train
+    [--strategy NAME]                Strategy to train; its trainer comes from
+                                     config/strategies/<name>.yaml. Omit for the
+                                     supervised pipeline (unchanged behaviour).
+    [--trainer NAME]                 Override which registered trainer runs
+    [--set KEY=VALUE]                Override a hyperparameter; repeatable.
+                                     Validated against that trainer's schema, so
+                                     an unknown key stops the run.
+    [--strategy-config PATH]         Override config/strategies/<name>.yaml
+    [--device auto|cuda|mps|cpu]     Device for training
+    [--tickers A,B,C]                Pin the universe to exactly these names
+    [--universe-snapshot PATH]       Train on a saved universe snapshot
+    [--save-snapshot PATH]           Write the universe used, for reproducibility
+    [--universe-size N]              Cap a fresh draw
+    [--models-dir DIR] [--model-name NAME]
     Train the configured model (default: LSTM) on real cached market data.
     Set training.use_synthetic_data: true in config.yaml to train on
     synthetic data instead (offline/CI testing only).
+
+portfolio-agent train-bulk
+    [--strategies a,b,c]             Train each on ONE pinned universe
+    [--sweep KEY=V1,V2]              Sweep a hyperparameter; repeatable for a
+                                     cross product. Needs one --strategies value.
+    [--set KEY=VALUE]                Held fixed across every job
+    [--save-checkpoints]             Write a checkpoint per sweep point (off by
+                                     default — a sweep asks which settings to use)
+    [--tickers | --universe-snapshot | --save-snapshot | --universe-size]
+    [--models-dir DIR]
+    Trains every job against the same tickers and prints a comparison table.
+    A failing job is reported and the rest continue.
+
+portfolio-agent list-trainers [--name TRAINER]
+    List registered training procedures. --name shows one trainer's
+    hyperparameters, their defaults and what each does.
 
 portfolio-agent backtest
     [--strategy rule_based|lstm|ensemble|...]   Strategy to backtest (default: config.strategy.type)
@@ -396,6 +428,34 @@ Networks on noisy financial data are systematically overconfident — the score 
 Plus, already in place from the underlying `DataLoader`/device setup: `pin_memory` on CUDA, `persistent_workers`/`prefetch_factor` for the training loop, and `cudnn.benchmark` enabled on fixed-size CUDA inputs.
 
 Set `training.use_synthetic_data: true` to fall back to generated random-walk data instead (offline/CI testing only — real training should leave this `false`).
+
+### Custom trainers (pluggable)
+
+Everything above is *one* training procedure — supervised regression on a forward-return label. A strategy that learns some other way (an RL policy, a ranker) plugs into a **trainer registry**, the same way features, model architectures and strategies already do:
+
+```bash
+portfolio-agent list-trainers                 # what can train
+portfolio-agent list-trainers --name sac      # and with which settings
+
+# Train a strategy through the trainer its YAML declares
+portfolio-agent train --strategy india_sac --set epochs=300
+
+# Compare several on one pinned universe, or sweep a grid
+portfolio-agent train-bulk --strategies india_sac,lstm --save-snapshot universe/cmp.json
+portfolio-agent train-bulk --strategies india_sac --sweep gamma=0.0,0.9
+```
+
+`portfolio-agent train` with no `--strategy` resolves to the supervised pipeline and behaves exactly as it always has.
+
+Three things make this more than a dispatch table:
+
+- **Each trainer declares a pydantic schema for its own hyperparameters**, with `extra="forbid"`. A knob aimed at the wrong procedure — or misspelled — stops the run and names the valid alternatives, instead of being accepted and silently ignored.
+- **Training settings resolve per strategy**: `--set` beats `config/strategies/<strategy>.yaml`, which beats the strategy class's declared defaults, which beat the global `training:` block, which beats the trainer's schema defaults.
+- **Universes can be pinned.** `--save-snapshot` / `--universe-snapshot` freeze the exact ticker set (with a content fingerprint that travels into the checkpoint), because comparing two models is only meaningful when both saw the same names — and the default cache draw does not guarantee that across two invocations.
+
+`notebooks/` holds two notebooks built on `portfolio_agent.lab.Lab`, which pins a universe once and uses it for training, backtesting and comparison alike.
+
+> **Full guide: [docs/CUSTOM_TRAINING.md](docs/CUSTOM_TRAINING.md)** — writing a trainer, the config precedence rules, bulk runs and sweeps, the checkpoint contract, and the SAC trainer's design.
 
 ## Parallelism
 

@@ -1,0 +1,75 @@
+# IndiaSAC — continuous-allocation RL strategy.
+#
+# The `training:` block below is read by the pluggable training layer
+# (portfolio_agent/training/config.py) when you run:
+#
+#     portfolio-agent train --strategy india_sac
+#
+# Precedence, strongest first:
+#   1. --set on the command line       (--set epochs=50)
+#   2. this file
+#   3. IndiaSACStrategy.training_defaults()
+#   4. the global `training:` block in config.yaml
+#   5. the SAC trainer's schema defaults (training/trainers/sac.py)
+#
+# Every key here is validated against SACTrainerConfig, which forbids unknown
+# fields — a misspelled setting stops the run and names itself rather than
+# being silently ignored.
+
+name: "India SAC Allocation"
+description: "Soft Actor-Critic policy emitting a per-name allocation weight in [0, 1]"
+version: "1.0"
+
+training:
+  trainer: sac
+
+  epochs: 200
+  batch_size: 256
+  learning_rate: 0.0003
+  # Chronological, never random: the last 20% of each ticker's history is held
+  # out, and the standardizer is fitted on the first 80% only.
+  train_fraction: 0.8
+  seed: 42
+
+  hidden_dim: 256
+
+  # 0 treats each allocation decision as a contextual bandit. A price-taking
+  # book does not move the market, so the state sequence is exogenous and
+  # bootstrapping over it adds variance without adding signal. Raise it only if
+  # you have a reason to believe the turnover coupling matters more than that.
+  gamma: 0.0
+  tau: 0.005
+  buffer_size: 200000
+
+  # Alpha is tuned against target_entropy rather than held fixed: the
+  # differential-Sortino reward's scale depends on the data, and a temperature
+  # that suits one universe suits no other.
+  entropy_coef: 0.1
+  auto_entropy: true
+
+  gradient_steps: 200
+  # Re-collect on-policy experience every epoch. Collecting once and training
+  # against a frozen buffer means the actor never sees the consequences of its
+  # own decisions — it just fits the initial random policy's returns.
+  rollout_every: 1
+
+  # Charged on |a_t - a_{t-1}|. A cost that does not depend on the action
+  # cannot penalize turnover: it shifts every action's reward equally and
+  # leaves the optimum exactly where it was.
+  friction_cost: 0.008
+
+  sortino_eta: 0.01
+  sortino_warmup: 20
+  reward_clip: 10.0
+  grad_clip: 1.0
+
+  min_history: 252
+  warmup_transitions: 1000
+
+# Inference-side parameters, read by IndiaSACStrategy.__init__ via
+# strategy.params in config.yaml. Listed here for reference — the strategy
+# reads them from config.yaml's `strategy.params`, not from this file.
+inference:
+  action_threshold: 0.60
+  exit_threshold: 0.40
+  model_name: india_sac

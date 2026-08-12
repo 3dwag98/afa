@@ -162,7 +162,9 @@ def _load_and_split_ticker(
     )
 
 
-def load_panel_by_ticker(config: AppConfig) -> Dict[str, pd.DataFrame]:
+def load_panel_by_ticker(
+    config: AppConfig, universe: Optional[List[str]] = None
+) -> Dict[str, pd.DataFrame]:
     """Featurized, date-indexed frames keyed by ticker.
 
     The shared source for both panel constructions: load_data() stacks these
@@ -170,6 +172,13 @@ def load_panel_by_ticker(config: AppConfig) -> Dict[str, pd.DataFrame]:
     each one by date. Keeping them separate is what lets walk-forward respect
     chronology — see that function for why a row-index split of the stacked
     panel does not.
+
+    Args:
+        config: Application configuration.
+        universe: Exact tickers to load, bypassing the cache draw below. Passed
+            by the pluggable training layer (training/universe.py) when several
+            runs must be compared on identical names — see the note on
+            purpose="train" for what pinning gives up.
     """
     if config.training.use_synthetic_data:
         return {"SYNTHETIC": prepare_features(_generate_synthetic_ohlcv(), config, verbose=False)}
@@ -178,7 +187,11 @@ def load_panel_by_ticker(config: AppConfig) -> Dict[str, pd.DataFrame]:
     # different draw from the cache than the backtest universe. Evaluating a
     # model on the very names it was fitted on is not out-of-sample in the
     # cross-sectional dimension, however carefully the dates are split.
-    tickers = resolve_backtest_universe(
+    #
+    # A caller that pins `universe` takes that separation on itself: it is the
+    # right trade when the point of the run is to compare two models, which is
+    # only meaningful when both saw the same names.
+    tickers = list(universe) if universe else resolve_backtest_universe(
         max_tickers=config.data.universe_size,
         selection=config.data.universe_selection,
         seed=config.data.universe_seed,
@@ -287,7 +300,7 @@ def load_panel_by_ticker(config: AppConfig) -> Dict[str, pd.DataFrame]:
     return ordered
 
 
-def load_data(config: AppConfig) -> pd.DataFrame:
+def load_data(config: AppConfig, universe: Optional[List[str]] = None) -> pd.DataFrame:
     """Load and featurize training data into a single stacked panel.
 
     Each ticker is featurized and split 70/15/15 chronologically
@@ -311,11 +324,12 @@ def load_data(config: AppConfig) -> pd.DataFrame:
 
     Args:
         config: Application configuration.
+        universe: Exact tickers to load, bypassing the cache draw.
 
     Returns:
         DataFrame with computed features and target column (already featurized).
     """
-    by_ticker = load_panel_by_ticker(config)
+    by_ticker = load_panel_by_ticker(config, universe)
 
     train_parts, val_parts, test_parts = [], [], []
     for frame in by_ticker.values():
@@ -1267,7 +1281,9 @@ def run_walk_forward_validation(
     return summary
 
 
-def run_training(config: AppConfig) -> Dict[str, Any]:
+def run_training(
+    config: AppConfig, universe: Optional[List[str]] = None
+) -> Dict[str, Any]:
     """Run GPU-accelerated training loop for portfolio forecasting model.
     
     This function implements:
@@ -1281,7 +1297,10 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
     
     Args:
         config: Application configuration containing training parameters.
-        
+        universe: Exact tickers to train on, bypassing the cache draw. Passed by
+            the pluggable training layer so several runs can be compared on
+            identical names.
+
     Returns:
         Dictionary with training metadata including:
             - feature_names: List of input feature names
@@ -1319,7 +1338,7 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
     # 2. Load and featurize training data (real cached tickers by default)
     # =========================================================================
     print("\nLoading and featurizing training data...")
-    panel_by_ticker = load_panel_by_ticker(config)
+    panel_by_ticker = load_panel_by_ticker(config, universe)
 
     # =========================================================================
     # 3. Walk-forward validation (before the final fit)

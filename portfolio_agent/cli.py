@@ -3,10 +3,12 @@
 
 Commands:
     download-data: Download market data for the configured universe
-    train: Train the ML model on historical data
+    train: Train a strategy through its registered trainer
+    train-bulk: Train several strategies, or sweep settings, on one universe
     backtest: Run backtesting simulation
     run-agent: Run the daily portfolio agent
     list-strategies: List registered strategies (rule-based, ML, UMA ensembles)
+    list-trainers: List registered training procedures and their settings
     gpu-check: Report which compute devices this install can actually use
 """
 
@@ -137,9 +139,15 @@ def cmd_download_data(args) -> int:
 
 
 def cmd_train(args) -> int:
-    """Train model command."""
+    """Train a strategy through its registered trainer.
+
+    With no --strategy this resolves to the supervised pipeline and behaves
+    exactly as it always has. With one, the strategy's declared trainer runs
+    instead — see portfolio_agent/training/ for the registry.
+    """
     try:
-        from portfolio_agent.agents.trainer import run_training
+        from portfolio_agent.training import run_training_job
+        from portfolio_agent.training.config import parse_overrides
         from portfolio_agent.utils.device import get_device
     except ImportError as e:
         print(f"Error: training requires PyTorch, which is not installed ({e}).")
@@ -148,30 +156,193 @@ def cmd_train(args) -> int:
 
     config = get_config()
 
-    # Override device if specified
-    if args.device:
-        config.training.device = args.device
+    try:
+        overrides = parse_overrides(getattr(args, "set", None))
+    except ValueError as e:
+        print(f"Error: {e}")
+        return 1
 
     # Resolve the device once, here. get_device() downgrades an unavailable
-    # accelerator to CPU itself, so writing the resolved type back to the
-    # config guarantees every later consumer (dataloaders, mixed precision,
-    # the checkpoint metadata) agrees with what was printed.
-    device = get_device(config.training.device)
-    config.training.device = device.type
+    # accelerator to CPU itself, so passing the resolved type down guarantees
+    # every later consumer (dataloaders, mixed precision, the checkpoint
+    # metadata) agrees with what was printed.
+    if args.device:
+        overrides.setdefault("device", get_device(args.device).type)
 
-    print(f"Starting training with device: {device}")
+    tickers = (
+        [t.strip() for t in args.tickers.split(",") if t.strip()]
+        if getattr(args, "tickers", None)
+        else None
+    )
 
     try:
-        metadata = run_training(config)
-        print("\nTraining complete!")
-        print(f"  Epochs trained: {metadata.get('epochs_trained', 0)}")
-        print(f"  Best validation loss: {metadata.get('best_val_loss', 'N/A')}")
-        return 0
-    except Exception as e:
-        print(f"Error during training: {e}")
-        import traceback
-        traceback.print_exc()
+        run = run_training_job(
+            config,
+            strategy=args.strategy,
+            trainer=args.trainer,
+            overrides=overrides,
+            universe=tickers,
+            snapshot=args.universe_snapshot,
+            universe_size=args.universe_size,
+            models_dir=args.models_dir,
+            model_name=args.model_name,
+            strategy_config_file=args.strategy_config,
+        )
+    except (KeyError, ValueError) as e:
+        # A bad trainer name or an unknown hyperparameter. The message already
+        # names the offending key and the valid alternatives.
+        print(f"Error: {e}")
         return 1
+
+    if not run.ok:
+        print(f"\nTraining failed: {run.error}")
+        return 1
+
+    if args.save_snapshot:
+        run.universe.save(args.save_snapshot)
+        print(f"Universe snapshot written to {args.save_snapshot}")
+
+    print("\nTraining complete!")
+    print(f"  Strategy:   {run.strategy or '(supervised default)'}")
+    print(f"  Trainer:    {run.trainer}")
+    print(f"  Universe:   {len(run.universe)} tickers (fingerprint {run.universe.fingerprint})")
+    print(f"  Duration:   {run.duration_seconds:.1f}s")
+    for key, value in sorted(run.artifact.metrics.items()):
+        if isinstance(value, (int, float)):
+            print(f"  {key}: {value:.6f}" if isinstance(value, float) else f"  {key}: {value}")
+    if run.checkpoint_path:
+        print(f"  Checkpoint: {run.checkpoint_path}")
+    return 0
+
+
+def cmd_train_bulk(args) -> int:
+    """Train several strategies or hyperparameter settings on one universe."""
+    try:
+        from portfolio_agent.training import run_bulk
+        from portfolio_agent.training.bulk import BulkJob, sweep
+        from portfolio_agent.training.config import parse_overrides
+    except ImportError as e:
+        print(f"Error: training requires PyTorch, which is not installed ({e}).")
+        print("Install it with: uv sync --extra gpu")
+        return 1
+
+    config = get_config()
+
+    try:
+        base_overrides = parse_overrides(getattr(args, "set", None))
+    except ValueError as e:
+        print(f"Error: {e}")
+        return 1
+
+    strategies = [s.strip() for s in (args.strategies or "").split(",") if s.strip()]
+
+    if args.sweep:
+        if len(strategies) != 1:
+            print("Error: --sweep trains one strategy; pass exactly one --strategies value.")
+            return 1
+        try:
+            grid = _parse_sweep_grid(args.sweep)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return 1
+        jobs = sweep(
+            strategies[0], grid, base_overrides=base_overrides, save=args.save_checkpoints
+        )
+    else:
+        if not strategies:
+            print("Error: pass --strategies a,b,c (or --sweep with one strategy).")
+            return 1
+        jobs = [
+            BulkJob(strategy=name, overrides=dict(base_overrides), model_name=name)
+            for name in strategies
+        ]
+
+    tickers = (
+        [t.strip() for t in args.tickers.split(",") if t.strip()]
+        if getattr(args, "tickers", None)
+        else None
+    )
+
+    report = run_bulk(
+        config,
+        jobs,
+        universe=tickers,
+        snapshot=args.universe_snapshot,
+        universe_size=args.universe_size,
+        models_dir=args.models_dir,
+        save_snapshot_to=args.save_snapshot,
+    )
+
+    print(f"\nBulk run: {len(jobs)} job(s) on {len(report.universe)} tickers "
+          f"(universe {report.universe.fingerprint})")
+    print(report.to_frame().to_string(index=False))
+
+    best = report.best()
+    if best is not None:
+        print(f"\nBest: {best.strategy or 'supervised'} ({best.trainer}) "
+              f"metric={best.artifact.primary_metric():.6f}")
+
+    if report.failures:
+        print(f"\n{len(report.failures)} job(s) failed: {report.failures}")
+        return 1
+    return 0
+
+
+def _parse_sweep_grid(specs: list[str]) -> dict:
+    """Turn `["epochs=10,50", "gamma=0.0,0.9"]` into a grid mapping.
+
+    Values stay strings; the trainer's schema coerces and validates them, so a
+    grid point that is not a legal value fails by name rather than silently.
+    """
+    grid: dict[str, list[str]] = {}
+    for spec in specs:
+        if "=" not in spec:
+            raise ValueError(f"--sweep expects KEY=v1,v2, got {spec!r}")
+        key, _, values = spec.partition("=")
+        key = key.strip()
+        parsed = [v.strip() for v in values.split(",") if v.strip()]
+        if not key or not parsed:
+            raise ValueError(f"--sweep expects KEY=v1,v2, got {spec!r}")
+        grid[key] = parsed
+    return grid
+
+
+def cmd_list_trainers(args) -> int:
+    """List registered training procedures and their hyperparameters."""
+    from portfolio_agent.training import get_trainer, list_trainers
+
+    names = list_trainers()
+    if not names:
+        print("No trainers are registered — PyTorch is probably not installed.")
+        print("Install it with: uv sync --extra gpu")
+        return 1
+
+    if args.name:
+        if args.name not in names:
+            print(f"Unknown trainer: {args.name!r}. Available: {names}")
+            return 1
+        trainer_class = get_trainer(args.name)
+        schema = trainer_class.config_model()
+        print(f"{args.name}  ({trainer_class.__name__})")
+        if trainer_class.strategy_name:
+            print(f"  trains: {trainer_class.strategy_name}")
+        print("  settings:")
+        for field_name, field in schema.model_fields.items():
+            default = field.default
+            description = field.description or ""
+            print(f"    {field_name} = {default!r}")
+            if description:
+                print(f"        {description}")
+        return 0
+
+    print("Registered trainers:")
+    for name in names:
+        trainer_class = get_trainer(name)
+        target = f" -> {trainer_class.strategy_name}" if trainer_class.strategy_name else ""
+        print(f"  - {name}{target}")
+    print("\nUse --name <trainer> to see its settings, and set them with")
+    print("  portfolio-agent train --strategy <s> --set key=value")
+    return 0
 
 
 def _resolve_inference_device(requested: str) -> str:
@@ -356,6 +527,41 @@ def cmd_gpu_check(args) -> int:
     return 0 if cuda_is_available() or config.training.device in ("cpu", "auto") else 1
 
 
+def _add_universe_arguments(parser: argparse.ArgumentParser) -> None:
+    """Universe-pinning flags shared by `train` and `train-bulk`.
+
+    Comparing two models is only meaningful when they saw the same names, and
+    the default cache draw does not guarantee that across two invocations — it
+    depends on what happens to be cached at the time. These flags make the
+    universe explicit and reproducible.
+    """
+    parser.add_argument(
+        "--tickers",
+        type=str,
+        default=None,
+        help="Comma-separated tickers to train on, pinning the universe exactly"
+    )
+    parser.add_argument(
+        "--universe-snapshot",
+        type=str,
+        default=None,
+        help="Path to a saved universe snapshot to train on (see --save-snapshot)"
+    )
+    parser.add_argument(
+        "--save-snapshot",
+        type=str,
+        default=None,
+        help="Write the universe actually used to this JSON file, so a later run "
+             "can reproduce the comparison with --universe-snapshot"
+    )
+    parser.add_argument(
+        "--universe-size",
+        type=int,
+        default=None,
+        help="Cap the drawn universe (default: config.data.universe_size)"
+    )
+
+
 def create_parser() -> argparse.ArgumentParser:
     """Create the argument parser."""
     parser = argparse.ArgumentParser(
@@ -421,7 +627,35 @@ def create_parser() -> argparse.ArgumentParser:
     # train command
     train_parser = subparsers.add_parser(
         "train",
-        help="Train the ML model on historical data"
+        help="Train a strategy through its registered trainer "
+             "(no --strategy runs the supervised pipeline, as before)"
+    )
+    train_parser.add_argument(
+        "--strategy",
+        type=str,
+        default=None,
+        help="Strategy to train, e.g. 'india_sac'. Its trainer comes from "
+             "config/strategies/<strategy>.yaml. Omit for the supervised default."
+    )
+    train_parser.add_argument(
+        "--trainer",
+        type=str,
+        default=None,
+        help="Override which registered trainer runs (see `list-trainers`)."
+    )
+    train_parser.add_argument(
+        "--set",
+        action="append",
+        metavar="KEY=VALUE",
+        default=None,
+        help="Override one training hyperparameter; repeatable. Validated against "
+             "the trainer's own schema, so an unknown key stops the run."
+    )
+    train_parser.add_argument(
+        "--strategy-config",
+        type=str,
+        default=None,
+        help="Path to the strategy's YAML, overriding config/strategies/<strategy>.yaml"
     )
     train_parser.add_argument(
         "--device",
@@ -430,8 +664,75 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         help="Device for training (default: auto)"
     )
+    _add_universe_arguments(train_parser)
+    train_parser.add_argument(
+        "--models-dir",
+        type=str,
+        default="models",
+        help="Directory for the checkpoint (default: models)"
+    )
+    train_parser.add_argument(
+        "--model-name",
+        type=str,
+        default=None,
+        help="Checkpoint basename, written as <name>_best.pt (default: the strategy name)"
+    )
     train_parser.set_defaults(func=cmd_train)
-    
+
+    # train-bulk command
+    bulk_parser = subparsers.add_parser(
+        "train-bulk",
+        help="Train several strategies, or sweep hyperparameters, on one pinned universe"
+    )
+    bulk_parser.add_argument(
+        "--strategies",
+        type=str,
+        default=None,
+        help="Comma-separated strategies to train, e.g. 'india_sac,lstm'"
+    )
+    bulk_parser.add_argument(
+        "--sweep",
+        action="append",
+        metavar="KEY=V1,V2",
+        default=None,
+        help="Sweep one hyperparameter over values; repeatable for a cross product. "
+             "Requires exactly one --strategies value."
+    )
+    bulk_parser.add_argument(
+        "--set",
+        action="append",
+        metavar="KEY=VALUE",
+        default=None,
+        help="Hyperparameter held fixed across every job; repeatable."
+    )
+    bulk_parser.add_argument(
+        "--save-checkpoints",
+        action="store_true",
+        help="Write a checkpoint per sweep point. Off by default: a sweep usually "
+             "asks which settings to use rather than producing the model."
+    )
+    _add_universe_arguments(bulk_parser)
+    bulk_parser.add_argument(
+        "--models-dir",
+        type=str,
+        default="models",
+        help="Directory for checkpoints (default: models)"
+    )
+    bulk_parser.set_defaults(func=cmd_train_bulk)
+
+    # list-trainers command
+    trainers_parser = subparsers.add_parser(
+        "list-trainers",
+        help="List registered training procedures and their settings"
+    )
+    trainers_parser.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        help="Show one trainer's settings in detail"
+    )
+    trainers_parser.set_defaults(func=cmd_list_trainers)
+
     # backtest command
     backtest_parser = subparsers.add_parser(
         "backtest",

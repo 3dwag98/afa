@@ -74,3 +74,48 @@ class BaseStrategy(ABC):
     def exit_rules(self) -> Dict[str, Any]:
         """Optional: return the exit rules for this strategy (for reporting/introspection)."""
         return {}
+
+
+class TrainableStrategy(BaseStrategy):
+    """A strategy whose weights come from a registered training procedure.
+
+    This is a *declaration*, not a training interface: a subclass says which
+    trainer produces its checkpoint and, optionally, what that trainer's
+    defaults should be for it. The loop itself lives in
+    `portfolio_agent/training/trainers/`.
+
+    Splitting it this way is deliberate. Putting `train()` on the strategy
+    couples what is being learned to how it is learned: two strategies could
+    not share one procedure without inheriting from each other, and retraining
+    a strategy a different way would mean editing the class that scores it.
+    With the trainer named rather than embedded, `trainer_name` is a one-line
+    change and the scoring path never moves.
+
+    Loading stays on `load()` — the contract the backtest engine already calls
+    (`agents/backtester.py`). A second loading method taking a path would be a
+    third convention alongside `load()` and `MLStrategy.load_model(name)`, and
+    nothing would call it.
+
+    Example:
+
+        class MyStrategy(TrainableStrategy):
+            trainer_name = "sac"
+
+            @classmethod
+            def training_defaults(cls) -> Dict[str, Any]:
+                return {"epochs": 300, "hidden_dim": 128}
+    """
+
+    #: Registry name of the trainer that produces this strategy's checkpoint
+    #: (see portfolio_agent/training/registry.py). Subclasses must set it.
+    trainer_name: str = ""
+
+    @classmethod
+    def training_defaults(cls) -> Dict[str, Any]:
+        """Trainer settings this strategy prefers, overriding schema defaults.
+
+        Sits below the strategy's YAML and any explicit override in precedence,
+        so it is a default rather than a lock. Return an empty dict to accept
+        the trainer's own defaults unchanged.
+        """
+        return {}
