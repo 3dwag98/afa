@@ -186,7 +186,7 @@ The two flags mean different things and should not be confused:
 | Property | Means | Set by | Consequence of getting it wrong |
 |---|---|---|---|
 | `supports_gpu_batch` | "`score_batch()` is a genuine batched forward pass" | `MLStrategy` | Performance only — you lose GPU batching |
-| `requires_full_batch` | "my signal depends on ranking against the whole universe" | `MomentumStrategy`, `LowVolatilityStrategy`, and any `EnsembleStrategy` containing one | **Correctness** — ranking against a universe of one is meaningless |
+| `requires_full_batch` | "my signal depends on ranking against the whole universe" | `MomentumStrategy`, `LowVolatilityStrategy`, `RuleBasedStrategy` under `scoring.method: rank_composite` or `probit_composite`, and any `EnsembleStrategy` containing one | **Correctness** — ranking against a universe of one is meaningless |
 
 A cross-sectional strategy scored one ticker at a time is not slow, it is
 wrong: the top decile of a single stock is always that stock.
@@ -672,10 +672,29 @@ flowchart TD
    portfolio-level bootstrap Monte Carlo are seeded (`simulation.random_seed`),
    and the bootstrap draws from a local generator so it neither disturbs nor
    depends on global NumPy state.
+4. **Cross-sectional estimators are pure functions of the round.** The
+   empirical drift prior, the per-date feature scaling and the probit composite
+   introduce no randomness at all — they are arithmetic over a
+   deterministically-ordered panel.
+
+Two properties in that last group are easy to break by accident and are worth
+stating explicitly, because neither fails loudly:
+
+- **The drift prior travels per task, not through the pool initializer.** The
+  scoring pool is created once per backtest and outlives the round it was built
+  in, so installing the prior at worker startup would silently pin a 1,250-day
+  run to day one's cross-section. It is four floats, so shipping it with each
+  task costs nothing next to the history frame already being sent.
+- **Trial identity hashes with SHA-256, never the builtin `hash()`.**
+  `str.__hash__` is salted per process unless `PYTHONHASHSEED` is pinned, so a
+  trial log keyed on it would count every re-run as a fresh trial, inflate N,
+  and slowly over-deflate every Sharpe the platform reports — a drift that
+  looks like a result rather than a bug.
 
 This is enforced by tests, not just convention:
 `portfolio_agent/tests/test_parallel_determinism.py` runs the same backtest
-serially and in parallel and compares the exported workbook sheet by sheet.
+serially and in parallel and compares the exported workbook sheet by sheet, and
+each estimator above has its own determinism test.
 
 ## Module map
 
@@ -691,7 +710,11 @@ portfolio_agent/
 ├── features/
 │   ├── registry.py         @register_feature name -> function
 │   ├── technical.py        the lag-safe indicators themselves
-│   └── pipeline.py         build_features(df, names) -> DataFrame
+│   ├── pipeline.py         build_features(df, names) -> DataFrame
+│   └── scaling.py          model-input standardization: the checkpointed
+│                           global scaler (a conditioning fix) and the
+│                           per-date cross-sectional z-score (a statistical
+│                           one, which fits no state and so cannot leak)
 ├── strategies/
 │   ├── base.py             BaseStrategy — the interface you implement
 │   ├── types.py            RiskParams, StrategyContext, StrategySignal, and
@@ -722,8 +745,15 @@ portfolio_agent/
     │                       applied as a ceiling on the fixed-fractional risk
     │                       budget), Beta-shrunk win rate, net-of-cost RR
     ├── portfolio.py        covariance estimation (Ledoit-Wolf shrinkage, EW,
-    │                       single-factor), portfolio risk measurement, the
-    │                       constrained long-only optimizer and HRP
+    │                       single-factor, and the two composed as
+    │                       shrunk_ewma_covariance), portfolio risk
+    │                       measurement, the projected-subgradient long-only
+    │                       optimizer and HRP
+    ├── portfolio_optimizer.py  the same mean-variance objective as a true QP
+    │                       (cvxpy, optional extra), adding the one constraint
+    │                       the subgradient solver cannot express: group /
+    │                       sector limits. L1 turnover linearized with an
+    │                       auxiliary variable
     ├── trigger_engine.py   signal arbitration: conflict penalty, vetoes,
     │                       firing modes, position-size multiplier
     ├── regime.py           market regime classification + volatility targeting
@@ -736,12 +766,18 @@ portfolio_agent/
     ├── liquidity.py        circuit-lock (1/2/5/10/20% bands), operator-trap
     │                       and illiquidity / zombie screening
     ├── sectors.py          ticker->sector map and concentration caps
-    ├── risk_analytics.py   CAGR/Sharpe/Sortino/drawdown, bootstrap MC
+    ├── risk_analytics.py   CAGR/Sharpe/Sortino/drawdown, bootstrap MC, and
+    │                       the risk-free rate resolution: a dated T-bill
+    │                       series when one is cached, otherwise the
+    │                       configured constant, logging which it used
     ├── performance_stats.py PSR / deflated Sharpe / PBO / rank IC, the
-    │                       Newey-West overlap correction and the trial log
+    │                       Newey-West overlap correction, and the trial log
+    │                       with its config-hash identity and deduplication
     ├── monte_carlo.py      per-symbol forward simulation (scoring input):
     │                       gaussian / block bootstrap / jump diffusion, with
-    │                       the drift shrunk and its uncertainty propagated
+    │                       the drift shrunk toward an empirical-Bayes prior
+    │                       measured off the cross-section, and its
+    │                       uncertainty propagated
     ├── volatility_models.py GJR-GARCH(1,1), incl. the gap-aware fit
     ├── compliance.py       eligibility gates
     ├── indicators.py       ATR/RSI/MACD/ADX and the IndicatorSnapshot the

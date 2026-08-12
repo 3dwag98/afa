@@ -252,10 +252,13 @@ simulation:
   separate_overnight_gaps: true
   # The sample mean of daily returns has a standard error of sigma/sqrt(T) —
   # about 14% a year for a 2%/day name over five years — so propagating it
-  # forward unshrunk made probability-of-profit mostly estimation noise:
-  # 5.2% of tickers with exactly zero true drift cleared the 0.55 gate below
-  # on noise alone. This is the prior dispersion of *true* annual drifts used
-  # to shrink each estimate toward zero; raising it recovers the raw mean.
+  # forward unshrunk made probability-of-profit mostly estimation noise: with
+  # T=1250, sigma=2%/day and a 20-day horizon, 8.9% of tickers with exactly
+  # zero true drift cleared the 0.55 gate below on noise alone. That figure is
+  # entirely set by those three inputs (see docs/QUANT_RESEARCH.md section 21
+  # for the closed form and its sensitivity). This is the prior dispersion of
+  # *true* annual drifts used to shrink each estimate toward zero; raising it
+  # recovers the raw mean.
   prior_annual_drift_std: 0.10
   # Draw each path's drift from the posterior rather than sharing its mean, so
   # probability_profit accounts for the drift being estimated, not known.

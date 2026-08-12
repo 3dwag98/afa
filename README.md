@@ -13,6 +13,7 @@ A lightweight, CLI-first platform for training and backtesting trading strategie
 | **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | How the platform works, with diagrams — the strategy/model layer in detail, the backtest day loop, the concurrency map, device selection, and report data lineage |
 | **[docs/STRATEGIES.md](docs/STRATEGIES.md)** | Plug-and-play guide to **creating, updating and deleting** strategies, with worked examples for each kind, plus adding features and model architectures |
 | **[docs/QUANT_RESEARCH.md](docs/QUANT_RESEARCH.md)** | The academic basis for every strategy and risk model |
+| **[docs/REVIEW_STATUS.md](docs/REVIEW_STATUS.md)** | Item-by-item status against the quantitative review: what is done, what is not, and what each gap is blocked on. Every "done" names the code and the test that pins it |
 
 ## Table of Contents
 
@@ -20,6 +21,7 @@ A lightweight, CLI-first platform for training and backtesting trading strategie
 - [CLI Reference](#cli-reference)
 - [GPU / CUDA setup](#gpu--cuda-setup)
 - [Strategies (plug-and-play)](#strategies-plug-and-play)
+  - [Scoring modes](#scoring-modes)
 - [UMAs — combining strategies](#umas--combining-strategies)
 - [Quant research basis](#quant-research-basis)
 - [Training](#training)
@@ -157,13 +159,54 @@ Every strategy — built-in or your own — implements one interface (`portfolio
 
 Built-in strategies:
 
-- **`rule_based`** (default) — "Trend + Breakout + Volume + Monte Carlo probability" scoring, configured via `config/strategies/trend_breakout.yaml`. Component weights self-adjust over time based on realized win rate (`strategies/weighting.py`). Cheap to evaluate; parallelizes across CPU workers for large universes (`--parallel`).
+- **`rule_based`** (default) — "Trend + Breakout + Volume + Monte Carlo probability" scoring, configured via `config/strategies/trend_breakout.yaml`. Component weights self-adjust over time based on realized win rate (`strategies/weighting.py`). Cheap to evaluate; parallelizes across CPU workers for large universes (`--parallel`). Three combination rules are available — see [Scoring modes](#scoring-modes) below.
 - **`momentum`** — cross-sectional momentum: long the top decile of the eligible universe by 9-month (skip 1-month) formation return (Jegadeesh-Titman convention). Params: `top_percentile` (default 0.1), `min_universe` (default 5, below which every ticker is `AVOID` since ranking isn't reliable).
 - **`low_volatility`** — the low-volatility anomaly: long the bottom decile by trailing 60-day realized volatility. Same params as `momentum`.
 - **`lstm`** — a trained sequence-forecasting model (`portfolio_agent/models/pytorch_models.py`). During backtesting, all eligible tickers on a given date are batched into a single GPU forward pass (`strategies/ml_strategy.py::score_batch`) rather than scored one at a time.
 - **`ensemble`** — combines multiple strategies into one; see [UMAs](#umas--combining-strategies) below.
 
 `momentum` and `low_volatility` are **cross-sectional**: a ticker's signal depends on where it ranks against the *entire* eligible universe that round, not on its own history alone (`BaseStrategy.requires_full_batch`). Both the backtest engine and the live orchestrator detect this and call `score_batch()` with every eligible ticker at once rather than looping per-ticker. For the same reason they cannot be used as UMA members today (a UMA scores members per-ticker) — use them directly instead. See [Quant research basis](#quant-research-basis) for the math.
+
+### Scoring modes
+
+`rule_based` combines its four components under one of three rules, set by
+`scoring.method` in the strategy YAML or `scoring_mode` in its params. They
+differ in what the score *means*, not in which components feed it.
+
+| Mode | Combination | Score scale | Use when |
+|---|---|---|---|
+| `weighted_sum` (default) | Weighted sum of the raw component values | 0–100, absolute | You want a fixed quality bar: a name clears 60 on its own merits, and on a bad day nothing clears it |
+| `rank_composite` | Weighted sum of cross-sectional percentile ranks | 0–100, relative | Components are on incommensurable scales and you want the combination invariant to each one's units |
+| `probit_composite` | Ranks → Φ⁻¹ → weighted sum → standardized per date | 0–100 via Φ, with a mean-zero unit-variance z alongside | The score is consumed as a *magnitude* — e.g. as the expected-return input to the portfolio optimizer — rather than only as an ordering |
+
+Two consequences worth stating plainly before switching:
+
+- **Both cross-sectional modes convert the entry threshold from an absolute bar
+  into a percentile.** Under them a roughly fixed share of the universe clears
+  60 every day, whatever the market is doing. That is the intended behaviour for
+  a ranking system and the wrong behaviour for a "only trade genuinely good
+  setups" mandate. Both are off by default for this reason.
+- **Neither fixes a component that discriminates nothing.** Ranking ties hand
+  every name the same percentile, so a near-constant component contributes a
+  flat number under all three rules — a different flat number, but still flat,
+  and still spending its full share of the weight budget. Making influence track
+  discrimination is a change to the weight learner, not to the combination rule.
+
+`probit_composite` exists because a percentile is a uniform variate: a weighted
+sum of uniforms has a spread that depends on how many components were
+measurable and how correlated they were that day, so the same 0.72 means
+different things on different dates. Pushing ranks through the inverse normal
+CDF and standardizing the result makes the composite mean-zero and
+variance-one on *every* date, which is the contract an optimizer needs from an
+alpha input. The reported `score` still maps back to 0–100 through Φ so the
+existing `>= 60` / `>= 45` gates keep working — Φ is monotone, so the ordering
+is unchanged and `>= 60` acquires a cleaner reading: "top 40% of today's
+cross-section". The raw z is exposed as `signal.extra["composite_z"]`.
+
+Both cross-sectional modes report `requires_full_batch = True`, so the
+orchestrator and the backtest engine score the whole eligible universe in one
+call. A UMA that reaches a cross-sectional member through per-ticker scoring is
+rejected at load time rather than silently ranking each name against itself.
 
 **Adding your own strategy** is three steps:
 
@@ -290,6 +333,36 @@ Half the model's features are price *levels* (`sma_20`, `sma_50`, `macd`, `atr_1
 
 This is deliberately *not* `features.normalize`: that flag rewrites the shared feature pipeline, whose output the rule-based strategies read in raw units ("RSI below 30"), so turning it on to fix training would change what every other strategy trades.
 
+**Two normalizations run, and they answer different questions.** The scaler
+above is a *conditioning* fix — it keeps the numbers in a range the network can
+train on. `training.feature_normalization: cross_sectional` (the default) adds a
+statistical one in front of it: each feature is z-scored across the universe
+**on each date** rather than against a pooled five-year mean.
+
+The difference matters because a pooled z-score answers "is this RSI high for
+this stock over the sample", while a model choosing *between* stocks needs "is
+this RSI high relative to what else I could buy today". The pooled form also
+quietly puts the market factor back into every column that
+`training.target_transform` just removed from the label: on a day the whole
+market gapped down, every name's return feature reads extreme against a
+five-year mean, and the network is handed a market state a long-only book
+cannot act on.
+
+The cross-sectional transform **cannot leak, by construction** — it fits no
+state and carries nothing across dates, so the transform for date *t* reads only
+rows dated *t*. That is a stronger guarantee than "the statistics were fitted on
+the training split", which is a property of the calling code rather than of the
+transform, and it is testable directly: the suite rewrites every later row and
+asserts the earlier dates come back bit-for-bit identical. Dates with too thin a
+cross-section are dropped, and a universe with no cross-section on any date is
+left unscaled rather than emptied — the same fallback `target_transform` uses,
+so the label and the inputs never disagree about which rows exist.
+
+Set `feature_normalization: global` to restore the pooled behaviour. The global
+scaler runs either way: after the cross-sectional pass it is close to a no-op,
+but it is the transform that ships in the checkpoint metadata and guarantees
+inference reproduces training.
+
 Rows that are non-finite — not just NaN — are dropped when the panel is built. Several features are ratios (`return_1d` divides by the previous close, `bollinger_pct_b` by the band width), and a cached bar with a zero price makes them infinite; `dropna()` alone leaves those rows in, and each one produces a NaN loss.
 
 ### What the model predicts, and why it isn't a single number
@@ -382,29 +455,45 @@ data:
   default_history_years: 5     # history kept, both sources
   download_workers: 4          # concurrent chunk downloads (yfinance); 1 if rate-limited
   parallel_ticker_prep: true   # prepare tickers across a CPU pool during run-agent
-compliance:
-  paper_trading_mode: true   # must remain true
 risk:
   portfolio_value_inr: 308733
   risk_per_trade_pct: 0.01
+  risk_free_rate: 0.065         # annualized Sharpe/Sortino hurdle; overridden by
+                                # paths.risk_free_rate_csv when that file exists
   use_kelly_sizing: false       # true = fractional-Kelly once enough realized trades exist
   kelly_fraction: 0.25          # kappa; hard-capped at 0.25 (quarter-Kelly) in src/risk.py
   kelly_min_trades: 50          # realized trades before Kelly is trusted (else fixed-fractional)
   kelly_shrinkage_strength: 20  # Beta prior pulling the win rate toward 0.5
-compliance:
-  min_reward_risk: 1.2          # applied to reward:risk NET of round-trip costs
   max_sector_pct: 0.25          # max share of portfolio in any one sector
   max_unknown_sector_pct: 0.30  # aggregate budget for tickers missing from the map
   max_portfolio_drawdown_pct: 0.15  # halt new buys past this drawdown
   drawdown_reentry_pct: 0.10        # resume buying once recovered to here
   slippage_pct_per_side: 0.0025     # assumed slippage when costing a signal
+compliance:
+  paper_trading_mode: true      # must remain true
+  min_reward_risk: 1.2          # applied to reward:risk NET of round-trip costs
+  min_price_inr: 20.0           # penny-stock floor
+  target_prob_profit: 0.55      # Monte Carlo probability gate
 simulation:
   method: block_bootstrap       # gaussian | block_bootstrap | jump_diffusion
   use_garch_volatility: false   # true = GJR-GARCH(1,1) instead of flat historical std
   separate_overnight_gaps: true # fit GARCH to sessions, add gap risk separately
+  prior_annual_drift_std: 0.10  # fixed fallback prior on the spread of true drifts
+  use_empirical_drift_prior: true   # measure that prior from the cross-section instead
 training:
   walk_forward_splits: 5        # expanding-window validation folds; 0 to skip
+  target_transform: cross_sectional_rank  # absolute | cross_sectional_demean | ..._rank
+  feature_normalization: cross_sectional  # global | cross_sectional
+paths:
+  trial_log: output/trials.jsonl        # append-only; supplies N for the deflated Sharpe
+  risk_free_rate_csv: data/risk_free_rate.csv  # optional date,annualized_yield series
 ```
+
+> The block above is grouped by the section each key actually belongs to.
+> `min_reward_risk`, `min_price_inr` and `target_prob_profit` live under
+> `compliance`, while the sector, drawdown and slippage controls live under
+> `risk` — a distinction worth checking against `config.yaml` before copying a
+> key from one section into another.
 
 ### Risk controls
 
@@ -527,6 +616,24 @@ a verdict on the architecture — but it is the result.
 uv run pytest portfolio_agent/tests/ -q
 ```
 
+**Optional extras change what collects.** `uv sync --frozen` installs neither
+`torch` nor `cvxpy`, and the two behave differently when absent:
+
+| Extra | Without it | Install |
+|---|---|---|
+| `torch` | Six test files **fail collection**, so the whole run aborts rather than skipping | `uv sync --extra gpu` (or `--extra cu126` / `--extra cu121` for CUDA) |
+| `cvxpy` | `test_portfolio_optimizer.py` skips cleanly via `importorskip` | `uv sync --extra optimize` |
+
+The torch case is worth knowing before assuming a red suite means a real
+failure: the six files import `torch` at module scope, so a missing optional
+dependency reads as `6 errors during collection` rather than as skips. To run
+everything the CI runs:
+
+```bash
+uv sync --extra gpu --extra optimize --extra hf
+uv run pytest portfolio_agent/tests/ -q
+```
+
 ## Project Structure
 
 ```
@@ -539,24 +646,36 @@ afa/
 │   ├── strategies/             # base.py, types.py (incl. ModelVerdict), rule_based.py,
 │   │                           # cross_sectional.py, ml_strategy.py, ensemble.py,
 │   │                           # weighting.py, registry.py
-│   ├── features/               # lag-safe technical indicators + pipeline
+│   ├── features/               # lag-safe technical indicators, pipeline, and
+│   │                           # scaling.py (global + per-date cross-sectional)
 │   ├── models/                 # LSTM + PatchTST, pinball loss, model registry
 │   ├── agents/                 # trainer.py, backtester.py
-│   ├── src/                    # orchestrator, backtest engine, data store, hf_dataset.py
-│   │                           # (HuggingFace source), risk.py (Kelly + cost-aware
-│   │                           # reward:risk), trigger_engine.py (signal arbitration),
-│   │                           # regime.py (classification + crash protection),
-│   │                           # calibration.py (isotonic), liquidity.py (circuit/zombie
-│   │                           # screen), sectors.py (concentration caps),
-│   │                           # volatility_models.py (GJR-GARCH), monte_carlo.py, ...
-│   └── tests/                  # 772 tests
+│   ├── src/                    # the engine room — see docs/ARCHITECTURE.md for the
+│   │                           # full annotated inventory. Broadly:
+│   │                           #   run loops    orchestrator.py, backtest_engine.py
+│   │                           #   sizing       risk.py (Kelly in allocation units),
+│   │                           #                portfolio.py (covariance + HRP),
+│   │                           #                portfolio_optimizer.py (QP w/ sector caps)
+│   │                           #   measurement  risk_analytics.py, performance_stats.py
+│   │                           #                (PSR/DSR, trial log), outcomes.py
+│   │                           #   simulation   monte_carlo.py, volatility_models.py,
+│   │                           #                execution_sim.py
+│   │                           #   gating       compliance.py, liquidity.py, sectors.py,
+│   │                           #                trigger_engine.py, regime.py,
+│   │                           #                markov_regime.py, rl.py, calibration.py
+│   │                           #   data / io    data_store.py, hf_dataset.py, universe.py,
+│   │                           #                storage.py, reporting.py,
+│   │                           #                backtest_reporting.py, indicators.py
+│   └── tests/                  # 1,111 tests (with all optional extras installed)
 ├── docs/
 │   ├── ARCHITECTURE.md         # how it all works, with diagrams
 │   ├── STRATEGIES.md           # create / update / delete a strategy
-│   └── QUANT_RESEARCH.md       # research basis for every strategy/risk model
+│   ├── QUANT_RESEARCH.md       # research basis for every strategy/risk model
+│   └── REVIEW_STATUS.md        # item-by-item status against the quant review
 ├── data/                       # gitignored: market_data/*.parquet cache, agent_brain.json, sqlite db
-│                               # optional: sector_map.csv (ticker,sector) for concentration caps
-├── output/                     # gitignored: Excel reports
+│                               # optional: sector_map.csv (ticker,sector) for concentration caps,
+│                               # risk_free_rate.csv (date,annualized_yield) for the Sharpe hurdle
+├── output/                     # gitignored: Excel reports; trials.jsonl (the DSR trial log)
 ├── models/                     # gitignored: trained model checkpoints
 └── logs/                       # gitignored
 ```

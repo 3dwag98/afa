@@ -537,7 +537,25 @@ Monotonicity is the whole trick: it preserves the model's *ranking*, which is wh
 
 **The problem.** The forward Monte Carlo estimated each ticker's drift as the in-sample mean log return over its whole history and propagated it forward as if it were known. The sample mean of daily returns is the noisiest statistic in finance: its standard error is \(\sigma/\sqrt{T}\), which for a 2%/day Indian mid-cap over five years is about 0.057%/day — roughly **14% a year**. The 20-day probability of profit is essentially \(\Phi(\hat\mu\sqrt{H}/\sigma)\), so it inherits that noise directly.
 
-Measured: simulating tickers whose true drift is *exactly zero*, 5.2% of them cleared the 0.55 `compliance.target_prob_profit` gate on estimation error alone. On a 3,800-name universe that is hundreds of zero-edge tickers passing the gate every day.
+Measured: simulating tickers whose true drift is *exactly zero*, **8.9%** of them cleared the 0.55 `compliance.target_prob_profit` gate on estimation error alone. On a 3,800-name universe that is ~340 zero-edge tickers passing the gate every day.
+
+That number is worth stating with its construction, because it is entirely determined by it — \(T = 1250\) observations, \(\sigma = 2\%\)/day, a 20-day horizon. Closed form, the share is
+
+$$
+1 - \Phi\!\left(\frac{\Phi^{-1}(0.55)\,\sigma\sqrt{H} + H\sigma^2/2}{H} \cdot \frac{\sqrt{T}}{\sigma}\right)
+$$
+
+which moves a long way on plausible inputs:
+
+| \(T\) | \(\sigma\)/day | \(H\) | False positives |
+|---|---|---|---|
+| 1250 | 2% | 20 | 8.9% |
+| 1250 | 2% | 10 | 3.9% |
+| 750 | 2% | 20 | 14.8% |
+| 2500 | 2% | 20 | 2.8% |
+| 1250 | 3% | 20 | 6.4% |
+
+Shorter histories are worse, longer horizons are worse, and a quoted figure without its \((T, \sigma, H)\) says very little. A Monte Carlo run of the headline row measures 9.3%, the gap being simulation noise and the discreteness of a 1,000-path probability estimate.
 
 The bias is also not independent of the rest of the platform. \(\hat\mu\) is largest precisely for stocks that have already run, so an unshrunk drift makes the Monte Carlo gate a noisy restatement of the momentum signal it is supposed to corroborate — it adds no independent information while appearing to confirm.
 
@@ -548,7 +566,30 @@ $$
 \text{Var}_{\text{post}} = \frac{\tau^2 \cdot \sigma^2/T}{\tau^2 + \sigma^2/T}
 $$
 
-An annual drift is 252 daily drifts, so a prior dispersion stated per year converts as \(\tau = \tau_{\text{annual}}/252\). `simulation.prior_annual_drift_std` defaults to 10%, which is deliberately generous — it says a genuinely exceptional name might compound 20% a year faster than the market. Method-of-moments estimates of this quantity on daily equity panels typically come out at or below zero, because the observed spread of sample means is almost entirely estimation noise.
+An annual drift is 252 daily drifts, so a prior dispersion stated per year converts as \(\tau = \tau_{\text{annual}}/252\). `simulation.prior_annual_drift_std` defaults to 10%, which is deliberately generous — it says a genuinely exceptional name might compound 20% a year faster than the market.
+
+**Estimating the prior instead of asserting it.** The posterior above is only as good as \(\tau\) and \(\mu_0\), and both were assumed. The cross-section can supply them. Writing \(\hat\mu_i \sim \text{Normal}(\mu_i, \sigma_i^2/T_i)\) with \(\mu_i \sim \text{Normal}(\bar\mu, \tau^2)\), the observed variance of the sample means is the sum of the true dispersion and the average sampling noise, so the method of moments gives
+
+$$
+\bar\mu = \frac{1}{N}\sum_i \hat\mu_i, \qquad
+\tau^2 = \max\!\left(0,\; \operatorname{Var}_i(\hat\mu_i) - \frac{1}{N}\sum_i \frac{\sigma_i^2}{T_i}\right)
+$$
+
+and each name is then shrunk toward \(\bar\mu\) rather than toward zero — the James-Stein form. The subtraction is the whole idea: what survives it is the dispersion the panel actually evidences. `simulation.use_empirical_drift_prior` (on by default) switches to this, falling back to the fixed prior when fewer than 20 names have usable history, since two moments cannot be told apart on a handful of names.
+
+Shrinking toward \(\bar\mu\) rather than zero matters for a long-only book. Zero is the conservative choice for *relative* drift but it also discards the one thing a cross-section does evidence — the common level. On Indian equities that level is not zero, and pushing every name to zero understates every probability of profit uniformly.
+
+**What it measures on real data.** Earlier versions of this section asserted that method-of-moments estimates on daily equity panels "typically come out at or below zero". On 66 cached NSE names that is not what happens:
+
+| Quantity | Value |
+|---|---|
+| \(\bar\mu\) | 3.28e-4 /day (≈ 8.3%/year) |
+| \(\tau^2\) | 4.15e-8 |
+| \(\tau\) | 2.04e-4 /day (≈ **5.1%/year**) |
+| Noise floor \(\overline{\sigma_i^2/T_i}\) | 7.91e-7 |
+| Shrinkage intensity | **0.95** |
+
+So the panel does evidence a real spread of true drifts — but a small one, about **half** the assumed 10%/year, with 95% of the observed spread in sample means attributable to estimation noise. The hardcoded prior was therefore *under*-shrinking on this data, which is the concrete argument for measuring it. On the synthetic zero-drift panel where there is genuinely nothing to find, the estimator returns \(\tau^2\) within a rounding error of zero and the false-positive rate goes to 0.0%.
 
 **Posterior predictive, not plug-in.** Each simulated path draws its own drift from the posterior rather than sharing the posterior mean (`simulation.propagate_drift_uncertainty`), so `probability_profit` is the probability *accounting for the drift being estimated*. That is the quantity the compliance gate should read, and it widens the tails the VaR/CVaR cells report rather than leaving the simulation confident about the one input it has least right. Under both changes, the same zero-drift experiment passes **0.0%** of tickers.
 
@@ -592,9 +633,29 @@ The **measurement runs unconditionally, the constraint is opt-in**. `portfolio_v
 
 `hierarchical_risk_parity` is the allocation to use when \(\mu\) is not trustworthy — which, given §21, is most of the time. It clusters the correlation matrix and recursively bisects, splitting capital by inverse variance, so it uses the covariance structure without ever inverting it and without needing expected returns at all.
 
+**Weighting and shrinkage are complementary, not alternatives.** Exponential weighting fixes *when* the matrix is measured — an equally weighted five-year window averages calm and crisis and is wrong in both. Shrinkage fixes *whether it can be used at all*. Weighting alone makes conditioning strictly worse: a 60-day half-life has an effective sample size of \(1/\sum_i w_i^2 \approx 87\) regardless of how much history is available, so the weighted matrix over any wide universe is massively rank-deficient. `shrunk_ewma_covariance` composes them.
+
+That singularity is the mechanism behind crash-state blowups, and it is worth being precise about. A mean-variance optimizer inverts \(\Sigma\), and \(\Sigma^{-1}\) is dominated by the *smallest* eigenvalues — which in a near-singular sample estimate are pure noise. The optimizer reads that noise as a near-riskless arbitrage between two almost-collinear names and takes a large offsetting position in both. Shrinkage lifts the small eigenvalues off the floor, which is what bounds the condition number and makes the weights a function of the data rather than of the noise. On a 60-asset, 40-period panel the sample covariance is singular (smallest eigenvalue \(< 10^{-10}\)); the composed estimator is positive definite with a condition number six orders of magnitude lower.
+
+**Group constraints need a different solver.** The subgradient optimizer is exact about its feasible set precisely *because* that set is a capped simplex with a closed-form projection. Add a sector limit \(S w \le c\) and the exact projection no longer exists, leaving only an approximation or a post-hoc clip — and a clipped solution is not the optimum of anything. `src/portfolio_optimizer.py` states the same objective as a quadratic program instead (cvxpy, optional extra):
+
+$$
+\max_w \; w'\mu - \tfrac{\lambda}{2} w'\Sigma w - c'u
+\quad\text{s.t.}\quad
+u \ge w - w_{\text{prev}},\; u \ge -(w - w_{\text{prev}}),\;
+\mathbf{1}'w \le B,\; 0 \le w \le \bar w,\; Sw \le c_{\text{sector}}
+$$
+
+The auxiliary \(u\) is what makes the L1 turnover term expressible: \(|w - w_{\text{prev}}|\) is not differentiable and cannot enter a QP directly, but since \(u\) appears in the objective only with a positive cost, the solver drives it down until one of its two constraints is tight — at which point \(u_i\) is *exactly* \(|w_i - w_{\text{prev},i}|\). The reformulation is therefore equivalent rather than a relaxation, and the test suite asserts the equality rather than assuming it.
+
+Sector limits are the constraint that actually binds in an Indian book. A momentum signal concentrates in whatever sector has been running, and a book with no group limit expresses a single macro bet through twenty tickers while reporting itself as diversified — the same failure this section exists to measure, arriving through a different door. Given a synthetic sector with overwhelming alpha the cap binds at exactly 25%; without it the same book puts over 90% there.
+
+One numerical detail that is not optional: a shrunk covariance is positive semi-definite in exact arithmetic but carries eigenvalues around \(-10^{-18}\) after floating point, and cvxpy rejects a non-PSD quadratic form outright. The matrix is symmetrized and its eigenvalues clipped at zero before use, which changes it by less than the error already in it.
+
 **Sources:**
 - Ledoit & Wolf (2003), "Honey, I Shrunk the Sample Covariance Matrix", *Journal of Portfolio Management*
 - López de Prado (2016), "Building Diversified Portfolios that Outperform Out-of-Sample", *Journal of Portfolio Management*
+- Boyd & Vandenberghe (2004), *Convex Optimization*, §4.4 — the epigraph reformulation of an L1 penalty
 
 ---
 
@@ -630,6 +691,15 @@ Also implemented: **PBO** by combinatorially-symmetric cross-validation, which a
 
 One calibrating result from the tests: five years of daily data showing an annualized Sharpe of −0.4 still leaves roughly a **one-in-five chance the true Sharpe is positive**. A backtest is a small sample even when it covers a long calendar.
 
+**\(N\) has to mean "configurations", not "runs".** DSR deflates against the expected maximum of \(N\) trials, so \(N\) is the input the whole adjustment turns on — and it is the one a research process is worst at recording. Two failure modes, opposite in sign:
+
+- *Under-counting.* The trial log recorded a hand-enumerated parameter dict, so any knob nobody thought to list made two materially different runs record as the same trial. Trial identity is now a SHA-256 hash of the whole resolved config (plus the backtest window and strategy selection, which arrive by CLI rather than config), so extending the search space cannot silently escape the count. Paths are excluded deliberately — writing the same backtest to a different filename is not a search step, and including it would make every timestamped run unique and defeat the deduplication entirely.
+- *Over-counting.* Re-running one configuration is not a new trial. Determinism is enforced, so a repeat reproduces its Sharpe; counting it again deflates against a search that never happened. Trials are deduplicated on that hash before the variance and count are taken.
+
+A detail that matters more than it looks: the hash is SHA-256, never Python's builtin `hash()`. `str.__hash__` is salted per process unless `PYTHONHASHSEED` is pinned, so a log keyed on it would count every re-run as fresh, inflate \(N\) monotonically, and slowly deflate every reported Sharpe — a drift that reads as a result rather than as a bug.
+
+**The risk-free rate is an input, not a constant.** The Sharpe numerator is the arithmetic mean of *excess* daily returns, which requires a rate to subtract. That rate used to be a `0.065` default argument on `RiskAnalyzer`, and the backtester constructed the analyzer without passing it at all — so every reported Sharpe was measured against a 6.5% hurdle no call site acknowledged. It is now a required argument, sourced from `risk.risk_free_rate` or, preferably, from a dated 91-day T-bill series at `paths.risk_free_rate_csv`, aligned to the return index and de-annualized so the excess return is taken day by day against the rate that actually prevailed. India's policy rate moved materially across 2021–2025; a single constant is wrong at both ends of any multi-year window, and which of the two was used is logged rather than left to be inferred from the absence of a file.
+
 **Sources:**
 - Bailey & López de Prado (2014), "The Deflated Sharpe Ratio", *Journal of Portfolio Management* 40(5)
 - Bailey, Borwein, López de Prado & Zhu (2016), "The Probability of Backtest Overfitting", *Journal of Computational Finance*
@@ -657,7 +727,20 @@ The rank form is the default (`training.target_transform`) and is the more robus
 
 **The evaluation had to follow.** A rank is not a return: +0.4 is a position in the ordering, not 40%, so a Sharpe computed on ranks is a confident number about the wrong quantity. Under a relative target the walk-forward folds report **rank IC and its information ratio** instead — which is the better metric regardless, being far less noisy than backtested P&L and free of any confounding with position sizing, costs or the covariance of the book.
 
-**What is deliberately not included.** Cross-sectional *feature* normalization (z-scoring or ranking each feature within each trading day) is the natural companion change, and `features/scaling.py` still standardizes globally. It is not a one-function change here: the fitted scaler ships inside the model checkpoint and is applied per ticker at inference, where no cross-section is available. PatchTST's per-window instance normalization partially compensates within a window; the plain LSTM path has nothing.
+**The companion change: cross-sectional features.** Normalizing the label without normalizing the inputs is half a fix. A feature z-scored against a pooled five-year mean answers "is this RSI high for this stock over the sample"; a model choosing *between* stocks needs "is this RSI high relative to what else I could buy today". Worse, the pooled form puts the market factor straight back into every input column that the label transform above just removed: on a day the whole market gapped down, every name's return feature reads extreme against a five-year mean, and the network is handed the one state a long-only book cannot act on.
+
+`training.feature_normalization: cross_sectional` (the default) z-scores each feature across the universe per date. Unlike the pooled scaler it **cannot leak by construction** — it fits no state and carries nothing across dates, so the transform for date \(t\) reads only rows dated \(t\). That is a stronger guarantee than "the statistics were fitted on the training split", which is a property of the calling code rather than of the transform, and it is directly testable: the suite rewrites every later row and asserts the earlier dates come back bit-for-bit identical.
+
+**The trap this walked into, recorded because it is not obvious.** An earlier version of this section called the change infeasible on the grounds that "the fitted scaler ships inside the model checkpoint and is applied per ticker at inference, where no cross-section is available". That objection is real, and enabling the cross-sectional pass at training time *without* addressing it produces a silent, severe failure rather than a loud one:
+
+1. Training z-scores each feature across the universe, so the values the global `FeatureScaler` is then fitted on are already \(\approx N(0,1)\).
+2. That scaler therefore comes out with mean \(\approx 0\) and standard deviation \(\approx 1\) — a near-identity transform.
+3. At inference it is applied to *raw* features. A price level of ₹1,500 passes through essentially unchanged and saturates the \(\pm 10\sigma\) clip.
+4. Every price-level feature for every name collapses to the same ceiling. Measured on a 20-name synthetic panel: the model trains on inputs spanning \([-2.40, 1.94]\) and receives a constant \(+10.00\) at inference — one distinct value where training saw 594.
+
+Nothing about that fails loudly. The scaler is a valid scaler, applied correctly; what diverges is the *pipeline*. So the mode travels in the checkpoint metadata exactly as the scaler's constants do, and `MLStrategy.score_batch` redoes the cross-sectional pass when the checkpoint says training used one — the cross-section it needs is precisely the batch it was handed. A checkpoint trained under `cross_sectional` also reports `requires_full_batch`, since a cross-section of one has no dispersion to standardize by. Checkpoints written before the mode existed default to `global` and are scored exactly as before.
+
+PatchTST's per-window instance normalization partially compensates within a window; the plain LSTM path has nothing, which is why this matters more for the default architecture than for the recommended one.
 
 **Sources:**
 - Gu, Kelly & Xiu (2020), "Empirical Asset Pricing via Machine Learning", *Review of Financial Studies*
@@ -755,6 +838,26 @@ Percentile rather than the review's \(\Phi^{-1}(\text{rank}/(N_t+1))\) form, del
 **What it changes about the strategy's meaning.** Under `weighted_sum`, `score >= 60` is an absolute quality bar that nothing need clear on a bad day. Under `rank_composite` it is a percentile, so a roughly fixed share of the universe clears it whatever the market is doing: the score stops being a quality filter and becomes a ranker, leaving the absolute gates — probability of profit, net reward:risk, minimum price, and the regime layer — as what remains to say "not today". On a worked five-name example the two agree on ordering exactly while the scores compress from a 23–90 range to 42–86, and a name sitting exactly on the 60 threshold moves to 69.
 
 That is a change of strategy rather than a defect fix, so `weighted_sum` remains the default and `rank_composite` is one YAML line away. `requires_full_batch` becomes True under rank scoring, since ranking a universe of one is not a degraded answer but a meaningless one.
+
+### The probit composite
+
+A percentile is a uniform variate, and that is the limitation `rank_composite` cannot escape: a weighted sum of uniforms has a spread that depends on how many components were measurable and on how correlated they happened to be that day. The composite is therefore comparable *within* a date and not *across* dates — fine for ordering names, useless as a magnitude. Anything that consumes the score as a number rather than as a rank (the expected-return input to §22's optimizer, most obviously) needs more than that.
+
+`scoring.method: probit_composite` applies the inverse normal CDF the review originally proposed, then standardizes the combination:
+
+$$
+z_{k,i,t} = \Phi^{-1}\!\left(\frac{r_{k,i,t}}{N_t + 1}\right), \qquad
+C_{i,t} = \sum_k w_k z_{k,i,t}, \qquad
+S_{i,t} = \frac{C_{i,t} - \bar C_t}{\operatorname{sd}_t(C)}
+$$
+
+so the composite is mean-zero and unit-variance on **every** date by construction, whatever the universe size or the correlation structure that day.
+
+**The plotting position is load-bearing, not a rounding detail.** Ranks are divided by \(N_t + 1\), not by \(N_t\). Under \(r/N\) the best name in the universe ranks at exactly 1.0 and \(\Phi^{-1}(1) = +\infty\) — and that does not fail loudly on that one ticker. It propagates into the weighted sum, then into \(\bar C_t\) and \(\operatorname{sd}_t(C)\), and nans **every** score on the date. The \(r/(N+1)\) convention (Van der Waerden) keeps the argument strictly inside \((0,1)\) for every \(N\).
+
+**Keeping the 0–100 gates.** The obvious move — publish \(S_{i,t}\) as the score — would break the platform silently: `_build_signal` gates on `score >= 60` and `>= 45`, and a z-score never clears 60, so the system would simply stop issuing BUY. The reported score is therefore \(100\,\Phi(S_{i,t})\). \(\Phi\) is monotone, so the ordering is exactly the z-ordering and the existing thresholds keep working while acquiring a cleaner reading — `>= 60` is "in the top 40% of today's cross-section". The raw \(z\) is published alongside as `signal.extra["composite_z"]` for consumers that want the magnitude.
+
+It inherits `rank_composite`'s percentile-threshold caveat, and it does **not** fix the near-constant component either: ties still hand every name the same quantile, so a flat percentile becomes a flat \(z\). Also off by default, for the same reason.
 
 
 ---

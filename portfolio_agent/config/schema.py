@@ -593,9 +593,11 @@ class SimulationConfig(BaseModel):
         "toward zero before simulating (src/monte_carlo.py::shrink_drift). The sample mean of "
         "daily returns has a standard error of sigma/sqrt(T) — roughly 14% a year for a 2%/day "
         "name over five years — so an unshrunk drift makes probability-of-profit mostly "
-        "estimation noise: 8.5% of tickers with exactly zero true drift clear a 0.55 gate on "
-        "noise alone. Raise this toward infinity to recover the raw sample mean; set it to 0 to "
-        "credit no ticker with any drift edge at all.",
+        "estimation noise: at T=1250, sigma=2%/day and a 20-day horizon, 8.9% of tickers with "
+        "exactly zero true drift clear a 0.55 gate on noise alone (the rate is set entirely by "
+        "those three inputs — see docs/QUANT_RESEARCH.md section 21). Raise this toward infinity "
+        "to recover the raw sample mean; set it to 0 to credit no ticker with any drift edge at "
+        "all.",
     )
     use_empirical_drift_prior: bool = Field(
         default=True,

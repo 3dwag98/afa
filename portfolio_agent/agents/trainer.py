@@ -1444,6 +1444,10 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
             'quantiles': list(config.training.quantiles) if n_outputs > 1 else None,
             'n_outputs': n_outputs,
             'feature_scaler': scaler.to_dict(),
+            # The pipeline, not just its last step: inference must redo the
+            # cross-sectional pass when training used one, or the near-identity
+            # scaler above is applied to raw features and saturates the clip.
+            'feature_normalization': config.training.feature_normalization,
         }, model_path)
         print(f"  ✓ Saved best model to {model_path}")
 
@@ -1496,6 +1500,10 @@ def run_training(config: AppConfig) -> Dict[str, Any]:
         # standardized inputs, so feeding it raw price levels would be feeding
         # it values tens of thousands of sigma from anything it ever saw.
         'feature_scaler': scaler.to_dict(),
+        # The pipeline, not just its last step: inference must redo the
+        # cross-sectional pass when training used one, or the near-identity
+        # scaler above is applied to raw features and saturates the clip.
+        'feature_normalization': config.training.feature_normalization,
         # The fitted score -> probability map, produced from the walk-forward
         # test folds. MLStrategy applies it so the confidence it publishes is a
         # frequency that held up out of sample, not a raw network output.

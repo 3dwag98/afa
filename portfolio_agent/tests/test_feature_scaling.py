@@ -396,3 +396,89 @@ class TestCrossSectionalFeatureScaling:
             np.testing.assert_array_equal(
                 first[ticker].to_numpy(), second[ticker].to_numpy()
             )
+
+
+class TestTrainInferenceNormalizationMatch:
+    """A checkpoint must be scored the way it was trained.
+
+    `feature_normalization: cross_sectional` z-scores each feature across the
+    universe per date *before* the global scaler is fitted, so that scaler ends
+    up with mean~0 and std~1 and is close to a no-op. Applying it to *raw*
+    features at inference then leaves a price level of 1500 essentially
+    untouched, and the model — trained on inputs in roughly [-3, 3] — is handed
+    a number that saturates the +/-10 clip. Every price-level feature collapses
+    to the same ceiling and the signal is destroyed.
+
+    The scaler alone cannot catch this: it is a legitimate scaler applied
+    correctly. What must match is the *pipeline*, so the mode travels in the
+    checkpoint metadata exactly as the scaler's constants do.
+    """
+
+    @staticmethod
+    def _panel(n_tickers=20, n_dates=30, seed=0):
+        import pandas as pd
+
+        rng = np.random.default_rng(seed)
+        dates = pd.bdate_range("2024-01-01", periods=n_dates)
+        return {
+            f"T{i:02d}": pd.DataFrame(
+                {"sma_50": rng.uniform(50, 5000, n_dates)}, index=dates
+            )
+            for i in range(n_tickers)
+        }
+
+    def test_raw_features_saturate_the_clip_when_the_mode_is_not_carried(self):
+        """The defect, stated as a measurement rather than a worry."""
+        from portfolio_agent.features.scaling import (
+            FeatureScaler, apply_cross_sectional_scaling,
+        )
+
+        panel = self._panel()
+        scaled = apply_cross_sectional_scaling(panel, feature_columns=["sma_50"])
+        trained_on = np.concatenate(
+            [f["sma_50"].to_numpy() for f in scaled.values()]
+        )[:, None]
+        scaler = FeatureScaler.fit(trained_on)
+
+        raw = np.concatenate([f["sma_50"].to_numpy() for f in panel.values()])[:, None]
+        naive_inference = scaler.transform(raw)
+
+        # Trained on a sane range...
+        assert np.abs(scaler.transform(trained_on)).max() < 5.0
+        # ...but raw features pinned at the clip ceiling, every one identical.
+        assert np.all(naive_inference == scaler.clip)
+
+    def test_applying_the_same_pipeline_reproduces_the_training_range(self):
+        """The fix: scale cross-sectionally first at inference too."""
+        from portfolio_agent.features.scaling import (
+            FeatureScaler, apply_cross_sectional_scaling,
+        )
+
+        panel = self._panel()
+        scaled = apply_cross_sectional_scaling(panel, feature_columns=["sma_50"])
+        trained_on = np.concatenate(
+            [f["sma_50"].to_numpy() for f in scaled.values()]
+        )[:, None]
+        scaler = FeatureScaler.fit(trained_on)
+
+        # Inference over the same universe, through the same two steps.
+        at_inference = np.concatenate([
+            f["sma_50"].to_numpy()
+            for f in apply_cross_sectional_scaling(
+                panel, feature_columns=["sma_50"]
+            ).values()
+        ])[:, None]
+        transformed = scaler.transform(at_inference)
+
+        np.testing.assert_allclose(
+            np.sort(transformed.ravel()),
+            np.sort(scaler.transform(trained_on).ravel()),
+            atol=1e-6,
+        )
+
+    def test_the_checkpoint_records_which_normalization_was_used(self):
+        """Without this the inference path cannot know which pipeline to run,
+        and a checkpoint trained either way looks identical."""
+        from portfolio_agent.strategies.ml_strategy import ModelLoader
+
+        assert hasattr(ModelLoader, "feature_normalization")

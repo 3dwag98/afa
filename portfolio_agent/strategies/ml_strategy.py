@@ -25,7 +25,7 @@ import torch.nn as nn
 from .base import BaseStrategy
 from .types import StrategyContext, StrategySignal
 from portfolio_agent.config.schema import StrategyConfig
-from portfolio_agent.features.scaling import FeatureScaler
+from portfolio_agent.features.scaling import FeatureScaler, apply_cross_sectional_scaling
 from portfolio_agent.models.pytorch_models import sorted_quantiles
 from portfolio_agent.models.registry import get_model
 from portfolio_agent.src.calibration import IsotonicCalibrator
@@ -173,6 +173,27 @@ class ModelLoader:
         return self._scaler
 
     @property
+    def feature_normalization(self) -> str:
+        """Which normalization pipeline this checkpoint was trained under.
+
+        The scaler's constants travel in the metadata so inference applies the
+        transform training used; this is the other half of that contract, and
+        without it the two silently diverge. Under `cross_sectional` the global
+        scaler was fitted on values that had *already* been z-scored across the
+        universe, so it comes out near mean 0 / std 1 and is close to a no-op —
+        which means applying it to raw features at inference leaves a price
+        level of 1500 essentially untouched and saturates the clip, handing a
+        model trained on [-3, 3] the same ceiling value for every name.
+
+        Defaults to "global" for checkpoints written before the mode existed:
+        those were trained on pooled statistics and must keep being scored that
+        way.
+        """
+        if self.metadata is None:
+            return "global"
+        return str(self.metadata.get("feature_normalization", "global"))
+
+    @property
     def calibrator(self) -> Optional[IsotonicCalibrator]:
         """Fitted score -> probability map shipped with this checkpoint, if any."""
         if self._calibrator is None and self.metadata is not None:
@@ -222,6 +243,21 @@ class MLStrategy(BaseStrategy):
     def supports_gpu_batch(self) -> bool:
         return True
 
+    @property
+    def requires_full_batch(self) -> bool:
+        """True when the checkpoint was trained with cross-sectional inputs.
+
+        Such a checkpoint's features are only meaningful against a universe: a
+        cross-section of one has no dispersion to standardize by, so the
+        transform declines to scale it and the near-identity global scaler then
+        hands the model raw price levels. This is `supports_gpu_batch`'s
+        neighbour but not its duplicate — that one is a performance claim,
+        this one is a correctness constraint, and callers that honour only the
+        first would still route correctly here while a UMA combining members
+        per-ticker must be refused.
+        """
+        return self._loader.feature_normalization == "cross_sectional"
+
     def required_features(self) -> List[str]:
         if self._loader.feature_names:
             return self._loader.feature_names
@@ -254,12 +290,26 @@ class MLStrategy(BaseStrategy):
         if not self._loaded:
             raise RuntimeError("MLStrategy.load() must be called before scoring")
 
+        # Reproduce the training pipeline, not just its last step. A checkpoint
+        # trained with cross-sectional normalization had each feature z-scored
+        # across the universe per date *before* the global scaler was fitted,
+        # so that scaler is near-identity and cannot stand in for the missing
+        # step: feeding it raw price levels saturates the clip and hands every
+        # name the same ceiling value. The cross-section needed to redo it is
+        # exactly this batch, which is why this cannot live in _sequence_tensor.
+        scaled_by_symbol = features_by_symbol
+        if self._loader.feature_normalization == "cross_sectional":
+            scaled_by_symbol = apply_cross_sectional_scaling(
+                {s: f for s, f in features_by_symbol.items() if not f.empty},
+                feature_columns=self._loader.feature_names,
+            )
+
         eligible: Dict[str, torch.Tensor] = {}
         last_close: Dict[str, float] = {}
         for symbol, features in features_by_symbol.items():
             if features.empty:
                 continue
-            seq = self._sequence_tensor(features)
+            seq = self._sequence_tensor(scaled_by_symbol.get(symbol, features))
             if seq is None:
                 continue
             eligible[symbol] = seq
