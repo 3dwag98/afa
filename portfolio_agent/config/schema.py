@@ -288,6 +288,20 @@ class TrainingConfig(BaseModel):
         "ranking (which walk-forward actually measured) and discards its scale (which nothing "
         "measured).",
     )
+    walk_forward_embargo: int = Field(
+        default=0,
+        ge=0,
+        description="Extra sessions excluded from training *after* each walk-forward test "
+        "fold, on top of the purge (validation/purged.py). The purge removes samples whose "
+        "label window reaches into the fold — a 5-day label observed daily means the last 5 "
+        "training samples are partly made of the test period — and that has always been "
+        "applied. The embargo is a different guard: it removes samples immediately after the "
+        "fold, whose *features* are nearly identical to the test fold's because financial "
+        "series are persistent, so a model that memorizes them recovers test-period "
+        "information through the inputs rather than the labels. Defaults to 0 because it "
+        "only binds when training data exists on the far side of a fold, which an expanding "
+        "window never produces; set it when moving to combinatorial splits.",
+    )
     walk_forward_min_train_fraction: float = Field(
         default=0.4,
         description="Fraction of the panel used to train the first walk-forward fold. Subsequent "
