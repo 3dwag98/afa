@@ -373,7 +373,132 @@
   <p class="why">Each run manifest renders to a short HTML page: config, universe fingerprint, metrics, decay curve, IC by regime. Makes results comparable across weeks and stops the accumulation of undocumented experiments that no one can reproduce.</p>
 </div>
 
-<h2><span class="num">Part 5 · Sequence</span>Order of work</h2>
+<h2><span class="num">Part 5 · Delete</span>What to remove completely</h2>
+
+<p class="col lede">Distinct from the freeze list. Freezing preserves accumulated correctness that is expensive to rebuild. Deleting is for things that are actively misleading, duplicated, or archaeological — where keeping them costs more than losing them.</p>
+
+<div class="twrap">
+<table>
+  <thead><tr><th>Delete</th><th>Evidence</th><th>Why it is worse than absent</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>Tracked <code>__pycache__</code> and <code>.pyc</code></strong></td>
+      <td class="mono-cell">6 tracked, including<br><code>__pycache__/setup_afa.cpython-312.pyc</code></td>
+      <td>That one is the compiled form of <code>setup_afa.py</code>, <strong>a file that no longer exists in the repository</strong>. Tracked bytecode produces phantom diffs on every machine that imports the package, and this one is a fossil of deleted source.</td>
+    </tr>
+    <tr>
+      <td><strong><code>src/indicators.py</code></strong></td>
+      <td class="mono-cell">SMA, RSI, MACD, Bollinger, ATR<br>exist in both it and<br><code>features/technical.py</code></td>
+      <td>Two implementations of RSI is a correctness hazard, not merely duplication: they can silently disagree, and which one a published number came from depends on the call path taken. Only <code>calculate_adx</code> is unique — move it into <code>features/technical.py</code> and delete the rest. <code>calculate_indicators</code> and <code>calculate_all_indicators</code> die with the orchestrator freeze.</td>
+    </tr>
+    <tr>
+      <td><strong>The synthetic-data fallback, on by default</strong></td>
+      <td class="mono-cell">data.allow_synthetic_fallback = True<br><code>data_store.py:349</code></td>
+      <td>A research platform that silently substitutes generated data when real data is missing will, sooner or later, publish a number describing a random-walk generator. Delete the default-on path; keep the generator behind an explicit test-only flag. A missing-data run should fail loudly.</td>
+    </tr>
+    <tr>
+      <td><strong>Market data in git</strong></td>
+      <td class="mono-cell">2,397 parquet, 112 MB tracked<br>pack size 80 MB</td>
+      <td>Data in version control cannot be updated without bloating history, goes stale silently, and every clone pays for it forever. Move to a release asset or regenerate on demand. Stopping the tracking is easy; reclaiming the 80 MB needs a history rewrite, which is a separate decision.</td>
+    </tr>
+    <tr>
+      <td><strong>The tracked model checkpoint</strong></td>
+      <td class="mono-cell">1 <code>.pt</code> in git</td>
+      <td>Same problem, and worse: a checkpoint in git implies it is the canonical model, with no record of the config or universe that produced it. Run manifests replace it.</td>
+    </tr>
+    <tr>
+      <td><strong>Five settings nothing reads</strong></td>
+      <td class="mono-cell">features.lookbacks, features.feature_sets,<br>paths.log_dir, paths.output_dir,<br>data.market_data_dir</td>
+      <td>A setting that does nothing is worse than one that is absent — someone will set it and expect an effect. Only 5 of 108 are unread, which is a good ratio; delete those five rather than documenting them.</td>
+    </tr>
+    <tr>
+      <td><strong>The <code>src</code> symlink and flat import fallbacks</strong></td>
+      <td class="mono-cell">17 runtime modules,<br>after <code>A1</code> is fixed</td>
+      <td>Once canonical imports work, keeping the flat fallbacks preserves exactly the ambiguity that made the package uninstallable, and hides the dependency graph from every static analysis tool. Remove them in the same change that fixes them.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout warn">
+  <p class="label">Deliberately not on this list</p>
+  <p>The RL exposure module, the Markov regime model, the portfolio optimizer, GARCH. All are unwired today, which makes them tempting deletions — but under the forecasting premise they get a second life as <em>feature generators and conditioning variables</em>. Deleting them would mean rebuilding them in three weeks. They belong on the repurpose list, not this one.</p>
+</div>
+
+<h2><span class="num">Part 6 · CLI</span>The command surface</h2>
+
+<p class="col lede">Today: 8 commands, 44 options, and <strong>no global options at all</strong> — no <code>--config</code>, no <code>--json</code>, no verbosity control. Every command loads <code>config.yaml</code> implicitly from the working directory, which combined with <code>A2</code> means you cannot point the tool at a different configuration. For a platform whose purpose is running experiments, that is the sharpest gap in the surface.</p>
+
+<h4>Global options — new, and the most useful addition</h4>
+<pre>portfolio-agent [--config PATH] [--json] [--quiet|-v] &lt;command&gt;
+
+  <b>--config PATH</b>   Which configuration to run. Experiments differ by config;
+                  without this every variation means editing a file in place.
+  <b>--json</b>          Machine-readable output, so runs can be piped and compared
+                  without scraping printed tables.
+  <b>--quiet / -v</b>    One knob for how much a long run says.</pre>
+
+<h4>Commands after the pivot</h4>
+<div class="twrap">
+<table>
+  <thead><tr><th>Command</th><th>Status</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td class="mono-cell">evaluate</td><td><span class="pill p-new">New — primary</span></td><td>Forecast skill for one strategy. The command that replaces <code>backtest</code> as the thing you run most</td></tr>
+    <tr><td class="mono-cell">compare</td><td><span class="pill p-new">New</span></td><td>Several strategies, one panel, one table. What <code>train-bulk</code> does for fitting, this does for measuring</td></tr>
+    <tr><td class="mono-cell">data build</td><td><span class="pill p-new">New</span></td><td>Fetch and assemble the store. Replaces <code>download-data</code> with something that also builds reference tables</td></tr>
+    <tr><td class="mono-cell">data validate</td><td><span class="pill p-new">New</span></td><td>Run the ingest invariants over what is on disk. Exit non-zero on violation</td></tr>
+    <tr><td class="mono-cell">data status</td><td><span class="pill p-new">New</span></td><td>Span, per-symbol coverage, gaps against the calendar, corporate actions found. The command that would have surfaced the five-year window on day one</td></tr>
+    <tr><td class="mono-cell">report</td><td><span class="pill p-new">New</span></td><td>Render a run manifest to a standalone HTML page — metrics, decay curve, IC by regime</td></tr>
+    <tr><td class="mono-cell">list-features</td><td><span class="pill p-new">New</span></td><td>The one registry with no inspection command. Completes the set</td></tr>
+    <tr><td class="mono-cell">train</td><td><span class="pill p-keep">Unchanged</span></td><td>Already correct — registry dispatch, per-trainer schema validation, universe pinning</td></tr>
+    <tr><td class="mono-cell">train-bulk</td><td><span class="pill p-keep">Unchanged</span></td><td>Sweeps and multi-strategy fitting on one pinned universe</td></tr>
+    <tr><td class="mono-cell">list-strategies</td><td><span class="pill p-keep">Unchanged</span></td><td></td></tr>
+    <tr><td class="mono-cell">list-trainers</td><td><span class="pill p-keep">Unchanged</span></td><td></td></tr>
+    <tr><td class="mono-cell">gpu-check</td><td><span class="pill p-keep">Unchanged</span></td><td></td></tr>
+    <tr><td class="mono-cell">backtest</td><td><span class="pill p-change">Demoted</span></td><td>Kept and working, but no longer the default path. Run it once a signal has earned a portfolio question</td></tr>
+    <tr><td class="mono-cell">download-data</td><td><span class="pill p-change">Folded in</span></td><td>Becomes <code>data build</code></td></tr>
+    <tr><td class="mono-cell">run-agent</td><td><span class="pill p-freeze">Removed</span></td><td>Live path. Frozen with the orchestrator</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h4>The centrepiece</h4>
+<pre>portfolio-agent evaluate --strategy lstm
+
+  <b>--strategy NAME</b>            What to measure
+  <b>--horizons 1,5,10,21</b>       Forecast horizons — produces the decay curve
+  <b>--cv purged|walkforward</b>    Default purged; walkforward kept to quantify the difference
+  <b>--embargo N</b>                Sessions held out either side of each test fold
+  <b>--neutralize sector,beta,size</b>  Report raw and neutralized IC side by side
+  <b>--by-regime</b>                Split every metric by volatility regime
+  <b>--baseline gbm</b>             Fit a boosting baseline on identical features and splits
+  <b>--universe-snapshot PATH</b>   Pin the names, so two runs are comparable
+  <b>--set key=value</b>            Model hyperparameters, validated by the trainer's schema
+  <b>--output DIR</b>               Where the manifest and rendered report land</pre>
+
+<p class="col">Two details worth keeping in the design. <strong><code>--cv</code> defaults to purged</strong> — the correct method should be what you get by not thinking about it, and the leaky one should require asking. And <strong><code>--baseline</code> is a first-class option</strong> rather than a separate run, because "better than gradient boosting on the same splits" is the claim that matters, and making it one flag means nobody skips it.</p>
+
+<h4>Smaller options worth adding to what exists</h4>
+<div class="twrap">
+<table>
+  <thead><tr><th>Option</th><th>Where</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td class="mono-cell">--dry-run</td><td>train, train-bulk, evaluate, data build</td><td>Resolve config, print what would run, exit. Catches a typo before an eight-hour sweep, not after</td></tr>
+    <tr><td class="mono-cell">--seed N</td><td>every command that fits anything</td><td>Reproducibility is already enforced internally; exposing it makes seed ensembling a shell loop</td></tr>
+    <tr><td class="mono-cell">--years N / --from --to</td><td>data build</td><td>The setting that silently capped history at five years should be visible at the point of use</td></tr>
+    <tr><td class="mono-cell">--keep-raw</td><td>data build</td><td>Store raw alongside adjusted, and retain the corporate-action columns the source already carries</td></tr>
+    <tr><td class="mono-cell">--fail-on-warning</td><td>data validate</td><td>Makes the invariant suite usable as a gate rather than a report</td></tr>
+    <tr><td class="mono-cell">--limit N</td><td>evaluate, compare, data build</td><td>Run against a small universe while iterating. The most-used flag in practice</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout">
+  <p class="label">One thing not to add</p>
+  <p>Resist a <code>--quick</code> or <code>--fast</code> preset that silently loosens the CV scheme or shortens the sample. Presets that trade correctness for speed get used by default, and the resulting numbers are indistinguishable from real ones in every report they appear in. <code>--limit</code> narrows the universe honestly and visibly; that is the right shape for the same need.</p>
+</div>
+
+<h2><span class="num">Part 7 · Sequence</span>Order of work</h2>
 
 <div class="phase">
   <div class="phase-tag">Week 1</div>
@@ -424,7 +549,7 @@
   </div>
 </div>
 
-<h2><span class="num">Part 6 · Honesty</span>What this plan does not fix</h2>
+<h2><span class="num">Part 8 · Honesty</span>What this plan does not fix</h2>
 
 <div class="col">
 <p>Stated plainly, because a plan that implies otherwise is worse than no plan.</p>
