@@ -1,5 +1,7 @@
 """Tests for Monte Carlo simulation module."""
 
+import math
+
 import pytest
 import numpy as np
 from src.monte_carlo import run_monte_carlo, MonteCarloResult
@@ -485,7 +487,16 @@ class TestDriftShrinkage:
 
         assert unshrunk > 0.02
         assert shrunk < unshrunk
-        assert shrunk == 0.0
+        # Not zero, and the change is instructive. This used to assert exactly
+        # 0.0, which held only because a *second* error was cancelling part of
+        # this one: the drift was Ito-corrected twice, costing every path
+        # 0.5*sigma^2 per day and pushing borderline names back under the gate.
+        # With that removed the fixed 10%/year prior is revealed to leak a
+        # little — two bugs were flattering each other. The empirical prior
+        # closes the gap (see
+        # TestCrossSectionalDriftPrior::test_zero_drift_universe_...), which is
+        # why it is the default.
+        assert shrunk <= 0.05
 
     def test_uncertainty_propagation_widens_the_distribution_of_outcomes(self):
         """A posterior predictive is wider than a plug-in, always."""
@@ -706,18 +717,29 @@ class TestCrossSectionalDriftPrior:
 
         Every ticker's true drift is zero, so no ticker has an edge and the
         honest pass rate through a 0.55 probability gate is zero. Propagating
-        the raw sample mean, ~8.9% clear it on estimation error alone: with
+        the raw sample mean, ~16% clear it on estimation error alone: with
         T=1250 and sigma=2%/day the standard error of mu_hat is 5.7bp/day, and
-        a name needs only 7.6bp/day of *spurious* drift to look like a 55%
-        proposition over 20 days. On a 3,800-name universe that is ~320 false
-        positives every day. Measured on this panel: 9.3%.
+        a name needs only 5.6bp/day of *spurious* drift to look like a 55%
+        proposition over 20 days. On a 3,800-name universe that is ~640 false
+        positives every day. Measured on this panel: 16.9%.
+
+        This figure used to read 9.3%, and the difference was not noise. The
+        simulator applied the Ito conversion to a drift already estimated in
+        log space, costing every path 0.5*sigma^2 per day and pushing about
+        half of these false positives back under the gate — so the drift-noise
+        problem looked half as bad as it was, and the threshold a name had to
+        clear was 7.6bp/day rather than the honest 5.6bp/day. Two errors were
+        flattering each other. Removing the Ito term (see
+        TestDriftIsNotItoCorrectedTwice) unmasks the rest.
 
         The empirical-Bayes prior finds no true dispersion here and shrinks
-        essentially all of it away, taking the pass rate to 0.0%. The fixed
-        10%/year prior already reached 0.1%; what the estimated prior adds is
-        that nobody had to supply the 10% — it read the absence of dispersion
-        off the panel, and would equally have found dispersion had there been
-        any (see test_method_of_moments_recovers_a_genuine_drift_spread).
+        essentially all of it away, holding the pass rate at 0.0% both before
+        and after that unmasking — which is what makes the two changes safe
+        together. The fixed 10%/year prior does not: it went from 0.1% to 0.8%
+        once the masking was removed. What the estimated prior adds is that
+        nobody had to supply the 10%; it read the absence of dispersion off the
+        panel, and would equally have found dispersion had there been any (see
+        test_method_of_moments_recovers_a_genuine_drift_spread).
         """
         from src.monte_carlo import (
             drift_observation_from_returns,
@@ -748,5 +770,142 @@ class TestCrossSectionalDriftPrior:
             drift_prior=prior, propagate_drift_uncertainty=False
         )
 
-        assert raw == pytest.approx(0.085, abs=0.03)
+        assert raw == pytest.approx(0.17, abs=0.04)
         assert james_stein < 0.01
+
+
+class TestDriftIsNotItoCorrectedTwice:
+    """The drift is estimated in log space, so it must not be converted again.
+
+    `sample_mu` is the mean of `np.log1p(returns)` — it *is* already
+    `mu_arith - sigma^2/2`, because that is what the log of a lognormal
+    return is. Subtracting `0.5 * sigma^2` from it a second time drives the
+    simulated log drift to `mu_arith - sigma^2` and every path down with it.
+
+    The error is `0.5 * sigma^2 * H`, which is proportional to *variance*. That
+    is what makes it worse than a level bias: it does not wash out of a ranking,
+    it is a penalty graded by volatility, applied hardest to the names it hurts
+    most — and it lands on a hard gate, since RuleBasedStrategy tests
+    `prob_profit >= compliance.target_prob_profit`. In effect it applies a
+    second, undocumented low-volatility tilt to every strategy that reads
+    `mc_result`, in a platform that already has an explicit
+    LowVolatilityStrategy.
+
+    One corroborating detail, visible only by reading the code: the
+    `sigma == 0` branch applies `mu` with no adjustment at all. It disagreed
+    with the other three branches, and it was the one that was right — which is
+    what marks the correction as a slip rather than a decision. It is not
+    asserted here because `shrink_drift` short-circuits to the prior mean when
+    `sample_sigma` is zero, so that branch's drift never reaches the paths.
+
+    Shrinkage is disabled throughout this class so the tests isolate the Ito
+    term rather than measuring the prior.
+    """
+
+    RAW = dict(prior_annual_drift_std=1e9, propagate_drift_uncertainty=False)
+
+    @staticmethod
+    def _driftless(sigma, n=4000, seed=5):
+        """Simple returns whose *log* returns have a mean of exactly zero."""
+        rng = np.random.default_rng(seed)
+        log_returns = rng.normal(0.0, sigma, size=n)
+        log_returns -= log_returns.mean()  # exactly zero, not just in expectation
+        return list(np.expm1(log_returns))
+
+    @pytest.mark.parametrize("sigma", [0.015, 0.030, 0.045])
+    def test_a_driftless_walk_is_a_coin_flip(self, sigma):
+        """The cleanest statement of the defect.
+
+        A driftless log random walk is equally likely to finish above or below
+        where it started, whatever its volatility. Under the double correction
+        the simulated drift is -sigma^2/2, so P(profit) falls to
+        Phi(-0.5*sigma*sqrt(H)) — below a half, and further below the more
+        volatile the name.
+        """
+        result = run_monte_carlo(
+            symbol="X", daily_returns=self._driftless(sigma), horizon_days=20,
+            simulations=60000, seed=11, method="gaussian", **self.RAW,
+        )
+
+        assert result.probability_profit == pytest.approx(0.5, abs=0.01)
+
+    def test_the_gate_does_not_penalize_volatility_by_itself(self):
+        """Why it is worse than a constant haircut.
+
+        Three names, identical zero log drift, volatility the only difference.
+        Any spread in P(profit) between them is the arithmetic, not the data —
+        and it is exactly the spread that decides who clears 0.55.
+        """
+        probabilities = [
+            run_monte_carlo(
+                symbol="X", daily_returns=self._driftless(sigma), horizon_days=20,
+                simulations=60000, seed=11, method="gaussian", **self.RAW,
+            ).probability_profit
+            for sigma in (0.015, 0.030, 0.045)
+        ]
+
+        assert max(probabilities) - min(probabilities) < 0.02
+
+    def test_a_driftless_walk_still_has_a_positive_expected_return(self):
+        """Not a contradiction with the coin flip above — lognormal convexity.
+
+        The *median* terminal price is unchanged and the *mean* is above it, by
+        exp(H*sigma^2/2). Under the double correction that convexity is exactly
+        cancelled and the expected return collapses to zero, which is what
+        makes the bug hard to spot: the number looks reasonable.
+        """
+        sigma, horizon = 0.03, 20
+        result = run_monte_carlo(
+            symbol="X", daily_returns=self._driftless(sigma), horizon_days=horizon,
+            simulations=60000, seed=11, method="gaussian", **self.RAW,
+        )
+
+        expected = math.exp(horizon * sigma**2 / 2.0) - 1.0
+        assert result.expected_return_pct == pytest.approx(expected, rel=0.15)
+        assert result.expected_return_pct > 0.0
+
+    @pytest.mark.parametrize("method", ["gaussian", "block_bootstrap", "jump_diffusion"])
+    def test_every_method_treats_the_drift_the_same_way(self, method):
+        """All three shared the corrected line, so all three inherited it.
+
+        jump_diffusion carries a negative mean jump, so its probability sits
+        below the other two by design; the tolerance covers that while still
+        excluding the sigma^2/2 shift.
+        """
+        result = run_monte_carlo(
+            symbol="X", daily_returns=self._driftless(0.02), horizon_days=20,
+            simulations=60000, seed=11, method=method,
+            jump_intensity_per_year=6.0, jump_mean=-0.02, jump_volatility=0.03,
+            **self.RAW,
+        )
+
+        assert result.probability_profit == pytest.approx(0.5, abs=0.03)
+
+    def test_the_jump_compensator_survives_the_fix(self):
+        """The compensator is a *different* correction and is correct.
+
+        It removes the expected contribution of the jump component so that
+        adding jump risk widens the tails without also shifting every expected
+        return down. Deleting it along with the Ito term would trade one
+        drift bug for another.
+        """
+        returns = self._driftless(0.02)
+        compensated = run_monte_carlo(
+            symbol="X", daily_returns=returns, horizon_days=20, simulations=60000,
+            seed=11, method="jump_diffusion",
+            jump_intensity_per_year=24.0, jump_mean=-0.05, jump_volatility=0.02,
+            **self.RAW,
+        )
+        none = run_monte_carlo(
+            symbol="X", daily_returns=returns, horizon_days=20, simulations=60000,
+            seed=11, method="jump_diffusion",
+            jump_intensity_per_year=0.0, jump_mean=-0.05, jump_volatility=0.02,
+            **self.RAW,
+        )
+
+        # Heavy negative jumps widen the left tail...
+        assert compensated.var_95 < none.var_95
+        # ...without dragging the mean down with them.
+        assert compensated.expected_return_pct == pytest.approx(
+            none.expected_return_pct, abs=0.02
+        )

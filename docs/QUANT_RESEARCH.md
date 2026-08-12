@@ -18,6 +18,7 @@ This document is the mathematical/research foundation behind the platform's stra
 12. [Momentum crash protection](#12-momentum-crash-protection) — implemented (`src/regime.py`)
 13. [Transaction costs and concentration limits](#13-transaction-costs-and-concentration-limits) — implemented (`src/execution_sim.py`, `src/sectors.py`)
 14. [Fat tails in the forward simulation](#14-fat-tails-in-the-forward-simulation) — implemented (`src/monte_carlo.py`)
+    - [14.1 The drift must not be Itô-converted twice](#141-the-drift-is-estimated-in-log-space-so-it-must-not-be-converted-again) — fixed (`src/monte_carlo.py`)
 15. [Circuit limits and the illiquidity illusion](#15-circuit-limits-and-the-illiquidity-illusion) — implemented (`src/liquidity.py`)
 16. [Overnight gaps and GARCH stationarity](#16-overnight-gaps-and-garch-stationarity) — implemented (`src/volatility_models.py`)
 17. [The long-only constraint](#17-the-long-only-constraint) — a known, accepted limitation
@@ -402,6 +403,52 @@ The rescaling matters: \(t_\nu\) has variance \(\nu/(\nu-2)\), so an unrescaled 
 
 ---
 
+### 14.1 The drift is estimated in log space, so it must not be converted again
+
+**The defect.** The simulator estimated drift as
+
+```python
+log_returns = np.log1p(returns_arr)
+sample_mu   = np.mean(log_returns)      # already a LOG-space drift
+```
+
+and then applied, in all three shock branches,
+
+```python
+daily_drift_path = mu - 0.5 * sigma_path ** 2
+```
+
+For a lognormal return, \(\log(1+r) \sim \text{Normal}(\mu_a - \tfrac12\sigma^2,\ \sigma^2)\). Since `mu` is estimated *directly from log returns*, it already **is** \(\mu_a - \tfrac12\sigma^2\). Subtracting \(\tfrac12\sigma^2\) a second time drives the simulated log drift to \(\mu_a - \sigma^2\).
+
+**Why it was worse than a level bias.** The error is \(\tfrac12\sigma^2 H\) — proportional to *variance*. It is therefore not a constant haircut that washes out of a cross-sectional ranking; it is a penalty graded by volatility, applied hardest to exactly the names it damages most. Two consequences:
+
+1. **It corrupted a hard gate.** `RuleBasedStrategy` tests `prob_profit >= compliance.target_prob_profit`. Signals were being rejected by an arithmetic error, and high-volatility names disproportionately.
+2. **It was a second, undocumented low-volatility tilt** applied to every strategy consuming `mc_result` — in a platform that already ships an explicit `LowVolatilityStrategy`. Two low-vol tilts, one of them invisible and unintended.
+
+**The sharpest test.** A driftless log random walk is a coin flip over any horizon, whatever its volatility — the median terminal price is the starting price. Under the double correction P(profit) fell to \(\Phi(-\tfrac12\sigma\sqrt{H})\): below a half, and further below the more volatile the name. That is now asserted directly at three volatilities.
+
+A companion property, easy to mistake for a contradiction: the same driftless walk has a *positive* expected return, \(e^{H\sigma^2/2} - 1\), because the mean of a lognormal sits above its median. The double correction cancelled that convexity exactly, collapsing the expected return to zero — which is part of why the bug survived: the number looked reasonable.
+
+**What was kept.** The jump compensator, \(-\lambda_{\text{daily}}\mu_J\), is a *different* correction and is correct. It offsets a shift that the jump shocks themselves introduce, so that adding jump risk widens the tails without also moving the mean. Removing it alongside the Itô term would have traded one drift bug for another.
+
+**Measured impact.** On 212 cached NSE names under the default configuration:
+
+| | Median P(profit) | Share clearing 0.55 |
+|---|---|---|
+| Before | 0.4660 | 0.5% |
+| After | 0.4950 | 3.3% |
+
+A median of 0.466 was the bug's signature: for a universe of real equities that on average drift upward, the whole distribution sat below a coin flip.
+
+**On recalibrating the gate.** Removing a downward bias raises every probability, so `compliance.target_prob_profit = 0.55` was tuned against biased numbers and the question of re-tuning it is real. It was left at 0.55 deliberately, for two measured reasons. First, the gate exists to reject noise, and its noise rejection is *unchanged*: on a zero-drift universe under the default empirical prior, 0.0% clear it both before and after. Second, re-tuning the threshold to restore the old pass rate would preserve the effect of an arithmetic error after removing its cause — encoding the bug into the config. 0.55 now means what it says; before, the bias made it silently demand about 0.58.
+
+For anyone who needs the old selectivity for continuity, the lever is explicit rather than implicit: `target_prob_profit: 0.60` reproduces the pre-fix pass rate (0.5%) on the same universe.
+
+**Sources:**
+- Itô's lemma as applied to geometric Brownian motion — the \(-\tfrac12\sigma^2\) term is the drift adjustment for the *arithmetic-to-log* conversion, and applies only in that direction
+
+---
+
 ## 15. Circuit limits and the illiquidity illusion
 
 Every ranking formula in this platform assumes continuous price discovery and that a printed close is a price you could have transacted at. On the NSE/BSE mid- and small-cap segments neither holds, in two specific ways that are both detectable from OHLCV alone.
@@ -537,25 +584,26 @@ Monotonicity is the whole trick: it preserves the model's *ranking*, which is wh
 
 **The problem.** The forward Monte Carlo estimated each ticker's drift as the in-sample mean log return over its whole history and propagated it forward as if it were known. The sample mean of daily returns is the noisiest statistic in finance: its standard error is \(\sigma/\sqrt{T}\), which for a 2%/day Indian mid-cap over five years is about 0.057%/day — roughly **14% a year**. The 20-day probability of profit is essentially \(\Phi(\hat\mu\sqrt{H}/\sigma)\), so it inherits that noise directly.
 
-Measured: simulating tickers whose true drift is *exactly zero*, **8.9%** of them cleared the 0.55 `compliance.target_prob_profit` gate on estimation error alone. On a 3,800-name universe that is ~340 zero-edge tickers passing the gate every day.
+Measured: simulating tickers whose true drift is *exactly zero*, **16%** of them cleared the 0.55 `compliance.target_prob_profit` gate on estimation error alone. On a 3,800-name universe that is ~610 zero-edge tickers passing the gate every day.
 
-That number is worth stating with its construction, because it is entirely determined by it — \(T = 1250\) observations, \(\sigma = 2\%\)/day, a 20-day horizon. Closed form, the share is
+That number is worth stating with its construction. Closed form, the share is
 
 $$
-1 - \Phi\!\left(\frac{\Phi^{-1}(0.55)\,\sigma\sqrt{H} + H\sigma^2/2}{H} \cdot \frac{\sqrt{T}}{\sigma}\right)
+1 - \Phi\!\left(\Phi^{-1}(0.55)\sqrt{T/H}\right)
 $$
 
-which moves a long way on plausible inputs:
+**\(\sigma\) does not appear.** The drift a name needs to fake the gate scales linearly in \(\sigma\), and so does the standard error of \(\hat\mu\), so volatility cancels exactly. Only the length of the history and the forecast horizon matter:
 
-| \(T\) | \(\sigma\)/day | \(H\) | False positives |
-|---|---|---|---|
-| 1250 | 2% | 20 | 8.9% |
-| 1250 | 2% | 10 | 3.9% |
-| 750 | 2% | 20 | 14.8% |
-| 2500 | 2% | 20 | 2.8% |
-| 1250 | 3% | 20 | 6.4% |
+| \(T\) | \(H\) | False positives |
+|---|---|---|
+| 750 | 20 | 22.1% |
+| 1250 | 20 | **16.0%** |
+| 2500 | 20 | 8.0% |
+| 1250 | 10 | 8.0% |
 
-Shorter histories are worse, longer horizons are worse, and a quoted figure without its \((T, \sigma, H)\) says very little. A Monte Carlo run of the headline row measures 9.3%, the gap being simulation noise and the discreteness of a 1,000-path probability estimate.
+Shorter histories are worse and longer horizons are worse, both because they widen \(\hat\mu\) relative to what the gate demands. A Monte Carlo run of the headline row measures 16.9%.
+
+**This figure used to read 8.9%, and the correction is instructive.** The simulator was applying the Itô conversion to a drift already estimated in log space (see §14.1), which cost every path \(\tfrac12\sigma^2\) per day and pushed roughly half of these false positives back under the gate. Two errors were partially cancelling: the drift-noise problem looked half as bad as it was, and the \(\sigma\)-dependence in the old closed form above was the second bug showing through the first. Removing the Itô term unmasks the rest — which is why the two changes belong in the same discussion even though they landed separately.
 
 The bias is also not independent of the rest of the platform. \(\hat\mu\) is largest precisely for stocks that have already run, so an unshrunk drift makes the Monte Carlo gate a noisy restatement of the momentum signal it is supposed to corroborate — it adds no independent information while appearing to confirm.
 

@@ -253,12 +253,12 @@ simulation:
   # The sample mean of daily returns has a standard error of sigma/sqrt(T) —
   # about 14% a year for a 2%/day name over five years — so propagating it
   # forward unshrunk made probability-of-profit mostly estimation noise: with
-  # T=1250, sigma=2%/day and a 20-day horizon, 8.9% of tickers with exactly
-  # zero true drift cleared the 0.55 gate below on noise alone. That figure is
-  # entirely set by those three inputs (see docs/QUANT_RESEARCH.md section 21
-  # for the closed form and its sensitivity). This is the prior dispersion of
-  # *true* annual drifts used to shrink each estimate toward zero; raising it
-  # recovers the raw mean.
+  # T=1250 and a 20-day horizon, 16% of tickers with exactly zero true drift
+  # cleared the 0.55 gate below on noise alone. The rate is
+  # 1 - Phi(Phi^-1(gate) * sqrt(T/H)) — sigma cancels — so only history length
+  # and horizon move it (docs/QUANT_RESEARCH.md section 21). This is the prior
+  # dispersion of *true* annual drifts used to shrink each estimate toward
+  # zero; raising it recovers the raw mean.
   prior_annual_drift_std: 0.10
   # Draw each path's drift from the posterior rather than sharing its mean, so
   # probability_profit accounts for the drift being estimated, not known.
@@ -268,8 +268,10 @@ simulation:
   # noise — tau^2 = max(0, Var(mu_hat) - mean(sigma_i^2/T_i)) — and shrinks
   # each name toward the universe mean rather than toward zero, by however
   # much of the spread turns out to be noise. On 1,000 zero-drift walks the
-  # share clearing the 0.55 gate goes 9.3% raw, 0.1% under the fixed prior
-  # above, 0.0% here. Estimated per scoring round from that round's universe,
+  # share clearing the 0.55 gate goes 16.9% raw, 0.8% under the fixed prior
+  # above, 0.0% here — and that 0.0% held both before and after the Ito fix
+  # (section 14.1), which the fixed prior did not. Estimated per scoring round
+  # from that round's universe,
   # and falls back to prior_annual_drift_std when fewer than 20 names have
   # usable history.
   use_empirical_drift_prior: true
@@ -277,6 +279,15 @@ simulation:
 # Trade compliance / eligibility checks
 compliance:
   min_price_inr: 20.0
+  # Left at 0.55 through the Ito fix (docs/QUANT_RESEARCH.md 14.1) rather than
+  # re-tuned. Removing that bias raised every probability — on 212 cached NSE
+  # names the share clearing this gate went 0.5% -> 3.3%, median probability
+  # 0.466 -> 0.495 — but the gate's job is rejecting noise, and that is
+  # unchanged: on a zero-drift universe under the default empirical drift prior,
+  # 0.0% clear it both before and after. Re-tuning to restore the old pass rate
+  # would keep the effect of an arithmetic error after removing its cause. 0.55
+  # now means what it says; the bias made it silently demand about 0.58. Set
+  # 0.60 to reproduce the pre-fix selectivity if you need continuity.
   target_prob_profit: 0.55
   # Applied to reward:risk measured NET of round-trip friction (~0.79% of
   # turnover), which is a materially harder test than the gross ratio this
