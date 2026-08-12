@@ -1,8 +1,20 @@
 """The one place training checkpoints are written and read.
 
-Every trainer routes through `save_artifact`, which is the only reason the
-on-disk contract can be relied on. The schema is the one the existing strategy
-loaders already read, not a new one:
+Every trainer routes through this module, which is the only reason the on-disk
+contract can be relied on. There are two writers, not one, because there are
+two kinds of payload:
+
+* `save_artifact` — a torch state dict, read back under `weights_only=True`.
+  This is the shape the strategy loaders already know.
+* `save_sklearn_artifact` — a fitted scikit-learn estimator, which cannot go
+  through the first one precisely *because* `weights_only=True` refuses
+  pickled objects. It writes joblib plus a JSON sidecar.
+
+Both guarantee the same metadata invariants, and a trainer picks between them
+by overriding `BaseTrainer.write_checkpoint`; neither opens a file of its own.
+
+The torch schema is the one the existing strategy loaders already read, not a
+new one:
 
     {
         "model_state_dict": {...},
@@ -173,6 +185,116 @@ def save_artifact(
         logger.info("Saved metadata sidecar to %s", sidecar_path)
 
     return path
+
+
+def save_sklearn_artifact(
+    artifact: TrainingArtifact,
+    path: Path | str,
+    *,
+    sidecar_path: Optional[Path | str] = None,
+) -> Path:
+    """Write a fitted scikit-learn estimator, plus a JSON sidecar beside it.
+
+    A fitted estimator cannot go through `save_artifact`. That function writes
+    with `torch.save` and its counterpart reads with `weights_only=True`, which
+    refuses arbitrary pickled objects — deliberately, because unpickling
+    executes whatever the file says. An estimator *is* such an object, so it
+    gets its own format rather than a weakened guarantee on the shared one.
+
+    The consequence is worth stating plainly: this file is a pickle. Loading
+    one runs code from it, so load only files this install produced. That is
+    the standard trade for scikit-learn persistence and there is no
+    weights-only equivalent to reach for.
+
+    The JSON sidecar is not a convenience. It carries the metadata and metrics
+    in a form that comparison tooling — a results table, a run manifest, a
+    notebook — can read *without* unpickling anything, so nothing has to
+    execute a checkpoint to find out how it scored.
+
+    Args:
+        artifact: `state_dict` must hold the estimator under `"estimator"`.
+        path: Destination `.joblib` file. Parent directories are created.
+        sidecar_path: Where the JSON goes. Defaults to `path` with a `.json`
+            suffix.
+
+    Returns:
+        The path written.
+    """
+    try:
+        import joblib
+    except ImportError as exc:  # pragma: no cover - depends on optional extras
+        raise ImportError(
+            "Saving a scikit-learn checkpoint needs joblib, which ships with "
+            "scikit-learn: uv sync --extra gbm"
+        ) from exc
+
+    estimator = artifact.state_dict.get("estimator")
+    if estimator is None:
+        raise ValueError(
+            "artifact.state_dict has no 'estimator' — save_sklearn_artifact "
+            "persists a fitted estimator, and a checkpoint without one would "
+            "load back as a model that silently predicts nothing"
+        )
+    if "feature_names" not in artifact.metadata:
+        raise ValueError(
+            "artifact.metadata is missing 'feature_names' — construct it with "
+            "training.artifacts.build_metadata() so the fields inference "
+            "depends on cannot be omitted"
+        )
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "estimator": estimator,
+        "metadata": _plain(artifact.metadata),
+        "metrics": _plain(artifact.metrics),
+    }
+    joblib.dump(payload, path)
+    logger.info("Saved scikit-learn checkpoint to %s", path)
+
+    sidecar = Path(sidecar_path) if sidecar_path is not None else path.with_suffix(".json")
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    document = dict(_plain(artifact.metadata))
+    document["metrics"] = _plain(artifact.metrics)
+    with open(sidecar, "w") as handle:
+        json.dump(document, handle, indent=2)
+    logger.info("Saved metadata sidecar to %s", sidecar)
+
+    return path
+
+
+def load_sklearn_artifact(path: Path | str) -> TrainingArtifact:
+    """Read a checkpoint written by `save_sklearn_artifact`.
+
+    This unpickles. See the security note on `save_sklearn_artifact`.
+
+    Raises:
+        FileNotFoundError: If the checkpoint is absent. Never treat this as
+            "start from an unfitted estimator" — scikit-learn would raise
+            `NotFittedError` at the first prediction, but only after the caller
+            has already reported a run as successful.
+    """
+    try:
+        import joblib
+    except ImportError as exc:  # pragma: no cover - depends on optional extras
+        raise ImportError(
+            "Loading a scikit-learn checkpoint needs joblib: uv sync --extra gbm"
+        ) from exc
+
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"No checkpoint at {path}")
+
+    payload = joblib.load(path)
+    if not isinstance(payload, dict) or "estimator" not in payload:
+        raise ValueError(f"{path} does not contain a scikit-learn checkpoint")
+
+    return TrainingArtifact(
+        state_dict={"estimator": payload["estimator"]},
+        metadata=dict(payload.get("metadata", {}) or {}),
+        metrics=dict(payload.get("metrics", {}) or {}),
+    )
 
 
 def load_artifact(path: Path | str) -> TrainingArtifact:
