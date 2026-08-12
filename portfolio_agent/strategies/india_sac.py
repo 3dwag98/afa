@@ -44,7 +44,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from .base import BaseStrategy
+from .base import TrainableStrategy
 from .types import StrategyContext, StrategySignal
 from portfolio_agent.config.schema import StrategyConfig
 from portfolio_agent.features.scaling import FeatureScaler
@@ -106,8 +106,18 @@ class SACActorNetwork(nn.Module):
         return torch.sigmoid(self.mean_head(self.net(state)))
 
 
-class IndiaSACStrategy(BaseStrategy):
+class IndiaSACStrategy(TrainableStrategy):
     """Continuous-allocation RL strategy, scored in one batched forward pass."""
+
+    #: Produced by the SAC trainer (training/trainers/sac.py). Training this
+    #: strategy is `portfolio-agent train --strategy india_sac`.
+    trainer_name = "sac"
+
+    @classmethod
+    def training_defaults(cls) -> Dict[str, Any]:
+        """Longer than the schema default: an entropy-regularized policy on
+        this reward needs more passes than a supervised regression does."""
+        return {"epochs": 200, "min_history": 252}
 
     def __init__(
         self,
