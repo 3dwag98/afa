@@ -593,11 +593,11 @@ class SimulationConfig(BaseModel):
         "toward zero before simulating (src/monte_carlo.py::shrink_drift). The sample mean of "
         "daily returns has a standard error of sigma/sqrt(T) — roughly 14% a year for a 2%/day "
         "name over five years — so an unshrunk drift makes probability-of-profit mostly "
-        "estimation noise: at T=1250, sigma=2%/day and a 20-day horizon, 8.9% of tickers with "
-        "exactly zero true drift clear a 0.55 gate on noise alone (the rate is set entirely by "
-        "those three inputs — see docs/QUANT_RESEARCH.md section 21). Raise this toward infinity "
-        "to recover the raw sample mean; set it to 0 to credit no ticker with any drift edge at "
-        "all.",
+        "estimation noise: at T=1250 and a 20-day horizon, 16% of tickers with exactly zero true "
+        "drift clear a 0.55 gate on noise alone. The rate is 1 - Phi(Phi^-1(gate) * sqrt(T/H)) — "
+        "sigma cancels — so only the history length and the horizon move it; see "
+        "docs/QUANT_RESEARCH.md section 21. Raise this toward infinity to recover the raw sample "
+        "mean; set it to 0 to credit no ticker with any drift edge at all.",
     )
     use_empirical_drift_prior: bool = Field(
         default=True,
@@ -625,7 +625,17 @@ class ComplianceConfig(BaseModel):
 
     min_price_inr: float = Field(default=20.0, description="Minimum share price to be eligible")
     target_prob_profit: float = Field(
-        default=0.55, description="Minimum Monte Carlo probability-of-profit required for a BUY signal"
+        default=0.55,
+        description="Minimum Monte Carlo probability-of-profit required for a BUY signal. Left at "
+        "0.55 through the Ito fix (docs/QUANT_RESEARCH.md section 14.1) rather than re-tuned, and "
+        "the choice was measured rather than assumed. Removing that bias raises every probability, "
+        "so on 212 cached NSE names the share clearing this gate went from 0.5% to 3.3% and the "
+        "median probability from 0.466 to 0.495. It was kept because the gate's job is rejecting "
+        "noise and that is unchanged — on a zero-drift universe under the default empirical drift "
+        "prior, 0.0% clear it both before and after — while re-tuning to restore the old pass rate "
+        "would preserve the effect of an arithmetic error after removing its cause. 0.55 now means "
+        "what it says; the bias previously made it silently demand about 0.58. Set 0.60 to "
+        "reproduce the pre-fix selectivity if continuity matters more.",
     )
     min_reward_risk: float = Field(
         default=1.2,

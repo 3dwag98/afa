@@ -15,7 +15,7 @@ not.
 | # | Finding | Status | Where |
 |---|---|---|---|
 | D1 | Kelly `f*` is a binary-bet stake fraction used as an allocation | **Done** | `src/risk.py::kelly_allocation_fraction` |
-| D2 | MC `probability_profit` dominated by drift-estimation noise | **Done**; prior now measured, not assumed | `src/monte_carlo.py::shrink_drift`, `::estimate_cross_sectional_drift_prior` |
+| D2 | MC `probability_profit` dominated by drift-estimation noise | **Done**; prior now measured, not assumed, and the drift no longer Itô-converted twice | `src/monte_carlo.py::shrink_drift`, `::estimate_cross_sectional_drift_prior` |
 | D3 | No portfolio covariance anywhere | **Done**, wired into sizing; group constraints added | `src/portfolio.py`, `src/portfolio_optimizer.py`, `BacktestEngine._apply_portfolio_risk_cap` |
 | D4 | Neural target is absolute, not cross-sectional | **Done** — target and feature normalization, with the pipeline recorded in the checkpoint so inference reproduces it | `agents/trainer.py::apply_cross_sectional_target`, `features/scaling.py::apply_cross_sectional_scaling`, `strategies/ml_strategy.py::feature_normalization` |
 | D5 | GJR-GARCH unusable at platform scale | **Not done** | — |
@@ -100,7 +100,7 @@ equities and trades them in India.
 
 | Phase | Status |
 |---|---|
-| 0 — Correctness | 7 of 8: Kelly, drift shrinkage, arithmetic Sharpe, weighting guards, rank composite (opt-in), leverage constraint, gap-aware stop fills (0.7). **Missing:** GARCH refit scheduling (0.5), net-of-cost training label (0.8) |
+| 0 — Correctness | 7 of 8, plus one defect found outside the review's list — the drift was Itô-converted twice (see below): Kelly, drift shrinkage, arithmetic Sharpe, weighting guards, rank composite (opt-in), leverage constraint, gap-aware stop fills (0.7). **Missing:** GARCH refit scheduling (0.5), net-of-cost training label (0.8) |
 | 1 — Measurement | Essentially complete: PSR, DSR, trial log, PBO, rank IC/ICIR, Newey–West. Trials are now identified by a hash of the whole resolved config rather than a hand-enumerated parameter list, and deduplicated before the deflation, so N counts configurations rather than runs. The risk-free rate is supplied rather than defaulted — see below. Note on 1.6 follows |
 | 2 — Data | **Not started.** Every downstream number is limited by this |
 | 3 — Portfolio construction | Estimators, optimizer and HRP built and wired as a volatility cap. EWMA weighting and Ledoit-Wolf shrinkage are composed in `shrunk_ewma_covariance`, and `src/portfolio_optimizer.py` adds the one constraint the projected-subgradient solver structurally cannot express — group limits, so a sector cap binds exactly rather than being clipped after the fact (optional `cvxpy` extra). Per-trade sizing is **not** retired (3.4) — the cap sits on top of it rather than replacing it |
@@ -120,6 +120,30 @@ precedes the test period and there is no right boundary to purge. The
 right-boundary purge is a requirement of K-fold, where test blocks sit in the
 middle of the sample. Moving to purged K-fold is a legitimate proposal (it uses
 more of the data), but it is a methodology change, not a leak being fixed.
+
+## A defect the review did not list
+
+The forward simulation estimated drift from `np.log1p(returns)` — already a
+log-space quantity — and then applied the Itô conversion to it anyway, driving
+the simulated log drift to `mu_arith - sigma^2` instead of `mu_arith -
+sigma^2/2`. All three shock methods shared the line.
+
+Recorded here because of how it interacted with D2 rather than for its own
+sake. The error is `0.5*sigma^2*H`, proportional to variance, so it was a
+volatility-graded penalty rather than a level bias — an undocumented second
+low-volatility tilt on every strategy reading `mc_result`. It also *masked*
+about half of D2: the zero-drift false-positive rate through a 0.55 gate reads
+16% once the Itô term is removed, not the 8.9% previously documented. Two
+errors were partially cancelling, and the drift-noise problem looked half as
+bad as it was.
+
+The empirical drift prior holds the zero-drift pass rate at 0.0% both before
+and after that unmasking, which is what makes the two changes safe together;
+the fixed 10%/year prior does not (0.1% → 0.8%). `compliance.target_prob_profit`
+was deliberately left at 0.55 — see docs/QUANT_RESEARCH.md §14.1 for the
+measurement behind that decision.
+
+Credit: identified in the audit response drafted under PR #9.
 
 ## What has not changed by default
 

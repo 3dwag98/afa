@@ -224,11 +224,13 @@ def shrink_drift(
     five years is ~0.057%/day — about 14% a year. Propagating that number
     forward as if it were known is what makes probability-of-profit an
     expensive random number generator: simulating tickers whose true drift is
-    exactly zero, 8.9% of them clear a 0.55 probability gate on estimation
-    error alone (at T=1250, sigma=2%/day, 20-day horizon — the rate is set
-    entirely by those three, ranging from 2.8% to 14.8% across plausible
-    values; see docs/QUANT_RESEARCH.md section 21). On a 3,800-name universe
-    that is ~340 zero-edge tickers passing the gate every day.
+    exactly zero, 16% of them clear a 0.55 probability gate on estimation error
+    alone. The rate is 1 - Phi(Phi^-1(gate) * sqrt(T/H)) — note that sigma
+    cancels, since the spurious drift a name needs and the standard error of
+    mu_hat both scale linearly in it. At T=1250 and a 20-day horizon that is
+    16.0%; a 750-day history gives 22.1%, a 2500-day one 8.0%. See
+    docs/QUANT_RESEARCH.md section 21. On a 3,800-name universe that is ~610
+    zero-edge tickers passing the gate every day.
 
     Worse, the error is not independent of the rest of the platform. mu_hat is
     large precisely for stocks that have already risen, so an unshrunk drift
@@ -696,16 +698,15 @@ def run_monte_carlo(
 
     if effective_method == "block_bootstrap":
         # Bootstrap the *shape* of the return distribution and re-apply drift
-        # explicitly, so the resampled shocks are centred and the drift term
-        # stays the same Ito-corrected one every method uses. Centring uses the
-        # *sample* mean — the shocks are the realized deviations from what
-        # actually happened — while the drift re-applied below is the shrunk
-        # posterior mean.
+        # explicitly, so the resampled shocks are centred and the drift term is
+        # the same one every method uses. Centring uses the *sample* mean — the
+        # shocks are the realized deviations from what actually happened —
+        # while the drift re-applied below is the shrunk posterior mean.
         demeaned = log_returns - sample_mu
         shocks = _block_bootstrap_shocks(
             demeaned, simulations, horizon_days, block_size_days, rng
         )
-        daily_drift_path = mu - 0.5 * sigma_path ** 2
+        daily_drift_path = np.full(horizon_days, mu, dtype=float)
     elif effective_method == "jump_diffusion":
         shocks = _jump_diffusion_shocks(
             sigma_path, simulations, horizon_days,
@@ -715,9 +716,11 @@ def run_monte_carlo(
         # Compensated drift: subtracting the jump component's expected
         # contribution keeps the process's mean return equal to the historical
         # one, so adding jump risk widens the tails without also quietly
-        # shifting every expected return downward.
+        # shifting every expected return downward. This is a different
+        # correction from the Ito term removed below and is genuinely needed —
+        # it offsets a shift this method's own shocks introduce.
         jump_compensator = (max(0.0, jump_intensity_per_year) / 252.0) * jump_mean
-        daily_drift_path = mu - 0.5 * sigma_path ** 2 - jump_compensator
+        daily_drift_path = np.full(horizon_days, mu - jump_compensator, dtype=float)
     elif sigma == 0 and daily_vol_forecast is None:
         # No volatility, deterministic path
         shocks = np.zeros((simulations, horizon_days), dtype=float)
@@ -726,8 +729,26 @@ def run_monte_carlo(
         shocks = _standardized_shocks(
             rng, (simulations, horizon_days), innovation_df
         ) * sigma_path[None, :]
-        daily_drift_path = mu - 0.5 * sigma_path ** 2
+        daily_drift_path = np.full(horizon_days, mu, dtype=float)
 
+    # `mu` is applied as-is, with no Ito conversion. It is estimated from
+    # np.log1p(returns), so it is *already* a log-space drift — already
+    # mu_arith - sigma^2/2, since that is what the log of a lognormal return
+    # is. The three branches above used to subtract 0.5*sigma^2 from it again,
+    # which drove the simulated log drift to mu_arith - sigma^2 and every path
+    # down with it.
+    #
+    # The error was 0.5*sigma^2*H, proportional to *variance*, which is what
+    # made it worse than a level bias: it does not wash out of a cross-sectional
+    # ranking, it is a penalty graded by volatility applied hardest to the names
+    # it hurts most, and it lands on a hard gate (RuleBasedStrategy tests
+    # prob_profit >= compliance.target_prob_profit). In effect it was a second,
+    # undocumented low-volatility tilt on every strategy reading mc_result — in
+    # a platform that already ships an explicit LowVolatilityStrategy.
+    #
+    # Sanity check that pins it: a driftless log random walk must be a coin
+    # flip over any horizon, whatever its volatility. See
+    # docs/QUANT_RESEARCH.md section 14.1.
     cumulative_returns = (daily_drift_path[None, :] + shocks).sum(axis=1)
 
     # Posterior predictive, not plug-in: every path gets its own draw of the
