@@ -721,9 +721,12 @@ class BacktestEngine:
             
             row = df.loc[current_date]
             
-            # Get high and low for the day
+            # Get open, high and low for the day. The open matters as much as
+            # the range: it is the first price at which anything could have
+            # filled, so it bounds what a gapped stop or target could achieve.
             high = None
             low = None
+            open_price = None
             for h_col in ['high', 'High']:
                 if h_col in row.index:
                     high = row[h_col]
@@ -732,9 +735,6 @@ class BacktestEngine:
                 if l_col in row.index:
                     low = row[l_col]
                     break
-            # The open decides where a triggered stop actually fills: a stop
-            # crossed by a gap was never available at its own price.
-            open_price = None
             for o_col in ['open', 'Open']:
                 if o_col in row.index:
                     open_price = row[o_col]
@@ -742,6 +742,11 @@ class BacktestEngine:
 
             if high is None or low is None:
                 continue
+            # A missing or unusable open falls back to the level itself, which
+            # is the old behaviour — better to keep the optimistic fill than to
+            # invent a gap out of a NaN.
+            if open_price is None or pd.isna(open_price) or open_price <= 0:
+                open_price = None
             
             stop_price = self.stop_loss_levels.get(ticker)
             target_price = self.take_profit_levels.get(ticker)
@@ -754,49 +759,55 @@ class BacktestEngine:
             triggered = False
             trigger_price = None
             trigger_type = None
-            # How far the realized fill was from the level it was set at, as a
-            # positive percentage of that level. Non-zero only on a gap.
-            gap_slippage_pct = 0.0
+            # Signed distance between the realized fill and the level it was
+            # set at, as a percentage of that level: negative when a gap
+            # carried a stop past its price, positive when one carried a target
+            # past its own, and zero whenever the level itself was available.
+            # Recorded rather than folded silently into P&L — the P&L alone
+            # cannot distinguish a gapped exit from a clean one, and how often
+            # the modelled stop was actually reachable is the thing worth
+            # measuring.
+            gap_fill_delta_pct = 0.0
 
-            # Check stop-loss (price hit or went below stop)
+            # **Gap-aware fills.** A stop is a resting order, not a guaranteed
+            # price: it becomes marketable when the price reaches it and fills
+            # at whatever is available then. Booking every stop at exactly
+            # `stop_price` assumes a fill that existed only if the level was
+            # crossed *during* the session.
+            #
+            # When the market gaps through the level overnight — the open is
+            # already past it — the first available price is the open, and the
+            # fill is worse than the stop by the whole gap. This engine booked
+            # the stop price regardless, so every gapped exit reported a loss
+            # smaller than the one actually taken, and the error is not rare
+            # here: NSE opens after both the US close and the Asian session,
+            # which is why the platform models overnight gap variance
+            # separately in the first place (volatility_models.py).
+            #
+            # The error also feeds back into sizing: Kelly reads its loss
+            # magnitude `l` from realized history
+            # (src/risk.py::estimate_kelly_inputs), so an understated `l`
+            # inflates f* and the book bets larger precisely because it has
+            # been mis-measuring its worst outcomes.
+            #
+            # The same logic runs the other way for a take-profit: a gap
+            # *through* the target fills at the open, above the target, so
+            # booking the target understates the gain. Both are corrected, and
+            # the stop is checked first so a session that touches both levels
+            # is charged the adverse one.
             if stop_price is not None and low <= stop_price:
                 triggered = True
+                trigger_price = min(open_price, stop_price) if open_price else stop_price
                 trigger_type = 'STOP_LOSS'
-                # A stop is a stop-*market* order: crossing the level sends a
-                # market order, it does not guarantee the level. When the
-                # session opens at or below the stop, the stock never traded at
-                # the stop at all — the first available price is the open, and
-                # that is the fill. Modelling it at the stop understates the
-                # loss on exactly the days that matter, and does so in one
-                # direction, so the error never averages out. It also feeds
-                # back into sizing: Kelly reads its loss magnitude from
-                # realized history (src/risk.py::estimate_kelly_inputs), so an
-                # understated l inflates f* and the book bets larger precisely
-                # because it has been mis-measuring its worst outcomes.
-                if open_price is not None and open_price <= stop_price:
-                    trigger_price = open_price
-                    if stop_price > 0:
-                        gap_slippage_pct = (stop_price - open_price) / stop_price * 100.0
-                else:
-                    trigger_price = stop_price
+                if stop_price > 0:
+                    gap_fill_delta_pct = (trigger_price - stop_price) / stop_price * 100.0
 
-            # Check take-profit (price hit or went above target)
             elif target_price is not None and high >= target_price:
                 triggered = True
+                trigger_price = max(open_price, target_price) if open_price else target_price
                 trigger_type = 'TAKE_PROFIT'
-                # Deliberately *not* gap-aware, and the asymmetry is the point.
-                # A gap up through a resting limit sell really would fill above
-                # the limit, so crediting the open here would be defensible
-                # market mechanics — but it is also the direction that flatters
-                # the backtest, and it makes the fill depend on how far past
-                # the target the price ran rather than on the exit rule. The
-                # adverse side is modelled because ignoring it understates
-                # realized losses and feeds an inflated Kelly fraction; the
-                # favourable side is left conservative because overstating
-                # gains has no such corrective. A backtest should be pessimistic
-                # where it is uncertain.
-                trigger_price = target_price
-
+                if target_price > 0:
+                    gap_fill_delta_pct = (trigger_price - target_price) / target_price * 100.0
 
             if triggered:
                 # Exits pay the same friction as any other sale — brokerage,
@@ -842,11 +853,7 @@ class BacktestEngine:
                     'return_pct': return_pct,
                     'holding_days': holding_days,
                     'exit_reason': exit_reason,
-                    # Recorded rather than folded silently into P&L, so a
-                    # gapped exit is distinguishable from a clean one — both in
-                    # the report and by anything measuring how often the
-                    # modelled stop was actually available.
-                    'gap_slippage_pct': gap_slippage_pct,
+                    'gap_fill_delta_pct': gap_fill_delta_pct,
                 }
                 self.trade_log.append(trade_record)
                 executed_trades.append(trade_record)

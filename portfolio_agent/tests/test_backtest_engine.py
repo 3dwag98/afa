@@ -1352,8 +1352,8 @@ class TestGapAwareStopFills:
 
         trades = engine._check_stop_loss_take_profit(day)
 
-        assert trades[0]['gap_slippage_pct'] == pytest.approx(
-            (95.0 - 90.0) / 95.0 * 100.0
+        assert trades[0]['gap_fill_delta_pct'] == pytest.approx(
+            (90.0 - 95.0) / 95.0 * 100.0
         )
 
     def test_a_clean_stop_records_no_gap_slippage(self, monkeypatch):
@@ -1363,7 +1363,7 @@ class TestGapAwareStopFills:
 
         trades = engine._check_stop_loss_take_profit(day)
 
-        assert trades[0]['gap_slippage_pct'] == pytest.approx(0.0)
+        assert trades[0]['gap_fill_delta_pct'] == pytest.approx(0.0)
 
     def test_the_loss_is_larger_than_the_stop_implied(self, monkeypatch):
         """What the defect actually cost: the realized loss must exceed the
@@ -1376,18 +1376,17 @@ class TestGapAwareStopFills:
 
         assert trades[0]['return_pct'] < -9.0
 
-    def test_a_gap_above_the_target_still_fills_at_the_target(self, monkeypatch):
-        """The asymmetry is deliberate, so it is pinned rather than left to
-        drift.
+    def test_a_gap_above_the_target_fills_at_the_open(self, monkeypatch):
+        """The favourable side, which is symmetric with the adverse one.
 
-        A gap up through a resting limit sell really would fill above the
-        limit, so crediting the open would be defensible mechanics. It is also
-        the direction that flatters the backtest, and it would make the fill
-        depend on how far past the target the price ran rather than on the exit
-        rule — in a fast market that turns a 10% target into an arbitrary
-        number. The adverse side is modelled because understating losses feeds
-        an inflated Kelly fraction; overstating gains has no such corrective,
-        so the favourable side stays conservative.
+        A take-profit is a resting limit sell, and a limit fills at the limit
+        *or better* — so a gap up through the target fills at the open, above
+        it. Booking the target would understate the exit for the same reason
+        booking the stop overstates it: both assume a price that was never
+        available. Because the fill now depends on where the session opened,
+        the exit must be evaluated on the *first* bar that reaches the target;
+        a test that skips ahead in a rising market is asking a different
+        question (see test_report_data_integrity.py::TestTradeLogAccounting).
         """
         engine, day = self._engine_holding(
             monkeypatch, open_price=112.0, high=115.0, low=111.0
@@ -1399,8 +1398,27 @@ class TestGapAwareStopFills:
 
         assert len(trades) == 1
         assert trades[0]['signal_trigger'] == 'TAKE_PROFIT'
-        assert trades[0]['exit_price'] == pytest.approx(110.0)
-        assert trades[0]['gap_slippage_pct'] == pytest.approx(0.0)
+        assert trades[0]['exit_price'] == pytest.approx(112.0)
+        assert trades[0]['gap_fill_delta_pct'] == pytest.approx(
+            (112.0 - 110.0) / 110.0 * 100.0
+        )
+
+    def test_a_session_touching_both_levels_is_charged_the_stop(self, monkeypatch):
+        """Order of evaluation is a modelling choice, so it is pinned.
+
+        A bar whose range spans both the stop and the target gives no
+        intraday sequence to read, and assuming the favourable one is how a
+        backtest quietly manufactures returns. The stop is checked first.
+        """
+        engine, day = self._engine_holding(
+            monkeypatch, open_price=99.0, high=115.0, low=93.0, close=112.0
+        )
+        engine.take_profit_levels = {"GAP.NS": 110.0}
+
+        trades = engine._check_stop_loss_take_profit(day)
+
+        assert trades[0]['signal_trigger'] == 'STOP_LOSS'
+        assert trades[0]['exit_price'] == pytest.approx(95.0)
 
     def test_an_intraday_target_cross_fills_at_the_target(self, monkeypatch):
         engine, day = self._engine_holding(

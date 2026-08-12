@@ -61,7 +61,13 @@ class TestTradeLogAccounting:
         engine.stop_loss_levels["UP.NS"] = 95.0
         engine.take_profit_levels["UP.NS"] = 110.0
 
-        exit_date = engine.master_date_index[40]
+        # Index 10 is the first bar whose high reaches the 110 target, and it
+        # opens at 108.40 — below the target, so the resting order fills
+        # exactly at 110. Later dates in this rising fixture open *above* the
+        # target, which is a gap the engine now fills at the open rather than
+        # pretending 110 was still available (see the gap-aware fill in
+        # _check_stop_loss_take_profit); index 40 opens at 133.61.
+        exit_date = engine.master_date_index[10]
         trades = engine._check_stop_loss_take_profit(exit_date)
 
         assert len(trades) == 1
@@ -115,7 +121,10 @@ class TestTradeLogAccounting:
         engine.take_profit_levels["UP.NS"] = 110.0
         cash_before = engine.cash
 
-        trade = engine._check_stop_loss_take_profit(engine.master_date_index[40])[0]
+        # Index 10: the first bar that reaches the target, and it opens below
+        # it, so the fill is exactly 110. See the note in
+        # test_exit_pnl_is_measured_from_the_entry_price.
+        trade = engine._check_stop_loss_take_profit(engine.master_date_index[10])[0]
 
         expected = cash_before + 100 * 110.0 - trade['transaction_costs'] - trade['taxes']
         assert engine.cash == pytest.approx(expected)
