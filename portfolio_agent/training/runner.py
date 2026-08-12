@@ -40,6 +40,8 @@ class TrainingRun:
     checkpoint_path: Optional[Path]
     duration_seconds: float
     error: Optional[str] = None
+    manifest_path: Optional[Path] = None
+    run_id: Optional[str] = None
 
     @property
     def ok(self) -> bool:
@@ -55,6 +57,8 @@ class TrainingRun:
             "seconds": round(self.duration_seconds, 1),
             "status": "ok" if self.ok else "failed",
         }
+        if self.run_id:
+            row["run"] = self.run_id
         if self.error:
             row["error"] = self.error
             return row
@@ -98,6 +102,8 @@ def run_training_job(
     model_name: Optional[str] = None,
     strategy_config_file: Optional[Path | str] = None,
     save: bool = True,
+    manifest: bool = True,
+    runs_dir: Optional[Path | str] = None,
 ) -> TrainingRun:
     """Train one strategy and (by default) write its checkpoint.
 
@@ -115,6 +121,10 @@ def run_training_job(
         strategy_config_file: Explicit strategy YAML.
         save: Write the checkpoint. False is for notebook experiments that
             should not clobber a good model.
+        manifest: Record what produced this run under `runs/`. On by default:
+            a checkpoint whose universe, config and commit are unrecorded is a
+            result nobody can check, and the cost is one small JSON file.
+        runs_dir: Where manifests go. None uses `provenance.DEFAULT_RUNS_DIR`.
 
     Returns:
         A `TrainingRun`. Failures are captured on the record rather than raised,
@@ -149,7 +159,7 @@ def run_training_job(
         artifact = instance.fit(data, cfg)
     except Exception as exc:
         logger.exception("Training failed for strategy=%s trainer=%s", strategy, trainer_name)
-        return TrainingRun(
+        failed = TrainingRun(
             strategy=strategy,
             trainer=trainer_name,
             config=cfg,
@@ -159,6 +169,11 @@ def run_training_job(
             duration_seconds=time.monotonic() - started,
             error=f"{type(exc).__name__}: {exc}",
         )
+        if manifest:
+            # A failed run is exactly the one someone will want to reconstruct,
+            # so it gets a manifest too — with the error in it.
+            _record_manifest(app_config, failed, runs_dir)
+        return failed
 
     # Record what the run actually saw, so a checkpoint can be traced back to
     # its sample without consulting a log.
@@ -180,7 +195,7 @@ def run_training_job(
             model_name=model_name or artifact.metadata.get("model_architecture"),
         )
 
-    return TrainingRun(
+    run = TrainingRun(
         strategy=strategy,
         trainer=trainer_name,
         config=cfg,
@@ -189,3 +204,51 @@ def run_training_job(
         checkpoint_path=checkpoint,
         duration_seconds=time.monotonic() - started,
     )
+    if manifest:
+        _record_manifest(app_config, run, runs_dir)
+    return run
+
+
+def _record_manifest(
+    app_config: Any, run: TrainingRun, runs_dir: Optional[Path | str]
+) -> None:
+    """Write this run's manifest, and never let doing so break the run.
+
+    Provenance is worth a file and is not worth losing a forty-minute training
+    job over. A failure here is logged and swallowed; the checkpoint is already
+    on disk either way.
+    """
+    try:
+        from portfolio_agent.provenance import DEFAULT_RUNS_DIR, build_manifest
+
+        metrics = {
+            key: value for key, value in run.artifact.metrics.items()
+            if isinstance(value, (int, float, bool))
+        }
+        artifacts = {}
+        if run.checkpoint_path is not None:
+            artifacts["checkpoint"] = str(run.checkpoint_path)
+
+        notes = []
+        if run.error:
+            notes.append(f"This run failed: {run.error}")
+
+        record = build_manifest(
+            "train",
+            app_config=app_config,
+            strategy=run.strategy,
+            trainer=run.trainer,
+            universe=list(run.universe.tickers),
+            universe_fingerprint=run.universe.fingerprint,
+            universe_name=run.universe.name,
+            settings=run.config.model_dump(),
+            metrics=metrics,
+            timings={"total": run.duration_seconds},
+            artifacts=artifacts,
+            notes=notes,
+        )
+        path = record.save(runs_dir if runs_dir is not None else DEFAULT_RUNS_DIR)
+        run.manifest_path = path
+        run.run_id = record.run_id
+    except Exception:  # pragma: no cover - provenance must never break a run
+        logger.exception("Could not write a run manifest; the run itself is unaffected")
