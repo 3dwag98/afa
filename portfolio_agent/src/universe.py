@@ -137,7 +137,7 @@ def resolve_backtest_universe(
     """
     # Import here to avoid circular imports
     import pandas as pd
-    from src.data_store import batch_download_and_cache
+    from portfolio_agent.src.data_store import batch_download_and_cache
     
     # Step 1: Discover available tickers
     tickers = discover_available_tickers()

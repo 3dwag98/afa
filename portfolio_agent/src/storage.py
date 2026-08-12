@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-from src.models import AgentBrain, Recommendation, TradeOutcome
+from portfolio_agent.src.models import AgentBrain, Recommendation, TradeOutcome
 
 
 def _ensure_directory(path: str) -> None:

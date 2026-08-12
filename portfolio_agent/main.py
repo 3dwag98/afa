@@ -21,7 +21,7 @@ app_path = Path(__file__).parent
 sys.path.insert(0, str(app_path))
 
 from portfolio_agent.config.loader import load_config as get_config
-from src.orchestrator import run_orchestrator
+from portfolio_agent.src.orchestrator import run_orchestrator
 
 
 def main():
