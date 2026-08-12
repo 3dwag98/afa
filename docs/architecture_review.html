@@ -1,0 +1,669 @@
+<title>AFA Architecture Register</title>
+<style>
+  :root {
+    --ground: #FBFBFD;
+    --surface: #FFFFFF;
+    --surface-2: #F4F5F9;
+    --ink: #1A1D26;
+    --ink-2: #4A4F5E;
+    --ink-3: #757B8C;
+    --rule: #DDE0E8;
+    --rule-strong: #C3C8D4;
+    --accent: #2B4C7E;
+    --accent-soft: #E8EDF6;
+    --critical: #B4322A;
+    --critical-soft: #FAEDEC;
+    --warning: #A96A18;
+    --warning-soft: #FBF2E4;
+    --ok: #2E7D5B;
+    --ok-soft: #E7F3ED;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #14161C;
+      --surface: #1B1E26;
+      --surface-2: #21252F;
+      --ink: #E8EAF0;
+      --ink-2: #B4BAC8;
+      --ink-3: #838A9B;
+      --rule: #2A2E3A;
+      --rule-strong: #3B4150;
+      --accent: #7BA3D9;
+      --accent-soft: #1E2734;
+      --critical: #E0736A;
+      --critical-soft: #2C1E1E;
+      --warning: #D9A055;
+      --warning-soft: #2B2318;
+      --ok: #63B892;
+      --ok-soft: #17271F;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #14161C;
+    --surface: #1B1E26;
+    --surface-2: #21252F;
+    --ink: #E8EAF0;
+    --ink-2: #B4BAC8;
+    --ink-3: #838A9B;
+    --rule: #2A2E3A;
+    --rule-strong: #3B4150;
+    --accent: #7BA3D9;
+    --accent-soft: #1E2734;
+    --critical: #E0736A;
+    --critical-soft: #2C1E1E;
+    --warning: #D9A055;
+    --warning-soft: #2B2318;
+    --ok: #63B892;
+    --ok-soft: #17271F;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.65;
+    margin: 0;
+    padding: 0 1.25rem 6rem;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 60rem; margin: 0 auto; }
+  .col { max-width: 42rem; }
+
+  /* ---- masthead ---- */
+  header.masthead {
+    padding: 4rem 0 2rem;
+    border-bottom: 2px solid var(--ink);
+    margin-bottom: 3rem;
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin: 0 0 1rem;
+  }
+  h1 {
+    font-family: var(--serif);
+    font-size: clamp(2.1rem, 5.5vw, 3.1rem);
+    line-height: 1.1;
+    font-weight: 600;
+    margin: 0 0 1rem;
+    text-wrap: balance;
+    letter-spacing: -0.01em;
+  }
+  .standfirst {
+    font-size: 1.08rem;
+    color: var(--ink-2);
+    max-width: 40rem;
+    margin: 0;
+  }
+
+  /* ---- scope strip ---- */
+  .scope {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    margin: 2.5rem 0 0;
+  }
+  .scope div { background: var(--surface); padding: 0.85rem 1rem; }
+  .scope dt {
+    font-family: var(--mono);
+    font-size: 0.65rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin: 0 0 0.3rem;
+  }
+  .scope dd {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 1.15rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+  .scope dd small { font-size: 0.7rem; color: var(--ink-3); font-family: var(--sans); }
+
+  /* ---- typography ---- */
+  h2 {
+    font-family: var(--serif);
+    font-size: 1.75rem;
+    font-weight: 600;
+    line-height: 1.2;
+    margin: 4rem 0 0.5rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--rule-strong);
+    text-wrap: balance;
+  }
+  h2 .num {
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    color: var(--accent);
+    display: block;
+    letter-spacing: 0.1em;
+    margin-bottom: 0.4rem;
+    font-weight: 400;
+  }
+  h3 {
+    font-family: var(--sans);
+    font-size: 1.02rem;
+    font-weight: 650;
+    margin: 2.25rem 0 0.5rem;
+    letter-spacing: -0.005em;
+  }
+  p { margin: 0 0 1rem; max-width: 42rem; }
+  .lede { font-size: 1.05rem; color: var(--ink-2); }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+  code {
+    font-family: var(--mono);
+    font-size: 0.855em;
+    background: var(--surface-2);
+    padding: 0.1em 0.35em;
+    border-radius: 3px;
+    color: var(--ink);
+  }
+  ul, ol { max-width: 42rem; padding-left: 1.15rem; margin: 0 0 1rem; }
+  li { margin-bottom: 0.45rem; }
+  strong { font-weight: 650; }
+
+  /* ---- finding register ---- */
+  .finding {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 4px solid var(--sev, var(--rule-strong));
+    padding: 1.25rem 1.4rem;
+    margin: 0 0 1rem;
+  }
+  .finding.crit { --sev: var(--critical); }
+  .finding.warn { --sev: var(--warning); }
+  .finding.info { --sev: var(--accent); }
+
+  .finding-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.7rem;
+    margin-bottom: 0.6rem;
+  }
+  .fid {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--sev, var(--accent));
+    letter-spacing: 0.04em;
+  }
+  .finding h3 { margin: 0; font-size: 1.04rem; flex: 1 1 16rem; }
+  .sev-tag {
+    font-family: var(--mono);
+    font-size: 0.62rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    padding: 0.2rem 0.5rem;
+    border-radius: 2px;
+    white-space: nowrap;
+  }
+  .crit .sev-tag { background: var(--critical-soft); color: var(--critical); }
+  .warn .sev-tag { background: var(--warning-soft); color: var(--warning); }
+  .info .sev-tag { background: var(--accent-soft); color: var(--accent); }
+
+  .finding p { margin-bottom: 0.75rem; max-width: 46rem; }
+  .finding p:last-child { margin-bottom: 0; }
+
+  .evidence {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    line-height: 1.55;
+    background: var(--surface-2);
+    border: 1px solid var(--rule);
+    padding: 0.7rem 0.85rem;
+    margin: 0 0 0.85rem;
+    overflow-x: auto;
+    white-space: pre;
+    color: var(--ink-2);
+  }
+  .fix {
+    font-size: 0.93rem;
+    color: var(--ink-2);
+    border-top: 1px dashed var(--rule-strong);
+    padding-top: 0.7rem;
+    margin-top: 0.85rem;
+  }
+  .fix b {
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    display: block;
+    margin-bottom: 0.25rem;
+    font-weight: 400;
+  }
+
+  /* ---- tables ---- */
+  .twrap { overflow-x: auto; margin: 0 0 1.5rem; border: 1px solid var(--rule); }
+  table { border-collapse: collapse; width: 100%; font-size: 0.88rem; min-width: 34rem; }
+  th, td {
+    text-align: left;
+    padding: 0.6rem 0.85rem;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+  }
+  thead th {
+    background: var(--surface-2);
+    font-family: var(--mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  td.num, th.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+  .flag { color: var(--critical); font-weight: 600; }
+  .mono-cell { font-family: var(--mono); font-size: 0.82rem; }
+
+  .pill {
+    font-family: var(--mono);
+    font-size: 0.63rem;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    padding: 0.15rem 0.45rem;
+    border-radius: 2px;
+    white-space: nowrap;
+  }
+  .p-have { background: var(--ok-soft); color: var(--ok); }
+  .p-part { background: var(--warning-soft); color: var(--warning); }
+  .p-none { background: var(--critical-soft); color: var(--critical); }
+
+  /* ---- callout ---- */
+  .callout {
+    background: var(--accent-soft);
+    border-left: 3px solid var(--accent);
+    padding: 1rem 1.25rem;
+    margin: 1.5rem 0;
+    max-width: 44rem;
+  }
+  .callout p:last-child { margin-bottom: 0; }
+  .callout .label {
+    font-family: var(--mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 0.4rem;
+  }
+
+  /* ---- roadmap ---- */
+  .phase {
+    display: grid;
+    grid-template-columns: 4.5rem 1fr;
+    gap: 1.25rem;
+    padding: 1.1rem 0;
+    border-bottom: 1px solid var(--rule);
+    max-width: 46rem;
+  }
+  .phase:last-child { border-bottom: none; }
+  .phase-tag {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    color: var(--ink-3);
+    letter-spacing: 0.06em;
+    padding-top: 0.2rem;
+  }
+  .phase h3 { margin: 0 0 0.35rem; }
+  .phase p { margin: 0 0 0.4rem; font-size: 0.94rem; color: var(--ink-2); }
+  .phase ul { margin: 0.4rem 0 0; font-size: 0.92rem; color: var(--ink-2); }
+
+  footer {
+    margin-top: 4rem;
+    padding-top: 1.5rem;
+    border-top: 2px solid var(--ink);
+    font-size: 0.85rem;
+    color: var(--ink-3);
+    max-width: 42rem;
+  }
+
+  @media (max-width: 40rem) {
+    .phase { grid-template-columns: 1fr; gap: 0.3rem; }
+    header.masthead { padding-top: 2.5rem; }
+  }
+</style>
+
+<div class="wrap">
+
+<header class="masthead">
+  <p class="eyebrow">Architecture Review · 3dwag98/afa · branch claude/custom-models-strategies-0xm9xp</p>
+  <h1>What holds this platform back</h1>
+  <p class="standfirst">Nine architectural findings, an assessment of whether the data can support the ambition, and what a best-in-class Indian-market forecasting engine would actually require. Findings are numbered <code>A1–A9</code> to sit alongside the existing <code>D1–D10</code> series in <code>docs/REVIEW_STATUS.md</code>.</p>
+
+  <dl class="scope">
+    <div><dt>Runtime</dt><dd>28,431 <small>loc</small></dd></div>
+    <div><dt>Tests</dt><dd>19,766 <small>loc</small></dd></div>
+    <div><dt>Passing</dt><dd>1,273</dd></div>
+    <div><dt>Strategies</dt><dd>6</dd></div>
+    <div><dt>Config knobs</dt><dd>108</dd></div>
+    <div><dt>Data sources</dt><dd>1</dd></div>
+  </dl>
+</header>
+
+<div class="col">
+<h2><span class="num">Verdict</span>The engineering is good. The structure and the data are what limit it.</h2>
+
+<p class="lede">This is a more carefully built repository than most in its category. The risk math has been reviewed and corrected, the reasoning is written down where the code is, determinism is enforced by test, and the known gaps are tracked honestly in <code>REVIEW_STATUS.md</code> rather than glossed. That is rare and it should not be undersold.</p>
+
+<p>The problems are not sloppiness. They are three structural decisions that have compounded, plus one hard external constraint:</p>
+
+<ul>
+  <li><strong>The package has two identities.</strong> <code>portfolio_agent/</code> is a proper package; <code>src/</code> is a flat script-style package reached through a repo-root symlink. Seventeen runtime modules import through the flat path. This is why the project cannot be installed.</li>
+  <li><strong>The backtest engine absorbed everything.</strong> 2,412 lines, 47 methods, one class — and the thinnest test coverage of any large module relative to its risk.</li>
+  <li><strong>Configuration is one flat surface of 108 settings</strong> with no notion of which subsystem owns what. (The training slice of this is fixed on the current branch; the rest is not.)</li>
+  <li><strong>There is exactly one data source</strong>, and it is adjusted daily OHLCV. Every ambition beyond price-and-volume technical signals is blocked on that, not on modelling.</li>
+</ul>
+
+<div class="callout">
+  <p class="label">The constraint that outranks everything else</p>
+  <p>The repo already names this as <code>D9</code> and it is the correct call: the universe is a current snapshot with no point-in-time membership, so every cross-sectional backtest carries survivorship and selection bias simultaneously. <strong>No amount of architectural work changes that.</strong> The findings below are about making the platform buildable, testable and extensible — not about making its current numbers believable.</p>
+</div>
+</div>
+
+<h2><span class="num">Part 1 · Register</span>Architecture findings</h2>
+
+<div class="finding crit">
+  <div class="finding-head">
+    <span class="fid">A1</span>
+    <h3>The package cannot be installed — strategies fail to import outside the repo root</h3>
+    <span class="sev-tag">Critical</span>
+  </div>
+  <p>Built the wheel and installed it into a clean virtualenv outside the repo. It builds and installs cleanly, and then cannot load a single strategy. <code>strategies/rule_based.py</code> tries <code>from src.risk</code>, then <code>from risk</code> — and never the canonical <code>from portfolio_agent.src.risk</code>, which works. Because <code>strategies/__init__.py</code> imports the registry eagerly, this one chain takes down the registry, the backtester and the engine together.</p>
+  <div class="evidence">$ pip install git+https://github.com/3dwag98/afa@&lt;branch&gt;   # succeeds
+&gt;&gt;&gt; from portfolio_agent.strategies.registry import get_available_strategies
+ModuleNotFoundError: No module named 'risk'
+
+17 runtime modules import through the flat path
+ 6 of them have no portfolio_agent.* import at all:
+   src/indicators.py  src/outcomes.py  src/portfolio_optimizer.py
+   src/regime.py      src/storage.py   src/universe.py</div>
+  <p>The root <code>src -&gt; portfolio_agent/src</code> symlink makes this invisible during development: everything resolves as long as the process starts at the repo root. It also means the real intra-<code>src</code> dependency graph is invisible to any tool that resolves imports properly — static analysis, IDE navigation and dead-code detection all under-report.</p>
+  <div class="fix"><b>Fix</b>Put <code>portfolio_agent.</code> first in every fallback chain (<code>india_sac.py</code> already does this correctly — copy that shape). Keep the flat fallbacks so script-style execution still works. Roughly a day, mechanical, and each file is independently verifiable by importing it from a scratch directory.</div>
+</div>
+
+<div class="finding crit">
+  <div class="finding-head">
+    <span class="fid">A2</span>
+    <h3><code>config.yaml</code> is not packaged, so an installed copy silently runs on different settings</h3>
+    <span class="sev-tag">Critical</span>
+  </div>
+  <p>The loader resolves <code>config.yaml</code> relative to the working directory, then to the repo root. In an installed package neither exists, so it loads <em>nothing</em> and every value falls back to its schema default — with no warning.</p>
+  <div class="evidence">repo config.yaml        universe_size: 4000
+installed package       universe_size: 10      (schema default)
+
+wheel contents: portfolio_agent/**  — config.yaml is absent</div>
+  <p>Silence is what makes this critical rather than annoying. A run that quietly uses a 10-name universe instead of 4,000 produces results, charts and a report, all of which look normal.</p>
+  <div class="fix"><b>Fix</b>Ship a packaged default config, resolve it as the last fallback, and log at <code>INFO</code> which file was actually loaded. A run should always be able to answer "which config am I on".</div>
+</div>
+
+<div class="finding crit">
+  <div class="finding-head">
+    <span class="fid">A3</span>
+    <h3><code>BacktestEngine</code> is a 2,412-line class holding at least nine responsibilities</h3>
+    <span class="sev-tag">Critical</span>
+  </div>
+  <p>One class owns data loading, price lookup, mark-to-market, position lifecycle, tax lots, stop/target evaluation, signal generation, regime classification, parallel scoring, order execution, Kelly sizing, the circuit breaker, sector caps, covariance and the portfolio risk cap, delisting, online learning, and performance reporting.</p>
+  <div class="evidence">src/backtest_engine.py    2,412 loc    47 methods    17 test mentions
+
+by comparison:
+src/risk.py                 714 loc                145 test mentions</div>
+  <p>The consequences are already visible. Every new feature adds a method here, so the class grows monotonically. Nothing inside it can be tested without constructing a full engine, which is why coverage is thin exactly where the money moves. And the live path (<code>src/orchestrator.py</code>, 637 loc) re-implements a subset of the same logic — the drift between backtest and live that <code>strategies/base.py</code> was introduced to eliminate has reappeared one level down.</p>
+  <div class="fix"><b>Fix</b>Extract collaborators the engine composes rather than contains: <code>Portfolio</code> (positions, tax lots, mark-to-market), <code>OrderRouter</code> (creation, execution, fills), <code>RiskGate</code> (Kelly, caps, breaker, sector), <code>ExitPolicy</code> (stops, targets, triggers). Each becomes independently testable, and the live orchestrator can then <em>use</em> them instead of paraphrasing them. Do this incrementally, one collaborator per PR, with the engine's public output pinned by a golden-file test first.</div>
+</div>
+
+<div class="finding warn">
+  <div class="finding-head">
+    <span class="fid">A4</span>
+    <h3>Test coverage is inverted against risk</h3>
+    <span class="sev-tag">Major</span>
+  </div>
+  <p>1,273 tests is a strong suite, but the distribution does not follow consequence. Modules that decide what gets traded and what gets reported are the least covered.</p>
+  <div class="twrap">
+  <table>
+    <thead><tr><th>Module</th><th class="num">LOC</th><th class="num">Test mentions</th><th>What it decides</th></tr></thead>
+    <tbody>
+      <tr><td class="mono-cell">cli.py</td><td class="num">873</td><td class="num flag">0</td><td>Every entry point</td></tr>
+      <tr><td class="mono-cell">src/backtest_reporting.py</td><td class="num">956</td><td class="num flag">3</td><td>The numbers humans read</td></tr>
+      <tr><td class="mono-cell">strategies/cross_sectional.py</td><td class="num">706</td><td class="num flag">3</td><td>Two of six strategies</td></tr>
+      <tr><td class="mono-cell">src/markov_regime.py</td><td class="num">703</td><td class="num flag">1</td><td>Regime gating (unwired)</td></tr>
+      <tr><td class="mono-cell">src/risk_analytics.py</td><td class="num">789</td><td class="num">7</td><td>Risk attribution</td></tr>
+      <tr><td class="mono-cell">src/backtest_engine.py</td><td class="num">2,412</td><td class="num">17</td><td>All simulated P&amp;L</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The CLI at zero is the sharpest: it is the only surface a user touches, and it is the one place with no test at all. Three of the bugs found while building the current branch were in exactly this shape of code — plumbing that looked obviously correct.</p>
+  <div class="fix"><b>Fix</b>Smoke-test every CLI subcommand with <code>--help</code> and one synthetic-data invocation; golden-file the report writer; give the two cross-sectional strategies the treatment <code>rule_based</code> already has.</div>
+</div>
+
+<div class="finding warn">
+  <div class="finding-head">
+    <span class="fid">A5</span>
+    <h3>Substantial modules are built, tested and never switched on</h3>
+    <span class="sev-tag">Major</span>
+  </div>
+  <p>By the repo's own tracking: the Markov regime model is "done as a module; not switched on"; <code>sleeve_weights</code> exists but the orchestrator does not use it; the rank composite is opt-in; the portfolio optimizer sits on top of per-trade sizing rather than replacing it.</p>
+  <p>That is roughly 1,400 lines of maintained, imported, never-executed code. Each one is a decision deferred — and a deferred decision in a live trading system is a fork in behaviour that nobody has had to defend.</p>
+  <div class="fix"><b>Fix</b>For each, either switch it on behind a default-on config flag with a documented before/after comparison, or move it to an <code>experimental/</code> namespace that is explicitly not part of the supported surface. The middle state is the expensive one.</div>
+</div>
+
+<div class="finding warn">
+  <div class="finding-head">
+    <span class="fid">A6</span>
+    <h3>Configuration is one flat 108-setting surface with no ownership</h3>
+    <span class="sev-tag">Major</span>
+  </div>
+  <p>Ten sections, 108 leaf settings, 330 lines of YAML — and no mechanism saying which subsystem may read what. Any module can reach any setting, so the config object is a global namespace and changing a default requires reading the whole repo to know who is affected.</p>
+  <p>The training slice of this is fixed on the current branch: each trainer declares a pydantic schema with <code>extra="forbid"</code>, so a misaimed setting is a startup error naming the alternatives. That pattern is the right one and it has not been applied to risk, simulation, compliance or execution.</p>
+  <div class="fix"><b>Fix</b>Extend the per-subsystem schema pattern outward. The test to aim for: given a setting name, the code should be able to say which components read it — enforceable, not just documented.</div>
+</div>
+
+<div class="finding info">
+  <div class="finding-head">
+    <span class="fid">A7</span>
+    <h3>Two reinforcement-learning implementations with no stated relationship</h3>
+    <span class="sev-tag">Moderate</span>
+  </div>
+  <p><code>src/rl.py</code> (499 loc) learns a portfolio-level exposure decision. <code>training/trainers/sac.py</code> (717 loc) learns per-name allocation. Both are defensible and they solve different problems — but nothing in either file says so, they share no abstractions, and a reader arriving at one has no way to know the other exists.</p>
+  <div class="fix"><b>Fix</b>Cheap: cross-reference the docstrings and state the division (exposure vs. allocation) in one place. If they are ever meant to compose — exposure scaling allocation — that is a design decision worth making explicitly rather than by accident.</div>
+</div>
+
+<div class="finding info">
+  <div class="finding-head">
+    <span class="fid">A8</span>
+    <h3>The sector map does not ship, and unmapped names silently weaken the cap</h3>
+    <span class="sev-tag">Moderate</span>
+  </div>
+  <p><code>src/sectors.py</code> loads <code>data/sector_map.csv</code>. That file is not in the repository, and <code>data/</code> contains only a ticker list and the parquet cache. The module reasons carefully about how to treat unmapped tickers — but the default state of a fresh clone is that <em>every</em> ticker is unmapped, so the concentration control that exists to stop a ten-name portfolio being one economic bet is inert until someone sources a file nobody tells them to source.</p>
+  <div class="fix"><b>Fix</b>Ship a sector map for the NSE 500, or derive one at ingest time and cache it. Failing that, log a warning at startup when coverage is below a threshold — silence is the wrong default for a disabled risk control.</div>
+</div>
+
+<div class="finding info">
+  <div class="finding-head">
+    <span class="fid">A9</span>
+    <h3>No workflow ties train → backtest → deploy into one traceable object</h3>
+    <span class="sev-tag">Moderate</span>
+  </div>
+  <p>Training writes a checkpoint. Backtesting reads it by filename convention. Nothing records that <em>this</em> backtest used <em>that</em> checkpoint trained on <em>that</em> universe with <em>those</em> settings. The universe fingerprint added on the current branch is the first piece of this, and it currently stops at the checkpoint.</p>
+  <div class="fix"><b>Fix</b>A run manifest: one JSON per experiment carrying config hash, universe fingerprint, checkpoint hash, code revision and results. It makes "which model produced this report" answerable, and is the precondition for any honest live/paper comparison.</div>
+</div>
+
+<div class="col">
+<h2><span class="num">Part 2 · Ergonomics</span>Making it pluggable and pleasant to use</h2>
+
+<p class="lede">Extension points are good; the workflow between them is the gap. Adding a strategy today means touching four files and reading a 950-line guide. Once added, taking it from idea to judged result is still a manual sequence of CLI calls with no record tying them together.</p>
+
+<h3>What already works and should be preserved</h3>
+<p>Four registries — features, model architectures, strategies, and now training procedures — all sharing one idiom. That consistency is the platform's best structural asset. <code>BaseStrategy</code> is a genuinely well-drawn interface: one contract serving live and backtest identically, with <code>requires_full_batch</code> and <code>supports_gpu_batch</code> capturing real distinctions rather than implementation detail.</p>
+
+<h3>The five gaps, in the order I would close them</h3>
+
+<div class="twrap">
+<table>
+  <thead><tr><th>Gap</th><th>Today</th><th>Should be</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>Registration is manual</strong></td>
+      <td>Edit <code>strategies/registry.py</code>, add an import, add a call</td>
+      <td>Entry-point discovery, so a strategy in a separate package registers on install — the difference between "extensible" and "forkable"</td>
+    </tr>
+    <tr>
+      <td><strong>No scaffold</strong></td>
+      <td>Copy an existing strategy, read the guide</td>
+      <td><code>portfolio-agent new-strategy my_idea</code> emitting class, YAML, test and registration</td>
+    </tr>
+    <tr>
+      <td><strong>No contract test</strong></td>
+      <td>Each strategy's tests are hand-written</td>
+      <td>A shared conformance suite every registered strategy runs automatically: lag-safety, NaN handling, determinism, empty-universe behaviour</td>
+    </tr>
+    <tr>
+      <td><strong>No single command</strong></td>
+      <td><code>train</code>, then <code>backtest</code>, then read a spreadsheet</td>
+      <td><code>portfolio-agent evaluate --strategy X</code> — train, walk-forward, backtest, report, one manifest</td>
+    </tr>
+    <tr>
+      <td><strong>Excel is the only report</strong></td>
+      <td>956-line writer, 3 test mentions</td>
+      <td>Structured results object; Excel becomes one renderer among several (HTML, JSON, notebook)</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout">
+  <p class="label">The one that pays for itself first</p>
+  <p>The <strong>conformance suite</strong>. Lag-safety in particular should not be a per-strategy discipline — it should be a property the framework verifies for every registered strategy automatically, by feeding it a signal built from future data and asserting the backtest cannot profit from it. That single test class prevents the most expensive category of error in this domain, permanently, for every strategy anyone ever adds.</p>
+</div>
+
+<h2><span class="num">Part 3 · Data</span>Is the data sufficient?</h2>
+
+<p class="lede">No — and this is the binding constraint. The platform ingests one thing: adjusted daily OHLCV for ~2,400 NSE/BSE symbols over about five years. Everything it can currently know is a function of price and volume.</p>
+
+<p>That supports technical and cross-sectional price-based signals competently. It cannot support value, quality, growth, size, earnings revisions, flows, positioning, or genuine capacity modelling — not because the models are missing, but because the inputs are.</p>
+
+<h3>What is missing, ranked by what it unlocks</h3>
+
+<div class="twrap">
+<table>
+  <thead><tr><th>Data</th><th>Status</th><th>Unlocks / why it matters for India</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Point-in-time index membership</strong><br><span class="mono-cell">NIFTY 50/100/500, from–to dates</span></td><td><span class="pill p-none">Absent</span></td><td>Fixes <code>D9</code>. Today's <code>nse500_tickers.csv</code> is 2,397 rows with a single <code>ticker</code> column and no dates. Until this exists no cross-sectional result is believable in either direction.</td></tr>
+    <tr><td><strong>Sector / industry classification</strong></td><td><span class="pill p-none">Absent</span></td><td>The concentration cap is inert without it (<code>A8</code>). Indian momentum concentrates hard by sector — IT through 2020–21, PSU banks through 2022–23.</td></tr>
+    <tr><td><strong>Delivery percentage</strong><br><span class="mono-cell">published daily by NSE</span></td><td><span class="pill p-none">Absent</span></td><td>Separates real accumulation from intraday churn. One of the most genuinely India-specific signals available, and it is free.</td></tr>
+    <tr><td><strong>F&amp;O: open interest, basis, IV, PCR</strong></td><td><span class="pill p-none">Absent</span></td><td>India runs one of the world's largest derivatives markets by volume. Ignoring it discards the richest positioning and expectations dataset the market produces.</td></tr>
+    <tr><td><strong>FII / DII daily flows</strong></td><td><span class="pill p-none">Absent</span></td><td>Published, well-documented driver of Indian index returns. Directly feeds regime classification.</td></tr>
+    <tr><td><strong>Circuit bands per stock per day</strong></td><td><span class="pill p-part">Inferred</span></td><td>The platform detects circuit locks from price behaviour rather than reading the published band. A circuit-locked session is untradeable; a backtest that fills one is reporting a trade that could not happen.</td></tr>
+    <tr><td><strong>Fundamentals</strong><br><span class="mono-cell">quarterly results, shares outstanding, book value</span></td><td><span class="pill p-none">Absent</span></td><td>All of value, quality and size. Also market-cap weighting and capacity estimation — without shares outstanding the platform cannot know how large a position it is modelling.</td></tr>
+    <tr><td><strong>Corporate actions ledger</strong></td><td><span class="pill p-part">Partial</span></td><td>The dataset carries <code>dividends</code> and <code>stock_splits</code>, and the adjustment uses them. Bonuses, rights, mergers and symbol changes are not handled — a symbol change looks like a delisting plus a new listing.</td></tr>
+    <tr><td><strong>Intraday bars</strong></td><td><span class="pill p-none">Absent</span></td><td>Any honest execution model. Close-to-close fills at a flat 25 bps is a placeholder, not a cost model.</td></tr>
+    <tr><td><strong>Risk-free curve</strong><br><span class="mono-cell">T-bill / MIBOR</span></td><td><span class="pill p-part">Supplied</span></td><td>Now passed in rather than hardcoded — correct. A term structure would be better than a scalar.</td></tr>
+    <tr><td><strong>Daily adjusted OHLCV</strong></td><td><span class="pill p-have">Present</span></td><td>Versioned and reproducible when <code>hf_revision</code> is pinned. The one genuinely solid piece of the data layer.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Roughly five years of history is the other quiet limit. It contains one crash (2020), one liquidity-driven bull run, and one rate-hiking cycle — a single realization of each. Any regime model fitted on it has seen each state approximately once.</p>
+
+<h2><span class="num">Part 4 · Ambition</span>What best-in-class would require</h2>
+
+<p class="lede">Taking "best in class for Indian markets" seriously means three things the platform does not yet have: a bitemporal data layer, a validation protocol built for overlapping financial labels, and an execution model that reflects how Indian equities actually trade.</p>
+
+<h3>The data layer becomes the product</h3>
+<p>Not a parquet cache — a store with <em>as-of</em> semantics, where every fact carries both the date it describes and the date it became known. Quarterly results are the clearest case: a result published on 15 May describing the quarter to 31 March must be invisible to any query dated 14 May. Without bitemporality this class of leak is undetectable by inspection, and it inflates exactly the factors people most want to add.</p>
+
+<h3>Validation has to assume overlapping labels</h3>
+<p>Predicting a 5-day forward return from daily observations means consecutive training samples share four days of outcome. Standard cross-validation leaks across that overlap and reports a skill that does not exist. The fixes are known and mechanical — purging and embargoing around the test fold, combinatorial purged CV for a distribution of outcomes rather than one number. The platform already has the harder half of this: PSR, DSR, PBO and a deduplicated trial log. Purged CV is the missing complement.</p>
+
+<h3>Models, in the order the evidence supports</h3>
+<ul>
+  <li><strong>Gradient-boosted trees on cross-sectional ranks first.</strong> On tabular panel data at this sample size they typically beat sequence networks, train in seconds, and are far easier to attribute. The LSTM is the more interesting model and the less appropriate default.</li>
+  <li><strong>Residual momentum</strong> — momentum on returns orthogonalized to market and sector — directly addresses the concentration problem <code>A8</code> describes, at the signal level rather than as a cap bolted on afterwards.</li>
+  <li><strong>Seed ensembling before architecture search.</strong> Averaging five seeds of one model reliably buys more out-of-sample stability than finding a better single architecture, and costs nothing but compute.</li>
+  <li><strong>Conformal prediction alongside isotonic calibration.</strong> Isotonic gives a calibrated point probability; conformal gives an interval with coverage guarantees that hold without distributional assumptions. Position sizing consumes uncertainty, so the interval is the more useful object.</li>
+  <li><strong>Latent factor models (IPCA, conditional autoencoders) last.</strong> High ceiling, and they need the fundamental data above to be worth attempting.</li>
+</ul>
+
+<h3>Execution modelling that matches the venue</h3>
+<p>Flat basis-point costs are the placeholder every backtest starts with and few replace. For Indian equities specifically: participation-rate limits against actual traded volume, square-root market impact, circuit-band awareness so untradeable sessions are skipped rather than filled, and separate treatment of the overnight gap — which is where a large share of the move happens, and which is precisely what invalidates a stop-based risk model. The repo already flags this last one as partly done.</p>
+
+<h2><span class="num">Part 5 · Sequence</span>What I would do, in order</h2>
+
+<div class="phase">
+  <div class="phase-tag">1–2 wks</div>
+  <div>
+    <h3>Make it installable and testable</h3>
+    <p><code>A1</code>, <code>A2</code>, and the CLI half of <code>A4</code>. Cheap, mechanical, unblocks everything else including distribution and any notebook that wants to import the framework.</p>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-tag">2–4 wks</div>
+  <div>
+    <h3>Fix the data floor</h3>
+    <p>Point-in-time index membership, a shipped sector map, delivery percentage. This is <code>D9</code> and <code>A8</code>, and it is what converts every existing backtest number from decorative to interpretable.</p>
+    <p>Do this <em>before</em> any modelling work. Improving a model measured on a biased sample tells you nothing about the model.</p>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-tag">3–6 wks</div>
+  <div>
+    <h3>Decompose the engine, add the conformance suite</h3>
+    <p><code>A3</code> and the rest of <code>A4</code>. Golden-file the current output first, then extract one collaborator per PR. Land the lag-safety conformance test early — it protects every strategy added afterwards.</p>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-tag">2–3 wks</div>
+  <div>
+    <h3>Close the workflow loop</h3>
+    <p><code>A9</code> plus the ergonomics table: run manifests, <code>evaluate</code> as one command, entry-point discovery, a scaffold generator. This is what makes the platform pleasant rather than merely capable.</p>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-tag">Ongoing</div>
+  <div>
+    <h3>Then, and only then, the modelling ambition</h3>
+    <p>Purged CV, gradient boosting, residual momentum, seed ensembling, conformal intervals. Each is a contained piece of work once the three above are done — and each is close to unmeasurable until they are.</p>
+    <ul>
+      <li>Resolve <code>A5</code> as you go: switch each dormant module on with a documented comparison, or move it to <code>experimental/</code>.</li>
+      <li>F&amp;O and flows data when the bitemporal store exists to hold them properly.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="callout">
+  <p class="label">The ordering principle</p>
+  <p>Every phase above is sequenced so that the work done in it can be <em>measured</em> by the time it lands. The most common failure mode for a platform at this stage is adding models before fixing the sample they are judged on — which produces months of work and no way to tell whether any of it helped.</p>
+</div>
+
+<footer>
+  <p>Findings <code>A1–A9</code> are architectural and complement the quantitative series <code>D1–D10</code> in <code>docs/REVIEW_STATUS.md</code>, which remains the authority on model correctness. Measurements taken on branch <code>claude/custom-models-strategies-0xm9xp</code> at commit <code>c7310aa</code>; line counts exclude tests and <code>__pycache__</code>; test-mention counts are a coverage proxy (symbol references across <code>portfolio_agent/tests/</code>), not statement coverage.</p>
+</footer>
+</div>
+
+</div>
