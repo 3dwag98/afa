@@ -143,7 +143,11 @@ def apply_cross_sectional_scaling(
         z = wide.sub(mean, axis=0).div(std.where(has_spread, 1.0), axis=0)
         # No dispersion means the feature separates nobody today; dividing by
         # that spread would let a column carrying no information dominate.
-        z = z.where(has_spread, 0.0)
+        # axis=0 is explicit because `has_spread` is indexed by date while the
+        # frame's columns are tickers: pandas happens to align on the index
+        # here, but only because the two label spaces never collide, and that
+        # is not a property worth depending on silently.
+        z = z.where(has_spread, 0.0, axis=0)
         z = z.clip(-clip, clip).fillna(0.0)
 
         for ticker in wide.columns:

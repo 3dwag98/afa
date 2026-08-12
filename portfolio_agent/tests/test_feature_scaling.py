@@ -253,6 +253,37 @@ class TestCrossSectionalFeatureScaling:
         for ticker in panel:
             assert np.all(scaled[ticker]["flat"].to_numpy() == 0.0)
 
+    def test_a_flat_date_is_zeroed_without_disturbing_the_dates_around_it(self):
+        """The mixed case, which an all-constant fixture cannot catch.
+
+        The zero-dispersion guard selects per date, and the selector is indexed
+        by date while the frame's columns are tickers. If that alignment were
+        wrong it would still look correct on a panel where *every* date is flat
+        — everything gets zeroed either way — so the discriminating test is a
+        panel with a flat date sandwiched between live ones.
+        """
+        import pandas as pd
+
+        dates = pd.bdate_range("2024-01-01", periods=3)
+        values = {"A": 1.0, "B": 2.0, "C": 3.0, "D": 4.0, "E": 5.0}
+        panel = {
+            ticker: pd.DataFrame(
+                # Live, flat, live.
+                {"x": [value, 7.0, value * 2]}, index=dates
+            )
+            for ticker, value in values.items()
+        }
+        from portfolio_agent.features.scaling import apply_cross_sectional_scaling
+
+        scaled = apply_cross_sectional_scaling(panel, feature_columns=["x"])
+        by_date = pd.DataFrame({t: f["x"] for t, f in scaled.items()})
+
+        assert np.all(by_date.iloc[1].to_numpy() == 0.0)
+        for row in (0, 2):
+            assert float(by_date.iloc[row].std(ddof=0)) == pytest.approx(1.0, abs=1e-12)
+            # And the live dates keep their ordering rather than being zeroed.
+            assert by_date.iloc[row]["A"] < by_date.iloc[row]["E"]
+
     def test_removes_the_market_factor_from_a_common_move(self):
         """The reason this beats the pooled scaler.
 
