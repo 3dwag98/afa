@@ -165,6 +165,19 @@ class TrainingConfig(BaseModel):
     target: str = Field(
         default="return_5d", description="Target variable for prediction"
     )
+    feature_normalization: Literal["global", "cross_sectional"] = Field(
+        default="cross_sectional",
+        description="How model inputs are standardized before training "
+        "(features/scaling.py::apply_cross_sectional_scaling). 'global' fits one mean and "
+        "standard deviation per feature over the pooled training rows, which answers 'is this RSI "
+        "high for this stock over the sample'. 'cross_sectional' z-scores each feature across the "
+        "universe separately on every date, which answers 'is this RSI high relative to what else "
+        "I could buy today' — the question a model that chooses between stocks is actually being "
+        "asked. The cross-sectional form also strips the market factor out of the inputs, the "
+        "same way target_transform strips it out of the label, and cannot leak across dates by "
+        "construction since it fits no state. The global scaler still runs afterwards either way: "
+        "it is what ships in the checkpoint metadata and guarantees inference reproduces training.",
+    )
     target_transform: Literal[
         "absolute", "cross_sectional_demean", "cross_sectional_rank"
     ] = Field(
@@ -313,6 +326,17 @@ class RiskConfig(BaseModel):
     )
     risk_per_trade_pct: float = Field(
         default=0.01, description="Risk per trade as a percentage"
+    )
+    risk_free_rate: float = Field(
+        default=0.065,
+        ge=0.0,
+        description="Annualized risk-free rate subtracted from strategy returns before the "
+        "Sharpe and Sortino ratios (decimal, so 0.065 is 6.5%). Stated here rather than defaulted "
+        "inside RiskAnalyzer so that whatever rate a reported Sharpe was computed against is "
+        "visible in the config a reviewer reads. This is a constant over the whole backtest "
+        "window, which is wrong for any multi-year run — India's policy rate moved materially "
+        "over 2021-2025 — so prefer paths.risk_free_rate_csv, which overrides this with a dated "
+        "series.",
     )
     max_single_position_pct: float = Field(
         default=0.03, description="Maximum allocation to a single position"
@@ -573,6 +597,17 @@ class SimulationConfig(BaseModel):
         "noise alone. Raise this toward infinity to recover the raw sample mean; set it to 0 to "
         "credit no ticker with any drift edge at all.",
     )
+    use_empirical_drift_prior: bool = Field(
+        default=True,
+        description="If True, estimate the drift prior from the cross-section of the active "
+        "universe each scoring round (src/monte_carlo.py::estimate_cross_sectional_drift_prior) "
+        "instead of using the fixed prior_annual_drift_std, and shrink each ticker toward the "
+        "universe mean rather than toward zero. The method of moments splits the observed spread "
+        "of sample means into true dispersion and estimation noise — tau^2 = max(0, Var(mu_hat) - "
+        "mean(sigma_i^2/T_i)) — so the amount of shrinkage is measured rather than assumed. Falls "
+        "back to the fixed prior automatically when the usable cross-section is too thin to "
+        "estimate two moments from. Set False to restore the fixed-prior behaviour.",
+    )
     propagate_drift_uncertainty: bool = Field(
         default=True,
         description="If True, each simulated path draws its own drift from the posterior instead "
@@ -623,6 +658,16 @@ class PathsConfig(BaseModel):
         "capital instead of sector concentration, leaving most of the portfolio in cash forever. "
         "A partial map gives each mapped sector max_sector_pct and the unmapped pool its own "
         "max_unknown_sector_pct.",
+    )
+    risk_free_rate_csv: str = Field(
+        default="data/risk_free_rate.csv",
+        description="Optional CSV of the dated risk-free rate — columns date,annualized_yield — "
+        "typically the 91-day T-bill. When the file exists it is aligned to the return index, "
+        "forward-filled across non-trading days and de-annualized, so the excess return is "
+        "computed day by day against the rate that actually prevailed. When it is absent, "
+        "risk.risk_free_rate is used as a constant across the whole window and the run logs that "
+        "it did so. Values may be given as decimals (0.068) or percent (6.8); both are read "
+        "correctly.",
     )
     trial_log: str = Field(
         default="output/trials.jsonl",

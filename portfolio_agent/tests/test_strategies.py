@@ -1,6 +1,9 @@
 """Tests for the unified strategy plugin system."""
 
+import math
+
 import pytest
+import numpy as np
 import pandas as pd
 from pathlib import Path
 
@@ -641,3 +644,207 @@ class TestIntegrationWithConfig:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestProbitCompositeScoring:
+    """Task 1.3: the rank composite, put on a proper z-scale.
+
+    `rank_composite` made the four components commensurable by ranking them,
+    but a percentile is still a uniform variate: averaging uniforms gives
+    something whose spread depends on how many components were measurable and
+    how correlated they are, so a 0.72 on one date is not a 0.72 on another.
+    Applying the inverse normal CDF to the ranks (Van der Waerden scores) puts
+    every component on a common z-scale, and standardizing the combination
+    makes the composite mean-zero and variance-one on every date by
+    construction — which is what makes a score comparable across dates and
+    usable as an input to a mean-variance optimizer.
+    """
+
+    _WEIGHTS = {"Trend": 25.0, "Breakout": 25.0, "Volume": 20.0, "MC_Prob": 30.0}
+
+    def _strategy(self, mode="probit_composite"):
+        return RuleBasedStrategy(
+            StrategyConfig(
+                type="rule_based",
+                params={
+                    "yaml_path": "config/strategies/trend_breakout.yaml",
+                    "scoring_mode": mode,
+                },
+            )
+        )
+
+    def _context(self, mc=0.70):
+        return StrategyContext(
+            risk=_risk_params(), weights=dict(self._WEIGHTS),
+            mc_result=_mc_result(mc) if mc is not None else None,
+        )
+
+    def _universe(self, n=40):
+        """A universe wide enough for cross-sectional moments to mean something."""
+        universe = {}
+        for i in range(n):
+            universe[f"T{i:03d}"] = _features(
+                close=100.0 + i,
+                sma_50=140.0 - i,
+                sma_200=120.0,
+                donchian_upper_20=155.0 - 2 * i,
+                volume_ratio_20=0.2 + 0.1 * i,
+            )
+        return universe
+
+    def _z_scores(self, signals):
+        return np.array(
+            [s.extra["composite_z"] for s in signals.values()], dtype=float
+        )
+
+    def test_mode_is_registered_and_requires_the_full_batch(self):
+        strategy = self._strategy()
+        assert strategy._scoring == "probit_composite"
+        # A cross-section of one has no ranks, so per-ticker scoring is
+        # semantically wrong rather than merely slow.
+        assert strategy.requires_full_batch is True
+
+    def test_composite_is_mean_zero_and_variance_one_per_date(self):
+        """The acceptance criterion.
+
+        Asserted on the composite z rather than on `score`, because `score`
+        stays on the platform's 0-100 scale (see
+        test_score_stays_on_the_zero_to_hundred_scale_the_gates_read).
+        """
+        signals = self._strategy().score_batch(self._universe(), self._context())
+        z = self._z_scores(signals)
+
+        assert z.size == 40
+        assert float(np.mean(z)) == pytest.approx(0.0, abs=1e-12)
+        assert float(np.std(z, ddof=0)) == pytest.approx(1.0, abs=1e-12)
+
+    def test_moments_hold_whatever_the_universe_size(self):
+        """Mean-zero/variance-one must be a property of the construction, not
+        a coincidence of one universe."""
+        for n in (5, 17, 40, 123):
+            signals = self._strategy().score_batch(
+                self._universe(n), self._context()
+            )
+            z = self._z_scores(signals)
+            assert float(np.mean(z)) == pytest.approx(0.0, abs=1e-12), n
+            assert float(np.std(z, ddof=0)) == pytest.approx(1.0, abs=1e-12), n
+
+    def test_probit_never_produces_an_infinite_score(self):
+        """The trap in `z = norm.ppf(rank)`.
+
+        A percentile rank computed as rank/N gives the best name exactly 1.0,
+        and Phi^-1(1) is +inf — which would propagate to the composite, the
+        standardization (mean becomes nan) and every score on the date. The
+        plotting position rank/(N+1) keeps the argument strictly inside (0, 1).
+        """
+        signals = self._strategy().score_batch(self._universe(), self._context())
+        z = self._z_scores(signals)
+
+        assert np.all(np.isfinite(z))
+        assert all(np.isfinite(s.score) for s in signals.values())
+
+    def test_score_stays_on_the_zero_to_hundred_scale_the_gates_read(self):
+        """`_build_signal` gates on `score >= 60` and `>= 45`.
+
+        Emitting a z-score as `score` would mean no name ever cleared 60 and
+        the platform would simply stop issuing BUY. The composite is mapped
+        back through Phi, which is monotone — so the ordering is exactly the
+        z-ordering, and `score >= 60` acquires a cleaner reading than it had
+        before: "in the top 40% of today's cross-section".
+        """
+        signals = self._strategy().score_batch(self._universe(), self._context())
+
+        scores = np.array([s.score for s in signals.values()])
+        assert np.all(scores >= 0.0) and np.all(scores <= 100.0)
+
+        by_score = sorted(signals, key=lambda t: -signals[t].score)
+        by_z = sorted(signals, key=lambda t: -signals[t].extra["composite_z"])
+        assert by_score == by_z
+
+    def test_ordering_matches_the_rank_composite_it_replaces(self):
+        """The probit changes the score's units, not its opinion: it is a
+        monotone transform of each component before a weighted sum, so on a
+        universe where the components agree the ordering must survive."""
+        universe = self._universe()
+        ranked = self._strategy("rank_composite").score_batch(universe, self._context())
+        probit = self._strategy().score_batch(universe, self._context())
+
+        assert sorted(universe, key=lambda t: -ranked[t].score) == sorted(
+            universe, key=lambda t: -probit[t].score
+        )
+
+    def test_is_invariant_to_a_monotone_rescaling_of_a_component(self):
+        """The property that makes ranks the right primitive.
+
+        Asserted on _probit_components rather than end-to-end through
+        score_batch, because the raw features are *not* the thing being
+        ranked. `_read_components` clips Volume at min(ratio/2, 1.0), and a
+        clip is not injective — rescaling the underlying ratio moves which
+        names sit on the cap, changing the tie structure before the transform
+        ever sees it. That is a property of the component definition, not of
+        the probit, so testing it through the features would be asserting the
+        wrong thing about the wrong layer.
+
+        What the transform actually guarantees: given component values,
+        applying any strictly increasing map to them leaves the normal scores
+        untouched, because ranks are all it reads.
+        """
+        from portfolio_agent.strategies.rule_based import _ComponentRead
+
+        rng = np.random.default_rng(17)
+        base_reads = {
+            f"T{i:03d}": _ComponentRead(
+                components={
+                    "Trend": float(rng.uniform(0, 1)),
+                    "Breakout": float(rng.uniform(0, 1)),
+                    "Volume": float(rng.uniform(0.1, 5.0)),
+                    "MC_Prob": float(rng.uniform(0.3, 0.8)),
+                }
+            )
+            for i in range(30)
+        }
+        # Strictly increasing on the positive reals, and wildly non-linear.
+        rescaled_reads = {
+            symbol: _ComponentRead(
+                components={
+                    name: math.log1p(value) ** 3
+                    for name, value in read.components.items()
+                }
+            )
+            for symbol, read in base_reads.items()
+        }
+
+        strategy = self._strategy()
+        base = strategy._probit_components(base_reads)
+        after = strategy._probit_components(rescaled_reads)
+
+        for symbol in base_reads:
+            for component in ("Trend", "Breakout", "Volume", "MC_Prob"):
+                assert base[symbol][component] == pytest.approx(
+                    after[symbol][component], abs=1e-12
+                )
+
+    def test_a_degenerate_cross_section_does_not_divide_by_zero(self):
+        """Every name identical means zero dispersion. Standardizing by a zero
+        standard deviation would give nan; the composite collapses to zero
+        instead, which is the honest statement that nothing separates them."""
+        identical = {
+            f"T{i}": _features(close=150.0, sma_50=140.0, sma_200=120.0,
+                               donchian_upper_20=145.0, volume_ratio_20=3.0)
+            for i in range(6)
+        }
+        signals = self._strategy().score_batch(identical, self._context())
+        z = self._z_scores(signals)
+
+        assert np.all(np.isfinite(z))
+        assert np.all(z == 0.0)
+        assert all(s.score == pytest.approx(50.0) for s in signals.values())
+
+    def test_is_deterministic(self):
+        universe = self._universe()
+        first = self._strategy().score_batch(universe, self._context())
+        second = self._strategy().score_batch(universe, self._context())
+
+        assert {t: s.score for t, s in first.items()} == {
+            t: s.score for t, s in second.items()
+        }

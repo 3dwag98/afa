@@ -31,7 +31,7 @@ try:
     from .models import AgentBrain
     from .regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
     from .execution_sim import ExecutionSimulator
-    from .monte_carlo import MonteCarloSettings
+    from .monte_carlo import CrossSectionalDriftPrior, MonteCarloSettings
     from .portfolio import (
         ledoit_wolf_covariance, portfolio_volatility, summarize_book_risk,
     )
@@ -45,7 +45,7 @@ except ImportError:
     from models import AgentBrain
     from regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
     from execution_sim import ExecutionSimulator
-    from monte_carlo import MonteCarloSettings
+    from monte_carlo import CrossSectionalDriftPrior, MonteCarloSettings
     from portfolio import (
         ledoit_wolf_covariance, portfolio_volatility, summarize_book_risk,
     )
@@ -121,13 +121,17 @@ def _score_one_ticker_in_worker(
     hist_data: pd.DataFrame,
     weights: Dict[str, float],
     regime_label: Optional[str] = None,
+    drift_prior: Optional[CrossSectionalDriftPrior] = None,
 ) -> Optional[StrategySignal]:
     """Worker-side entry point: only the per-day varying arguments travel."""
     if _WORKER_STRATEGY is None or _WORKER_RISK is None:
         raise RuntimeError("Scoring worker was not initialized")
+    mc_settings = _WORKER_MC_SETTINGS
+    if drift_prior is not None:
+        mc_settings = mc_settings.with_drift_prior(drift_prior)
     return _score_one_ticker(
         _WORKER_STRATEGY, ticker, hist_data, _WORKER_FEATURES,
-        _WORKER_RISK, weights, _WORKER_MC_SETTINGS, regime_label,
+        _WORKER_RISK, weights, mc_settings, regime_label,
     )
 
 
@@ -755,6 +759,15 @@ class BacktestEngine:
             triggered = False
             trigger_price = None
             trigger_type = None
+            # Signed distance between the realized fill and the level it was
+            # set at, as a percentage of that level: negative when a gap
+            # carried a stop past its price, positive when one carried a target
+            # past its own, and zero whenever the level itself was available.
+            # Recorded rather than folded silently into P&L — the P&L alone
+            # cannot distinguish a gapped exit from a clean one, and how often
+            # the modelled stop was actually reachable is the thing worth
+            # measuring.
+            gap_fill_delta_pct = 0.0
 
             # **Gap-aware fills.** A stop is a resting order, not a guaranteed
             # price: it becomes marketable when the price reaches it and fills
@@ -771,6 +784,12 @@ class BacktestEngine:
             # which is why the platform models overnight gap variance
             # separately in the first place (volatility_models.py).
             #
+            # The error also feeds back into sizing: Kelly reads its loss
+            # magnitude `l` from realized history
+            # (src/risk.py::estimate_kelly_inputs), so an understated `l`
+            # inflates f* and the book bets larger precisely because it has
+            # been mis-measuring its worst outcomes.
+            #
             # The same logic runs the other way for a take-profit: a gap
             # *through* the target fills at the open, above the target, so
             # booking the target understates the gain. Both are corrected, and
@@ -780,12 +799,16 @@ class BacktestEngine:
                 triggered = True
                 trigger_price = min(open_price, stop_price) if open_price else stop_price
                 trigger_type = 'STOP_LOSS'
+                if stop_price > 0:
+                    gap_fill_delta_pct = (trigger_price - stop_price) / stop_price * 100.0
 
             elif target_price is not None and high >= target_price:
                 triggered = True
                 trigger_price = max(open_price, target_price) if open_price else target_price
                 trigger_type = 'TAKE_PROFIT'
-            
+                if target_price > 0:
+                    gap_fill_delta_pct = (trigger_price - target_price) / target_price * 100.0
+
             if triggered:
                 # Exits pay the same friction as any other sale — brokerage,
                 # STT, exchange charges, GST and capital gains tax. Booking
@@ -829,7 +852,8 @@ class BacktestEngine:
                     'net_pnl': net_pnl,
                     'return_pct': return_pct,
                     'holding_days': holding_days,
-                    'exit_reason': exit_reason
+                    'exit_reason': exit_reason,
+                    'gap_fill_delta_pct': gap_fill_delta_pct,
                 }
                 self.trade_log.append(trade_record)
                 executed_trades.append(trade_record)
@@ -887,6 +911,17 @@ class BacktestEngine:
 
         weights = dict(self.agent_brain.weights)
 
+        # The drift prior is estimated from this round's cross-section, and
+        # `eligible` is exactly the point-in-time panel: every frame in it came
+        # from _get_historical_data_up_to(ticker, current_date), so nothing
+        # here has seen T. Re-estimated per date rather than once per run for
+        # the same reason — a prior fitted over the whole backtest would carry
+        # the future into every day's posterior.
+        mc_settings = self.mc_settings.with_drift_prior_from_panel(
+            history['close'].pct_change().dropna().to_numpy()
+            for history in eligible.values()
+        )
+
         if self.strategy.supports_gpu_batch or self.strategy.requires_full_batch:
             features_by_symbol = {
                 ticker: build_features(hist_data, self.strategy.required_features())
@@ -918,7 +953,9 @@ class BacktestEngine:
         )
 
         if self.parallel and len(eligible) > 1:
-            parallel_signals = self._score_tickers_parallel(eligible, weights, regime_label)
+            parallel_signals = self._score_tickers_parallel(
+                eligible, weights, regime_label, mc_settings.drift_prior
+            )
             if parallel_signals is not None:
                 return parallel_signals
 
@@ -928,7 +965,7 @@ class BacktestEngine:
         for ticker, hist_data in eligible.items():
             result = _score_one_ticker(
                 self.strategy, ticker, hist_data, required_features,
-                self.risk_params, weights, self.mc_settings, regime_label,
+                self.risk_params, weights, mc_settings, regime_label,
             )
             if result is not None:
                 signals[ticker] = result
@@ -1037,6 +1074,7 @@ class BacktestEngine:
         eligible: Dict[str, pd.DataFrame],
         weights: Dict[str, float],
         regime_label: Optional[str] = None,
+        drift_prior: Optional[CrossSectionalDriftPrior] = None,
     ) -> Optional[Dict[str, StrategySignal]]:
         """Score every eligible ticker across the run's CPU process pool.
 
@@ -1050,12 +1088,20 @@ class BacktestEngine:
 
         Returns None if the pool could not be used at all, so the caller can
         fall back to serial scoring rather than losing the run.
+
+        `drift_prior` rides with each task rather than through the pool
+        initializer: the pool is created once per backtest, but the prior is
+        re-estimated every scoring round, so installing it at worker startup
+        would pin the whole run to day one's cross-section. It is four floats,
+        so per-task pickling costs nothing next to the history frame already
+        being shipped.
         """
         try:
             executor = self._get_scoring_executor()
             futures = {
                 ticker: executor.submit(
-                    _score_one_ticker_in_worker, ticker, hist_data, weights, regime_label
+                    _score_one_ticker_in_worker, ticker, hist_data, weights,
+                    regime_label, drift_prior,
                 )
                 for ticker, hist_data in eligible.items()
             }

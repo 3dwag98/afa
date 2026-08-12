@@ -11,10 +11,12 @@ inputs.
 from __future__ import annotations
 
 import math
+import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 import yaml
 
@@ -33,7 +35,23 @@ except ImportError:
 # rank transform and the score both walk the same set.
 COMPONENT_NAMES = ("Trend", "Breakout", "Volume", "MC_Prob")
 
-SCORING_MODES = ("weighted_sum", "rank_composite")
+SCORING_MODES = ("weighted_sum", "rank_composite", "probit_composite")
+
+# Modes whose score is a statement about the cross-section, so a per-ticker
+# call cannot produce one.
+_CROSS_SECTIONAL_MODES = ("rank_composite", "probit_composite")
+
+# Phi and Phi^-1 from the stdlib, matching src/performance_stats.py, which is
+# the other module in this package that needs them. NormalDist.inv_cdf is
+# Wichura's AS241 and accurate to full double precision, so this is the same
+# number scipy.stats.norm.ppf returns, without a second convention for the same
+# quantity living in two files.
+_NORMAL = statistics.NormalDist()
+
+# A cross-section with dispersion below this has nothing to standardize by;
+# np.std of a constant column lands near 1e-17 rather than exactly zero, and
+# dividing by that turns a tie into an arbitrary ±1e17 ordering.
+_MIN_COMPOSITE_DISPERSION = 1e-12
 
 
 @dataclass
@@ -137,10 +155,17 @@ class RuleBasedStrategy(BaseStrategy):
         """Score one ticker.
 
         Under ``scoring: weighted_sum`` (the default) this is self-contained.
-        Under ``scoring: rank_composite`` a single ticker is a cross-section of
-        one, so every component ranks at the 100th percentile and the score is
-        meaningless — callers must use score_batch() with the full eligible
-        universe, which is what ``requires_full_batch`` tells them to do.
+
+        Under ``rank_composite`` or ``probit_composite`` a single ticker is a
+        cross-section of one — every component ranks at the same quantile and
+        the score says nothing — so callers must use score_batch() with the
+        full eligible universe. ``requires_full_batch`` is what tells them so,
+        and every production path honours it: the orchestrator and the backtest
+        engine both branch on it before dispatching, and EnsembleStrategy
+        refuses to build a UMA that would reach a cross-sectional member
+        through this method. A direct call here still returns the weighted sum
+        of the raw components, which is a different quantity on a different
+        scale from what score_batch() produces.
         """
         read = self._read_components(symbol, features, context)
         if read is None:
@@ -152,7 +177,7 @@ class RuleBasedStrategy(BaseStrategy):
     ) -> Dict[str, StrategySignal]:
         """Score many tickers, ranking their components against each other
         when ``scoring: rank_composite`` is configured."""
-        if self._scoring != "rank_composite":
+        if self._scoring not in _CROSS_SECTIONAL_MODES:
             return super().score_batch(features_by_symbol, context)
 
         reads = {
@@ -163,21 +188,50 @@ class RuleBasedStrategy(BaseStrategy):
         if not usable:
             return {symbol: self._empty_signal(symbol) for symbol in features_by_symbol}
 
-        ranked = self._rank_components(usable)
-
         signals = {
             symbol: self._empty_signal(symbol)
             for symbol, read in reads.items() if read is None
         }
+
+        if self._scoring == "rank_composite":
+            ranked = self._rank_components(usable)
+            for symbol, read in usable.items():
+                signals[symbol] = self._build_signal(
+                    symbol, read, ranked[symbol], context
+                )
+            return signals
+
+        # probit_composite: normal-score each component, combine, then
+        # standardize the combination across the date. The standardization is
+        # cross-sectional, so it cannot happen inside the per-symbol
+        # _build_signal — the composite is computed for the whole batch first
+        # and handed down.
+        scored = self._probit_components(usable)
+        composites = {
+            symbol: combine_weighted(
+                scored[symbol], context.weights, unavailable=read.unavailable
+            )[0]
+            for symbol, read in usable.items()
+        }
+        standardized = self._standardize(composites)
+
         for symbol, read in usable.items():
-            signals[symbol] = self._build_signal(symbol, read, ranked[symbol], context)
+            z = standardized[symbol]
+            signals[symbol] = self._build_signal(
+                symbol, read, scored[symbol], context,
+                # Phi is monotone, so the 0-100 score orders names exactly as
+                # the z does while staying on the scale the >=60 / >=45 gates
+                # and every downstream report already read.
+                final_score=100.0 * _NORMAL.cdf(z),
+                composite_z=z,
+            )
         return signals
 
     @property
     def requires_full_batch(self) -> bool:
-        """Rank scoring is a statement about a cross-section, so a per-ticker
-        loop is semantically wrong rather than merely slow."""
-        return self._scoring == "rank_composite"
+        """Cross-sectional scoring is a statement about a whole universe, so a
+        per-ticker loop is semantically wrong rather than merely slow."""
+        return self._scoring in _CROSS_SECTIONAL_MODES
 
     def _empty_signal(self, symbol: str) -> StrategySignal:
         return StrategySignal(
@@ -216,7 +270,12 @@ The weighted sum this replaces adds four incommensurable quantities: an
         on 0-100, so the existing `score >= 60` / `>= 45` thresholds stay
         syntactically valid and gain a clean reading — "60th percentile of the
         weighted composite" — instead of requiring every YAML to be rewritten
-        against a z-scale.
+        against a z-scale. The inverse-normal form is available as the separate
+        ``probit_composite`` mode (see _probit_components), which keeps the
+        0-100 score by mapping back through Phi and exposes the z alongside it;
+        prefer that one when the score is being consumed as a magnitude rather
+        than as an ordering, since a weighted sum of percentiles has a spread
+        that depends on how many components were measurable that day.
 
         Ties take the average rank, which matters here: Breakout is binary and
         Trend has three levels, so ties are the common case rather than an edge
@@ -249,6 +308,89 @@ The weighted sum this replaces adds four incommensurable quantities: an
                 )
 
         return ranked
+
+    def _probit_components(
+        self, reads: Dict[str, "_ComponentRead"]
+    ) -> Dict[str, Dict[str, float]]:
+        """Cross-sectional percentile ranks pushed through Phi^-1.
+
+        The rank composite made the components commensurable; this makes them
+        *additive*. A percentile is a uniform variate, and a weighted sum of
+        uniforms has a spread that depends on how many components were
+        measurable and how correlated they are — so the same 0.72 means
+        different things on different dates and in different universes. Normal
+        scores are the standard fix (Van der Waerden): rank, map to a normal
+        quantile, and the sum inherits a scale that is stable across dates.
+
+        **The plotting position is load-bearing, not a rounding detail.**
+        Ranks are converted with r/(N+1), not the r/N that `pct=True` gives.
+        Under r/N the best name in the universe ranks at exactly 1.0 and
+        Phi^-1(1) is +inf — which does not fail loudly on that one ticker, it
+        propagates into the weighted sum, makes the cross-sectional mean and
+        standard deviation nan, and takes down every score on the date. r/(N+1)
+        is the Blom/Van der Waerden convention and keeps the argument strictly
+        inside (0, 1) for every N.
+
+        Ties take the average rank, as under rank scoring: Breakout is binary
+        and Trend has three levels, so ties are the common case, and a
+        first-past-the-post rank would order tied names by dict iteration
+        order.
+
+        An unavailable component is left at its raw value and dropped from the
+        combination by the caller, rather than being ranked — ranking a column
+        nobody has hands every ticker the same quantile, which spends the
+        weight to say nothing.
+        """
+        symbols = list(reads)
+        scored: Dict[str, Dict[str, float]] = {symbol: {} for symbol in symbols}
+
+        for component in COMPONENT_NAMES:
+            measurable = [s for s in symbols if component not in reads[s].unavailable]
+            if not measurable:
+                for symbol in symbols:
+                    scored[symbol][component] = reads[symbol].components[component]
+                continue
+
+            values = pd.Series(
+                {s: reads[s].components[component] for s in measurable}, dtype=float
+            )
+            # Ranks are 1..N; dividing by N+1 keeps Phi^-1's argument off both
+            # singularities however large or small the cross-section is.
+            quantiles = values.rank(method="average") / (len(values) + 1)
+            for symbol in symbols:
+                scored[symbol][component] = (
+                    _NORMAL.inv_cdf(float(quantiles[symbol]))
+                    if symbol in quantiles.index
+                    else reads[symbol].components[component]
+                )
+
+        return scored
+
+    @staticmethod
+    def _standardize(composites: Dict[str, float]) -> Dict[str, float]:
+        """Centre and scale the composite so the date is mean-zero, variance-one.
+
+        This is the step that makes a score comparable across dates. The probit
+        transform fixes each component's marginal shape, but the *combination*
+        still has a variance set by the weights and by how correlated the
+        components happened to be that day — standardizing removes both, so a
+        z of 1.5 means "1.5 standard deviations better than today's universe"
+        on every date, which is the contract a portfolio optimizer needs from
+        an alpha input.
+
+        A degenerate cross-section (every name identical, or a universe of one)
+        has no dispersion to divide by and collapses to zero rather than nan.
+        """
+        symbols = list(composites)
+        values = np.array([composites[s] for s in symbols], dtype=float)
+
+        centred = values - values.mean()
+        dispersion = float(np.std(centred, ddof=0))
+        if dispersion < _MIN_COMPOSITE_DISPERSION:
+            return {symbol: 0.0 for symbol in symbols}
+
+        standardized = centred / dispersion
+        return {symbol: float(z) for symbol, z in zip(symbols, standardized)}
 
     def _read_components(
         self, symbol: str, features: pd.DataFrame, context: StrategyContext
@@ -332,23 +474,31 @@ The weighted sum this replaces adds four incommensurable quantities: an
         read: "_ComponentRead",
         score_inputs: Dict[str, float],
         context: StrategyContext,
+        final_score: Optional[float] = None,
+        composite_z: Optional[float] = None,
     ) -> StrategySignal:
         """Turn component values into a signal.
 
         `score_inputs` is what the weights are applied to — the raw components
         under weighted-sum scoring, their within-batch percentile ranks under
-        rank-composite scoring. `read.components` stays the raw values
-        throughout, because the trigger, the reported component scores and the
-        rationale are all statements about the indicators themselves.
+        rank-composite scoring, their normal scores under probit-composite.
+        `read.components` stays the raw values throughout, because the trigger,
+        the reported component scores and the rationale are all statements
+        about the indicators themselves.
+
+        `final_score` and `composite_z` are supplied only by probit-composite
+        scoring, where the score depends on the whole cross-section and so
+        cannot be derived from one symbol's inputs here.
         """
         close, atr = read.close, read.atr
         prob_profit = read.prob_profit
         unavailable = read.unavailable
         component_scores = read.components
 
-        final_score, _ = combine_weighted(
-            score_inputs, context.weights, unavailable=unavailable
-        )
+        if final_score is None:
+            final_score, _ = combine_weighted(
+                score_inputs, context.weights, unavailable=unavailable
+            )
         trigger = select_trigger(component_scores)
 
         # 5. Stop / target from ATR (YAML multipliers, falling back to context defaults)
@@ -447,5 +597,11 @@ The weighted sum this replaces adds four incommensurable quantities: an
                 "round_trip_cost_pct": round(
                     context.risk.buy_cost_pct + context.risk.sell_cost_pct, 6
                 ),
+                # The standardized cross-sectional composite, under
+                # probit_composite scoring only. Kept unrounded and alongside
+                # the 0-100 score rather than replacing it: `score` is what the
+                # gates and the reports read, while this is the mean-zero,
+                # variance-one quantity an optimizer wants as its alpha input.
+                **({} if composite_z is None else {"composite_z": float(composite_z)}),
             },
         )

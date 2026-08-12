@@ -97,6 +97,16 @@ training:
   # stocks. Rank is the default: on Indian data a circuit-limited print
   # dominates the cross-sectional mean but moves a ranking by one place.
   target_transform: cross_sectional_rank
+  # The same treatment for the inputs. 'global' fits one mean and standard
+  # deviation per feature over the pooled training rows, which answers "is this
+  # RSI high for this stock over the sample"; 'cross_sectional' z-scores each
+  # feature across the universe on each date, which answers "is this RSI high
+  # relative to what else I could buy today" — the question a model that
+  # chooses between stocks is being asked. The pooled form also puts the market
+  # factor back into every column that target_transform just removed from the
+  # label: on a day the whole market gapped down, every name reads extreme
+  # against a five-year mean. Cannot leak across dates, because it fits nothing.
+  feature_normalization: cross_sectional
   sequence_length: 60
   train_fraction: 0.8
   batch_size: 128
@@ -140,6 +150,13 @@ backtest:
 risk:
   portfolio_value_inr: 308733.0
   risk_per_trade_pct: 0.01
+  # Annualized hurdle subtracted from strategy returns before Sharpe and
+  # Sortino. Stated here rather than defaulted inside RiskAnalyzer, where it
+  # used to sit as 0.065 that no call site had to acknowledge — and the
+  # backtester was not passing the argument at all. A constant is still wrong
+  # for any multi-year window, so prefer paths.risk_free_rate_csv below, which
+  # overrides this with a dated series.
+  risk_free_rate: 0.065
   max_single_position_pct: 0.03
   # The exit plan, in ATR multiples. These reach the fill: a filled position's
   # stop and target are sized from the signal's own levels, so changing them
@@ -243,6 +260,16 @@ simulation:
   # Draw each path's drift from the posterior rather than sharing its mean, so
   # probability_profit accounts for the drift being estimated, not known.
   propagate_drift_uncertainty: true
+  # Measure the prior above instead of assuming it. Method of moments splits
+  # the observed spread of sample means into true dispersion and estimation
+  # noise — tau^2 = max(0, Var(mu_hat) - mean(sigma_i^2/T_i)) — and shrinks
+  # each name toward the universe mean rather than toward zero, by however
+  # much of the spread turns out to be noise. On 1,000 zero-drift walks the
+  # share clearing the 0.55 gate goes 9.3% raw, 0.1% under the fixed prior
+  # above, 0.0% here. Estimated per scoring round from that round's universe,
+  # and falls back to prior_annual_drift_std when fewer than 20 names have
+  # usable history.
+  use_empirical_drift_prior: true
 
 # Trade compliance / eligibility checks
 compliance:
@@ -265,6 +292,14 @@ paths:
   # exactly what a research process forgets. Search enough configurations of a
   # strategy with no edge and the best still prints a respectable Sharpe.
   trial_log: output/trials.jsonl
+  # Optional date,annualized_yield CSV — typically the 91-day T-bill. When the
+  # file exists it is aligned to the return index, forward-filled across
+  # non-trading days and de-annualized, so the excess return is measured day by
+  # day against the rate that actually prevailed; India's policy rate moved
+  # materially over 2021-2025, which a single constant cannot represent. When
+  # absent, risk.risk_free_rate is used across the whole window and the run
+  # logs that it did. Decimals (0.068) and percent (6.8) are both read.
+  risk_free_rate_csv: data/risk_free_rate.csv
   brain_file: data/agent_brain.json
   sqlite_path: data/portfolio_agent.db
   excel_output: output/Agent_Orchestrator_Output.xlsx

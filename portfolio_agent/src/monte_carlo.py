@@ -36,8 +36,8 @@ trade log to report risk-of-ruin as an output metric, not a scoring input.
 import math
 
 import numpy as np
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Optional
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Iterable, Literal, NamedTuple, Optional, Sequence
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -63,6 +63,144 @@ DEFAULT_PRIOR_ANNUAL_DRIFT_STD = 0.10
 
 SimulationMethod = Literal["gaussian", "block_bootstrap", "jump_diffusion"]
 
+# A cross-section this thin cannot separate true drift dispersion from the
+# estimation noise in the sample means — Var(mu_hat) over a handful of names is
+# itself mostly noise, so the method of moments would be estimating one noisy
+# quantity by subtracting another. Below this, callers keep the fixed prior.
+MIN_CROSS_SECTION_FOR_EMPIRICAL_PRIOR = 20
+
+
+class DriftObservation(NamedTuple):
+    """One ticker's contribution to the cross-sectional drift estimate.
+
+    Deliberately just the three sufficient statistics rather than the return
+    series: the panel pre-pass runs over the whole active universe, and holding
+    3,800 return histories in memory to compute two moments is wasteful.
+    """
+
+    sample_mean_log_return: float  # mu_hat_i
+    sample_sigma: float  # sigma_i, daily log-return standard deviation
+    n_observations: int  # T_i
+
+
+class CrossSectionalDriftPrior(NamedTuple):
+    """Empirical-Bayes prior for true drifts, measured off the cross-section.
+
+    `shrink_drift`'s posterior algebra was always right; what it lacked was a
+    defensible tau and mu_0. Hardcoding tau = 10%/year and mu_0 = 0 asserts two
+    things about the universe without measuring either. The method of moments
+    reads both off the panel instead:
+
+        mu_bar = mean_i(mu_hat_i)
+        tau^2  = max(0, Var_i(mu_hat_i) - mean_i(sigma_i^2 / T_i))
+
+    The subtraction is the whole idea. The observed spread of sample means is
+    the sum of the true spread and the estimation noise, and the second term is
+    exactly the average noise contribution — so what survives is the dispersion
+    the panel actually evidences. On daily equity panels it very often comes out
+    at or below zero, which is a finding rather than a failure: it says the
+    cross-section of realized mean returns is indistinguishable from noise, and
+    the floor at zero shrinks every name to mu_bar accordingly.
+    """
+
+    prior_mean_log_return: float  # mu_bar, daily log-return units
+    prior_variance: float  # tau^2, daily, >= 0
+    n_tickers: int
+    mean_estimator_variance: float  # mean_i(sigma_i^2 / T_i), the noise floor
+
+    @property
+    def shrinkage_intensity(self) -> float:
+        """Fraction of the way a ticker of average precision moves to mu_bar.
+
+        1.0 means total shrinkage (no true dispersion found); 0.0 means the
+        sample means are trusted as they stand.
+        """
+        denominator = self.prior_variance + self.mean_estimator_variance
+        if denominator <= 0:
+            return 1.0
+        return float(self.mean_estimator_variance / denominator)
+
+
+def drift_observation_from_returns(
+    daily_returns: Sequence[float] | np.ndarray,
+) -> Optional[DriftObservation]:
+    """Reduce one ticker's simple returns to its drift sufficient statistics.
+
+    Converts to log returns with the same log1p the simulator uses, so the
+    prior is estimated in the units the drift is applied in. Feeding simple
+    returns straight in would put mu_bar about sigma^2/2 above the quantity it
+    is meant to be a prior for.
+
+    Returns None when the history is too short or degenerate to contribute.
+    """
+    arr = np.asarray(daily_returns, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    arr = arr[arr > -1.0]  # log1p is undefined at or below -100%
+    if arr.size < 2:
+        return None
+
+    log_returns = np.log1p(arr)
+    sigma = float(np.std(log_returns, ddof=0))
+    if not np.isfinite(sigma) or sigma <= 0:
+        return None
+
+    return DriftObservation(
+        sample_mean_log_return=float(np.mean(log_returns)),
+        sample_sigma=sigma,
+        n_observations=int(log_returns.size),
+    )
+
+
+def estimate_cross_sectional_drift_prior(
+    observations: Iterable[Optional[DriftObservation]],
+) -> Optional[CrossSectionalDriftPrior]:
+    """Method-of-moments empirical-Bayes prior over the universe's true drifts.
+
+    Point-in-time by construction: it reads only the sufficient statistics of
+    histories the caller already sliced to the as-of date, and introduces no
+    randomness. Callers must not hand it returns from beyond the decision date —
+    the prior would then carry the future into every ticker's posterior, which
+    is a subtler look-ahead than using a future price because it leaks through
+    the whole universe at once rather than one name at a time.
+
+    Args:
+        observations: Per-ticker statistics; None entries (too little history)
+            are skipped.
+
+    Returns:
+        The estimated prior, or None when the usable cross-section is smaller
+        than MIN_CROSS_SECTION_FOR_EMPIRICAL_PRIOR — in which case the caller
+        should fall back to the fixed prior rather than trust two moments
+        estimated off a handful of names.
+    """
+    usable = [
+        o for o in observations
+        if o is not None and o.n_observations > 0 and o.sample_sigma > 0
+    ]
+    if len(usable) < MIN_CROSS_SECTION_FOR_EMPIRICAL_PRIOR:
+        return None
+
+    sample_means = np.array([o.sample_mean_log_return for o in usable], dtype=float)
+    estimator_variances = np.array(
+        [(o.sample_sigma ** 2) / o.n_observations for o in usable], dtype=float
+    )
+
+    mu_bar = float(np.mean(sample_means))
+    # ddof=1: Var(mu_hat) is being compared against the average sampling
+    # variance of those same means, and the biased (1/N) form would understate
+    # it and over-shrink by a factor of (N-1)/N.
+    observed_variance = float(np.var(sample_means, ddof=1))
+    noise_floor = float(np.mean(estimator_variances))
+
+    tau_squared = max(0.0, observed_variance - noise_floor)
+
+    return CrossSectionalDriftPrior(
+        prior_mean_log_return=mu_bar,
+        prior_variance=tau_squared,
+        n_tickers=len(usable),
+        mean_estimator_variance=noise_floor,
+    )
+
 
 def shrink_drift(
     sample_mean_log_return: float,
@@ -70,6 +208,7 @@ def shrink_drift(
     n_observations: int,
     prior_annual_drift_std: float = DEFAULT_PRIOR_ANNUAL_DRIFT_STD,
     prior_mean_log_return: float = 0.0,
+    prior_variance: Optional[float] = None,
 ) -> tuple[float, float]:
     """Bayesian posterior for a ticker's daily drift, and its uncertainty.
 
@@ -107,7 +246,13 @@ def shrink_drift(
             before seeing its own history. Defaults to 0 rather than the
             universe mean, which is the conservative choice for a long-only
             book: it declines to credit any name with an edge it has not
-            demonstrated beyond the noise.
+            demonstrated beyond the noise. Supply the universe mean (see
+            CrossSectionalDriftPrior) to get the James-Stein form instead.
+        prior_variance: tau^2 in *daily* units, overriding
+            prior_annual_drift_std when supplied. This is the empirical-Bayes
+            entry point: estimate_cross_sectional_drift_prior() measures tau^2
+            off the panel rather than assuming it, so the amount of shrinkage
+            responds to how much true dispersion the universe actually shows.
 
     Returns:
         (posterior_mean_daily_log_drift, posterior_standard_deviation).
@@ -115,8 +260,11 @@ def shrink_drift(
     if n_observations <= 0 or sample_sigma <= 0:
         return prior_mean_log_return, 0.0
 
-    tau = max(0.0, float(prior_annual_drift_std)) / TRADING_DAYS_PER_YEAR
-    tau_squared = tau * tau
+    if prior_variance is not None:
+        tau_squared = max(0.0, float(prior_variance))
+    else:
+        tau = max(0.0, float(prior_annual_drift_std)) / TRADING_DAYS_PER_YEAR
+        tau_squared = tau * tau
     estimator_variance = (sample_sigma * sample_sigma) / n_observations
 
     denominator = tau_squared + estimator_variance
@@ -164,6 +312,45 @@ class MonteCarloSettings:
     separate_overnight_gaps: bool = True
     prior_annual_drift_std: float = DEFAULT_PRIOR_ANNUAL_DRIFT_STD
     propagate_drift_uncertainty: bool = True
+    use_empirical_drift_prior: bool = True
+    # Estimated once per decision date over the whole universe and attached
+    # with with_drift_prior(); None keeps the fixed prior. A NamedTuple so the
+    # settings stay picklable for ProcessPoolExecutor dispatch.
+    drift_prior: Optional[CrossSectionalDriftPrior] = None
+
+    def with_drift_prior(
+        self, prior: Optional[CrossSectionalDriftPrior]
+    ) -> "MonteCarloSettings":
+        """Return a copy carrying `prior`, leaving this instance untouched.
+
+        The settings are frozen and shared across worker processes, so the
+        per-date prior is attached by making a new value rather than mutating
+        one every worker holds a reference to.
+        """
+        return replace(self, drift_prior=prior)
+
+    def with_drift_prior_from_panel(
+        self, returns_by_symbol: Iterable[Sequence[float] | np.ndarray]
+    ) -> "MonteCarloSettings":
+        """Estimate the empirical-Bayes prior off a panel and attach it.
+
+        **The panel must be point-in-time.** Every return series handed in has
+        to be sliced to the same as-of date the signals are being generated
+        for. This is a sharper requirement than it looks: a prior contaminated
+        with future returns does not leak into one ticker's score, it leaks
+        into every ticker's score at once, through mu_bar and tau^2.
+
+        Returns self unchanged when the feature is off or the cross-section is
+        too thin to estimate from, so both callers can apply it unconditionally.
+        """
+        if not self.use_empirical_drift_prior:
+            return self
+        prior = estimate_cross_sectional_drift_prior(
+            drift_observation_from_returns(returns) for returns in returns_by_symbol
+        )
+        if prior is None:
+            return self
+        return self.with_drift_prior(prior)
 
     @classmethod
     def from_simulation_config(cls, simulation) -> "MonteCarloSettings":
@@ -181,6 +368,7 @@ class MonteCarloSettings:
             separate_overnight_gaps=simulation.separate_overnight_gaps,
             prior_annual_drift_std=simulation.prior_annual_drift_std,
             propagate_drift_uncertainty=simulation.propagate_drift_uncertainty,
+            use_empirical_drift_prior=simulation.use_empirical_drift_prior,
         )
 
     def run(
@@ -213,6 +401,7 @@ class MonteCarloSettings:
                 jump_volatility=self.jump_volatility,
                 prior_annual_drift_std=self.prior_annual_drift_std,
                 propagate_drift_uncertainty=self.propagate_drift_uncertainty,
+                drift_prior=self.drift_prior,
             )
 
         intraday = overnight = None
@@ -240,6 +429,7 @@ class MonteCarloSettings:
             overnight_returns=overnight,
             prior_annual_drift_std=self.prior_annual_drift_std,
             propagate_drift_uncertainty=self.propagate_drift_uncertainty,
+            drift_prior=self.drift_prior,
         )
 
 
@@ -385,6 +575,7 @@ def run_monte_carlo(
     innovation_df: Optional[float] = None,
     prior_annual_drift_std: float = DEFAULT_PRIOR_ANNUAL_DRIFT_STD,
     propagate_drift_uncertainty: bool = True,
+    drift_prior: Optional[CrossSectionalDriftPrior] = None,
 ) -> MonteCarloResult:
     """Run Monte Carlo simulation on historical returns using log returns.
 
@@ -423,6 +614,13 @@ def run_monte_carlo(
             probability of profit — the probability accounting for the fact
             that the drift is estimated, not known. This is the quantity the
             compliance gate should be reading.
+        drift_prior: Empirical-Bayes prior estimated from the cross-section of
+            the active universe (see estimate_cross_sectional_drift_prior).
+            When supplied it replaces `prior_annual_drift_std` and the zero
+            prior mean, giving the James-Stein posterior — each ticker shrunk
+            toward the universe mean by however much of the panel's spread is
+            noise. Must be estimated from data available as of the decision
+            date; see the note in estimate_cross_sectional_drift_prior.
 
     Returns:
         MonteCarloResult with simulation statistics.
@@ -463,6 +661,10 @@ def run_monte_carlo(
         sample_sigma=sigma,
         n_observations=len(log_returns),
         prior_annual_drift_std=prior_annual_drift_std,
+        prior_mean_log_return=(
+            drift_prior.prior_mean_log_return if drift_prior is not None else 0.0
+        ),
+        prior_variance=drift_prior.prior_variance if drift_prior is not None else None,
     )
     if not propagate_drift_uncertainty:
         drift_posterior_sd = 0.0
@@ -569,6 +771,7 @@ def run_monte_carlo_garch(
     overnight_returns: Optional[list[float]] = None,
     prior_annual_drift_std: float = DEFAULT_PRIOR_ANNUAL_DRIFT_STD,
     propagate_drift_uncertainty: bool = True,
+    drift_prior: Optional[CrossSectionalDriftPrior] = None,
 ) -> MonteCarloResult:
     """Like run_monte_carlo(), but forecasts volatility with GJR-GARCH(1,1)
     (see volatility_models.py) instead of assuming a flat historical
@@ -626,4 +829,5 @@ def run_monte_carlo_garch(
         innovation_df=innovation_df,
         prior_annual_drift_std=prior_annual_drift_std,
         propagate_drift_uncertainty=propagate_drift_uncertainty,
+        drift_prior=drift_prior,
     )

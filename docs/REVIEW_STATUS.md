@@ -15,9 +15,9 @@ not.
 | # | Finding | Status | Where |
 |---|---|---|---|
 | D1 | Kelly `f*` is a binary-bet stake fraction used as an allocation | **Done** | `src/risk.py::kelly_allocation_fraction` |
-| D2 | MC `probability_profit` dominated by drift-estimation noise | **Done** | `src/monte_carlo.py::shrink_drift` |
-| D3 | No portfolio covariance anywhere | **Done**, wired into sizing | `src/portfolio.py`, `BacktestEngine._apply_portfolio_risk_cap` |
-| D4 | Neural target is absolute, not cross-sectional | **Done** (target); feature normalization not done | `agents/trainer.py::apply_cross_sectional_target` |
+| D2 | MC `probability_profit` dominated by drift-estimation noise | **Done**; prior now measured, not assumed | `src/monte_carlo.py::shrink_drift`, `::estimate_cross_sectional_drift_prior` |
+| D3 | No portfolio covariance anywhere | **Done**, wired into sizing; group constraints added | `src/portfolio.py`, `src/portfolio_optimizer.py`, `BacktestEngine._apply_portfolio_risk_cap` |
+| D4 | Neural target is absolute, not cross-sectional | **Done** — target and feature normalization | `agents/trainer.py::apply_cross_sectional_target`, `features/scaling.py::apply_cross_sectional_scaling` |
 | D5 | GJR-GARCH unusable at platform scale | **Not done** | — |
 | D6 | No Markov chains / regime-switching models | **Done** as a module; not switched on | `src/markov_regime.py` |
 | D7 | Sharpe mis-specified; no PSR/DSR/PBO | **Done** | `src/performance_stats.py` |
@@ -55,6 +55,20 @@ marginal distribution. It is off by default because it converts the entry
 threshold from an absolute quality bar into a percentile — under it a roughly
 fixed share of the universe always clears 60, whatever the market is doing.
 
+A third mode, `probit_composite`, pushes the ranks through Phi^-1 before
+combining and standardizes the result, so the composite is mean-zero and
+variance-one on every date. That matters where the rank composite does not
+reach: a weighted sum of percentiles has a spread that depends on how many
+components were measurable and how correlated they were that day, so the same
+0.72 means different things on different dates — fine for ordering names within
+a date, useless as a magnitude fed to an optimizer. The reported `score` stays
+on 0-100 via Phi, so the 60/45 gates keep working and gain a cleaner reading
+("top 40% of today's cross-section"); the z is exposed as
+`extra["composite_z"]`. It shares the rank composite's percentile-threshold
+caveat, and it does **not** fix the near-constant component either — ties give
+every name the same quantile, so a flat percentile becomes a flat z. Also off
+by default.
+
 ## Smaller findings (D11)
 
 | Issue | Status |
@@ -70,14 +84,14 @@ fixed share of the universe always clears 60, whatever the market is doing.
 
 ## India-specific strategy problems (§5)
 
-None of these are addressed. Recorded because they are the difference between a
-platform that models Indian equities and one that models equities and trades
-them in India.
+Only 5.2 is addressed, and only in part. Recorded because they are the
+difference between a platform that models Indian equities and one that models
+equities and trades them in India.
 
 | § | Issue | Blocked on |
 |---|---|---|
 | 5.1 | Circuit limits break the return-generating assumption; a locked day is a censored observation, not a price | A Tobit-style censored GARCH likelihood; at minimum, excluding locked days from volatility estimation |
-| 5.2 | Gap risk reaches volatility estimation but not the stop fill or position sizing | `fill = min(open, stop)` for longs, and adding the overnight component to risk-per-share |
+| 5.2 | **Partly done.** The stop fill is gap-aware — `fill = min(open, stop)` for longs, `max(open, target)` for take-profits, with the realized distance recorded as `gap_fill_delta_pct` on the trade. Position sizing still is not: risk-per-share is the modelled stop distance, which the gap is precisely what invalidates | Adding the overnight component to risk-per-share |
 | 5.3 | SEBI surveillance frameworks are published, objective and change tradability | A daily scraper for the NSE ASM/GSM/ESM/T2T lists (Phase 2 data) |
 | 5.4 | No tax-lot accounting; no 365-day LTCG boundary optimization | FIFO lots per demat; a real India-specific alpha source left unclaimed |
 | 5.5 | Momentum and low-vol run without factor neutralization | Residual momentum needs only the sector map from Phase 2 |
@@ -86,11 +100,11 @@ them in India.
 
 | Phase | Status |
 |---|---|
-| 0 — Correctness | 6 of 8: Kelly, drift shrinkage, arithmetic Sharpe, weighting guards, rank composite (opt-in), leverage constraint. **Missing:** GARCH refit scheduling (0.5), gap-aware stop fills (0.7), net-of-cost training label (0.8) |
-| 1 — Measurement | Essentially complete: PSR, DSR, trial log, PBO, rank IC/ICIR, Newey–West. See the note on 1.6 below |
+| 0 — Correctness | 7 of 8: Kelly, drift shrinkage, arithmetic Sharpe, weighting guards, rank composite (opt-in), leverage constraint, gap-aware stop fills (0.7). **Missing:** GARCH refit scheduling (0.5), net-of-cost training label (0.8) |
+| 1 — Measurement | Essentially complete: PSR, DSR, trial log, PBO, rank IC/ICIR, Newey–West. Trials are now identified by a hash of the whole resolved config rather than a hand-enumerated parameter list, and deduplicated before the deflation, so N counts configurations rather than runs. The risk-free rate is supplied rather than defaulted — see below. Note on 1.6 follows |
 | 2 — Data | **Not started.** Every downstream number is limited by this |
-| 3 — Portfolio construction | Estimators, optimizer and HRP built and wired as a volatility cap. Per-trade sizing is **not** retired (3.4) — the cap sits on top of it rather than replacing it |
-| 4 — Signal | Only 4.1 (cross-sectional target). No residual momentum, feature expansion, conditional autoencoder, Kronos features, or seed ensembling |
+| 3 — Portfolio construction | Estimators, optimizer and HRP built and wired as a volatility cap. EWMA weighting and Ledoit-Wolf shrinkage are composed in `shrunk_ewma_covariance`, and `src/portfolio_optimizer.py` adds the one constraint the projected-subgradient solver structurally cannot express — group limits, so a sector cap binds exactly rather than being clipped after the fact (optional `cvxpy` extra). Per-trade sizing is **not** retired (3.4) — the cap sits on top of it rather than replacing it |
+| 4 — Signal | 4.1 complete: cross-sectional target *and* per-date cross-sectional feature normalization. No residual momentum, feature expansion, conditional autoencoder, Kronos features, or seed ensembling |
 | 5 — Regime | 5.1 and 5.5 done (HMM + honest validation). No TVTP (5.2), no MS-GARCH (5.3). `sleeve_weights` exists but the orchestrator is not switched to it (5.4) |
 | 6 — Uncertainty | Not started. Isotonic calibration is unchanged |
 | 7 — Execution and capacity | Not started |
@@ -109,9 +123,17 @@ more of the data), but it is a methodology change, not a leak being fixed.
 
 ## What has not changed by default
 
-Backtest numbers move because of three changed defaults, all reversible:
-`training.target_transform`, the Monte Carlo drift shrinkage, and the weighting
-guards. Deliberately unchanged: `risk.portfolio_volatility_target` is off,
+Backtest numbers move because of five changed defaults, all reversible:
+`training.target_transform`, `training.feature_normalization`, the Monte Carlo
+drift shrinkage, `simulation.use_empirical_drift_prior`, and the weighting
+guards. Two further changes move reported numbers without being toggles: stop
+fills are gap-aware, and `RiskAnalyzer` no longer defaults the risk-free rate
+to 6.5% — it is a required argument now, sourced from `risk.risk_free_rate` or
+the dated series at `paths.risk_free_rate_csv`. The backtester previously
+constructed it without the argument at all, so every Sharpe it reported was
+measured against a hurdle no call site acknowledged.
+
+Deliberately unchanged: `risk.portfolio_volatility_target` is off,
 `scoring.method` is `weighted_sum`, `src/regime.py` is untouched, and
 `paper_trading_mode` is true.
 

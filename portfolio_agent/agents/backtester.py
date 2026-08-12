@@ -20,9 +20,10 @@ from portfolio_agent.strategies.types import RiskParams
 from portfolio_agent.src.backtest_engine import BacktestEngine
 from portfolio_agent.src.backtest_reporting import export_backtest_excel
 from portfolio_agent.src.performance_stats import (
-    Trial, log_trial, read_trials, trial_sharpe_variance,
+    Trial, config_hash, distinct_trials, log_trial, read_trials,
+    trial_sharpe_variance,
 )
-from portfolio_agent.src.risk_analytics import RiskAnalyzer
+from portfolio_agent.src.risk_analytics import RiskAnalyzer, resolve_risk_free_rate
 
 logger = logging.getLogger(__name__)
 
@@ -179,13 +180,23 @@ class BacktesterAgent:
         analyzer = RiskAnalyzer(
             daily_equity_curve=engine.daily_equity_curve,
             trade_log=engine.trade_log,
+            # Explicit rather than inherited from a constructor default: this
+            # call site used to omit the argument entirely and silently report
+            # every Sharpe against a hardcoded 6.5% hurdle.
+            risk_free_rate=resolve_risk_free_rate(
+                self.config.paths.risk_free_rate_csv,
+                self.config.risk.risk_free_rate,
+            ),
             random_seed=self.config.simulation.random_seed,
         )
         # The trial count comes from the log, not from memory: DSR is undefined
         # without N, and N is exactly the quantity a research process forgets.
         # Absent a log this is a single pre-registered run (N = 1, no
         # deflation), which is the honest default rather than a flattering one.
-        trials = read_trials(self.config.paths.trial_log)
+        # Deduplicated first: five recordings of two configurations is a
+        # two-trial search, and deflating it as a five-trial one penalizes the
+        # Sharpe against a search that never happened.
+        trials = distinct_trials(read_trials(self.config.paths.trial_log))
         n_trials, sharpe_variance = trial_sharpe_variance(trials)
         analytics_report = analyzer.generate_analytics_report(
             n_trials=max(1, n_trials),
@@ -285,8 +296,13 @@ class BacktesterAgent:
 
         The parameters recorded are the ones a research session actually varies
         — they are what makes two runs different trials rather than the same
-        trial twice. Failures are swallowed deliberately: a research log that
-        cannot be written is a reason to lose the count, not the backtest.
+        trial twice. They are also hand-enumerated, and therefore incomplete by
+        construction: every knob added to the config after this list was written
+        is invisible to it. The config hash alongside them covers the whole
+        resolved configuration, so trial identity does not depend on anyone
+        remembering to extend this dict. Failures are swallowed deliberately: a
+        research log that cannot be written is a reason to lose the count, not
+        the backtest.
         """
         risk = self.config.risk
         try:
@@ -295,6 +311,7 @@ class BacktesterAgent:
                 Trial(
                     label=f"{self.strategy_config.type}:{strategy.name}",
                     sharpe=float(analytics_report.get('sharpe_ratio', 0.0)),
+                    config_hash=self._config_fingerprint(start_date, end_date),
                     parameters={
                         'strategy': self.strategy_config.type,
                         'strategy_config': self.strategy_config.config_path,
@@ -317,6 +334,27 @@ class BacktesterAgent:
             )
         except OSError as error:
             logger.warning(f"Could not append to the trial log: {error}")
+
+    def _config_fingerprint(self, start_date: str, end_date: str) -> str:
+        """Hash the whole resolved config, plus what is not in it.
+
+        The backtest window and the strategy selection come from CLI arguments
+        rather than the config file, so two runs of one config over different
+        date ranges are genuinely different trials and must hash differently.
+
+        Paths are excluded on purpose: writing the report to a different
+        filename is not a new trial, and including them would make every run
+        with a timestamped output path unique, which would defeat the
+        deduplication entirely.
+        """
+        payload = self.config.model_dump(mode="json", exclude={"paths"})
+        payload["_window"] = {"start": start_date, "end": end_date}
+        payload["_strategy"] = {
+            "type": self.strategy_config.type,
+            "config_path": self.strategy_config.config_path,
+            "params": self.strategy_config.params,
+        }
+        return config_hash(payload)
 
 
 def run_backtest_cli(

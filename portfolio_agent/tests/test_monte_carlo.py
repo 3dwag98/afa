@@ -526,3 +526,227 @@ class TestDriftShrinkage:
         ).run("X", returns)
 
         assert tight.probability_profit < wide.probability_profit
+
+
+def _random_walk(rng, log_drift, log_sigma, size):
+    """Simple returns whose *log* returns are exactly Normal(log_drift, sigma).
+
+    The distinction matters and is easy to get backwards. Drawing simple
+    returns as Normal(0, sigma) does not give a driftless walk — it gives log
+    returns with mean -sigma^2/2, i.e. a price that drifts *down*, which
+    suppresses the very false-positive rate these tests are trying to measure.
+    Both the estimator and the simulator work in log space, so the synthetic
+    data is specified there and converted back with expm1.
+    """
+    return np.expm1(rng.normal(log_drift, log_sigma, size=size))
+
+
+class TestCrossSectionalDriftPrior:
+    """Empirical-Bayes (James-Stein) drift shrinkage.
+
+    `shrink_drift` already had the right posterior algebra, but it was fed a
+    *hardcoded* prior: tau = 10% a year, mu_0 = 0. Both numbers were assumed
+    rather than measured. The estimator here reads them off the cross-section
+    instead, which is what makes the shrinkage adaptive: when the observed
+    spread of sample means is no wider than their own standard errors, the
+    method of moments returns tau^2 = 0 and every ticker collapses to the
+    universe mean, because nothing in the panel evidences a real drift spread.
+    """
+
+    def test_method_of_moments_finds_no_dispersion_when_all_spread_is_noise(self):
+        """A zero-drift panel has no true dispersion to find.
+
+        Var(mu_hat) and mean(sigma_i^2/T_i) estimate the same quantity when
+        every true drift is identical, so their difference is zero up to
+        sampling error and tau^2 lands negligible next to the noise floor.
+
+        Asserted as a ratio rather than `== 0.0` deliberately. The difference
+        of two nearly-equal moments has sampling error of order
+        sqrt(2/N) * noise_floor — about 4.5% of it at N=1000 — so which side of
+        zero it falls on is a coin flip in the seed. A test pinning it to
+        exactly zero passes on luck; what actually matters is that whatever
+        survives is too small to let any drift through, which is what the
+        shrinkage intensity measures. The clamp itself is pinned separately in
+        test_negative_moment_difference_is_floored_at_zero.
+        """
+        from src.monte_carlo import (
+            drift_observation_from_returns,
+            estimate_cross_sectional_drift_prior,
+        )
+
+        rng = np.random.default_rng(20260811)
+        observations = [
+            drift_observation_from_returns(_random_walk(rng, 0.0, 0.02, 1250))
+            for _ in range(1000)
+        ]
+        prior = estimate_cross_sectional_drift_prior(observations)
+
+        assert prior is not None
+        assert prior.n_tickers == 1000
+        # Whatever survives the subtraction is a rounding error on the noise.
+        assert prior.prior_variance < 0.10 * prior.mean_estimator_variance
+        # So essentially all of every ticker's sample mean is shrunk away.
+        assert prior.shrinkage_intensity > 0.90
+
+    def test_negative_moment_difference_is_floored_at_zero(self):
+        """tau^2 is a variance and cannot go negative, however the moments fall.
+
+        Constructed rather than sampled so the difference is unambiguously
+        negative: identical sample means give Var(mu_hat) = 0 against a
+        strictly positive noise floor.
+        """
+        from src.monte_carlo import (
+            DriftObservation,
+            estimate_cross_sectional_drift_prior,
+        )
+
+        observations = [
+            DriftObservation(
+                sample_mean_log_return=0.0004, sample_sigma=0.02, n_observations=1250
+            )
+            for _ in range(50)
+        ]
+        prior = estimate_cross_sectional_drift_prior(observations)
+
+        assert prior is not None
+        assert prior.prior_variance == 0.0
+        assert prior.shrinkage_intensity == pytest.approx(1.0)
+        assert prior.prior_mean_log_return == pytest.approx(0.0004)
+
+    def test_method_of_moments_recovers_a_genuine_drift_spread(self):
+        """When true drifts really do differ, tau^2 must not be shrunk away.
+
+        Built so the signal is unmistakable: true daily drifts are drawn with a
+        standard deviation of 0.0008, roughly 1.4x each ticker's own standard
+        error, so the observed cross-sectional variance is about 3x the noise
+        floor and the difference is real rather than sampling slack.
+        """
+        from src.monte_carlo import (
+            drift_observation_from_returns,
+            estimate_cross_sectional_drift_prior,
+        )
+
+        rng = np.random.default_rng(4242)
+        true_tau = 0.0008
+        true_drifts = rng.normal(0.0, true_tau, size=1000)
+        observations = [
+            drift_observation_from_returns(_random_walk(rng, d, 0.02, 1250))
+            for d in true_drifts
+        ]
+        prior = estimate_cross_sectional_drift_prior(observations)
+
+        assert prior is not None
+        # Recovers the planted dispersion to within 15%.
+        assert np.sqrt(prior.prior_variance) == pytest.approx(true_tau, rel=0.15)
+        # And therefore shrinks only partially, unlike the pure-noise panel.
+        assert 0.2 < prior.shrinkage_intensity < 0.5
+
+    def test_shrinks_toward_the_universe_mean_not_toward_zero(self):
+        """The distinguishing property of the James-Stein form.
+
+        A panel whose drifts are all genuinely positive should keep that
+        common level: shrinking it to zero would throw away the one thing the
+        cross-section actually evidences.
+        """
+        from src.monte_carlo import (
+            drift_observation_from_returns,
+            estimate_cross_sectional_drift_prior,
+            shrink_drift,
+        )
+
+        rng = np.random.default_rng(99)
+        common = 0.0006
+        observations = [
+            drift_observation_from_returns(_random_walk(rng, common, 0.02, 1250))
+            for _ in range(500)
+        ]
+        prior = estimate_cross_sectional_drift_prior(observations)
+
+        assert prior is not None
+        assert prior.prior_mean_log_return == pytest.approx(common, abs=1.5e-4)
+
+        # An outlier ticker is pulled back to the universe mean, not to zero.
+        posterior, _ = shrink_drift(
+            sample_mean_log_return=0.004,
+            sample_sigma=0.02,
+            n_observations=1250,
+            prior_variance=prior.prior_variance,
+            prior_mean_log_return=prior.prior_mean_log_return,
+        )
+        assert posterior == pytest.approx(prior.prior_mean_log_return, abs=3e-4)
+        assert posterior > 0.0
+
+    def test_estimator_is_deterministic(self):
+        from src.monte_carlo import (
+            drift_observation_from_returns,
+            estimate_cross_sectional_drift_prior,
+        )
+
+        rng = np.random.default_rng(3)
+        histories = [_random_walk(rng, 0.0002, 0.018, 800) for _ in range(50)]
+        observations = [drift_observation_from_returns(h) for h in histories]
+
+        first = estimate_cross_sectional_drift_prior(observations)
+        second = estimate_cross_sectional_drift_prior(observations)
+        assert first == second
+
+    def test_insufficient_cross_section_returns_none(self):
+        from src.monte_carlo import (
+            drift_observation_from_returns,
+            estimate_cross_sectional_drift_prior,
+        )
+
+        rng = np.random.default_rng(3)
+        one = [drift_observation_from_returns(_random_walk(rng, 0.0, 0.02, 400))]
+        assert estimate_cross_sectional_drift_prior(one) is None
+        assert estimate_cross_sectional_drift_prior([]) is None
+
+    def test_zero_drift_universe_stops_clearing_the_probability_gate(self):
+        """The acceptance criterion, measured on a 1,000-ticker universe.
+
+        Every ticker's true drift is zero, so no ticker has an edge and the
+        honest pass rate through a 0.55 probability gate is zero. Propagating
+        the raw sample mean, ~8.5% clear it on estimation error alone: with
+        T=1250 and sigma=2%/day the standard error of mu_hat is 5.7bp/day, and
+        a name needs only 7.6bp/day of *spurious* drift to look like a 55%
+        proposition over 20 days. On a 3,800-name universe that is ~320 false
+        positives every day. Measured on this panel: 9.3%.
+
+        The empirical-Bayes prior finds no true dispersion here and shrinks
+        essentially all of it away, taking the pass rate to 0.0%. The fixed
+        10%/year prior already reached 0.1%; what the estimated prior adds is
+        that nobody had to supply the 10% — it read the absence of dispersion
+        off the panel, and would equally have found dispersion had there been
+        any (see test_method_of_moments_recovers_a_genuine_drift_spread).
+        """
+        from src.monte_carlo import (
+            drift_observation_from_returns,
+            estimate_cross_sectional_drift_prior,
+        )
+
+        rng = np.random.default_rng(20260812)
+        histories = [_random_walk(rng, 0.0, 0.02, 1250) for _ in range(1000)]
+        prior = estimate_cross_sectional_drift_prior(
+            [drift_observation_from_returns(h) for h in histories]
+        )
+        assert prior is not None
+
+        def share_clearing_gate(**kwargs):
+            probs = [
+                run_monte_carlo(
+                    symbol="X", daily_returns=list(h), horizon_days=20,
+                    simulations=1000, seed=5000 + i, **kwargs,
+                ).probability_profit
+                for i, h in enumerate(histories)
+            ]
+            return float(np.mean(np.asarray(probs) >= 0.55))
+
+        raw = share_clearing_gate(
+            prior_annual_drift_std=1e9, propagate_drift_uncertainty=False
+        )
+        james_stein = share_clearing_gate(
+            drift_prior=prior, propagate_drift_uncertainty=False
+        )
+
+        assert raw == pytest.approx(0.085, abs=0.03)
+        assert james_stein < 0.01

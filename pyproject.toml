@@ -52,6 +52,14 @@ cu121 = [
 hf = [
     "huggingface_hub>=0.20.0",
 ]
+# Constrained mean-variance allocation with sector limits
+# (src/portfolio_optimizer.py). Optional because it pulls a solver stack, and
+# because everything else in the platform runs without it — including the
+# projected-subgradient optimizer in src/portfolio.py, which handles every
+# constraint except group limits.
+optimize = [
+    "cvxpy>=1.4",
+]
 
 # The CUDA extras and the plain `gpu` extra all name `torch`, and only one of
 # them can be installed at a time.

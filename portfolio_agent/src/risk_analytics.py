@@ -9,9 +9,20 @@ which runs a forward-looking, per-symbol lognormal simulation that feeds
 strategy *scoring* decisions during a run — not a backtest report metric.
 """
 
+import logging
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+# A published yield above this is being quoted in percent (6.8) rather than as
+# a decimal (0.068). No plausible 91-day T-bill yield reaches 100% a year, and
+# reading 6.8 raw would report a 680% risk-free rate — which silently drives
+# every Sharpe deeply negative rather than failing.
+_PERCENT_UNIT_THRESHOLD = 1.0
 
 try:
     from .performance_stats import (
@@ -35,6 +46,73 @@ except ImportError:  # running from inside src/ as a flat package
 # and zero loss, which made win rate, profit factor, expectancy and the whole
 # Monte Carlo risk-of-ruin block meaningless in the exported report.
 _PNL_KEYS = ('net_pnl', 'pnl', 'gross_pnl')
+
+
+def load_risk_free_series(path: str | Path) -> Optional[pd.Series]:
+    """Read a dated risk-free rate series, e.g. the 91-day T-bill.
+
+    Expects two columns, `date` and `annualized_yield`. The Sharpe wants the
+    excess return computed day by day against the rate that actually prevailed,
+    not against a single number chosen for the whole window — over a five-year
+    Indian backtest a constant is off by hundreds of basis points at both ends.
+
+    Units are normalized rather than assumed: rate series are published both as
+    decimals (0.068) and as percent (6.8), and reading the latter raw would
+    subtract a 680% annual hurdle from every daily return.
+
+    Returns:
+        A date-indexed Series of annualized decimal yields, sorted, or None
+        when the file does not exist — the caller then falls back to the
+        configured constant and says so.
+    """
+    source = Path(path)
+    if not source.exists():
+        return None
+
+    frame = pd.read_csv(source)
+    missing = {"date", "annualized_yield"} - set(frame.columns)
+    if missing:
+        raise ValueError(
+            f"{source}: risk-free rate CSV needs columns date,annualized_yield "
+            f"(missing {sorted(missing)})"
+        )
+
+    index = pd.to_datetime(frame["date"], errors="coerce")
+    values = pd.to_numeric(frame["annualized_yield"], errors="coerce")
+    series = pd.Series(values.to_numpy(), index=pd.DatetimeIndex(index)).dropna()
+    series = series[~series.index.isna()].sort_index()
+    if series.empty:
+        return None
+
+    if float(series.abs().max()) > _PERCENT_UNIT_THRESHOLD:
+        series = series / 100.0
+
+    return series
+
+
+def resolve_risk_free_rate(
+    csv_path: str | Path, fallback_annual_rate: float
+) -> float | pd.Series:
+    """The dated series when it exists, otherwise the configured constant.
+
+    Logs which one it used. A Sharpe measured against a 6.5% hurdle and one
+    measured against a moving 4-7% hurdle are different statistics, and which
+    was computed should never have to be inferred from the absence of a file.
+    """
+    series = load_risk_free_series(csv_path)
+    if series is not None:
+        logger.info(
+            "Risk-free rate: %d dated observations from %s (%s to %s)",
+            series.size, csv_path, series.index.min().date(), series.index.max().date(),
+        )
+        return series
+
+    logger.info(
+        "Risk-free rate: no series at %s; using the constant %.4f from "
+        "risk.risk_free_rate across the whole window",
+        csv_path, fallback_annual_rate,
+    )
+    return fallback_annual_rate
 
 
 def _trade_pnl(trade: Dict[str, Any]) -> float:
@@ -78,14 +156,15 @@ class RiskAnalyzer:
     Attributes:
         daily_equity_curve: pd.Series of daily portfolio values.
         trade_log: List of trade dictionaries with pnl information.
-        risk_free_rate: Annual risk-free rate (default 6.5% for India).
+        risk_free_rate: Annual risk-free rate, or a dated Series of them. No
+            default — see __init__.
     """
     
     def __init__(
         self,
         daily_equity_curve: pd.Series,
         trade_log: List[Dict[str, Any]],
-        risk_free_rate: float | pd.Series = 0.065,
+        risk_free_rate: float | pd.Series,
         random_seed: Optional[int] = 42,
     ):
         """
@@ -94,11 +173,17 @@ class RiskAnalyzer:
         Args:
             daily_equity_curve: Time series of daily portfolio values.
             trade_log: List of trade records with 'net_pnl' (or 'pnl') fields.
-            risk_free_rate: Annual risk-free rate (default 6.5% for India), or
-                a date-indexed Series of annualized rates — e.g. the 91-day
-                T-bill yield. A constant is a guess about the entire window,
-                and India's policy rate moved materially over 2021-2025; the
-                Series form is the correct input once that data is cached.
+            risk_free_rate: Annual risk-free rate as a decimal, or a
+                date-indexed Series of annualized rates — e.g. the 91-day
+                T-bill yield (see load_risk_free_series).
+
+                Deliberately has no default. It used to default to 0.065, which
+                meant every Sharpe this class reported was quietly measured
+                against a 6.5% hurdle that no call site had to acknowledge —
+                and the backtester was in fact constructing it without the
+                argument at all. A constant is also a guess about the entire
+                window: India's policy rate moved materially over 2021-2025, so
+                the Series form is the correct input wherever that data exists.
             random_seed: Seed for the bootstrap Monte Carlo. Defaults to a
                 fixed seed so re-running the same backtest reproduces the same
                 risk-of-ruin and terminal-wealth percentiles — unseeded, those

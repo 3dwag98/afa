@@ -111,10 +111,27 @@ def sample_covariance(
     return _wrap(cov, names)
 
 
+def _observation_weights(n_periods: int, half_life_days: Optional[float]) -> np.ndarray:
+    """Normalized per-observation weights, newest row last.
+
+    None gives uniform weights, which is what makes the exponentially-weighted
+    estimator a strict generalization of the equally-weighted one rather than
+    a second implementation of it.
+    """
+    if half_life_days is None:
+        return np.full(n_periods, 1.0 / n_periods, dtype=float)
+
+    decay = math.log(2.0) / max(1e-9, float(half_life_days))
+    age = np.arange(n_periods - 1, -1, -1, dtype=float)  # newest row has age 0
+    weights = np.exp(-decay * age)
+    return weights / weights.sum()
+
+
 def ledoit_wolf_covariance(
     returns: pd.DataFrame | np.ndarray,
     annualize: bool = False,
     shrinkage: Optional[float] = None,
+    half_life_days: Optional[float] = None,
 ) -> Tuple[pd.DataFrame | np.ndarray, float]:
     """Covariance shrunk toward a constant-correlation target.
 
@@ -140,6 +157,10 @@ def ledoit_wolf_covariance(
         annualize: Multiply by 252 to return an annualized covariance.
         shrinkage: Override the computed intensity, mainly for testing. 0
             recovers the sample covariance, 1 the pure target.
+        half_life_days: When given, weight observations exponentially with this
+            half-life before shrinking, so the estimate tracks a correlation
+            regime shift instead of averaging across it. None weights every
+            observation equally and reproduces the classical estimator exactly.
 
     Returns:
         (covariance, shrinkage_intensity). The covariance is a DataFrame when
@@ -154,10 +175,21 @@ def ledoit_wolf_covariance(
     if n_periods < 2 or n_assets < 1:
         return _wrap(np.zeros((n_assets, n_assets)), names), 0.0
 
-    demeaned = matrix - matrix.mean(axis=0)
+    # Observation weights are folded into the rows rather than threaded through
+    # every expression below: scaling each demeaned row by sqrt(w_i * T_eff)
+    # makes its *unweighted* moments equal the weighted ones, so one code path
+    # serves both estimators. With uniform weights w_i = 1/T the effective
+    # sample size is T and the scale factor is exactly 1, which is what makes
+    # the equally-weighted result bit-for-bit unchanged.
+    weights = _observation_weights(n_periods, half_life_days)
+    effective_n = float(1.0 / np.sum(weights**2))
+
+    demeaned = matrix - weights @ matrix
+    demeaned = demeaned * np.sqrt(weights * effective_n)[:, None]
+
     # MLE covariance (1/T), which is the convention the shrinkage constants
     # below are derived under.
-    sample = demeaned.T @ demeaned / n_periods
+    sample = demeaned.T @ demeaned / effective_n
     variances = np.diag(sample).copy()
 
     if n_assets == 1:
@@ -178,13 +210,13 @@ def ledoit_wolf_covariance(
     if shrinkage is None:
         # pi: summed asymptotic variances of the sample covariance entries.
         squared = demeaned**2
-        pi_matrix = (squared.T @ squared) / n_periods - sample**2
+        pi_matrix = (squared.T @ squared) / effective_n - sample**2
         pi = float(np.sum(pi_matrix))
 
         # rho: the diagonal contributes pi_ii; the off-diagonal picks up how
         # the target's own estimation error (through r_bar and the variances)
         # co-moves with the sample covariances.
-        term = (demeaned**3).T @ demeaned / n_periods - variances[:, None] * sample
+        term = (demeaned**3).T @ demeaned / effective_n - variances[:, None] * sample
         np.fill_diagonal(term, 0.0)
         with np.errstate(divide="ignore", invalid="ignore"):
             ratio = np.where(outer_std > 0, std[None, :] / np.where(std[:, None] > 0, std[:, None], 1.0), 0.0)
@@ -196,7 +228,7 @@ def ledoit_wolf_covariance(
         if gamma <= 0:
             intensity = 0.0
         else:
-            intensity = max(0.0, min(1.0, (pi - rho) / gamma / n_periods))
+            intensity = max(0.0, min(1.0, (pi - rho) / gamma / effective_n))
     else:
         intensity = float(min(1.0, max(0.0, shrinkage)))
 
@@ -247,6 +279,51 @@ def exponentially_weighted_covariance(
     if annualize:
         cov = cov * TRADING_DAYS_PER_YEAR
     return _wrap(cov, names)
+
+
+def shrunk_ewma_covariance(
+    returns: pd.DataFrame | np.ndarray,
+    half_life_days: Optional[float] = 60.0,
+    annualize: bool = False,
+) -> Tuple[pd.DataFrame | np.ndarray, float]:
+    """The covariance an optimizer should be handed: EWMA-weighted, then shrunk.
+
+    The two halves fix different problems and neither is sufficient alone.
+    Exponential weighting fixes *when* the matrix is measured — an equally
+    weighted five-year window averages calm and crisis and is wrong in both.
+    Shrinkage fixes *whether it can be used at all* — with N names and T
+    periods where T is not comfortably larger than N, the sample covariance is
+    rank-deficient, has exact zero eigenvalues, and has no inverse. Weighting
+    alone makes this worse, not better: a 60-day half-life over 3,800 names has
+    an effective sample size of about 87, so the unshrunk weighted matrix is
+    massively singular.
+
+    That singularity is the mechanism behind crash-state blowups. A
+    mean-variance optimizer inverts this matrix, and the inverse is dominated
+    by the smallest eigenvalues — which, in a near-singular sample estimate,
+    are pure noise. The optimizer reads that noise as a risk-free arbitrage
+    between two nearly-collinear names and takes an enormous offsetting
+    position in both. Shrinkage lifts the small eigenvalues off the floor,
+    which is what bounds the condition number and makes the weights a function
+    of the data instead of the noise.
+
+    Args:
+        returns: (T, N) frame or array of period returns, oldest row first.
+        half_life_days: Observation weighting half-life. 60 days is the default
+            for the reason given in exponentially_weighted_covariance. None
+            weights equally.
+        annualize: Multiply by 252.
+
+    Returns:
+        (covariance, shrinkage_intensity). Positive semi-definite by
+        construction, and positive definite whenever the intensity is above
+        zero and any asset has non-zero variance.
+    """
+    return ledoit_wolf_covariance(
+        returns,
+        annualize=annualize,
+        half_life_days=half_life_days,
+    )
 
 
 def single_factor_covariance(
