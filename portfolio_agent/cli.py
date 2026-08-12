@@ -5,6 +5,7 @@ Commands:
     download-data: Download market data for the configured universe
     train: Train the ML model on historical data
     train-sac: Train Soft Actor-Critic model for IndiaSAC strategy
+    train-custom: Train any custom strategy implementing TrainableStrategy
     backtest: Run backtesting simulation
     run-agent: Run the daily portfolio agent
     list-strategies: List registered strategies (rule-based, ML, UMA ensembles)
@@ -496,6 +497,70 @@ def create_parser() -> argparse.ArgumentParser:
     train_sac_parser.set_defaults(func=lambda args: __import__(
         'portfolio_agent.agents.sac_trainer', fromlist=['run_sac_training_cli']
     ).run_sac_training_cli(args))
+    
+    # train-custom command
+    train_custom_parser = subparsers.add_parser(
+        "train-custom",
+        help="Train any custom strategy implementing TrainableStrategy"
+    )
+    train_custom_parser.add_argument(
+        "--strategy",
+        type=str,
+        required=True,
+        help="Name of registered strategy to train (must implement TrainableStrategy)"
+    )
+    train_custom_parser.add_argument(
+        "--epochs",
+        type=int,
+        default=100,
+        help="Number of training epochs (default: 100)"
+    )
+    train_custom_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=256,
+        help="Mini-batch size (default: 256)"
+    )
+    train_custom_parser.add_argument(
+        "--lr",
+        type=float,
+        default=3e-4,
+        help="Learning rate (default: 3e-4)"
+    )
+    train_custom_parser.add_argument(
+        "--device",
+        type=str,
+        choices=["auto", "cuda", "mps", "cpu"],
+        default="auto",
+        help="Device for training (default: auto)"
+    )
+    train_custom_parser.add_argument(
+        "--models-dir",
+        type=str,
+        default="models",
+        help="Directory to save checkpoints (default: models)"
+    )
+    train_custom_parser.add_argument(
+        "--model-name",
+        type=str,
+        default=None,
+        help="Name for the saved model (default: strategy name)"
+    )
+    train_custom_parser.add_argument(
+        "--years",
+        type=int,
+        default=3,
+        help="Years of historical data to use (default: 3)"
+    )
+    train_custom_parser.add_argument(
+        "--strategy-config",
+        type=str,
+        default=None,
+        help="Path to strategy-specific config file (optional)"
+    )
+    train_custom_parser.set_defaults(func=lambda args: __import__(
+        'portfolio_agent.agents.custom_trainer', fromlist=['run_custom_training_cli']
+    ).run_custom_training_cli(args))
     
     # backtest command
     backtest_parser = subparsers.add_parser(

@@ -318,6 +318,167 @@ class SACTrainingResult:
         logger.info(f"Saved SAC checkpoint to {path}")
 
 
+def run_sac_training(
+    tickers: list[str],
+    feature_names: list[str],
+    prices: dict[str, pd.DataFrame],
+    scaler: Optional[FeatureScaler] = None,
+    hidden_dim: int = 256,
+    epochs: int = 100,
+    batch_size: int = 256,
+    lr: float = DEFAULT_LR,
+    gamma: float = DEFAULT_GAMMA,
+    tau: float = DEFAULT_TAU,
+    entropy_coef: float = DEFAULT_ENTROPY_COEF,
+    buffer_size: int = DEFAULT_BUFFER_SIZE,
+    device: str = "cpu",
+    models_dir: str = "models",
+    model_name: str = "india_sac",
+) -> dict:
+    """Run SAC training with pre-loaded data.
+    
+    This is a simplified interface for use by the generic custom trainer.
+    
+    Args:
+        tickers: List of ticker symbols
+        feature_names: Names of features to use
+        prices: Dict of price DataFrames by ticker
+        scaler: Optional fitted FeatureScaler
+        hidden_dim: Hidden layer dimension
+        epochs: Training epochs
+        batch_size: Mini-batch size
+        lr: Learning rate
+        gamma: Discount factor
+        tau: Target network soft update rate
+        entropy_coef: Entropy regularization coefficient
+        buffer_size: Replay buffer capacity
+        device: Device for training
+        models_dir: Directory to save checkpoints
+        model_name: Name for the saved model
+        
+    Returns:
+        dict: Training metadata
+    """
+    from portfolio_agent.config.schema import AppConfig
+    from portfolio_agent.config.loader import load_config
+    
+    config = load_config()
+    resolved_device = get_device(device)
+    
+    # Build data dict in format expected by simulate_actions_and_rewards
+    data_by_ticker = {}
+    for ticker in tickers:
+        if ticker in prices and ticker in feature_names:
+            feat_df = prices[ticker].copy()  # Use prices as placeholder
+            data_by_ticker[ticker] = feat_df
+    
+    if not data_by_ticker:
+        raise ValueError("No valid data for training")
+    
+    state_dim = len(feature_names)
+    logger.info(f"Training SAC on device: {resolved_device}")
+    logger.info(f"Features ({state_dim}): {feature_names}")
+    
+    # Initialize actor
+    actor = SACActorNetwork(state_dim=state_dim, action_dim=1, hidden_dim=hidden_dim)
+    actor = actor.to(resolved_device)
+    
+    # Optimizer
+    actor_optimizer = optim.Adam(actor.parameters(), lr=lr)
+    
+    # Replay buffer
+    replay_buffer = ReplayBuffer(buffer_size)
+    
+    # Populate buffer with initial experience
+    logger.info("Populating replay buffer...")
+    for ticker, features in data_by_ticker.items():
+        states, actions, rewards = simulate_actions_and_rewards(
+            features, actor, resolved_device
+        )
+        for i in range(len(states) - 1):
+            replay_buffer.push(
+                state=states[i],
+                action=actions[i],
+                reward=rewards[i],
+                next_state=states[i + 1],
+                done=(i == len(states) - 2),
+            )
+    
+    logger.info(f"Replay buffer size: {len(replay_buffer)}")
+    
+    # Training loop
+    training_curve = []
+    dataloader = DataLoader(replay_buffer, batch_size=batch_size, shuffle=True)
+    
+    logger.info(f"Starting training for {epochs} epochs...")
+    for epoch in range(epochs):
+        epoch_rewards = []
+        
+        for batch in dataloader:
+            state = torch.tensor(np.array([t.state for t in batch]), dtype=torch.float32).to(resolved_device)
+            action = torch.tensor([t.action for t in batch], dtype=torch.float32).to(resolved_device)
+            reward = torch.tensor([t.reward for t in batch], dtype=torch.float32).to(resolved_device)
+            next_state = torch.tensor(np.array([t.next_state for t in batch]), dtype=torch.float32).to(resolved_device)
+            done = torch.tensor([t.done for t in batch], dtype=torch.float32).to(resolved_device)
+            
+            # Actor loss: maximize expected reward + entropy
+            pred_action = actor(state).squeeze(-1)
+            actor_loss = -(pred_action * reward.detach()).mean()
+            
+            # Entropy bonus (encourage exploration)
+            entropy = -torch.log(torch.clamp(pred_action, 1e-6, 1.0 - 1e-6)).mean()
+            actor_loss = actor_loss - entropy_coef * entropy
+            
+            actor_optimizer.zero_grad()
+            actor_loss.backward()
+            actor_optimizer.step()
+            
+            epoch_rewards.append(reward.mean().item())
+        
+        avg_reward = np.mean(epoch_rewards)
+        training_curve.append(avg_reward)
+        
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            logger.info(f"Epoch {epoch + 1}/{epochs}, Avg Reward: {avg_reward:.6f}")
+    
+    # Prepare result
+    result = SACTrainingResult(
+        actor_state_dict=actor.state_dict(),
+        metadata={
+            'feature_names': feature_names,
+            'hidden_dim': hidden_dim,
+            'training_config': {
+                'epochs': epochs,
+                'batch_size': batch_size,
+                'lr': lr,
+                'gamma': gamma,
+                'tau': tau,
+                'entropy_coef': entropy_coef,
+                'device': resolved_device.type,
+            },
+            'scaler_params': {
+                'mean': scaler.mean_.tolist() if scaler and hasattr(scaler, 'mean_') else None,
+                'scale': scaler.scale_.tolist() if scaler and hasattr(scaler, 'scale_') else None,
+            },
+        },
+        training_curve=training_curve,
+        final_avg_reward=training_curve[-1] if training_curve else 0.0,
+        epochs_trained=epochs,
+    )
+    
+    # Save checkpoint
+    checkpoint_path = Path(models_dir) / f"{model_name}_best.pt"
+    result.save(checkpoint_path)
+    
+    return {
+        'metrics': {
+            'final_reward': result.final_avg_reward,
+            'epochs_trained': result.epochs_trained,
+        },
+        'metadata': result.metadata,
+    }
+
+
 def train_sac(
     config: AppConfig,
     feature_names: Optional[List[str]] = None,

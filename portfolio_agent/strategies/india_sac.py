@@ -44,7 +44,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from .base import BaseStrategy
+from .base import BaseStrategy, TrainableStrategy
 from .types import StrategyContext, StrategySignal
 from portfolio_agent.config.schema import StrategyConfig
 from portfolio_agent.features.scaling import FeatureScaler
@@ -106,7 +106,7 @@ class SACActorNetwork(nn.Module):
         return torch.sigmoid(self.mean_head(self.net(state)))
 
 
-class IndiaSACStrategy(BaseStrategy):
+class IndiaSACStrategy(TrainableStrategy):
     """Continuous-allocation RL strategy, scored in one batched forward pass."""
 
     def __init__(
@@ -147,10 +147,16 @@ class IndiaSACStrategy(BaseStrategy):
         self._model: Optional[SACActorNetwork] = None
         self._scaler: Optional[FeatureScaler] = None
         self._loaded = False
+        self._actor: Optional[SACActorNetwork] = None  # Alias for trainer compatibility
 
     @property
     def name(self) -> str:
         return "india_sac"
+
+    @property
+    def model_artifact_name(self) -> str:
+        """Return the filename for the saved model artifact."""
+        return f"{self._model_name}_best.pt"
 
     @property
     def supports_gpu_batch(self) -> bool:
@@ -159,6 +165,101 @@ class IndiaSACStrategy(BaseStrategy):
 
     def required_features(self) -> List[str]:
         return list(self._feature_names)
+
+    @classmethod
+    def get_default_training_config(cls) -> dict:
+        """Return default training configuration for SAC."""
+        return {
+            "epochs": 100,
+            "batch_size": 256,
+            "lr": 3e-4,
+            "device": "auto",
+            "hidden_dim": 256,
+            "gamma": 0.99,
+            "tau": 0.005,
+            "buffer_size": 100000,
+            "entropy_coef": 0.1,
+        }
+
+    def train(self, data: dict, config: dict) -> dict:
+        """Train the SAC actor using the generic trainer.
+        
+        This delegates to the sac_trainer module which implements
+        the full SAC training loop.
+        
+        Args:
+            data: Dict with 'features', 'prices', 'tickers', 'scaler'
+            config: Training hyperparameters
+            
+        Returns:
+            dict: Training metrics
+        """
+        from portfolio_agent.agents.sac_trainer import run_sac_training
+        
+        # Prepare data in format expected by sac_trainer
+        training_data = {
+            'features': data['features'],
+            'prices': data['prices'],
+            'tickers': data['tickers'],
+            'feature_names': data.get('feature_names', self.required_features()),
+            'scaler': data.get('scaler'),
+        }
+        
+        # Run SAC training
+        metadata = run_sac_training(
+            tickers=data['tickers'],
+            feature_names=data.get('feature_names', self.required_features()),
+            prices=data['prices'],
+            scaler=data.get('scaler'),
+            epochs=config.get('epochs', 100),
+            batch_size=config.get('batch_size', 256),
+            lr=config.get('lr', 3e-4),
+            hidden_dim=config.get('hidden_dim', 256),
+            device=config.get('device', 'cpu'),
+            buffer_size=config.get('buffer_size', 100000),
+            entropy_coef=config.get('entropy_coef', 0.1),
+            models_dir=self._models_dir,
+            model_name=self._model_name,
+        )
+        
+        # Store trained actor for later use
+        checkpoint_path = Path(self._models_dir) / f"{self._model_name}_best.pt"
+        if checkpoint_path.exists():
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
+            self._actor = SACActorNetwork(
+                state_dim=self._state_dim,
+                action_dim=1,
+                hidden_dim=config.get('hidden_dim', 256),
+            )
+            self._actor.load_state_dict(state_dict)
+            self._actor.eval()
+        
+        return metadata.get('metrics', {'epochs_trained': config.get('epochs', 100)})
+
+    def load_model(self, artifact_path: str) -> None:
+        """Load trained weights from disk.
+        
+        Args:
+            artifact_path: Full path to the model file.
+            
+        Raises:
+            FileNotFoundError: If checkpoint doesn't exist
+        """
+        from pathlib import Path
+        
+        checkpoint_path = Path(artifact_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Model checkpoint not found at {artifact_path}")
+        
+        # Use existing load method
+        original_path = self._checkpoint_path
+        self._checkpoint_path = checkpoint_path
+        try:
+            if not self.load():
+                raise ValueError("Failed to load model checkpoint")
+        finally:
+            self._checkpoint_path = original_path
 
     def load(self) -> bool:
         """Load the trained actor. Returns False rather than improvising.
