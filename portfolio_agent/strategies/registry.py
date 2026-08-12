@@ -32,8 +32,12 @@ register_strategy("low_volatility", LowVolatilityStrategy)
 try:
     from .ml_strategy import MLStrategy
     register_strategy("lstm", MLStrategy)
+
+    from .india_sac import IndiaSACStrategy
+    register_strategy("india_sac", IndiaSACStrategy)
 except ImportError:
-    # torch (the `gpu` extra) is not installed; the "lstm" strategy is unavailable.
+    # torch (the `gpu` extra) is not installed; the "lstm" and "india_sac"
+    # strategies are unavailable.
     pass
 
 from .ensemble import EnsembleStrategy

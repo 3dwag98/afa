@@ -723,6 +723,9 @@ portfolio_agent/
 │   ├── rule_based.py       trend + breakout + volume + Monte Carlo
 │   ├── cross_sectional.py  momentum, low_volatility (requires_full_batch)
 │   ├── ml_strategy.py      trained model, GPU-batched (supports_gpu_batch)
+│   ├── india_sac.py        IndiaSACStrategy — continuous-action RL actor
+│   │                       emitting an allocation weight in [0,1]; refuses
+│   │                       to score without a trained checkpoint
 │   ├── ensemble.py         UMAs: trigger / weighted_blend / vote
 │   └── weighting.py        pure weight-adaptation used live and in backtests
 ├── models/
