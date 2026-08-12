@@ -1259,3 +1259,156 @@ class TestExitLevelsComeFromTheSignal:
         assert buy['stop_price'] == 91.0
         assert buy['target_price'] == 112.0
         assert buy['signal_entry_price'] == 100.0
+
+
+class TestGapAwareStopFills:
+    """Task 4.2: a stop cannot fill at its own price through an overnight gap.
+
+    The simulator assumed every triggered stop filled exactly at the stop
+    price. That is only true when the stop is crossed *during* the session. An
+    Indian equity that closes at 100 and opens at 90 on an earnings miss or a
+    block deal never trades at the 95 stop — the first available price is 90,
+    and that is where a stop-market order fills.
+
+    The error is one-directional, so it does not average out: every gap through
+    a stop is recorded as a smaller loss than it was. It also feeds back into
+    sizing, because Kelly reads its loss magnitude `l` from realized history
+    (see src/risk.py::estimate_kelly_inputs) — an understated `l` inflates f*,
+    so the book takes larger positions precisely because it has been
+    mis-measuring its worst outcomes.
+    """
+
+    @staticmethod
+    def _engine_holding(monkeypatch, *, open_price, high, low, close=None):
+        """An engine holding 100 shares into a day with the given bar."""
+        dates = pd.bdate_range("2024-01-01", periods=2)
+        frame = pd.DataFrame(
+            {
+                "open": [100.0, open_price],
+                "high": [101.0, high],
+                "low": [99.0, low],
+                "close": [100.0, close if close is not None else open_price],
+                "volume": [1_000_000, 1_000_000],
+            },
+            index=dates,
+        )
+
+        def _load(ticker, start_date=None, end_date=None):
+            return frame.copy() if ticker == "GAP.NS" else None
+
+        monkeypatch.setattr("src.backtest_engine.load_ticker_data", _load)
+
+        engine = BacktestEngine(
+            start_date="2024-01-01", end_date="2024-01-02",
+            initial_capital=1_000_000.0, universe_tickers=["GAP.NS"],
+        )
+        engine.ticker_data = {"GAP.NS": frame}
+        engine.holdings = {"GAP.NS": 100}
+        # The cost basis lives in open_positions — _get_entry_price_for_tax
+        # reads it there, and P&L is zero without it.
+        engine.open_positions = {
+            "GAP.NS": {
+                'entry_price': 100.0,
+                'entry_date': dates[0].strftime('%Y-%m-%d'),
+                'quantity': 100,
+            }
+        }
+        engine.stop_loss_levels = {"GAP.NS": 95.0}
+        engine.take_profit_levels = {}
+        return engine, dates[1]
+
+    def test_a_gap_through_the_stop_fills_at_the_open(self, monkeypatch):
+        """The acceptance criterion: Close=100, Stop=95, Next_Open=90 -> 90."""
+        engine, day = self._engine_holding(
+            monkeypatch, open_price=90.0, high=92.0, low=88.0
+        )
+
+        trades = engine._check_stop_loss_take_profit(day)
+
+        assert len(trades) == 1
+        assert trades[0]['signal_trigger'] == 'STOP_LOSS'
+        assert trades[0]['exit_price'] == pytest.approx(90.0)
+
+    def test_an_intraday_cross_still_fills_at_the_stop(self, monkeypatch):
+        """The other half. Opening above the stop and only crossing it later in
+        the session is the case the original logic was right about, and it must
+        keep filling at 95 rather than being penalized to the open."""
+        engine, day = self._engine_holding(
+            monkeypatch, open_price=99.0, high=99.5, low=93.0, close=94.0
+        )
+
+        trades = engine._check_stop_loss_take_profit(day)
+
+        assert len(trades) == 1
+        assert trades[0]['exit_price'] == pytest.approx(95.0)
+
+    def test_the_slippage_is_recorded_against_the_stop(self, monkeypatch):
+        """The gap has to be visible as gap, not folded silently into P&L —
+        otherwise nothing downstream can tell a gapped exit from a clean one.
+        """
+        engine, day = self._engine_holding(
+            monkeypatch, open_price=90.0, high=92.0, low=88.0
+        )
+
+        trades = engine._check_stop_loss_take_profit(day)
+
+        assert trades[0]['gap_slippage_pct'] == pytest.approx(
+            (95.0 - 90.0) / 95.0 * 100.0
+        )
+
+    def test_a_clean_stop_records_no_gap_slippage(self, monkeypatch):
+        engine, day = self._engine_holding(
+            monkeypatch, open_price=99.0, high=99.5, low=93.0, close=94.0
+        )
+
+        trades = engine._check_stop_loss_take_profit(day)
+
+        assert trades[0]['gap_slippage_pct'] == pytest.approx(0.0)
+
+    def test_the_loss_is_larger_than_the_stop_implied(self, monkeypatch):
+        """What the defect actually cost: the realized loss must exceed the
+        5% the stop was set at, because the fill was 10% down."""
+        engine, day = self._engine_holding(
+            monkeypatch, open_price=90.0, high=92.0, low=88.0
+        )
+
+        trades = engine._check_stop_loss_take_profit(day)
+
+        assert trades[0]['return_pct'] < -9.0
+
+    def test_a_gap_above_the_target_still_fills_at_the_target(self, monkeypatch):
+        """The asymmetry is deliberate, so it is pinned rather than left to
+        drift.
+
+        A gap up through a resting limit sell really would fill above the
+        limit, so crediting the open would be defensible mechanics. It is also
+        the direction that flatters the backtest, and it would make the fill
+        depend on how far past the target the price ran rather than on the exit
+        rule — in a fast market that turns a 10% target into an arbitrary
+        number. The adverse side is modelled because understating losses feeds
+        an inflated Kelly fraction; overstating gains has no such corrective,
+        so the favourable side stays conservative.
+        """
+        engine, day = self._engine_holding(
+            monkeypatch, open_price=112.0, high=115.0, low=111.0
+        )
+        engine.stop_loss_levels = {}
+        engine.take_profit_levels = {"GAP.NS": 110.0}
+
+        trades = engine._check_stop_loss_take_profit(day)
+
+        assert len(trades) == 1
+        assert trades[0]['signal_trigger'] == 'TAKE_PROFIT'
+        assert trades[0]['exit_price'] == pytest.approx(110.0)
+        assert trades[0]['gap_slippage_pct'] == pytest.approx(0.0)
+
+    def test_an_intraday_target_cross_fills_at_the_target(self, monkeypatch):
+        engine, day = self._engine_holding(
+            monkeypatch, open_price=105.0, high=112.0, low=104.0, close=111.0
+        )
+        engine.stop_loss_levels = {}
+        engine.take_profit_levels = {"GAP.NS": 110.0}
+
+        trades = engine._check_stop_loss_take_profit(day)
+
+        assert trades[0]['exit_price'] == pytest.approx(110.0)

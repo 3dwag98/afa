@@ -732,7 +732,14 @@ class BacktestEngine:
                 if l_col in row.index:
                     low = row[l_col]
                     break
-            
+            # The open decides where a triggered stop actually fills: a stop
+            # crossed by a gap was never available at its own price.
+            open_price = None
+            for o_col in ['open', 'Open']:
+                if o_col in row.index:
+                    open_price = row[o_col]
+                    break
+
             if high is None or low is None:
                 continue
             
@@ -747,19 +754,50 @@ class BacktestEngine:
             triggered = False
             trigger_price = None
             trigger_type = None
-            
+            # How far the realized fill was from the level it was set at, as a
+            # positive percentage of that level. Non-zero only on a gap.
+            gap_slippage_pct = 0.0
+
             # Check stop-loss (price hit or went below stop)
             if stop_price is not None and low <= stop_price:
                 triggered = True
-                trigger_price = stop_price
                 trigger_type = 'STOP_LOSS'
-            
+                # A stop is a stop-*market* order: crossing the level sends a
+                # market order, it does not guarantee the level. When the
+                # session opens at or below the stop, the stock never traded at
+                # the stop at all — the first available price is the open, and
+                # that is the fill. Modelling it at the stop understates the
+                # loss on exactly the days that matter, and does so in one
+                # direction, so the error never averages out. It also feeds
+                # back into sizing: Kelly reads its loss magnitude from
+                # realized history (src/risk.py::estimate_kelly_inputs), so an
+                # understated l inflates f* and the book bets larger precisely
+                # because it has been mis-measuring its worst outcomes.
+                if open_price is not None and open_price <= stop_price:
+                    trigger_price = open_price
+                    if stop_price > 0:
+                        gap_slippage_pct = (stop_price - open_price) / stop_price * 100.0
+                else:
+                    trigger_price = stop_price
+
             # Check take-profit (price hit or went above target)
             elif target_price is not None and high >= target_price:
                 triggered = True
-                trigger_price = target_price
                 trigger_type = 'TAKE_PROFIT'
-            
+                # Deliberately *not* gap-aware, and the asymmetry is the point.
+                # A gap up through a resting limit sell really would fill above
+                # the limit, so crediting the open here would be defensible
+                # market mechanics — but it is also the direction that flatters
+                # the backtest, and it makes the fill depend on how far past
+                # the target the price ran rather than on the exit rule. The
+                # adverse side is modelled because ignoring it understates
+                # realized losses and feeds an inflated Kelly fraction; the
+                # favourable side is left conservative because overstating
+                # gains has no such corrective. A backtest should be pessimistic
+                # where it is uncertain.
+                trigger_price = target_price
+
+
             if triggered:
                 # Exits pay the same friction as any other sale — brokerage,
                 # STT, exchange charges, GST and capital gains tax. Booking
@@ -803,7 +841,12 @@ class BacktestEngine:
                     'net_pnl': net_pnl,
                     'return_pct': return_pct,
                     'holding_days': holding_days,
-                    'exit_reason': exit_reason
+                    'exit_reason': exit_reason,
+                    # Recorded rather than folded silently into P&L, so a
+                    # gapped exit is distinguishable from a clean one — both in
+                    # the report and by anything measuring how often the
+                    # modelled stop was actually available.
+                    'gap_slippage_pct': gap_slippage_pct,
                 }
                 self.trade_log.append(trade_record)
                 executed_trades.append(trade_record)

@@ -165,6 +165,19 @@ class TrainingConfig(BaseModel):
     target: str = Field(
         default="return_5d", description="Target variable for prediction"
     )
+    feature_normalization: Literal["global", "cross_sectional"] = Field(
+        default="cross_sectional",
+        description="How model inputs are standardized before training "
+        "(features/scaling.py::apply_cross_sectional_scaling). 'global' fits one mean and "
+        "standard deviation per feature over the pooled training rows, which answers 'is this RSI "
+        "high for this stock over the sample'. 'cross_sectional' z-scores each feature across the "
+        "universe separately on every date, which answers 'is this RSI high relative to what else "
+        "I could buy today' — the question a model that chooses between stocks is actually being "
+        "asked. The cross-sectional form also strips the market factor out of the inputs, the "
+        "same way target_transform strips it out of the label, and cannot leak across dates by "
+        "construction since it fits no state. The global scaler still runs afterwards either way: "
+        "it is what ships in the checkpoint metadata and guarantees inference reproduces training.",
+    )
     target_transform: Literal[
         "absolute", "cross_sectional_demean", "cross_sectional_rank"
     ] = Field(

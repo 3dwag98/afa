@@ -26,9 +26,12 @@ test rows, so this introduces no look-ahead.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence
 
 import numpy as np
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 # Standard deviations below this are treated as "constant feature" and scaled
 # by 1.0 instead: dividing by a near-zero spread turns a column that carries no
@@ -40,6 +43,116 @@ _MIN_STD = 1e-8
 # sit tens of sigma above the mean even after centring. Clipping bounds the
 # input the network can ever see without discarding the row.
 DEFAULT_CLIP = 10.0
+
+# Below this many names on a date there is no cross-section to standardize
+# against: a z-score across two tickers says almost nothing, and mixing those
+# rows in hands the model two different definitions of the same feature. Kept
+# equal to agents/trainer.py::MIN_CROSS_SECTION_NAMES, which drops the same
+# dates from the label for the same reason, but defined here rather than
+# imported — this module sits below the trainer and must not depend on it.
+MIN_CROSS_SECTION_NAMES = 5
+
+
+def apply_cross_sectional_scaling(
+    panel_by_ticker: Dict[str, "pd.DataFrame"],
+    feature_columns: Sequence[str],
+    clip: float = DEFAULT_CLIP,
+    min_names: int = MIN_CROSS_SECTION_NAMES,
+) -> Dict[str, "pd.DataFrame"]:
+    """Z-score each feature across the universe, separately on every date.
+
+    FeatureScaler answers "is this RSI high for this stock over the sample?".
+    A cross-sectional model needs "is this RSI high relative to what else I
+    could buy today?", and those are different questions with different
+    answers. The pooled form also encodes the market factor into every column:
+    on a day the whole market gapped down, every name's return feature reads
+    extreme against a five-year mean, so the model is handed a market state it
+    is structurally unable to act on — the same defect the cross-sectional
+    *label* transform exists to remove, arriving through the inputs instead.
+
+    **This cannot leak, by construction.** The transform for date t reads only
+    rows dated t. There is no fitted state, nothing carried across dates, and
+    therefore nothing that a train/validation split could get wrong — a
+    stronger guarantee than "the statistics were fitted on the training rows",
+    which is a property of the calling code rather than of the transform. The
+    test suite asserts it directly: rewriting every later row leaves the
+    earlier dates bit-for-bit unchanged.
+
+    Composes with FeatureScaler rather than replacing it. After this runs the
+    inputs are already ~N(0, 1), so the global scaler becomes close to a no-op
+    — but it stays in the pipeline because it is the transform that ships in
+    the checkpoint metadata and guarantees inference reproduces training, and
+    because it is the backstop against the fp16 overflow this module was
+    originally written for.
+
+    Args:
+        panel_by_ticker: Date-indexed frames keyed by ticker, all sharing a
+            column layout.
+        feature_columns: Columns to standardize. Anything absent from this
+            list — the label above all — passes through untouched.
+        clip: Absolute bound in standard deviations, applied after scaling.
+        min_names: Dates with fewer usable names than this are dropped from
+            every ticker.
+
+    Returns:
+        New frames, same keys. Rows on too-thin dates are removed.
+    """
+    import pandas as pd
+
+    tickers = list(panel_by_ticker)
+    if not tickers:
+        return {}
+
+    columns = [c for c in feature_columns if any(
+        c in panel_by_ticker[t].columns for t in tickers
+    )]
+
+    scaled = {t: panel_by_ticker[t].copy() for t in tickers}
+
+    # Names present per date, which is what decides whether the date is usable.
+    presence = pd.DataFrame({
+        t: pd.Series(True, index=panel_by_ticker[t].index) for t in tickers
+    })
+    usable_dates = presence.fillna(False).sum(axis=1) >= max(2, int(min_names))
+
+    # Every date too thin means this universe has no cross-section at all —
+    # two tickers, or a synthetic fixture. Standardizing nothing and returning
+    # the panel unscaled is the honest degradation; emptying it would throw the
+    # entire training set away over a property of the universe rather than of
+    # the data. This mirrors apply_cross_sectional_target, which falls back the
+    # same way for the same reason, so the label and the inputs never disagree
+    # about which rows exist.
+    if not bool(usable_dates.any()):
+        return {t: frame.copy() for t, frame in panel_by_ticker.items()}
+
+    for column in columns:
+        wide = pd.DataFrame({
+            t: panel_by_ticker[t][column]
+            for t in tickers if column in panel_by_ticker[t].columns
+        }, dtype=float)
+        # An inf left over from a division by a zero price would otherwise take
+        # the whole date's mean to inf and every z-score on it to NaN.
+        wide = wide.where(np.isfinite(wide))
+
+        mean = wide.mean(axis=1)
+        # Population std: the cross-section on a date is the whole population
+        # of choices available that day, not a sample drawn from a larger one.
+        std = wide.std(axis=1, ddof=0)
+
+        has_spread = std > _MIN_STD
+        z = wide.sub(mean, axis=0).div(std.where(has_spread, 1.0), axis=0)
+        # No dispersion means the feature separates nobody today; dividing by
+        # that spread would let a column carrying no information dominate.
+        z = z.where(has_spread, 0.0)
+        z = z.clip(-clip, clip).fillna(0.0)
+
+        for ticker in wide.columns:
+            scaled[ticker][column] = z[ticker].reindex(
+                panel_by_ticker[ticker].index
+            ).to_numpy()
+
+    keep = usable_dates[usable_dates].index
+    return {t: frame.loc[frame.index.isin(keep)] for t, frame in scaled.items()}
 
 
 class FeatureScaler:

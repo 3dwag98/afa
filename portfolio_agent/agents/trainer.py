@@ -20,7 +20,7 @@ from tqdm import tqdm
 from portfolio_agent.config.schema import AppConfig, TrainingConfig
 from portfolio_agent.data.dataset import TimeSeriesDataset, create_dataloaders
 from portfolio_agent.features.pipeline import build_features
-from portfolio_agent.features.scaling import FeatureScaler
+from portfolio_agent.features.scaling import FeatureScaler, apply_cross_sectional_scaling
 from portfolio_agent.models.pytorch_models import PointLoss, QuantileLoss, sorted_quantiles
 from portfolio_agent.models.registry import get_model
 from portfolio_agent.src.calibration import IsotonicCalibrator, calibration_error
@@ -263,6 +263,25 @@ def load_panel_by_ticker(config: AppConfig) -> Dict[str, pd.DataFrame]:
         print(
             f"Target transform {transform!r} needs at least 2 tickers; "
             f"training on the absolute forward return instead"
+        )
+
+    # Inputs get the same treatment as the label, and for the same reason: a
+    # feature measured against a pooled five-year mean carries the market
+    # factor the label transform just removed. Applied here, while the panel is
+    # still keyed by ticker and date — downstream it is stacked into a flat
+    # matrix and the cross-section is no longer recoverable.
+    if config.training.feature_normalization == "cross_sectional" and len(ordered) >= 2:
+        target_name = target_column_name(config.training.target)
+        feature_columns = [
+            c for c in next(iter(ordered.values())).columns if c != target_name
+        ]
+        before = sum(len(f) for f in ordered.values())
+        ordered = apply_cross_sectional_scaling(ordered, feature_columns)
+        after = sum(len(f) for f in ordered.values())
+        print(
+            f"Features standardized cross-sectionally per date across "
+            f"{len(ordered)} names ({before - after} rows dropped for too thin "
+            f"a cross-section)"
         )
 
     return ordered
