@@ -41,10 +41,11 @@ SCORING_MODES = ("weighted_sum", "rank_composite", "probit_composite")
 # call cannot produce one.
 _CROSS_SECTIONAL_MODES = ("rank_composite", "probit_composite")
 
-# Phi and Phi^-1 from the stdlib rather than scipy, matching
-# src/performance_stats.py: NormalDist.inv_cdf is Wichura's AS241, accurate to
-# full double precision, and the package deliberately carries no scipy
-# dependency (see src/portfolio.py::_quasi_diagonal_order).
+# Phi and Phi^-1 from the stdlib, matching src/performance_stats.py, which is
+# the other module in this package that needs them. NormalDist.inv_cdf is
+# Wichura's AS241 and accurate to full double precision, so this is the same
+# number scipy.stats.norm.ppf returns, without a second convention for the same
+# quantity living in two files.
 _NORMAL = statistics.NormalDist()
 
 # A cross-section with dispersion below this has nothing to standardize by;
@@ -269,7 +270,12 @@ The weighted sum this replaces adds four incommensurable quantities: an
         on 0-100, so the existing `score >= 60` / `>= 45` thresholds stay
         syntactically valid and gain a clean reading — "60th percentile of the
         weighted composite" — instead of requiring every YAML to be rewritten
-        against a z-scale.
+        against a z-scale. The inverse-normal form is available as the separate
+        ``probit_composite`` mode (see _probit_components), which keeps the
+        0-100 score by mapping back through Phi and exposes the z alongside it;
+        prefer that one when the score is being consumed as a magnitude rather
+        than as an ordering, since a weighted sum of percentiles has a spread
+        that depends on how many components were measurable that day.
 
         Ties take the average rank, which matters here: Breakout is binary and
         Trend has three levels, so ties are the common case rather than an edge
