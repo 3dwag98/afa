@@ -106,6 +106,32 @@ def load_ticker_data(
         return None
 
 
+def read_cached_bars(
+    ticker: str, cache_dir: Optional[Path] = None
+) -> Optional[pd.DataFrame]:
+    """Read one ticker's bars exactly as stored, from any cache directory.
+
+    Distinct from the two loaders beside it in ways that matter to a caller
+    checking data quality:
+
+    * `load_ticker_data` reads only the module-level `DATA_DIR`, so it cannot
+      be pointed at a second store.
+    * `DataStore.load_ticker_data` *forward-fills* up to three missing days to
+      paper over holidays. That is the right default for a strategy that wants
+      a continuous series and exactly wrong here — a gap detector reading
+      through a gap filler can never report a gap.
+
+    Args:
+        ticker: Ticker symbol, in the cache's own spelling.
+        cache_dir: Directory to read. Defaults to `DATA_DIR`.
+
+    Returns:
+        Date-indexed bars sorted ascending, or None when the file is absent,
+        empty, or has no usable date column.
+    """
+    return DataStore(cache_dir=cache_dir)._load_raw_ticker_data(ticker)
+
+
 def batch_download_and_cache(
     tickers: List[str],
     start_date: str,
