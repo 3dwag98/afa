@@ -1,6 +1,6 @@
 # T07 — Make the package installable, and let the CLI take a config path
 
-**Status:** not started · **Effort:** ~1.5 days · **Depends on:** none
+**Status:** done · **Effort:** ~1.5 days · **Depends on:** none
 **Plan reference:** `docs/forecasting_plan.html` Architecture register A1, A2; Part 1 (platform)
 
 ## Goal
@@ -46,13 +46,13 @@ at a different configuration.
 
 ## Acceptance criteria
 
-- [ ] From a clean virtualenv outside the repository:
+- [x] From a clean virtualenv outside the repository:
       `from portfolio_agent.strategies.registry import get_available_strategies`
       returns all six strategies.
-- [ ] `load_config()` on an installed copy finds the packaged default and logs
+- [x] `load_config()` on an installed copy finds the packaged default and logs
       its path.
-- [ ] `--config` selects a configuration file for every command.
-- [ ] A CI check builds the wheel and runs the import probe, so this cannot
+- [x] `--config` selects a configuration file for every command.
+- [x] A CI check builds the wheel and runs the import probe, so this cannot
       regress silently.
 
 ## Note
@@ -60,3 +60,27 @@ at a different configuration.
 `tools/probe_nse_source.py` is unrelated, but the same pattern applies: a test
 that runs the real import path from outside the repository is the only thing
 that catches this class of bug.
+
+## Outcome
+
+Done. Twelve first-attempt flat imports across eight files meant the package
+resolved only when the working directory happened to be the repository root.
+Fixed, plus a packaged `default_config.yaml` — without it an installed copy
+loaded nothing and every setting silently fell back to its schema default while
+still producing normal-looking results.
+
+The CLI gained global `--config`, `--json` and `-v/-q`, and now logs which
+configuration file it actually loaded at INFO regardless of verbosity: a run
+that quietly used schema defaults is the failure that justifies the line.
+
+Verified from a clean virtualenv **outside the repository**, which is the only
+check that means anything here:
+
+```
+strategies: ['ensemble', 'low_volatility', 'momentum', 'rule_based']
+config from: .../site-packages/portfolio_agent/config/default_config.yaml
+universe_size: 4000
+backtester: ok
+```
+
+82 new tests; suite 1303 passed.

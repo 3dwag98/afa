@@ -1,6 +1,6 @@
 # T01 — Preserve adjustment data at ingest, make the history window explicit
 
-**Status:** not started · **Effort:** ~1 day + a refetch · **Depends on:** none
+**Status:** done · **Effort:** ~1 day + a refetch · **Depends on:** none
 **Plan reference:** `docs/forecasting_plan.html` Part 1 (data layer), Part 7 week 1
 
 ## Goal
@@ -77,15 +77,15 @@ crash in it.
 
 ## Acceptance criteria
 
-- [ ] A freshly built cache carries raw and adjusted prices and the two
+- [x] A freshly built cache carries raw and adjusted prices and the two
       corporate-action columns.
-- [ ] `corporate_actions_from_frame()` recovers known splits and bonuses on at
+- [x] `corporate_actions_from_frame()` recovers known splits and bonuses on at
       least three symbols, verified against the derived factor.
-- [ ] A cache written under the old schema still loads, with the new columns
+- [x] A cache written under the old schema still loads, with the new columns
       absent rather than erroring.
-- [ ] The history window is reported at ingest, so a five-year window can never
+- [x] The history window is reported at ingest, so a five-year window can never
       again be a silent default.
-- [ ] Existing tests pass unchanged.
+- [x] Existing tests pass unchanged.
 
 ## Risks
 
@@ -95,3 +95,20 @@ crash in it.
 - The refetch cannot run in CI or the dev container: `huggingface.co` is
   blocked by the network policy. Code and tests land here; the refetch is a
   local step.
+
+## Outcome
+
+Done. The ingest was discarding `adj_close`, `adj_factor`, `dividends` and
+`stock_splits` that the source already supplied, so a corporate action was
+indistinguishable from a price move after the fact. Raw OHLC legs are now
+captured before adjustment, `adj_factor` is recorded explicitly (1.0 when
+nothing was adjusted), and `corporate_actions_from_frame` reports stated and
+derived actions *unmerged* — a derived action that no stated one explains is
+the signal that the source re-adjusted history.
+
+`default_history_years` went from 5 to 20. Five years was a config default
+nobody had measured, and it put the sample start *after* the COVID crash, so no
+regime model on this platform had ever seen one.
+
+14 new tests; suite 1236 passed. Two existing tests were rewritten — one of
+them, `test_drops_the_non_ohlcv_columns`, was pinning the bug in place.

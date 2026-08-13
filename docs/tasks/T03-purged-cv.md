@@ -1,6 +1,6 @@
 # T03 — Purged and embargoed cross-validation
 
-**Status:** not started · **Effort:** ~3 days · **Depends on:** none
+**Status:** done · **Effort:** ~3 days · **Depends on:** none
 **Plan reference:** `docs/forecasting_plan.html` Part 4 (additions, first entry)
 
 ## Goal
@@ -43,12 +43,12 @@ serial correlation that bridges it.
 
 ## Acceptance criteria
 
-- [ ] With horizon `h` and embargo `e`, no training sample's label window
+- [x] With horizon `h` and embargo `e`, no training sample's label window
       intersects its test fold, asserted directly on index sets.
-- [ ] A deliberately leaky synthetic signal — the label itself as a feature —
+- [x] A deliberately leaky synthetic signal — the label itself as a feature —
       scores near-perfectly under naive CV and near-zero under purged CV. This
       is the test that proves the mechanism works.
-- [ ] Existing walk-forward behaviour is reachable unchanged, so the difference
+- [x] Existing walk-forward behaviour is reachable unchanged, so the difference
       between the two can be quantified rather than assumed.
 
 ## The measurement this unlocks
@@ -56,3 +56,24 @@ serial correlation that bridges it.
 Rank IC of the existing LSTM under purged CV, against the same model under the
 current walk-forward. The gap between those two numbers is leakage that has
 been reported as skill. Expect it to be uncomfortable.
+
+## Outcome
+
+Done, and the task's own premise needed correcting first. I claimed
+walk-forward "does not purge the overlap at the fold boundary". It **does** —
+`history.iloc[:-horizon_days]`, under a comment mislabelling it an embargo.
+That was the right operation with the wrong name.
+
+What was genuinely missing: a real embargo (no setting existed), a unit that
+could be tested directly, and an assertion of the property purging exists to
+guarantee. `validation/purged.py` supplies all three, computed on **positions in
+a sorted date index** rather than calendar days — a horizon of 5 means five
+trading sessions, and calendar arithmetic is silently wrong by a variable
+amount across a weekend or an exchange holiday.
+
+One test expectation of mine was wrong and exposed a redundancy: purging
+requires `p <= test_end_pos` and the embargo requires `p > test_end_pos`, so
+the two are disjoint by construction and the reconciliation between them was
+dead code. Removed, and the disjointness is now the test.
+
+29 new tests; suite 1250 passed.

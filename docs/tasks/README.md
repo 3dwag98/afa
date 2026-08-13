@@ -1,0 +1,77 @@
+# The forecasting pivot: eleven tasks
+
+All eleven are done and merged. Each task's own file carries its spec, its
+acceptance criteria, and what actually shipped — including the places where the
+spec turned out to be wrong.
+
+The premise behind all of them: **no trades will ever be executed, so tracking
+error is acceptable and forecast skill is the thing worth measuring.** That
+single decision is why the evaluation layer routes around `BacktestEngine`
+rather than decomposing it, why the live path is frozen rather than improved,
+and why the data work is about provenance rather than latency.
+
+| Task | What it did | Tests added |
+| --- | --- | --- |
+| [T01](T01-preserve-adjustment-data.md) | Keep the adjustment data the ingest was discarding; 5→20 years | 14 |
+| [T02](T02-data-validation.md) | Ingest invariants, `data status` / `data validate` | 53 |
+| [T03](T03-purged-cv.md) | Purged CV as a testable unit, plus the embargo that was missing | 29 |
+| [T04](T04-forecast-harness.md) | Forecast evaluation without simulating a book | 47 |
+| [T05](T05-neutralized-ic-and-decay.md) | Neutralized IC and decay curves | 39 |
+| [T06](T06-gbm-baseline.md) | Gradient-boosting baseline, the model to beat | 44 |
+| [T07](T07-installable-package.md) | Make the package installable; `--config` | 82 |
+| [T08](T08-cli-forecasting.md) | `evaluate`, `compare`, `list-features`, `data build` | 70 |
+| [T09](T09-run-manifests.md) | Run manifests and rendered research notes | 48 |
+| [T10](T10-remove-dead-code.md) | Delete what is actively misleading | 26 |
+| [T11](T11-freeze-execution.md) | Freeze the live-trading namespace | 67 |
+
+## What the work found
+
+These are the results, not the mechanics. Each is in the relevant task file with
+its numbers.
+
+**Neither strategy survives neutralization intact.** Momentum's rank IC is
++0.061 raw and +0.026 once beta and size are removed; low volatility's is
++0.061 and +0.018. So 58% and 71% of what looked like alpha is factor loading.
+For a low-volatility screen that is close to tautological — it *is* a beta bet —
+and the number now says so instead of appearing as selection skill.
+
+**Low volatility ranks the cross-section better than momentum and still has a
+negative decile spread.** It orders names well and cannot be traded long-only.
+Separating those two facts is the entire reason the evaluation layer exists; an
+equity curve reports their product and never their difference.
+
+**Momentum does not beat gradient boosting** on identical features and splits.
+
+**Momentum's IC rises to day 3 and is flat to day 21** — a slow signal, so a
+monthly rebalance keeps essentially all of it. The single-horizon number could
+not support that conclusion either way.
+
+**`rule_based` makes almost no claims.** Its score dispersion is 0.016: one
+floor value for 98% of the universe, and no cross-section left to rank. Its IC
+is not low because its claims are wrong.
+
+**The shipped data had six impossible bars** — low above the open/close — plus
+nine symbols with one-session moves between +63% and +90%, which no NSE price
+band permits and which are splits that escaped adjustment.
+
+## Two things deliberately left undone
+
+**The ~80 MB of market data already in git history is not reclaimed.** T10 stops
+the growth; reclaiming the history needs a rewrite that invalidates every clone
+and open branch. Noted in [`docs/OBTAINING_DATA.md`](../OBTAINING_DATA.md), and
+a test asserts it stays noted rather than quietly presented as fixed.
+
+**No sector map ships with the repository (finding A8).** Sector neutralization
+is implemented and tested — pass `sector_map=` and it works — but every result
+that runs without one says in its printed notes that it is *not* sector-neutral.
+Indian momentum concentrates hard by sector, so this is exactly where an
+apparent alpha most often turns out to be a sector bet.
+
+## Getting started
+
+```bash
+uv sync --extra hf --extra gbm
+portfolio-agent data build --years 20      # download, then check what arrived
+portfolio-agent evaluate --strategy momentum --baseline gbm --neutralize beta,size
+portfolio-agent report --run <id>
+```

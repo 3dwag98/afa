@@ -1,6 +1,6 @@
 # T11 — Freeze the execution and live-trading namespace
 
-**Status:** not started · **Effort:** ~1 day · **Depends on:** none
+**Status:** done · **Effort:** ~1 day · **Depends on:** none
 **Plan reference:** `docs/forecasting_plan.html` Part 3 (frozen)
 
 ## Goal
@@ -46,13 +46,32 @@ rebuild, and all of it is right. Deleting would be a false economy.
 
 ## Acceptance criteria
 
-- [ ] The forecasting path imports nothing from `execution/`.
-- [ ] `backtest` still runs, since it remains a secondary check.
-- [ ] Frozen tests still pass when run explicitly.
-- [ ] The README says why, not just what.
+- [x] The forecasting path imports nothing from `execution/`.
+- [x] `backtest` still runs, since it remains a secondary check.
+- [x] Frozen tests still pass when run explicitly.
+- [x] The README says why, not just what.
 
 ## Note
 
 Several of the modules with broken flat imports (`A1`) live here — orchestrator,
 storage, reporting, outcomes. Freezing them shrinks the surface T07 has to fix,
 so doing this first makes that task smaller.
+
+## Outcome
+
+Done. `orchestrator.py`, `storage.py`, `reporting.py` and `outcomes.py` moved
+into `portfolio_agent/execution/` with their five test files, and `run-agent`
+was removed from the CLI. The namespace is the boundary: research code that
+imports from `execution/` is doing something the freeze forbids, and 67 tests
+assert no research module does.
+
+Two modules deliberately did **not** move. `src/execution_sim.py` is used by
+`BacktestEngine`, which is research, and `src/models.py` holds dataclasses
+shared by both sides. Moving either would have made the freeze a lie about
+where the boundary really is.
+
+A dead `try/except ImportError` in the orchestrator was collapsed on the way
+through — it existed to let the module run as a loose script, which is the
+same ambiguity T07 removed everywhere else.
+
+67 new tests; suite 1261 passed.
