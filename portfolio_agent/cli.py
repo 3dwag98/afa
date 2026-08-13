@@ -10,6 +10,7 @@ Commands:
     list-trainers: List registered training procedures and their settings
     data status: Report span, coverage and gaps in the cached market data
     data validate: Check data invariants; non-zero exit on a structural failure
+    report: List recorded runs, or render one as a standalone research note
     gpu-check: Report which compute devices this install can actually use
 """
 
@@ -610,6 +611,60 @@ def cmd_data_validate(args) -> int:
     return report.exit_code
 
 
+def cmd_report(args) -> int:
+    """List recorded runs, or render one as a standalone research note."""
+    import json
+
+    from portfolio_agent.provenance import (
+        DEFAULT_RUNS_DIR, find_manifest, list_manifests, render_index, write_note,
+    )
+
+    runs_dir = args.runs_dir or DEFAULT_RUNS_DIR
+
+    if args.run:
+        try:
+            manifest = find_manifest(args.run, runs_dir)
+        except (FileNotFoundError, ValueError) as error:
+            print(f"Error: {error}")
+            return 1
+
+        if args.json:
+            print(json.dumps(manifest.to_dict(), indent=2, default=str))
+            return 0
+
+        print(manifest.render())
+        if not args.no_html:
+            # Beside the manifest that produced it, which is not necessarily
+            # the default runs directory — `--runs-dir` has to carry through or
+            # the note lands somewhere the manifest is not.
+            default = Path(runs_dir) / f"{manifest.run_id}.html"
+            path = write_note(manifest, args.output or default)
+            print(f"\nResearch note written to {path}")
+        # A run from a dirty tree is reported as a failure on purpose: it is
+        # the one result someone must not quote without knowing, and an exit
+        # code is what a script can act on.
+        return 0 if manifest.reproducible or args.allow_dirty else 2
+
+    manifests = list_manifests(runs_dir, limit=args.limit)
+    if not manifests:
+        print(f"No runs recorded in {runs_dir}.")
+        print("Runs are written automatically by `train` and `evaluate`.")
+        return 1
+
+    if args.json:
+        print(json.dumps([m.summary() for m in manifests], indent=2, default=str))
+        return 0
+
+    print(render_index(manifests))
+    dirty = [m for m in manifests if m.git.get("dirty")]
+    if dirty:
+        print(
+            f"\n{len(dirty)} of {len(manifests)} run(s) came from a dirty working "
+            f"tree and cannot be reproduced."
+        )
+    return 0
+
+
 def cmd_gpu_check(args) -> int:
     """Report what compute devices this install can actually use."""
     try:
@@ -1022,6 +1077,38 @@ def create_parser() -> argparse.ArgumentParser:
     )
     validate_parser.set_defaults(func=cmd_data_validate)
     data_parser.set_defaults(func=lambda a: (data_parser.print_help(), 1)[1])
+    # report command
+    report_parser = subparsers.add_parser(
+        "report",
+        help="List recorded runs, or render one as a standalone research note",
+    )
+    report_parser.add_argument(
+        "--run", type=str, default=None,
+        help="Run id, or a unique prefix of one. Omit to list every run.",
+    )
+    report_parser.add_argument(
+        "--runs-dir", type=str, default=None,
+        help="Directory holding run manifests (default: runs/)",
+    )
+    report_parser.add_argument(
+        "--output", type=str, default=None,
+        help="Where the HTML note goes (default: beside the manifest)",
+    )
+    report_parser.add_argument(
+        "--no-html", action="store_true",
+        help="Print the summary without writing an HTML note",
+    )
+    report_parser.add_argument(
+        "--limit", type=int, default=None, help="Show at most this many runs",
+    )
+    report_parser.add_argument(
+        "--allow-dirty", action="store_true",
+        help="Exit 0 for a run made from a dirty working tree. Without this "
+             "such a run exits 2, so a script cannot quote an irreproducible "
+             "number without noticing.",
+    )
+    report_parser.add_argument("--json", action="store_true", help="Emit JSON")
+    report_parser.set_defaults(func=cmd_report)
 
     # gpu-check command
     gpu_check_parser = subparsers.add_parser(
