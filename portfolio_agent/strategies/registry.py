@@ -9,7 +9,11 @@ from typing import Dict, Type
 
 from .base import BaseStrategy
 from .rule_based import RuleBasedStrategy
-from .cross_sectional import MomentumStrategy, LowVolatilityStrategy
+from .cross_sectional import (
+    IdiosyncraticLowVolatilityStrategy,
+    LowVolatilityStrategy,
+    MomentumStrategy,
+)
 from portfolio_agent.config.schema import StrategyConfig
 
 STRATEGY_REGISTRY: Dict[str, Type[BaseStrategy]] = {}
@@ -28,6 +32,11 @@ def register_strategy(name: str, strategy_class: Type[BaseStrategy]) -> None:
 register_strategy("rule_based", RuleBasedStrategy)
 register_strategy("momentum", MomentumStrategy)
 register_strategy("low_volatility", LowVolatilityStrategy)
+# The same anomaly sorted on the CAPM residual instead of total volatility.
+# Registered separately so `evaluate --strategy low_volatility_idio` and
+# `compare --strategies low_volatility,low_volatility_idio` both work without
+# editing a config — see the class docstring for why that matters.
+register_strategy("low_volatility_idio", IdiosyncraticLowVolatilityStrategy)
 
 try:
     from .ml_strategy import MLStrategy

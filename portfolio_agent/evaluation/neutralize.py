@@ -392,7 +392,9 @@ def rolling_beta(
     Returns:
         Wide (date x symbol) betas, NaN until the window fills.
     """
-    market = returns.mean(axis=1)
+    from portfolio_agent.features.market_relative import market_composite
+
+    market = market_composite(returns)
     market_variance = market.rolling(window, min_periods=window // 2).var()
     betas = {}
     for symbol in returns.columns:

@@ -44,6 +44,10 @@ import pandas as pd
 from .base import BaseStrategy
 from .types import StrategyContext, StrategySignal
 from portfolio_agent.config.schema import StrategyConfig
+from portfolio_agent.features.market_relative import (
+    DEFAULT_VOL_WINDOW,
+    idiosyncratic_vol_from_closes,
+)
 
 try:
     from portfolio_agent.src.risk import calculate_stop_target, net_reward_risk
@@ -608,9 +612,33 @@ class MomentumStrategy(BaseStrategy):
         )
 
 
+#: How `LowVolatilityStrategy` measures risk. `total` is trailing realized
+#: volatility — the original sort. `idiosyncratic` is the volatility of the
+#: CAPM residual, which is the sort the 2025 literature finds survives.
+VOLATILITY_SORTS = ("total", "idiosyncratic")
+
+
 class LowVolatilityStrategy(BaseStrategy):
-    """Low-volatility anomaly: long the bottom decile by trailing 60-day
-    realized volatility (docs/QUANT_RESEARCH.md section 2).
+    """Low-volatility anomaly: long the bottom decile by trailing volatility
+    (docs/QUANT_RESEARCH.md section 2).
+
+    Two ways to measure that volatility, chosen with the `sort_on` param:
+
+    - ``total`` (default) — trailing 60-day realized volatility. The original
+      sort, and the one whose result T05 reported: rank IC +0.061 raw, +0.018
+      once beta and size are removed. 71% of the apparent alpha was factor
+      loading, which for a volatility screen is close to tautological. It *is*
+      a beta bet.
+    - ``idiosyncratic`` — volatility of the CAPM residual over the same window.
+      Total volatility is beta times market volatility plus the residual, so
+      sorting on the total ranks high-beta names and idiosyncratically-wild
+      names identically. The 2025 work on the low-risk anomaly finds those two
+      sorts behave very differently out of sample: idiosyncratic-volatility
+      sorts survive where beta sorts largely do not.
+
+    Registered under both `low_volatility` and `low_volatility_idio` so the two
+    can be evaluated against each other without editing a config — which is the
+    only way the comparison actually gets made.
 
     Volatility targeting applies here too, but the market-regime crash filter
     is off by default: this is the defensive sleeve, and the anomaly's whole
@@ -628,6 +656,14 @@ class LowVolatilityStrategy(BaseStrategy):
         self._protection = CrashProtection.from_params(params, regime_filter_default=False)
         self._tradability = TradabilityFilter.from_params(params)
 
+        sort_on = str(params.get("sort_on", "total")).lower()
+        if sort_on not in VOLATILITY_SORTS:
+            raise ValueError(
+                f"sort_on must be one of {list(VOLATILITY_SORTS)}, got {sort_on!r}"
+            )
+        self._sort_on = sort_on
+        self._vol_window = int(params.get("vol_window", DEFAULT_VOL_WINDOW))
+
     @property
     def name(self) -> str:
         return self._name
@@ -640,9 +676,18 @@ class LowVolatilityStrategy(BaseStrategy):
         return ["close", "realized_vol_60", "atr_14"] + self._tradability.required_features()
 
     def entry_rules(self) -> Dict[str, Any]:
+        measure = (
+            "trailing 60-day annualized realized volatility"
+            if self._sort_on == "total"
+            else (
+                f"annualized volatility of the CAPM residual over "
+                f"{self._vol_window} sessions"
+            )
+        )
         return {
-            "rule": "Long bottom decile of the eligible universe by trailing "
-                    "60-day annualized realized volatility",
+            "rule": f"Long bottom decile of the eligible universe by {measure}",
+            "sort_on": self._sort_on,
+            "vol_window": self._vol_window,
             "bottom_percentile": self._top_fraction,
             "min_universe": self._min_universe,
             "long_only": True,
@@ -669,6 +714,12 @@ class LowVolatilityStrategy(BaseStrategy):
 
         rejected: Dict[str, str] = {}
 
+        idiosyncratic = (
+            self._idiosyncratic_vol(features_by_symbol, context)
+            if self._sort_on == "idiosyncratic"
+            else {}
+        )
+
         for symbol, features in features_by_symbol.items():
             if features.empty:
                 continue
@@ -682,7 +733,15 @@ class LowVolatilityStrategy(BaseStrategy):
                 rejected[symbol] = reason
                 continue
 
-            vol = _clean(latest.get("realized_vol_60"))
+            if self._sort_on == "idiosyncratic":
+                # No fallback to total volatility for a symbol whose residual
+                # could not be estimated. Mixing two different measures into one
+                # ranking is the failure this task exists to remove, and a
+                # partially-idiosyncratic sort would be harder to notice than a
+                # thin one.
+                vol = idiosyncratic.get(symbol)
+            else:
+                vol = _clean(latest.get("realized_vol_60"))
             if vol is not None:
                 metric_by_symbol[symbol] = vol
 
@@ -698,9 +757,71 @@ class LowVolatilityStrategy(BaseStrategy):
             top_fraction=self._top_fraction,
             higher_is_better=False,
             trigger="LowVolatility",
-            component_name="RealizedVol",
+            component_name=(
+                "RealizedVol" if self._sort_on == "total" else "IdiosyncraticVol"
+            ),
             min_universe=self._min_universe,
             protection=self._protection,
             regime=regime,
             rejected=rejected,
         )
+
+    def _idiosyncratic_vol(
+        self, features_by_symbol: Dict[str, pd.DataFrame], context: StrategyContext
+    ) -> Dict[str, float]:
+        """Latest residual volatility per symbol, or an empty map if unusable.
+
+        The market is the cached index when the context carries one and the
+        equal-weighted composite of this batch otherwise — the same preference
+        order `_assess_regime` uses, for the same reason: a real index is what
+        the research studied, and the composite is always available.
+
+        A residual against a one-name "cross-section" is the return itself, so
+        below two symbols this returns nothing rather than a number that would
+        rank identically to the total-volatility sort while being labelled
+        differently.
+        """
+        closes = {
+            symbol: features["close"]
+            for symbol, features in features_by_symbol.items()
+            if not features.empty and "close" in features.columns
+        }
+        if len(closes) < 2:
+            return {}
+
+        frame = pd.DataFrame(closes).sort_index()
+        if len(frame) < self._vol_window + 2:
+            return {}
+
+        residual = idiosyncratic_vol_from_closes(
+            frame, market_close=context.benchmark_close, window=self._vol_window
+        )
+        if residual.empty:
+            return {}
+
+        latest = residual.iloc[-1]
+        return {
+            symbol: value
+            for symbol, value in (
+                (symbol, _clean(latest.get(symbol))) for symbol in frame.columns
+            )
+            if value is not None
+        }
+
+
+class IdiosyncraticLowVolatilityStrategy(LowVolatilityStrategy):
+    """`LowVolatilityStrategy` with the residual sort as its default.
+
+    A subclass rather than a config preset because the registry maps a name to
+    a class and constructs it from whatever `StrategyConfig` the caller has.
+    Without a distinct class, comparing the two sorts would mean editing a
+    config between runs — and a comparison that requires editing a file to
+    perform is a comparison that does not get performed. An explicit
+    `sort_on` in params still wins, so this is a default and not a lock.
+    """
+
+    def __init__(self, config: StrategyConfig):
+        params = dict(config.params or {})
+        params.setdefault("sort_on", "idiosyncratic")
+        params.setdefault("name", "low_volatility_idio")
+        super().__init__(config.model_copy(update={"params": params}))
