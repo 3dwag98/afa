@@ -129,6 +129,14 @@ class TrainingArtifact:
         than inventing a comparison when a trainer reports neither.
         """
         for key in (
+            # Rank IC leads because it is the one metric on this list that
+            # answers the question a cross-sectional forecaster is actually
+            # asked — did it order the names correctly — and because, like the
+            # two ratios after it, higher is better. The loss entries below are
+            # the fallback for trainers that report nothing else, and their
+            # direction is inverted; a summary table shows every numeric metric
+            # anyway, so the column is a pointer rather than a verdict.
+            "val_rank_ic",
             "val_sortino",
             "val_sharpe",
             "best_val_loss",
@@ -146,8 +154,16 @@ class BaseTrainer(ABC):
     """Base class for a registered training procedure.
 
     Subclasses declare a config schema, prepare data and run a loop. They do
-    *not* write checkpoints: `artifacts.py::save_artifact` is the only writer,
-    which is what keeps the on-disk contract identical across trainers.
+    not open files: `artifacts.py` holds every writer, and a trainer selects
+    which one applies to the thing it produced. That is what keeps the on-disk
+    contract in one module instead of spread across trainers.
+
+    Selecting a writer is not the same as writing one. A tensor state dict goes
+    through `save_artifact` (torch, readable back under `weights_only=True`); a
+    fitted scikit-learn estimator cannot, because that loader refuses pickled
+    objects by design, so it goes through `save_sklearn_artifact` instead. Both
+    write the same `{weights, metadata, metrics}` shape and both guarantee
+    `feature_names` is present.
     """
 
     #: Registry name, for error messages and artifact provenance.
@@ -157,18 +173,47 @@ class BaseTrainer(ABC):
     #: None means the trainer is strategy-agnostic (the supervised one is).
     strategy_name: ClassVar[Optional[str]] = None
 
+    #: Extension of the file this trainer's weights land in. Override alongside
+    #: `write_checkpoint`; the two have to agree or the runner reports a path
+    #: that does not exist.
+    checkpoint_suffix: ClassVar[str] = ".pt"
+
+    @staticmethod
+    def write_checkpoint(artifact: "TrainingArtifact", path: Any) -> Any:
+        """Persist `artifact` at `path` and return the path written.
+
+        The default is the torch writer, which is what every network-shaped
+        trainer wants. Override it *and* `checkpoint_suffix` together for a
+        payload torch cannot carry.
+        """
+        from .artifacts import save_artifact
+
+        return save_artifact(artifact, path)
+
     @property
     def writes_own_checkpoint(self) -> bool:
         """Whether `fit` already persisted the weights itself.
 
         False for everything written against this package — the runner calls
-        `save_artifact` so there is one writer and one on-disk shape. True only
-        for the supervised adapter, which delegates to a pre-existing pipeline
-        that writes its own checkpoint and its own `models/metadata.json`
-        sidecar; re-saving over those would replace a populated checkpoint with
-        an empty one.
+        `write_checkpoint` so the file lands in one of `artifacts.py`'s shapes.
+        True only for the supervised adapter, which delegates to a pre-existing
+        pipeline that writes its own checkpoint and its own
+        `models/metadata.json` sidecar; re-saving over those would replace a
+        populated checkpoint with an empty one.
         """
         return False
+
+    @classmethod
+    def availability(cls) -> Optional[str]:
+        """Why this trainer cannot run here, or None if it can.
+
+        For a trainer whose dependency is imported lazily — so that it stays
+        *registered* and discoverable on an install that lacks it — this is how
+        `list-trainers` reports the gap without paying for the import. Check
+        with `importlib.util.find_spec`, not by importing: a listing command
+        should not cost a second per optional library.
+        """
+        return None
 
     @classmethod
     def config_model(cls) -> Type[TrainerConfig]:

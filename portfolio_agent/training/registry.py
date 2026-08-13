@@ -91,12 +91,17 @@ def get_trainer(name: str) -> Type["BaseTrainer"]:
     _ensure_builtins_loaded()
     if name not in _TRAINER_REGISTRY:
         available = sorted(_TRAINER_REGISTRY)
-        hint = (
-            f" Available: {available}."
-            if available
-            else " No trainers are registered — PyTorch is probably not installed "
-            "(`uv sync --extra gpu`)."
-        )
+        if available:
+            hint = (
+                f" Available: {available}. A built-in trainer missing from that "
+                "list needs an optional extra that is not installed — 'sac' needs "
+                "`uv sync --extra gpu`."
+            )
+        else:
+            hint = (
+                " No trainers are registered at all, which means the package "
+                "itself failed to import."
+            )
         raise KeyError(f"Trainer {name!r} is not registered.{hint}")
     return _TRAINER_REGISTRY[name]
 
@@ -105,6 +110,22 @@ def list_trainers() -> List[str]:
     """Return the sorted names of every registered trainer."""
     _ensure_builtins_loaded()
     return sorted(_TRAINER_REGISTRY)
+
+
+def unavailable_trainers() -> Dict[str, str]:
+    """Built-ins that could not be imported, mapped to why.
+
+    Absence and unavailability are different facts and deserve different
+    messages: a name that is simply not in `list_trainers()` looks like a typo,
+    where "sac needs the gpu extra" tells you what to install.
+    """
+    _ensure_builtins_loaded()
+    try:
+        from .trainers import UNAVAILABLE
+
+        return dict(UNAVAILABLE)
+    except ImportError:  # pragma: no cover - the package itself failed to load
+        return {}
 
 
 def is_trainer_registered(name: str) -> bool:
