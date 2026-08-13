@@ -46,14 +46,14 @@ from .types import StrategyContext, StrategySignal
 from portfolio_agent.config.schema import StrategyConfig
 
 try:
-    from src.risk import calculate_stop_target, net_reward_risk
-    from src.liquidity import (
+    from portfolio_agent.src.risk import calculate_stop_target, net_reward_risk
+    from portfolio_agent.src.liquidity import (
         DEFAULT_MAX_CIRCUIT_LOCK_FRACTION,
         DEFAULT_MAX_OPERATOR_TRAP_FRACTION,
         DEFAULT_MAX_ZERO_RETURN_FRACTION,
         DEFAULT_MIN_TRADED_VALUE_INR,
     )
-    from src.regime import (
+    from portfolio_agent.src.regime import (
         DEFAULT_CRASH_VOL_MULTIPLE,
         DEFAULT_MAX_SCALE,
         DEFAULT_MIN_SCALE,

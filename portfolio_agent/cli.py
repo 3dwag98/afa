@@ -20,10 +20,15 @@ from pathlib import Path
 from typing import Optional
 
 
+# Set by main() from --config, so every command loads the same file without
+# each one having to thread the path through its own signature.
+_ACTIVE_CONFIG_PATH = {"path": "config.yaml"}
+
+
 def get_config() -> "AppConfig":
-    """Load application configuration."""
+    """Load application configuration from the path --config selected."""
     from portfolio_agent.config.loader import load_config
-    return load_config()
+    return load_config(_ACTIVE_CONFIG_PATH["path"])
 
 
 def cmd_download_data(args) -> int:
@@ -568,7 +573,34 @@ def create_parser() -> argparse.ArgumentParser:
         prog="portfolio-agent",
         description="Portfolio Agent CLI - Autonomous Financial Advisor"
     )
-    
+
+    # Global options, applying to every subcommand.
+    #
+    # --config is the one that was genuinely missing. Every command loaded
+    # config.yaml implicitly from the working directory, so running two
+    # experiments meant editing a file in place — on a platform whose purpose
+    # is running experiments.
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config.yaml",
+        metavar="PATH",
+        help="Configuration file to use (default: config.yaml, falling back to "
+             "the project root and then the packaged default)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable output where a command produces results",
+    )
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument(
+        "-v", "--verbose", action="store_true", help="Show INFO-level logging"
+    )
+    verbosity.add_argument(
+        "-q", "--quiet", action="store_true", help="Show warnings and errors only"
+    )
+
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
     
     # download-data command
@@ -859,13 +891,25 @@ def create_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list[str]] = None) -> int:
     """Main entry point."""
+    import logging
+
     parser = create_parser()
     args = parser.parse_args(argv)
-    
+
     if args.command is None:
         parser.print_help()
         return 1
-    
+
+    level = logging.WARNING if args.quiet else (logging.INFO if args.verbose else logging.WARNING)
+    logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
+    # Which configuration a run used is worth an INFO line regardless of
+    # verbosity elsewhere — a run that silently used schema defaults is the
+    # failure this exists to prevent.
+    logging.getLogger("portfolio_agent.config.loader").setLevel(logging.INFO)
+
+    # Every command resolves its config through get_config(), which reads this.
+    _ACTIVE_CONFIG_PATH["path"] = args.config
+
     return args.func(args)
 
 
