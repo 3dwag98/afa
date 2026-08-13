@@ -7,7 +7,7 @@ import math
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -21,6 +21,7 @@ from portfolio_agent.config.schema import AppConfig, TrainingConfig
 from portfolio_agent.data.dataset import (
     TimeSeriesDataset,
     create_dataloaders,
+    sequence_target_positions,
     test_split_dates,
 )
 from portfolio_agent.evaluation.metrics import MIN_CROSS_SECTION_NAMES
@@ -315,37 +316,30 @@ def load_panel_by_ticker(
     return ordered
 
 
-def load_data(config: AppConfig, universe: Optional[List[str]] = None) -> pd.DataFrame:
-    """Load and featurize training data into a single stacked panel.
+def split_ordered_panel(
+    by_ticker: Dict[str, pd.DataFrame]
+) -> Tuple[pd.DataFrame, List[int]]:
+    """Stack per-ticker frames split-major, and say where each block ends.
 
-    Each ticker is featurized and split 70/15/15 chronologically
-    *individually*, then all tickers' train portions are concatenated,
-    followed by all val portions, then all test portions. That ordering lets
-    create_dataloaders()'s single top-level 70/15/15 index split land exactly
-    on those boundaries, so validation/test proportionally represent every
-    ticker rather than only the last one in the panel.
+    Each ticker is split 70/15/15 chronologically *individually*, then all
+    tickers' train portions are concatenated, followed by all val portions,
+    then all test portions. That ordering lets create_dataloaders()'s single
+    top-level 70/15/15 index split land on those boundaries, so
+    validation/test proportionally represent every ticker rather than only the
+    last one in the panel.
+
+    The row counts come back with the frame because they cannot be recovered
+    from it: dates repeat across tickers, and the blocks cover overlapping
+    calendar periods. Anything that slides a window over these rows needs them
+    — a window that crosses a join is one stock's history labelled with the
+    next stock's forward return, and nothing about that raises.
 
     Note what this ordering is *not* suitable for: because it groups by split
     and then by ticker, a row-index split of the result is not chronological
     across the panel. Walk-forward validation therefore works from
     load_panel_by_ticker() and splits by date — see
     run_walk_forward_validation().
-
-    Sequence windows that straddle two concatenated tickers' boundaries mix
-    data from different instruments; this is a bounded, documented limitation
-    of pooling multiple series through a single-series windowing dataset
-    (TimeSeriesDataset), not a look-ahead bias — it affects at most
-    sequence_length * (n_tickers - 1) windows out of the full panel.
-
-    Args:
-        config: Application configuration.
-        universe: Exact tickers to load, bypassing the cache draw.
-
-    Returns:
-        DataFrame with computed features and target column (already featurized).
     """
-    by_ticker = load_panel_by_ticker(config, universe)
-
     train_parts, val_parts, test_parts = [], [], []
     for frame in by_ticker.values():
         n = len(frame)
@@ -355,7 +349,30 @@ def load_data(config: AppConfig, universe: Optional[List[str]] = None) -> pd.Dat
         val_parts.append(frame.iloc[train_end:val_end])
         test_parts.append(frame.iloc[val_end:])
 
-    combined = pd.concat(train_parts + val_parts + test_parts, ignore_index=True)
+    parts = train_parts + val_parts + test_parts
+    # The index is kept rather than reset: it carries the dates rank IC groups
+    # by, and its backwards steps are how create_dataloaders recognizes a
+    # stacked panel that arrived without its boundaries.
+    return pd.concat(parts), [len(part) for part in parts]
+
+
+def load_data(config: AppConfig, universe: Optional[List[str]] = None) -> pd.DataFrame:
+    """Load and featurize training data into a single stacked panel.
+
+    Thin wrapper over split_ordered_panel() for callers that only want the
+    frame. Anything that builds sequence windows from it wants the block
+    lengths too, and should call split_ordered_panel() directly — see
+    run_training(); create_dataloaders() refuses this frame without them.
+
+    Args:
+        config: Application configuration.
+        universe: Exact tickers to load, bypassing the cache draw.
+
+    Returns:
+        DataFrame with computed features and target column (already featurized).
+    """
+    by_ticker = load_panel_by_ticker(config, universe)
+    combined, _ = split_ordered_panel(by_ticker)
     print(f"Built training panel from {len(by_ticker)} tickers: {len(combined)} total rows")
     return combined
 
@@ -610,20 +627,25 @@ def evaluate_predictions(
 
 
 def _make_loader(
-    features: np.ndarray,
-    targets: np.ndarray,
+    panel: Optional[StackedPanel],
     config: TrainingConfig,
     shuffle: bool = False,
     drop_last: bool = False,
 ) -> Optional[DataLoader]:
-    """Wrap a contiguous feature/target slice in a sequence DataLoader.
+    """Wrap a stacked panel in a sequence DataLoader, one ticker per window.
 
-    Returns None when the slice is shorter than one sequence, so a fold that
-    lands on too little data is skipped rather than raising.
+    Returns None when no single ticker's block is longer than one sequence, so
+    a fold that lands on too little history *per name* is skipped rather than
+    raising — and rather than being rescued by windows that splice two names
+    together to reach the required length.
     """
-    if len(features) <= config.sequence_length:
+    if panel is None:
         return None
-    dataset = TimeSeriesDataset(features, targets, config.sequence_length)
+    if not any(length > config.sequence_length for length in panel.group_lengths):
+        return None
+    dataset = TimeSeriesDataset(
+        panel.features, panel.targets, config.sequence_length, panel.group_lengths
+    )
     if len(dataset) == 0:
         return None
     return DataLoader(
@@ -855,33 +877,57 @@ def _predict(
     return np.concatenate(predictions), np.concatenate(actuals)
 
 
-def _stack_blocks(blocks: List[pd.DataFrame]) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """Concatenate per-ticker blocks into (features, targets) arrays."""
+class StackedPanel(NamedTuple):
+    """Several tickers' rows in one matrix, plus where one ticker ends.
+
+    `group_lengths` travels with the arrays rather than being recomputed later
+    because dropping it has no visible symptom: a window slid over the bare
+    concatenation produces samples whose history belongs to one stock and whose
+    label belongs to the next, and the run trains and reports metrics anyway.
+    """
+
+    features: np.ndarray
+    targets: np.ndarray
+    group_lengths: List[int]
+
+
+def _stack_blocks(blocks: List[pd.DataFrame]) -> Optional[StackedPanel]:
+    """Concatenate per-ticker blocks into (features, targets) and their joins."""
     usable = [b for b in blocks if b is not None and not b.empty]
     if not usable:
         return None
     panel = pd.concat(usable)
-    return panel.iloc[:, :-1].values, panel.iloc[:, -1].values
+    return StackedPanel(
+        panel.iloc[:, :-1].values,
+        panel.iloc[:, -1].values,
+        [len(block) for block in usable],
+    )
 
 
 def _stacked_dates(blocks: List[pd.DataFrame], sequence_length: int) -> np.ndarray:
     """Dates aligned to what a `TimeSeriesDataset` over the same blocks predicts.
 
     The dataset slides a window of `sequence_length` rows and targets the row
-    *after* it, so sample `i` scores the concatenated panel's row
-    `i + sequence_length`. The first `sequence_length` rows are consumed as
-    history for the first prediction and have no prediction of their own.
+    after it, and never lets that window reach back into the previous ticker.
+    So *every block* spends its own first `sequence_length` rows as history,
+    not just the first block in the concatenation, and a block no longer than
+    the window contributes no predictions at all.
 
     Kept next to `_stack_blocks` because the two must agree on ordering: both
     concatenate `usable` in the same order, so row `k` means the same row in
     both. If one grows a sort the other does not, the IC silently scores
-    predictions against the wrong dates.
+    predictions against the wrong dates. Which rows carry a prediction is
+    `sequence_target_positions`, the same function the dataset indexes with,
+    so the window rule cannot change on one side only.
     """
     usable = [b for b in blocks if b is not None and not b.empty]
     if not usable:
         return np.asarray([])
-    index = pd.concat(usable).index
-    return np.asarray(index[sequence_length:])
+    index = np.asarray(pd.concat(usable).index)
+    positions = sequence_target_positions(
+        [len(block) for block in usable], sequence_length
+    )
+    return index[positions]
 
 
 def _fit_confidence_calibration(
@@ -1092,15 +1138,21 @@ def run_walk_forward_validation(
         # whole panel would carry the mean and spread of the test period into
         # the training inputs, which is exactly the leakage the date split
         # exists to prevent.
-        fold_scaler = FeatureScaler.fit(train_data[0])
-        train_data = (fold_scaler.transform(train_data[0]), train_data[1])
-        test_data = (fold_scaler.transform(test_data[0]), test_data[1])
+        fold_scaler = FeatureScaler.fit(train_data.features)
+        train_data = train_data._replace(
+            features=fold_scaler.transform(train_data.features)
+        )
+        test_data = test_data._replace(
+            features=fold_scaler.transform(test_data.features)
+        )
         if val_data is not None:
-            val_data = (fold_scaler.transform(val_data[0]), val_data[1])
+            val_data = val_data._replace(
+                features=fold_scaler.transform(val_data.features)
+            )
 
-        train_loader = _make_loader(*train_data, training, drop_last=True)
-        val_loader = _make_loader(*val_data, training) if val_data is not None else None
-        test_loader = _make_loader(*test_data, training)
+        train_loader = _make_loader(train_data, training, drop_last=True)
+        val_loader = _make_loader(val_data, training)
+        test_loader = _make_loader(test_data, training)
         if train_loader is None or test_loader is None:
             print(f"Fold {fold + 1}/{n_splits}: skipped (not enough rows)")
             continue
@@ -1152,8 +1204,8 @@ def run_walk_forward_validation(
             "fold": fold + 1,
             "train_end": train_end_date.strftime("%Y-%m-%d"),
             "test_end": test_end_date.strftime("%Y-%m-%d"),
-            "train_rows": int(len(train_data[0])),
-            "test_rows": int(len(test_data[0])),
+            "train_rows": int(len(train_data.features)),
+            "test_rows": int(len(test_data.features)),
         })
         fold_metrics.append(metrics)
 
@@ -1338,16 +1390,12 @@ def run_training(
         panel_by_ticker, config, device, use_mixed_precision
     )
 
-    train_parts, val_parts, test_parts = [], [], []
-    for frame in panel_by_ticker.values():
-        n = len(frame)
-        train_parts.append(frame.iloc[:int(n * 0.70)])
-        val_parts.append(frame.iloc[int(n * 0.70):int(n * 0.85)])
-        test_parts.append(frame.iloc[int(n * 0.85):])
-    # The index is kept rather than reset: it carries the dates that rank IC
-    # groups by, and `test_split_dates` re-derives the test slice from it using
-    # the same boundaries `create_dataloaders` slices the arrays with.
-    feature_df = pd.concat(train_parts + val_parts + test_parts)
+    # `group_lengths` is where one ticker's rows end and the next begin. It is
+    # carried all the way to the loaders and to `test_split_dates`: the sliding
+    # window must not cross a join, and the dates must name the rows that
+    # survive that rule, or rank IC scores each prediction against the wrong
+    # day's cross-section.
+    feature_df, group_lengths = split_ordered_panel(panel_by_ticker)
     print(f"Built training panel from {len(panel_by_ticker)} tickers: {len(feature_df)} total rows")
 
     # Extract feature and target names for metadata
@@ -1376,7 +1424,7 @@ def run_training(
     # =========================================================================
     print("\nCreating DataLoaders...")
     train_loader, val_loader, test_loader = create_dataloaders(
-        feature_df, config.training
+        feature_df, config.training, group_lengths
     )
 
     # =========================================================================
@@ -1487,7 +1535,9 @@ def run_training(
     # The 15% test tail was never touched by training or early stopping, so
     # this is the single-split counterpart to the walk-forward numbers above.
     test_predictions, test_actuals = _predict(model, test_loader, device, median_index)
-    test_dates = test_split_dates(feature_df.index, config.training.sequence_length)
+    test_dates = test_split_dates(
+        feature_df.index, config.training.sequence_length, group_lengths
+    )
     test_metrics = evaluate_predictions(
         test_predictions,
         test_actuals,

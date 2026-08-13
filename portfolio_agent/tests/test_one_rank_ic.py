@@ -313,36 +313,104 @@ def test_the_split_boundaries_are_shared_not_copied():
 # --------------------------------------------------------------------------
 
 
+def _ticker_blocks(n_tickers=3, n_rows=12):
+    """Blocks whose targets identify which ticker and row each value came from.
+
+    The target encodes `100 * ticker + row`, so a prediction can be traced back
+    to exactly the row it was built from — which is what makes the alignment
+    check below an identity rather than a plausibility argument.
+    """
+    blocks = []
+    for offset in range(n_tickers):
+        index = pd.date_range("2024-01-01", periods=n_rows) + pd.Timedelta(days=offset)
+        blocks.append(
+            pd.DataFrame(
+                {
+                    "feature": np.arange(n_rows, dtype=float),
+                    "target": np.arange(n_rows, dtype=float) + 100 * offset,
+                },
+                index=index,
+            )
+        )
+    return blocks
+
+
 def test_stacked_dates_line_up_with_what_the_dataset_predicts():
     """The IC is only meaningful if row i's date is row i's date.
 
-    Builds two ticker blocks, runs the real `TimeSeriesDataset` over the same
-    concatenation, and checks that the target the dataset hands back at
-    position i belongs to the row `_stacked_dates` names at position i.
+    Runs the real `TimeSeriesDataset` over the same concatenation and checks
+    that the target it hands back at position i is the target of the row
+    `_stacked_dates` names at position i — matched on the exact value, since
+    T18's encoding makes every row's target unique across the panel.
     """
     pytest.importorskip("torch")
     from portfolio_agent.agents.trainer import _stack_blocks, _stacked_dates
     from portfolio_agent.data.dataset import TimeSeriesDataset
 
     sequence_length = 3
-    blocks = []
-    for offset, ticker in enumerate(("A", "B")):
-        index = pd.date_range("2024-01-01", periods=12) + pd.Timedelta(days=offset)
-        blocks.append(
-            pd.DataFrame(
-                {"feature": np.arange(12, dtype=float),
-                 "target": np.arange(12, dtype=float) + 100 * offset},
-                index=index,
-            )
-        )
-
-    features, targets = _stack_blocks(blocks)
+    blocks = _ticker_blocks()
+    panel = _stack_blocks(blocks)
     dates = _stacked_dates(blocks, sequence_length)
-    dataset = TimeSeriesDataset(features, targets, sequence_length)
+    dataset = TimeSeriesDataset(
+        panel.features, panel.targets, sequence_length, panel.group_lengths
+    )
 
     assert len(dataset) == len(dates)
+
     stacked = pd.concat(blocks)
     for i in range(len(dataset)):
         _, target = dataset[i]
-        row = stacked.index.get_indexer_for([dates[i]])
-        assert float(target) in set(stacked["target"].to_numpy()[row])
+        rows = stacked.index.get_indexer_for([dates[i]])
+        assert float(target) in set(stacked["target"].to_numpy()[rows])
+
+
+def test_every_block_pays_its_own_history_cost():
+    """T18 changed how many predictions a multi-ticker panel yields.
+
+    Before, only the first `sequence_length` rows of the whole concatenation
+    were consumed as history and every later window was allowed to reach back
+    into the previous ticker. Now each block spends its own first
+    `sequence_length` rows, so the count drops by `sequence_length` per extra
+    ticker — and `_stacked_dates` has to drop exactly the same ones or the IC
+    scores predictions against the wrong days.
+    """
+    pytest.importorskip("torch")
+    from portfolio_agent.agents.trainer import _stack_blocks, _stacked_dates
+    from portfolio_agent.data.dataset import TimeSeriesDataset
+
+    sequence_length, n_tickers, n_rows = 3, 3, 12
+    blocks = _ticker_blocks(n_tickers, n_rows)
+    panel = _stack_blocks(blocks)
+    dataset = TimeSeriesDataset(
+        panel.features, panel.targets, sequence_length, panel.group_lengths
+    )
+
+    expected = n_tickers * (n_rows - sequence_length)
+    assert len(dataset) == expected
+    assert len(_stacked_dates(blocks, sequence_length)) == expected
+    # The un-grouped count, which is what the old code produced.
+    assert n_tickers * n_rows - sequence_length > expected
+
+
+def test_no_window_mixes_two_tickers():
+    """The defect itself, asserted directly.
+
+    Every value in a sequence must come from the same block. The feature column
+    counts 0..n-1 within each ticker, so a window that spans a join steps
+    backwards — which is the signature this checks for.
+    """
+    pytest.importorskip("torch")
+    from portfolio_agent.agents.trainer import _stack_blocks
+    from portfolio_agent.data.dataset import TimeSeriesDataset
+
+    sequence_length = 4
+    blocks = _ticker_blocks(n_tickers=4, n_rows=10)
+    panel = _stack_blocks(blocks)
+    dataset = TimeSeriesDataset(
+        panel.features, panel.targets, sequence_length, panel.group_lengths
+    )
+
+    for i in range(len(dataset)):
+        sequence, _ = dataset[i]
+        steps = np.diff(sequence.numpy().ravel())
+        assert (steps == 1).all(), f"sample {i} spans a ticker boundary"
