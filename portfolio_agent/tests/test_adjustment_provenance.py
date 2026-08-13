@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.hf_dataset import (
+from portfolio_agent.src.hf_dataset import (
     ADJUSTMENT_COLUMNS,
     OHLCV_COLUMNS,
     RAW_PRICE_COLUMNS,
@@ -204,7 +204,7 @@ def test_old_narrow_frames_are_tolerated():
 
 def test_columns_survive_a_parquet_round_trip(tmp_path):
     """The store must persist the wider schema, not just accept it."""
-    from src.data_store import DataStore
+    from portfolio_agent.src.data_store import DataStore
 
     out = normalize_frame(raw_hub_frame(n=12, split_at=6, dividend_at=3))
     store = DataStore(cache_dir=tmp_path)

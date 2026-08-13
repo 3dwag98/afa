@@ -153,7 +153,7 @@ def test_the_unshifted_adx_is_still_available_for_the_regime_filter():
 
 
 def test_the_snapshot_helpers_travelled_with_their_only_caller():
-    from portfolio_agent.src.orchestrator import (  # noqa: F401
+    from portfolio_agent.execution.orchestrator import (  # noqa: F401
         calculate_all_indicators,
         calculate_indicators,
     )

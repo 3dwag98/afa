@@ -11,10 +11,10 @@ option, and a `--json` parse where it produces results. Depth belongs in the
 tests for the layers underneath; what was missing was anything at all at this
 one.
 
-Two commands are exercised through their guarded early exits rather than end to
-end, and it is worth being explicit about which: `download-data` needs the
-network, and `run-agent` drives the frozen live path and writes an Excel
-report. Both are asserted to parse and to reach their first decision.
+One command is exercised through its guarded early exit rather than end to
+end: `download-data` needs the network, so it is asserted to parse and to
+reach its first decision with its flags intact. `run-agent` is gone entirely
+— T11 froze the live path — and what is tested is that it stays gone.
 """
 
 from __future__ import annotations
@@ -76,12 +76,26 @@ def fake_cache(monkeypatch, tmp_path):
         raising=True,
     )
 
-    store = DataStore(cache_dir=tmp_path / "market_data")
+    cache_dir = tmp_path / "market_data"
+    store = DataStore(cache_dir=cache_dir)
     for ticker, frame in frames.items():
         store.save_ticker_data(f"{ticker}.NS", frame.copy())
 
-    return {"frames": frames, "cache_dir": tmp_path / "market_data",
-            "runs_dir": tmp_path / "runs"}
+    # Point the universe resolver at the temp cache too, not just the loader. A
+    # command that resolves a universe rather than being handed one scans the
+    # parquet cache, and every clone is now dataless — whereupon
+    # resolve_backtest_universe falls through to a *network download* and the
+    # test hangs rather than failing.
+    #
+    # Patched at discover_available_tickers rather than at DATA_DIR because it
+    # takes `data_dir: str = "data/market_data"` as a hardcoded default and so
+    # ignores the module constant entirely.
+    monkeypatch.setattr(
+        "portfolio_agent.src.universe.discover_available_tickers",
+        lambda data_dir="ignored": sorted(f"{t}.NS" for t in frames),
+    )
+
+    return {"frames": frames, "cache_dir": cache_dir, "runs_dir": tmp_path / "runs"}
 
 
 # --------------------------------------------------------------------------
@@ -567,23 +581,16 @@ def test_download_data_reaches_its_source_branch(monkeypatch, capsys):
     assert seen["start_date"] < seen["end_date"]
 
 
-def test_run_agent_parses_and_dispatches(monkeypatch, capsys):
-    """Drives the frozen live path and writes an Excel report, so it is not run.
+def test_run_agent_is_no_longer_a_command(capsys):
+    """T11 froze the live path and removed this command.
 
-    What is asserted is that its flags reach the orchestrator, which is the
-    class of bug this file exists for.
+    Asserted rather than deleted: `run-agent` executed the whole
+    order-generation pipeline, and a command that quietly comes back is exactly
+    what the freeze exists to prevent.
     """
-    seen = {}
-
-    def fake_run(**kwargs):
-        seen.update(kwargs)
-        return "output/report.xlsx"
-
-    monkeypatch.setattr("portfolio_agent.src.orchestrator.run_orchestrator", fake_run)
-    code = main(["run-agent", "--force-refresh"])
-
-    assert code == 0
-    assert seen.get("force_refresh") is True
+    with pytest.raises(SystemExit):
+        main(["run-agent"])
+    assert "invalid choice" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------
