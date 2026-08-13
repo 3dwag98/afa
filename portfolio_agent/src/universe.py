@@ -106,6 +106,25 @@ def select_universe(
     return list(tickers[:max_tickers])
 
 
+#: The draw used by everything that *measures* a strategy rather than fits one.
+#:
+#: `purpose` offsets the RNG so training and measurement sample different names
+#: — a model must not be scored on the tickers it was fitted on. But that split
+#: is two-way, not three-way, and `evaluate` had silently fallen through to
+#: `"train"`: it scored the *training* draw while `backtest` traded a different
+#: one. At `universe_size=50` on a 400-name cache the two shared **6 names**,
+#: so an IC and an equity curve for "the same strategy" described essentially
+#: different markets, and the platform printed them side by side.
+#:
+#: Named rather than spelled out at each call site, because the bug was a
+#: default argument nobody passed, and a shared constant is the thing a reader
+#: notices is missing.
+MEASUREMENT_PURPOSE = "backtest"
+
+#: The draw a model is fitted on. Deliberately different from the above.
+TRAINING_PURPOSE = "train"
+
+
 def resolve_backtest_universe(
     force_full_download: bool = False,
     max_tickers: int | None = None,

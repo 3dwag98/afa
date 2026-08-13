@@ -451,6 +451,7 @@ def cmd_backtest(args) -> int:
             start_date=start_date,
             end_date=end_date,
             show_progress=not args.no_progress,
+            universe_snapshot=getattr(args, "universe_snapshot", None),
         )
 
         if result.get('status') == 'success':
@@ -948,6 +949,14 @@ def create_parser() -> argparse.ArgumentParser:
         "--use-trained-model",
         action="store_true",
         help="Shorthand for --strategy lstm"
+    )
+    backtest_parser.add_argument(
+        "--universe-snapshot",
+        type=str,
+        default=None,
+        help="Path to a saved universe snapshot. Pin the same one an evaluate "
+             "run used and the two describe identical names; without it each "
+             "takes its own seeded draw"
     )
     backtest_parser.add_argument(
         "--parallel",

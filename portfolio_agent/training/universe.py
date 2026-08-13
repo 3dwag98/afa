@@ -201,15 +201,34 @@ def resolve_universe(
     snapshot: Optional[Path | str] = None,
     size: Optional[int] = None,
     name: str = "default",
+    purpose: Optional[str] = None,
 ) -> UniverseSnapshot:
     """Get the universe for a run, from the most specific source available.
 
     Order: an explicit ticker list, then a saved snapshot file, then a fresh
     draw from the cache. Bulk runs and notebooks pass a snapshot so every
     entry in a comparison sees identical names.
+
+    Args:
+        purpose: Which draw to take when falling through to a fresh one —
+            `TRAINING_PURPOSE` for anything that fits a model,
+            `MEASUREMENT_PURPOSE` for anything that scores one. **Required in
+            spirit, optional in signature only because every existing training
+            caller means the former.**
+
+            This defaulted silently to `"train"`, so `evaluate` — which never
+            passed it — scored the training draw while `backtest` traded the
+            measurement draw. At `universe_size=50` the two shared 6 names.
+            A default that is right for one caller and wrong for another is
+            how that happens, so the parameter is now explicit at every call
+            site that is not fitting a model.
     """
+    from portfolio_agent.src.universe import TRAINING_PURPOSE
+
     if tickers:
         return UniverseSnapshot.from_tickers(tickers, name=name)
     if snapshot:
         return UniverseSnapshot.load(snapshot)
-    return UniverseSnapshot.create(app_config, size=size, name=name)
+    return UniverseSnapshot.create(
+        app_config, size=size, name=name, purpose=purpose or TRAINING_PURPOSE
+    )

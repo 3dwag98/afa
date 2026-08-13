@@ -368,6 +368,7 @@ def run_backtest_cli(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     show_progress: bool = True,
+    universe_snapshot: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run backtest from CLI with configuration.
 
@@ -383,6 +384,10 @@ def run_backtest_cli(
         end_date: Optional explicit end date (YYYY-MM-DD), defaults to today.
         show_progress: Draw progress bars during the run (pass False for
             unattended/scripted runs).
+        universe_snapshot: Path to a saved universe snapshot. Without one the
+            names come from a seeded draw, and a draw is only comparable to
+            another draw taken with the same purpose — so pinning is what lets
+            a backtest and an `evaluate` run describe the same market.
 
     Returns:
         Dictionary with backtest results.
@@ -396,14 +401,22 @@ def run_backtest_cli(
         output_file = config.paths.backtest_excel_output
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
 
-    from portfolio_agent.src.universe import resolve_backtest_universe
-    tickers = resolve_backtest_universe(
-        force_full_download=False,
-        max_tickers=config.data.universe_size,
-        selection=config.data.universe_selection,
-        seed=config.data.universe_seed,
-        purpose="backtest",
+    # A snapshot beats a draw whenever one is supplied — it is the only way to
+    # put a backtest and an evaluation on identical names. `evaluate` and
+    # `train` have accepted one since T09; the backtest did not, so the two
+    # sides of "does the measured IC show up in the equity curve" could not be
+    # pinned together even in principle.
+    from portfolio_agent.src.universe import MEASUREMENT_PURPOSE
+    from portfolio_agent.training.universe import resolve_universe
+
+    snapshot = resolve_universe(
+        config,
+        snapshot=universe_snapshot,
+        size=config.data.universe_size,
+        name="backtest",
+        purpose=MEASUREMENT_PURPOSE,
     )
+    tickers = list(snapshot.tickers)
 
     if not tickers:
         raise ValueError("No tickers available for backtest")

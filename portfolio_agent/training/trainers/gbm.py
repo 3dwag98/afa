@@ -298,6 +298,28 @@ class GBMPanel:
     all_dates: np.ndarray = field(default_factory=lambda: np.array([]))
 
 
+def _purge_cutoff_position(n_dates: int, split_pos: int, horizon: int) -> int:
+    """First training position whose label window reaches the validation block.
+
+    A single date split is the degenerate walk-forward fold — one training
+    block, one test block, nothing after — so it is expressed through
+    `validation/purged.py`'s `label_window_overlaps` rather than through
+    arithmetic restated here. Everything the package does about overlap now
+    reads the same predicate, in positions.
+    """
+    from portfolio_agent.validation.purged import label_window_overlaps
+
+    if split_pos <= 0 or horizon <= 0:
+        return max(split_pos, 0)
+
+    candidates = np.arange(split_pos, dtype=int)
+    overlaps = label_window_overlaps(
+        candidates, test_start_pos=split_pos, test_end_pos=n_dates - 1, horizon=horizon
+    )
+    kept = candidates[~overlaps]
+    return int(kept[-1]) + 1 if kept.size else 0
+
+
 def horizon_from_target(target: str) -> int:
     """Trading days between the decision and the realized label.
 
@@ -385,8 +407,15 @@ def build_gbm_panel(
 
     # Purge: a row dated t carries a label realized at t + horizon, so training
     # rows inside one horizon of the cut have already seen across it.
+    #
+    # The cutoff comes from `validation/purged.py` rather than from arithmetic
+    # restated here. The two agreed — this was `max(cut - purge, 0)`, and
+    # `label_window_overlaps` marks exactly the positions `p` with
+    # `p + horizon >= cut` — but they agreed by coincidence of two people
+    # deriving the same expression, which is the state T12 removed for rank IC
+    # and T14 for the market composite. Positions, never calendar days.
     purge = horizon if cfg.purge_days is None else int(cfg.purge_days)
-    purge_cutoff_pos = max(cut - purge, 0)
+    purge_cutoff_pos = _purge_cutoff_position(len(all_dates), cut, purge)
     purge_cutoff = all_dates[purge_cutoff_pos]
 
     train_blocks: List[pd.DataFrame] = []
