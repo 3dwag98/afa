@@ -90,3 +90,70 @@ which is the state the deleted `lstm_best.pt` was in.
 | `models/` | Checkpoints and their sidecars | no |
 | `runs/` | Run manifests and rendered notes | no |
 | `output/` | Generated reports | no |
+
+## Point-in-time index membership (the largest uncorrected bias)
+
+Everything above downloads the tickers that **exist today**. A stock that was
+in the Nifty 500 in 2012 and was delisted in 2015 has no parquet file, so it
+never enters a cross-section, so the 2012 deciles are formed from a universe
+that excludes exactly the names that went on to fail.
+
+This is not a rounding error. The 2026 study of Nifty constituents reports
+**82.5% membership turnover** over its sample and roughly **4.94 percentage
+points of annual return overstatement**. Both strategies' neutralized rank IC
+is smaller than that.
+
+Every evaluation run without a membership file prints a note saying so. To
+supply one:
+
+```bash
+portfolio-agent evaluate --strategy momentum \
+    --membership universe/nifty500_membership.csv \
+    --index-name NIFTY500
+```
+
+### The file format
+
+CSV, one row per stay. `end_date` empty means "still a member". Both ends are
+inclusive, matching the convention NSE change announcements use.
+
+```csv
+symbol,index_name,start_date,end_date
+RELIANCE.NS,NIFTY50,2000-01-01,
+YESBANK.NS,NIFTY50,2017-03-27,2020-03-19
+YESBANK.NS,NIFTY500,2020-03-20,
+```
+
+A symbol may appear more than once — names leave an index and come back, and a
+re-entry is a second interval rather than an extension of the first.
+Overlapping stays for one symbol are rejected at load: they read as a single
+longer membership, which would make a name look eligible through a period it
+had left.
+
+### Where to get it
+
+No feed ships this for free, and it is the one input here that cannot be
+reconstructed from prices. The options, in descending order of quality:
+
+| Source | Cost | Notes |
+| --- | --- | --- |
+| NSE index-maintenance circulars | free | Authoritative. Every reconstitution is announced; assembling ~20 years of them into intervals is manual work measured in days, not hours. |
+| [niftyhistory.in](https://niftyhistory.in/) | free | Already-assembled historical constituents. Verify a few dates against the circulars before trusting it. |
+| Bloomberg / Refinitiv / CMIE Prowess | paid | Point-in-time membership is a standard field. Prowess is the usual Indian academic source. |
+
+Whichever route, delisted symbols also need **prices**, and yfinance will not
+serve them. Prowess or a paid vendor covers both; otherwise the membership file
+alone still helps — it removes names from dates they were not in the index,
+which corrects part of the bias even when the failed names remain absent.
+
+The filter reports what it removed, so the correction is auditable rather than
+assumed:
+
+```
+Note: Point-in-time membership removed 4,812 of 51,300 observations (9.4%)
+that were not index constituents on their own date, across 137 symbol(s).
+```
+
+Dates outside the file's coverage are left **unfiltered** rather than dropped,
+and counted separately — a shorter window that looks clean is worse than a
+longer one that says which part of it is uncorrected.

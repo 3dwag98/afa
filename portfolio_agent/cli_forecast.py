@@ -207,6 +207,8 @@ def cmd_evaluate(args) -> int:
             None if getattr(args, "slippage_bps", None) is None
             else args.slippage_bps / 1e4
         ),
+        membership=getattr(args, "membership", None),
+        index_name=getattr(args, "index_name", None),
     )
 
     try:
@@ -554,6 +556,12 @@ def add_forecast_commands(subparsers) -> None:
         parser.add_argument("--slippage-bps", type=float, default=None,
                             help="Slippage per side in basis points (default: 25, "
                                  "conservative for mid-caps)")
+        parser.add_argument("--membership", type=str, default=None,
+                            help="Point-in-time index membership CSV. Without one "
+                                 "every date is ranked against the names that "
+                                 "survived to be downloaded")
+        parser.add_argument("--index-name", type=str, default=None,
+                            help="Narrow a multi-index membership file to one index")
         parser.add_argument("--seed", type=int, default=None,
                             help="Seed numpy's global stream before scoring")
         parser.add_argument("--output", type=str, default=None,
