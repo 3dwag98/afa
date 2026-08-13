@@ -247,10 +247,12 @@ def decay_curve(
         raise ValueError("decay_curve needs at least one horizon")
 
     if universe is None:
+        from portfolio_agent.src.universe import MEASUREMENT_PURPOSE
         from portfolio_agent.training.universe import resolve_universe
 
         snap = resolve_universe(
-            app_config, snapshot=snapshot, size=universe_size, name=f"decay:{name}"
+            app_config, snapshot=snapshot, size=universe_size, name=f"decay:{name}",
+            purpose=MEASUREMENT_PURPOSE,
         )
         universe = list(snap.tickers)
 

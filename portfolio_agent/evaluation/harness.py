@@ -739,10 +739,12 @@ def evaluate_forecast(
 
     snap = None
     if universe is None:
+        from portfolio_agent.src.universe import MEASUREMENT_PURPOSE
         from portfolio_agent.training.universe import resolve_universe
 
         snap = resolve_universe(
-            app_config, snapshot=snapshot, size=universe_size, name=f"eval:{name}"
+            app_config, snapshot=snapshot, size=universe_size, name=f"eval:{name}",
+            purpose=MEASUREMENT_PURPOSE,
         )
         universe = list(snap.tickers)
 

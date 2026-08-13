@@ -103,6 +103,7 @@ def resolve_universe_for_cli(config, args) -> tuple:
     if tickers:
         return tickers, None
 
+    from portfolio_agent.src.universe import MEASUREMENT_PURPOSE
     from portfolio_agent.training.universe import resolve_universe
 
     snapshot = resolve_universe(
@@ -110,6 +111,7 @@ def resolve_universe_for_cli(config, args) -> tuple:
         snapshot=getattr(args, "universe_snapshot", None),
         size=getattr(args, "limit", None) or getattr(args, "universe_size", None),
         name="evaluate",
+        purpose=MEASUREMENT_PURPOSE,
     )
     return list(snapshot.tickers), snapshot
 

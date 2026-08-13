@@ -1102,15 +1102,28 @@ def run_walk_forward_validation(
             if horizon_days > 0:
                 history = history.iloc[:-horizon_days] if len(history) > horizon_days else history.iloc[:0]
             if training.walk_forward_embargo > 0:
+                # Sessions, not calendar days. This used to be
+                # `test_end_date + pd.Timedelta(days=embargo)`, which is the
+                # exact mistake `validation/purged.py` was written to eliminate:
+                # "A horizon of 5 means five *trading sessions*, not five
+                # calendar days. A weekend or an exchange holiday would make a
+                # calendar-day arithmetic silently wrong by a variable amount."
+                # An embargo of 5 spanning a weekend excluded three sessions;
+                # spanning Diwali, fewer still.
+                #
                 # Only binds where training rows exist after a test fold, which
-                # an expanding window never produces — kept so the setting
-                # means what it says once splits stop being purely forward.
-                embargo_end = test_end_date + pd.Timedelta(
-                    days=training.walk_forward_embargo
-                )
-                history = history[
-                    (history.index <= test_end_date) | (history.index > embargo_end)
-                ]
+                # an expanding window never produces — kept so the setting means
+                # what it says once splits stop being purely forward, and stated
+                # in the units the rest of the package uses so it means the
+                # right thing on the day it does bind.
+                after = frame.index[frame.index > test_end_date]
+                if len(after):
+                    embargo_end = after[
+                        min(training.walk_forward_embargo, len(after)) - 1
+                    ]
+                    history = history[
+                        (history.index <= test_end_date) | (history.index > embargo_end)
+                    ]
             if len(history) <= training.sequence_length:
                 continue
 

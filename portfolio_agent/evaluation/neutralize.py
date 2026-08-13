@@ -334,11 +334,13 @@ def evaluate_neutralized(
     resolved, name = _resolve_strategy(app_config, strategy)
 
     if universe is None:
+        from portfolio_agent.src.universe import MEASUREMENT_PURPOSE
         from portfolio_agent.training.universe import resolve_universe
 
         snap = resolve_universe(
             app_config, snapshot=snapshot, size=universe_size,
             name=f"neutralized:{name}",
+            purpose=MEASUREMENT_PURPOSE,
         )
         universe = list(snap.tickers)
 
