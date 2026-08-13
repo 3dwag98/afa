@@ -94,9 +94,15 @@ equity curve reports their product and never their difference.
 monthly rebalance keeps essentially all of it. The single-horizon number could
 not support that conclusion either way.
 
-**`rule_based` makes almost no claims.** Its score dispersion is 0.016: one
-floor value for 98% of the universe, and no cross-section left to rank. Its IC
-is not low because its claims are wrong.
+**~~`rule_based` makes almost no claims.~~ Retracted — that was a harness bug,
+not a property of the strategy.** The original finding read: *"score dispersion
+is 0.016: one floor value for 98% of the universe, and no cross-section left to
+rank."* [T20](T20-strategy-context-contract.md) found the cause. `rule_based`
+took its component weights from `StrategyContext.weights`, and the evaluation
+harness never set that field, so the weighted sum ran over an empty mapping and
+returned **0.0 for every name**. The floor was the harness. Reading its own
+configured weights, the same strategy scores the same cross-section at
+dispersion **1.0** — every name distinctly ranked.
 
 **The shipped data had six impossible bars** — low above the open/close — plus
 nine symbols with one-session moves between +63% and +90%, which no NSE price

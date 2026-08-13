@@ -81,10 +81,47 @@ def _default_cost_pct(side: str) -> float:
 
 @dataclass
 class StrategyContext:
-    """Everything besides the feature DataFrame that score()/score_batch() need."""
+    """Everything besides the feature DataFrame that score()/score_batch() need.
+
+    **Every field except `risk` is optional, and which ones arrive depends on
+    the caller.** That is the part worth knowing before writing a strategy: a
+    field is not "usually there", it is there on some paths and absent on
+    others, and a strategy that assumes one silently produces a different
+    answer depending on who called it.
+
+    | field | backtest, per-ticker | backtest, batched | evaluate | live |
+    | --- | --- | --- | --- | --- |
+    | `risk` | yes | yes | yes | yes |
+    | `weights` | yes | yes | **no** | yes |
+    | `mc_result` | yes | **no** | **no** | yes |
+    | `benchmark_close` / `_ohlcv` | **no** | yes | yes | yes |
+    | `regime_label` | yes | yes | **no** | yes |
+    | `run_id` | **no** | **no** | **no** | yes |
+
+    This table is not a wish list; it is what the callers do today, and the
+    gaps are why it exists. `rule_based` read its component weights from
+    `weights` alone, so under `evaluate` — which fills none — the weighted sum
+    ran over an empty mapping and returned 0.0 for every name, and that floor
+    was published as the strategy's measured score dispersion. It now falls
+    back to its own configured weights (`rule_based.py::_load_weights`).
+
+    The rule for a strategy: **treat every optional field as absent and degrade
+    to something defensible**, the way `combine_weighted`'s `unavailable`
+    argument does — do not treat a missing input as a zero measurement. Where
+    degrading is not defensible, say so in the rationale rather than emitting a
+    number that looks like one.
+    """
 
     risk: RiskParams
+    #: Component weights. The backtest evolves these across a run and passes
+    #: them down; `evaluate` has no learning loop and leaves them empty, so a
+    #: strategy that needs weights must carry its own default.
     weights: Dict[str, float] = field(default_factory=dict)
+    #: Monte Carlo result for this ticker. Only the per-ticker backtest path
+    #: and the live orchestrator run one, so a strategy whose gate depends on
+    #: it cannot pass under `evaluate` or a batched backtest. That is the
+    #: correct default for a compliance gate with no evidence either way, but
+    #: it belongs in the rationale rather than looking like a bad score.
     mc_result: Optional["MonteCarloResult"] = None
     run_id: Optional[str] = None
     # Benchmark index close series (e.g. the Nifty 50), truncated to the
