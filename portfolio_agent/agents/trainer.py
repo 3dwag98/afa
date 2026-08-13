@@ -1105,10 +1105,24 @@ def run_walk_forward_validation(
 
         for frame in panel_by_ticker.values():
             history = frame[frame.index < train_end_date]
-            # Embargo: labels of the final `horizon_days` training rows are
-            # computed from prices inside the test period.
+            # Purge, not embargo — the comment here used to say the latter, and
+            # the distinction matters. This drops the final `horizon_days`
+            # training rows because their *labels* are computed from prices
+            # inside the test period. An embargo is the separate guard against
+            # feature-side serial correlation on the far side of the fold, and
+            # it is applied below via training.walk_forward_embargo.
             if horizon_days > 0:
                 history = history.iloc[:-horizon_days] if len(history) > horizon_days else history.iloc[:0]
+            if training.walk_forward_embargo > 0:
+                # Only binds where training rows exist after a test fold, which
+                # an expanding window never produces — kept so the setting
+                # means what it says once splits stop being purely forward.
+                embargo_end = test_end_date + pd.Timedelta(
+                    days=training.walk_forward_embargo
+                )
+                history = history[
+                    (history.index <= test_end_date) | (history.index > embargo_end)
+                ]
             if len(history) <= training.sequence_length:
                 continue
 
