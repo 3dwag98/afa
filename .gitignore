@@ -22,6 +22,10 @@ models/*.pt
 models/metadata.json
 output/*.xlsx
 logs/
+# Run manifests and rendered notes (portfolio_agent/provenance). Generated
+# per run, one file each, so a week of experiments is a week of untracked
+# files — and the provenance they carry is about a run, not about the repo.
+runs/
 
 # Logs and temp files
 *.log

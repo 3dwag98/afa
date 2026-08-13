@@ -761,11 +761,11 @@ def test_max_dates_keeps_the_most_recent_window(app_config, fake_cache):
 # --------------------------------------------------------------------------
 
 
-def test_evaluate_forecast_runs_a_registered_strategy(app_config, fake_cache):
+def test_evaluate_forecast_runs_a_registered_strategy(app_config, fake_cache, tmp_path):
     result = evaluate_forecast(
         app_config, "momentum", universe=list(fake_cache),
         horizon=5, stride=40, min_history=260, min_names=5,
-        n_buckets=4, use_benchmark=False,
+        n_buckets=4, use_benchmark=False, runs_dir=str(tmp_path),
     )
     assert result.strategy == "momentum"
     assert result.n_observations > 0
@@ -774,11 +774,11 @@ def test_evaluate_forecast_runs_a_registered_strategy(app_config, fake_cache):
     assert "momentum" in result.render()
 
 
-def test_buys_only_narrows_the_panel_and_says_so(app_config, fake_cache):
+def test_buys_only_narrows_the_panel_and_says_so(app_config, fake_cache, tmp_path):
     result = evaluate_forecast(
         app_config, RecordingStrategy(), universe=list(fake_cache),
         horizon=5, stride=40, min_history=260, min_names=5,
-        n_buckets=4, use_benchmark=False, buys_only=True,
+        n_buckets=4, use_benchmark=False, buys_only=True, runs_dir=str(tmp_path),
     )
     assert any("BUY" in note for note in result.notes)
     assert "Note:" in result.render()

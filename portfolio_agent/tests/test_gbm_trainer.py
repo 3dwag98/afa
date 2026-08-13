@@ -486,7 +486,7 @@ def test_end_to_end_run_writes_a_loadable_checkpoint(app_config, fake_cache, tmp
         universe=list(fake_cache),
         overrides={"epochs": 20, "n_iter_no_change": 10, "min_history": 260,
                    "importance_repeats": 1},
-        models_dir=tmp_path,
+        models_dir=tmp_path, runs_dir=tmp_path,
     )
     assert run.ok, run.error
     assert run.checkpoint_path == tmp_path / "gbm_best.joblib"
@@ -517,7 +517,7 @@ def test_sidecar_carries_metrics_without_unpickling(app_config, fake_cache, tmp_
         universe=list(fake_cache),
         overrides={"epochs": 20, "n_iter_no_change": 10, "min_history": 260,
                    "importance_repeats": 1},
-        models_dir=tmp_path,
+        models_dir=tmp_path, runs_dir=tmp_path,
     )
     sidecar = tmp_path / "gbm_best.json"
     assert sidecar.exists()
@@ -611,7 +611,7 @@ run = run_training_job(
     load_config(), trainer="gbm", universe=list(frames),
     overrides={"epochs": 20, "n_iter_no_change": 10, "min_history": 260,
                "importance_repeats": 1},
-    models_dir=sys.argv[1],
+    models_dir=sys.argv[1], runs_dir=sys.argv[1],
 )
 print("TRAINERS", ",".join(trainers))
 print("OK", run.ok, run.error)
