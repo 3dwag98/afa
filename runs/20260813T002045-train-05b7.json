@@ -1,0 +1,70 @@
+{
+  "run_id": "20260813T002045-train-05b7",
+  "kind": "train",
+  "created_at": "2026-08-13T00:20:45+00:00",
+  "strategy": null,
+  "trainer": "_recording",
+  "config_fingerprint": "60287ac2c1f2",
+  "universe_fingerprint": "2e70d7238a20",
+  "universe_name": "_recording",
+  "n_symbols": 3,
+  "settings": {
+    "epochs": 100,
+    "batch_size": 128,
+    "learning_rate": 0.003,
+    "device": "auto",
+    "seed": 42,
+    "train_fraction": 0.8,
+    "marker": 2.0,
+    "explode": false
+  },
+  "split": {},
+  "metrics": {
+    "val_sharpe": 2.0
+  },
+  "timings": {
+    "total": 0.00045337800020206487
+  },
+  "artifacts": {
+    "checkpoint": "models/_recording_best.pt"
+  },
+  "git": {
+    "commit": "9cd1f513f529858ad3dceba8dadfdf60e8213ffe",
+    "branch": "claude/t08-cli-forecasting",
+    "dirty": true,
+    "dirty_files": [
+      "ortfolio_agent/cli.py",
+      "portfolio_agent/cli_forecast.py",
+      "portfolio_agent/tests/test_cli.py",
+      "runs/20260813T001659-evaluate-momentum-bcfa.json",
+      "runs/20260813T001659-evaluate-recording-16b6.json",
+      "runs/20260813T001706-train-1cc7.json",
+      "runs/20260813T001707-train-5752.json",
+      "runs/20260813T001709-train-3f2e.json",
+      "runs/20260813T002045-train-b39d.json"
+    ]
+  },
+  "data": {
+    "cache_dir": "data/market_data",
+    "n_symbols": 0,
+    "n_missing": 3,
+    "fingerprint": "4f53cda18c2b",
+    "method": "size+mtime per file, not a content hash"
+  },
+  "libraries": {
+    "numpy": "2.4.6",
+    "pandas": "3.0.5",
+    "scipy": "1.17.1",
+    "torch": "2.13.0",
+    "scikit-learn": "1.9.0",
+    "pyarrow": "25.0.1"
+  },
+  "environment": {
+    "python": "3.11.15",
+    "platform": "Linux-6.18.5-fc-v20-x86_64-with-glibc2.39"
+  },
+  "notes": [
+    "The working tree had uncommitted changes when this ran, so the code that produced these numbers is not recoverable from the recorded commit."
+  ],
+  "extras": {}
+}

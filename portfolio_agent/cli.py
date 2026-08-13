@@ -1120,7 +1120,48 @@ def create_parser() -> argparse.ArgumentParser:
              "a gate becomes something people disable.",
     )
     validate_parser.set_defaults(func=cmd_data_validate)
+
+    from portfolio_agent.cli_forecast import cmd_data_build
+
+    build_parser = data_sub.add_parser(
+        "build",
+        help="Download market data and immediately check what arrived",
+    )
+    build_parser.add_argument("--source", type=str, default=None,
+                              choices=["huggingface", "yfinance"])
+    build_parser.add_argument("--years", type=int, default=None,
+                              help="Years of history to keep (default: config)")
+    build_parser.add_argument("--universe-size", type=int, default=None)
+    build_parser.add_argument("--workers", type=int, default=None)
+    build_parser.add_argument("--force", action="store_true",
+                              help="Re-download symbols already cached")
+    build_parser.add_argument("--hf-dataset", type=str, default=None)
+    build_parser.add_argument("--hf-revision", type=str, default=None)
+    build_parser.add_argument(
+        "--keep-raw", action="store_true",
+        help="Keep unadjusted OHLC alongside the adjusted legs, so an "
+             "adjustment can be audited after the fact rather than taken on "
+             "trust.",
+    )
+    build_parser.add_argument(
+        "--no-validate", action="store_true",
+        help="Skip the invariant check after downloading. A download that "
+             "half-succeeds looks exactly like one that worked.",
+    )
+    build_parser.add_argument(
+        "--fail-on-warning", action="store_true",
+        help="Exit non-zero on advisory findings too, not only structural ones",
+    )
+    build_parser.add_argument("--validate-limit", type=int, default=None,
+                              help="Check at most this many symbols afterwards")
+    build_parser.set_defaults(func=cmd_data_build)
+
     data_parser.set_defaults(func=lambda a: (data_parser.print_help(), 1)[1])
+    # evaluate / compare / list-features
+    from portfolio_agent.cli_forecast import add_forecast_commands
+
+    add_forecast_commands(subparsers)
+
     # report command
     report_parser = subparsers.add_parser(
         "report",
@@ -1184,6 +1225,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # Every command resolves its config through get_config(), which reads this.
     _ACTIVE_CONFIG_PATH["path"] = args.config
+    # The forecasting commands load it themselves rather than through
+    # get_config(), so --config has to reach them explicitly. Set *after* the
+    # line above, not before: reading _ACTIVE_CONFIG_PATH first hands them the
+    # stale default and --config is silently ignored on exactly those commands.
+    args._config_path = args.config
 
     return args.func(args)
 
