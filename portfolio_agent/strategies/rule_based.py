@@ -26,7 +26,7 @@ from .weighting import combine_weighted, select_trigger
 from portfolio_agent.config.schema import StrategyConfig
 
 try:
-    from src.risk import calculate_stop_target, net_reward_risk
+    from portfolio_agent.src.risk import calculate_stop_target, net_reward_risk
 except ImportError:
     from risk import calculate_stop_target, net_reward_risk
 

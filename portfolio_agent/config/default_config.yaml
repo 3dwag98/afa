@@ -1,0 +1,330 @@
+# Portfolio Agent Configuration
+# These values can be overridden by environment variables with the AFA_ prefix
+# and double-underscore nesting, e.g. AFA_TRAINING__DEVICE="cuda" overrides training.device
+
+# Data configuration
+data:
+  data_dir: data
+  market_data_dir: data/market_data
+  # huggingface | yfinance. The Hub dataset downloads once as a columnar file
+  # and is reproducible when hf_revision is pinned; yfinance fetches per ticker
+  # and returns whatever it has today. Both land in the same parquet cache.
+  source: huggingface
+  hf_dataset_id: vishnun0027/indian-market-historical-ohlcv
+  hf_revision: null      # pin a branch/tag/commit for a reproducible backtest
+  hf_asset_dir: stocks   # one parquet per symbol under this directory
+  # Back-adjust OHLC by adj_close/close. Leave on: an unadjusted 1:10 split
+  # prints as a -90% day, which momentum reads as a crash.
+  hf_adjust_prices: true
+  # Index used by the momentum crash filter (indices/ directory). ^NSEI is the
+  # Nifty 50; when cached, the regime filter keys off it instead of a
+  # composite of the traded universe.
+  benchmark_symbol: "^NSEI"
+  # Years of history kept, applied to both sources.
+  default_history_years: 5
+  # alphabetical | random. The cache is scanned in sorted filename order, so
+  # 'alphabetical' returns whatever sits at the front of the alphabet — the
+  # same names every run, for training and backtesting alike, which means a
+  # model is evaluated on the very tickers it was fitted on. 'random' draws a
+  # seeded sample and offsets the seed by purpose, so train and backtest get
+  # different names. Seeded, not truly random: one config must reproduce one
+  # universe. Does NOT fix survivorship bias (see docs/REVIEW_STATUS.md, D9).
+  universe_selection: random
+  universe_seed: 42
+  universe_size: 4000
+  tickers: []
+  min_history_days: 250
+  allow_synthetic_fallback: true
+  # Concurrent chunk downloads (network-bound work -> threads). Set to 1 if
+  # the data provider rate-limits you.
+  download_workers: 4
+  # Prepare per-ticker indicators/Monte Carlo/features across a CPU process
+  # pool during `run-agent`. Speed only: results are order-stable.
+  parallel_ticker_prep: true
+  ticker_prep_workers: null
+
+# Feature engineering configuration
+features:
+  normalize: false
+  normalize_window: 252
+  feature_sets:
+    core:
+      - sma_20
+      - sma_50
+      - sma_200
+    momentum:
+      - rsi_14
+      - macd
+      - return_1d
+      - return_5d
+    volatility:
+      - atr_14
+      - bollinger_pct_b
+      - donchian_upper_20
+
+# Strategy configuration
+strategy:
+  enabled: true
+  type: rule_based
+  module: portfolio_agent.strategies
+  config_path: config/strategies/trend_breakout.yaml
+  params: {}
+
+# Training configuration
+training:
+  # lstm | patchtst. PatchTST is the recommended one: it attends over 5-day
+  # patches instead of squeezing a 60-day window through a single LSTM hidden
+  # state, and encodes each feature channel with shared weights so attention
+  # cannot fit spurious cross-feature relationships.
+  model: lstm
+  target: return_5d
+  # Largest |forward return| accepted as a label; rows above it are dropped.
+  # Features are standardized and clipped before training but the target never
+  # was, and one bad cached bar is enough to poison a whole run: a close
+  # printed at 0.001 turns a 5-day forward return into 111,300, and one
+  # gradient step against a loss that size leaves every later batch NaN. This
+  # is why NaN losses outlived the mixed-precision fix and still appeared on
+  # CPU — the cause was the label, not fp16. 5.0 admits any reachable move
+  # (five 20% upper circuits compound to +149%) and rejects only arithmetic
+  # that cannot be a price.
+  max_abs_target: 5.0
+  # absolute | cross_sectional_demean | cross_sectional_rank. Most of the
+  # variance of an absolute 5-day return is the market factor, which a
+  # long-only book with no index hedge cannot act on — so the network spent
+  # its capacity on the one component it cannot trade. The cross-sectional
+  # forms measure each name against the rest of the universe on the same date,
+  # leaving the idiosyncratic part the platform monetizes by choosing between
+  # stocks. Rank is the default: on Indian data a circuit-limited print
+  # dominates the cross-sectional mean but moves a ranking by one place.
+  target_transform: cross_sectional_rank
+  # The same treatment for the inputs. 'global' fits one mean and standard
+  # deviation per feature over the pooled training rows, which answers "is this
+  # RSI high for this stock over the sample"; 'cross_sectional' z-scores each
+  # feature across the universe on each date, which answers "is this RSI high
+  # relative to what else I could buy today" — the question a model that
+  # chooses between stocks is being asked. The pooled form also puts the market
+  # factor back into every column that target_transform just removed from the
+  # label: on a day the whole market gapped down, every name reads extreme
+  # against a five-year mean. Cannot leak across dates, because it fits nothing.
+  feature_normalization: cross_sectional
+  sequence_length: 60
+  train_fraction: 0.8
+  batch_size: 128
+  epochs: 100
+  learning_rate: 0.003
+  # quantile | mse. Squared error is minimized by the conditional mean, and the
+  # conditional mean of a 5-day return is nearly constant — so an MSE-trained
+  # network collapses to a near-constant output that validates beautifully and
+  # forecasts nothing. Pinball loss over the quantiles below asks for a
+  # distribution instead, which a constant cannot satisfy, and hands the
+  # trigger engine a native confidence interval.
+  loss: quantile
+  quantiles: [0.1, 0.5, 0.9]
+  # Fit an isotonic score -> win-rate map on the walk-forward test folds and
+  # ship it with the checkpoint. Networks on noisy financial data are
+  # systematically overconfident, and this score feeds Kelly sizing.
+  calibrate_confidence: true
+  # Expanding-window walk-forward validation: 5 folds, each re-trained on all
+  # prior data and tested on the next contiguous block. Set to 0 to skip.
+  walk_forward_splits: 5
+  walk_forward_min_train_fraction: 0.4
+  walk_forward_epochs: null   # default: min(20, epochs) — folds estimate, they don't ship
+  device: auto
+  use_mixed_precision: true
+  num_workers: 2
+  use_synthetic_data: false
+  parallel_data_loading: true
+  data_load_workers: null
+  use_torch_compile: false
+
+# Backtest configuration
+backtest:
+  initial_capital: 1000000.0
+  start_years_ago: 5
+  use_trained_model: false
+  model_path: ""
+  parallel: false
+  max_workers: null
+
+# Risk configuration
+risk:
+  portfolio_value_inr: 308733.0
+  risk_per_trade_pct: 0.01
+  # Annualized hurdle subtracted from strategy returns before Sharpe and
+  # Sortino. Stated here rather than defaulted inside RiskAnalyzer, where it
+  # used to sit as 0.065 that no call site had to acknowledge — and the
+  # backtester was not passing the argument at all. A constant is still wrong
+  # for any multi-year window, so prefer paths.risk_free_rate_csv below, which
+  # overrides this with a dated series.
+  risk_free_rate: 0.065
+  max_single_position_pct: 0.03
+  # The exit plan, in ATR multiples. These reach the fill: a filled position's
+  # stop and target are sized from the signal's own levels, so changing them
+  # changes both what min_reward_risk screens and what actually happens on exit.
+  #
+  # MATCH THESE TO YOUR SIGNAL'S HORIZON. Cross-sectional momentum forms on a
+  # 9-month window; at 1.5x ATR its positions exited at a 5-day median holding
+  # period and lost 2.0% gross, while at 6.0x the same signal over the same
+  # data held for 94 days and returned +4.4% gross. The stop was cutting the
+  # thesis short, not protecting it. 1.5/2.0 is kept as the default because it
+  # suits the per-ticker trend/breakout strategy (which overrides the target to
+  # 3.0x in its own YAML); raise it for anything forming over months.
+  atr_stop_multiplier: 1.5
+  atr_target_multiplier: 2.0
+  # Fractional-Kelly sizing (off by default; needs real realized trades).
+  use_kelly_sizing: false
+  # 50 trades is the floor at which a win-rate estimate is worth betting on,
+  # and the win rate is shrunk toward 0.5 with a 20-pseudo-trade Beta prior
+  # before it reaches the Kelly formula.
+  kelly_min_trades: 50
+  kelly_shrinkage_strength: 20.0
+  # Hard-capped at 0.25 (quarter-Kelly) in src/risk.py: a lower-circuit lock
+  # realizes far worse than the modelled stop, so the measured payoff ratio —
+  # and therefore f* — is biased upward.
+  kelly_fraction: 0.25
+  # Portfolio-level concentration and drawdown guardrails.
+  # Annualized volatility ceiling for the WHOLE book, enforced at order time
+  # against a shrunk covariance estimate. 0 disables the constraint but not the
+  # measurement — book risk is reported either way. Every other limit here is
+  # per-position and therefore blind to correlation: twenty 3% positions
+  # correlated 0.6 carry ~3.5x the volatility of twenty independent ones, and
+  # Indian correlations run to 0.6-0.85 in exactly the drawdowns the circuit
+  # breaker exists to survive. Off by default because picking a target is a
+  # risk-policy decision, not a defect fix; 0.15-0.25 is the usual range.
+  portfolio_volatility_target: 0.0
+  covariance_lookback_days: 252
+  max_sector_pct: 0.25            # max share of portfolio in any one sector
+  # Aggregate budget for tickers missing from the sector map, so an incomplete
+  # map cannot become a route around the cap. Inactive when no map is loaded.
+  max_unknown_sector_pct: 0.30
+  max_portfolio_drawdown_pct: 0.15  # halt new buys past this drawdown
+  drawdown_reentry_pct: 0.10        # resume buying once recovered to here
+  # Trading days after which a halted breaker re-arms anyway, resetting the
+  # equity peak. Recovery-only re-arming deadlocks: halting buys does not stop
+  # open positions exiting through their stops, and a book that is entirely
+  # cash cannot appreciate back toward the peak it is measured against. Set to
+  # 0 for the old recovery-only behaviour.
+  drawdown_halt_max_days: 60
+  # Exit a holding that closed pinned at its lower circuit, at the next
+  # session. Waiting for the modelled stop means waiting for a bid that is not
+  # there, and every further locked session realizes a loss sizing never priced.
+  exit_on_lower_circuit_lock: true
+  # Also sell the whole book when the breaker trips. Off by default: open
+  # positions already carry stops, and force-liquidating at a drawdown trough
+  # is how a bad quarter becomes a permanent loss.
+  liquidate_on_drawdown_halt: false
+  # Per-side slippage assumed when charging round-trip costs against a
+  # signal's reward:risk (realized fills price slippage off ATR and volume).
+  slippage_pct_per_side: 0.0025
+
+# Self-learning weight adaptation
+learning:
+  learning_rate: 0.15
+  min_trades_for_learning: 5
+  # Weight adaptation is a closed feedback loop — weights change which trades
+  # are taken, which changes the outcomes the next adaptation sees — so an
+  # unshrunk win rate at a 5-trade floor (standard error ~22 percentage
+  # points) made noise self-reinforcing. A component's weight now moves only
+  # on its own sample, shrunk by the same Beta prior the Kelly path uses, and
+  # only when an exact binomial test can distinguish it from a coin flip.
+  min_trades_per_component: 30
+  shrinkage_strength: 20.0
+  significance_level: 0.05
+
+# Per-symbol Monte Carlo forward simulation (feeds strategy scoring)
+simulation:
+  mc_horizon_days: 20
+  mc_simulations: 1000
+  random_seed: 42
+  # gaussian | block_bootstrap | jump_diffusion. Block bootstrap resamples
+  # contiguous runs of the ticker's own returns, so the simulated tails and
+  # volatility clustering come from real Indian market behaviour rather than
+  # a normal distribution that understates both.
+  method: block_bootstrap
+  block_size_days: 5
+  # Only used when method: jump_diffusion
+  jump_intensity_per_year: 12.0
+  jump_mean: -0.02
+  jump_volatility: 0.05
+  # Fit GARCH to intraday sessions and add overnight gap risk separately —
+  # NSE opens after the US close, so gaps are frequent and destabilize a
+  # close-to-close fit.
+  separate_overnight_gaps: true
+  # The sample mean of daily returns has a standard error of sigma/sqrt(T) —
+  # about 14% a year for a 2%/day name over five years — so propagating it
+  # forward unshrunk made probability-of-profit mostly estimation noise: with
+  # T=1250 and a 20-day horizon, 16% of tickers with exactly zero true drift
+  # cleared the 0.55 gate below on noise alone. The rate is
+  # 1 - Phi(Phi^-1(gate) * sqrt(T/H)) — sigma cancels — so only history length
+  # and horizon move it (docs/QUANT_RESEARCH.md section 21). This is the prior
+  # dispersion of *true* annual drifts used to shrink each estimate toward
+  # zero; raising it recovers the raw mean.
+  prior_annual_drift_std: 0.10
+  # Draw each path's drift from the posterior rather than sharing its mean, so
+  # probability_profit accounts for the drift being estimated, not known.
+  propagate_drift_uncertainty: true
+  # Measure the prior above instead of assuming it. Method of moments splits
+  # the observed spread of sample means into true dispersion and estimation
+  # noise — tau^2 = max(0, Var(mu_hat) - mean(sigma_i^2/T_i)) — and shrinks
+  # each name toward the universe mean rather than toward zero, by however
+  # much of the spread turns out to be noise. On 1,000 zero-drift walks the
+  # share clearing the 0.55 gate goes 16.9% raw, 0.8% under the fixed prior
+  # above, 0.0% here — and that 0.0% held both before and after the Ito fix
+  # (section 14.1), which the fixed prior did not. Estimated per scoring round
+  # from that round's universe,
+  # and falls back to prior_annual_drift_std when fewer than 20 names have
+  # usable history.
+  use_empirical_drift_prior: true
+
+# Trade compliance / eligibility checks
+compliance:
+  min_price_inr: 20.0
+  # Left at 0.55 through the Ito fix (docs/QUANT_RESEARCH.md 14.1) rather than
+  # re-tuned. Removing that bias raised every probability — on 212 cached NSE
+  # names the share clearing this gate went 0.5% -> 3.3%, median probability
+  # 0.466 -> 0.495 — but the gate's job is rejecting noise, and that is
+  # unchanged: on a zero-drift universe under the default empirical drift prior,
+  # 0.0% clear it both before and after. Re-tuning to restore the old pass rate
+  # would keep the effect of an arithmetic error after removing its cause. 0.55
+  # now means what it says; the bias made it silently demand about 0.58. Set
+  # 0.60 to reproduce the pre-fix selectivity if you need continuity.
+  target_prob_profit: 0.55
+  # Applied to reward:risk measured NET of round-trip friction (~0.79% of
+  # turnover), which is a materially harder test than the gross ratio this
+  # threshold used to compare against. With the rule-based strategy's 1.5x/3.0x
+  # ATR exits (set in config/strategies/trend_breakout.yaml), net RR runs
+  # ~1.2-1.7 across realistic ATR levels, so 1.2 is a gate good setups clear
+  # and marginal ones fail.
+  min_reward_risk: 1.2
+  paper_trading_mode: true
+
+# File/directory locations
+paths:
+  # Append-only record of every backtest configuration tried and the Sharpe it
+  # produced. This is what makes the Deflated Sharpe Ratio computable: DSR
+  # adjusts a reported Sharpe for the number of trials behind it, and N is
+  # exactly what a research process forgets. Search enough configurations of a
+  # strategy with no edge and the best still prints a respectable Sharpe.
+  trial_log: output/trials.jsonl
+  # Optional date,annualized_yield CSV — typically the 91-day T-bill. When the
+  # file exists it is aligned to the return index, forward-filled across
+  # non-trading days and de-annualized, so the excess return is measured day by
+  # day against the rate that actually prevailed; India's policy rate moved
+  # materially over 2021-2025, which a single constant cannot represent. When
+  # absent, risk.risk_free_rate is used across the whole window and the run
+  # logs that it did. Decimals (0.068) and percent (6.8) are both read.
+  risk_free_rate_csv: data/risk_free_rate.csv
+  brain_file: data/agent_brain.json
+  sqlite_path: data/portfolio_agent.db
+  excel_output: output/Agent_Orchestrator_Output.xlsx
+  backtest_excel_output: output/Backtest_Report.xlsx
+  # Optional ticker,sector CSV backing risk.max_sector_pct. With NO map the cap
+  # is inactive and both engines log a warning — capping a single pooled
+  # UNKNOWN bucket would limit total invested capital rather than sector
+  # concentration, freezing three quarters of the portfolio in cash. With a
+  # PARTIAL map, mapped sectors get max_sector_pct each and the unmapped pool
+  # gets max_unknown_sector_pct.
+  sector_map_csv: data/sector_map.csv
+  log_file: logs/agent.log
+  log_dir: logs
+  output_dir: output

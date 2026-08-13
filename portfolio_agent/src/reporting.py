@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 
 from portfolio_agent.config.schema import AppConfig
-from src.models import Recommendation, IndicatorSnapshot, AgentBrain
-from src.monte_carlo import MonteCarloResult
+from portfolio_agent.src.models import Recommendation, IndicatorSnapshot, AgentBrain
+from portfolio_agent.src.monte_carlo import MonteCarloResult
 
 
 def export_excel_report(

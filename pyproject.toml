@@ -101,3 +101,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["portfolio_agent"]
+# The packaged default configuration. Without it an installed copy
+# loads nothing and every setting falls back to its schema default —
+# silently, while still producing normal-looking results.
+artifacts = ["portfolio_agent/config/default_config.yaml"]

@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     import pandas as pd
 
     from portfolio_agent.config.schema import AppConfig
-    from src.monte_carlo import MonteCarloResult
+    from portfolio_agent.src.monte_carlo import MonteCarloResult
 
 
 @dataclass
