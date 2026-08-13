@@ -195,9 +195,17 @@ class TestBacktestEngineRun:
 
 
 class TestLookAheadBiasPrevention:
-    """Test that look-ahead bias is properly prevented."""
+    """Test that look-ahead bias is properly prevented.
 
-    def test_signals_use_only_historical_data(self, synthetic_data):
+    The invariant is *nothing after the decision date*, not *nothing on it*.
+    This class used to assert `index.max() < test_date`, which pinned a
+    decision point one session behind where the engine's own loop stands —
+    step E runs after step D has marked the book at T's close. That is not a
+    look-ahead guard, and it made the backtest read different feature values
+    than `evaluate` and the trainers on the same date. See T19.
+    """
+
+    def test_signals_see_the_decision_date_and_nothing_after_it(self, synthetic_data):
         tickers = synthetic_data['tickers']
 
         engine = BacktestEngine(
@@ -209,10 +217,40 @@ class TestLookAheadBiasPrevention:
         signals = engine._generate_signals(test_date)
 
         assert isinstance(signals, dict)
-        for ticker, sig in signals.items():
-            hist_data = engine._get_historical_data_up_to(ticker, test_date)
-            if hist_data is not None:
-                assert hist_data.index.max() < test_date
+        for ticker in signals:
+            history = engine._history_through(ticker, test_date)
+            if history is not None and not history.empty:
+                assert history.index.max() <= test_date
+                assert history.index.max() == test_date
+
+    def test_a_future_bar_cannot_change_todays_signal(self, synthetic_data):
+        """The property the slice exists to guarantee, tested directly.
+
+        Rewriting every bar *after* the decision date must leave that date's
+        signals bit-identical. This is stronger than checking an index bound:
+        it would catch a feature that reached forward regardless of how the
+        frame was sliced.
+        """
+        tickers = synthetic_data['tickers']
+
+        engine = BacktestEngine(
+            start_date="2023-01-02", end_date="2023-05-31",
+            initial_capital=1000000.0, universe_tickers=tickers
+        )
+        test_date = engine.master_date_index[len(engine.master_date_index) // 2]
+        before = engine._generate_signals(test_date)
+
+        for ticker, frame in engine.ticker_data.items():
+            future = frame.index > test_date
+            if future.any():
+                frame.loc[future, ["open", "high", "low", "close"]] *= 3.0
+
+        after = engine._generate_signals(test_date)
+
+        assert set(before) == set(after)
+        for ticker in before:
+            assert before[ticker].score == after[ticker].score, ticker
+            assert before[ticker].signal == after[ticker].signal, ticker
 
 
 class TestCorporateActions:
@@ -689,9 +727,15 @@ class TestBenchmarkWiring:
             benchmark_symbol="^NSEI",
         )
 
-    def test_loads_the_benchmark_and_truncates_before_the_decision_date(
+    def test_loads_the_benchmark_and_truncates_through_the_decision_date(
         self, monkeypatch, synthetic_data
     ):
+        """Inclusive, matching `_history_through`.
+
+        The regime state and the signals it gates have to be read off the same
+        session; truncating the benchmark one bar tighter than the ticker panel
+        would gate today's ranking on yesterday's market. See T19.
+        """
         dates = pd.bdate_range("2023-01-02", periods=60)
         series = pd.Series(np.linspace(100, 160, 60), index=dates)
 
@@ -701,7 +745,8 @@ class TestBenchmarkWiring:
         cutoff = dates[30]
         truncated = engine._benchmark_up_to(cutoff)
         assert truncated is not None
-        assert truncated.index.max() < cutoff
+        assert truncated.index.max() == cutoff
+        assert not (truncated.index > cutoff).any()
 
     def test_missing_benchmark_degrades_to_none(self, synthetic_data):
         engine = BacktestEngine(

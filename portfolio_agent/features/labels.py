@@ -40,13 +40,26 @@ def build_forward_return(close: pd.Series, target: str) -> pd.Series:
     model is supposed to predict, dated at the decision point t. The value is
     unknown at t by construction, which is the point; rows near the end of the
     series are NaN and get dropped.
+
+    This used to be `close.shift(-periods).pct_change(periods)`, which computes
+    the identical value — shifting then differencing over the same span lands
+    on `close[t+h]/close[t] - 1` either way — but which additionally NaNs the
+    **first** `periods` rows, because `pct_change` has nothing to difference
+    against there. Those rows have a perfectly well-defined forward return.
+    Every trainer silently discarded them: on a ticker at the 252-session
+    minimum with a 21-day label that is 8% of its training rows, dropped at the
+    start of the sample where the long-lookback features have just warmed up.
+
+    The evaluation harness never had the bug, so training and evaluation
+    disagreed about how much of each ticker was labelled at all. Stated as the
+    direct expression so there is nothing to re-derive.
     """
     periods = 1
     if 'return' in target:
         digits = "".join(ch for ch in target if ch.isdigit())
         if digits:
             periods = max(1, int(digits))
-    return close.shift(-periods).pct_change(periods)
+    return close.shift(-periods) / close - 1.0
 
 
 # Below this many names on a date there is no cross-section to rank against, so
