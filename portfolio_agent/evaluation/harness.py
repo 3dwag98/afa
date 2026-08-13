@@ -52,6 +52,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
+from .costs import CostModel, NetSpread, cost_notes, evaluate_net
 from .metrics import (
     MIN_CROSS_SECTION_NAMES,
     BucketAnalysis,
@@ -122,6 +123,10 @@ class ForecastEvaluation:
     dispersion: float
     ic_series: pd.Series = field(repr=False, default_factory=lambda: pd.Series(dtype=float))
     folds: List[FoldEvaluation] = field(default_factory=list)
+    #: The spread after paying the shipped Indian cost schedule to harvest it.
+    #: Optional because a caller can switch it off, and None reads differently
+    #: from a zero cost — one means "not charged", the other "charged nothing".
+    costs: Optional[NetSpread] = None
     universe_fingerprint: Optional[str] = None
     notes: List[str] = field(default_factory=list)
     #: Set when a manifest was written. Frozen dataclass, so the writer uses
@@ -153,6 +158,8 @@ class ForecastEvaluation:
             **self.buckets.to_dict(),
             **self.errors.to_dict(),
         }
+        if self.costs is not None:
+            document.update(self.costs.to_dict())
         if self.folds:
             document["folds"] = [fold.to_dict() for fold in self.folds]
         if self.notes:
@@ -194,6 +201,36 @@ class ForecastEvaluation:
             f"({self.buckets.monotone_steps:.0%} of steps rise)",
             f"    hit rate         {self.hit_rate:.1%}",
             f"    score dispersion {self.dispersion:.1%} of names distinctly scored",
+        ]
+
+        if self.costs is not None:
+            net = self.costs
+            verdict = "clears costs" if net.survives else "does not clear costs"
+            long_only = (
+                "clears costs" if net.long_only_survives else "does not clear costs"
+            )
+            share = (
+                "     n/a" if not np.isfinite(net.cost_share)
+                else f"{net.cost_share:7.1%}"
+            )
+            breakeven = (
+                "      n/a" if not np.isfinite(net.breakeven_cost)
+                else f"{net.breakeven_cost:+.4%}"
+            )
+            lines += [
+                "",
+                "  Net of costs",
+                f"    turnover         {net.turnover:.1%} one-way per rebalance "
+                f"({net.n_rebalances} rebalances)",
+                f"    cost charged     {net.cost_per_rebalance:.4%} per rebalance "
+                f"({net.costs.round_trip:.4%} round trip)",
+                f"    spread net       {net.net:+.4%}   [{verdict}]",
+                f"    long-only net    {net.long_only_net:+.4%}   [{long_only}]",
+                f"    cost share       {share} of the gross spread",
+                f"    breakeven cost   {breakeven} round trip",
+            ]
+
+        lines += [
             "",
             "  Bucket mean forward return (low score -> high)",
         ]
@@ -252,6 +289,8 @@ def evaluate_panel(
     stride: int = 1,
     splitter: Any = None,
     universe_fingerprint: Optional[str] = None,
+    charge_costs: bool = True,
+    slippage_per_side: Optional[float] = None,
 ) -> ForecastEvaluation:
     """Score a tidy `(date, symbol, score, forward_return)` panel.
 
@@ -270,6 +309,11 @@ def evaluate_panel(
             purge and embargo counts travel into the report so the exclusions
             stay visible.
         universe_fingerprint: Provenance, carried into the result.
+        charge_costs: Report the spread net of the shipped Indian cost
+            schedule. On by default: a gross spread is the number that looks
+            best and means least.
+        slippage_per_side: Slippage assumption. Defaults to the 25 bps/side in
+            `execution_sim`, deliberately conservative for mid-caps.
 
     Returns:
         A `ForecastEvaluation`.
@@ -279,6 +323,18 @@ def evaluate_panel(
 
     folds: List[FoldEvaluation] = []
     notes: List[str] = []
+
+    net: Optional[NetSpread] = None
+    if charge_costs and not clean.empty:
+        net = evaluate_net(
+            clean,
+            horizon=horizon,
+            costs=CostModel.from_execution_sim(slippage_per_side),
+            n_buckets=n_buckets,
+            min_names=min_names,
+            stride=stride,
+        )
+        notes.extend(cost_notes(net))
     if splitter is not None and not clean.empty:
         folds = _evaluate_folds(clean, splitter, horizon, min_names, stride)
         if getattr(splitter, "embargo", 0) and not any(f.n_embargoed for f in folds):
@@ -309,6 +365,7 @@ def evaluate_panel(
         folds=folds,
         universe_fingerprint=universe_fingerprint,
         notes=notes,
+        costs=net,
     )
 
 
@@ -621,6 +678,8 @@ def evaluate_forecast(
     buys_only: bool = False,
     manifest: bool = True,
     runs_dir: Optional[str] = None,
+    charge_costs: bool = True,
+    slippage_per_side: Optional[float] = None,
 ) -> ForecastEvaluation:
     """Measure one strategy's forecast skill, end to end.
 
@@ -647,6 +706,10 @@ def evaluate_forecast(
             default — a metric whose universe, config and commit are unrecorded
             is one nobody can check later, including the person who ran it.
         runs_dir: Where the manifest goes.
+        charge_costs: Report the decile spread net of the shipped Indian cost
+            schedule, with the signal's measured turnover. On by default.
+        slippage_per_side: Slippage assumption per leg, as a fraction of
+            turnover. Defaults to the 25 bps in `execution_sim`.
 
     Returns:
         A `ForecastEvaluation`, carrying `run_id` when a manifest was written.
@@ -687,6 +750,7 @@ def evaluate_forecast(
         panel, horizon=horizon, strategy=name, n_buckets=n_buckets,
         min_names=min_names, stride=stride, splitter=splitter,
         universe_fingerprint=snap.fingerprint if snap is not None else None,
+        charge_costs=charge_costs, slippage_per_side=slippage_per_side,
     )
     if notes:
         evaluation.notes.extend(notes)
