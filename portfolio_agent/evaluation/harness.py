@@ -1,0 +1,680 @@
+"""Evaluate a forecast without simulating a book.
+
+The platform could previously only judge a signal by running `BacktestEngine`
+— 2,412 lines of order router, tax lots, circuit breakers and Kelly sizing, for
+a book that will never trade. Two costs came with that. The obvious one is
+speed. The one that actually matters is that every measurement arrived filtered
+through portfolio-construction choices — position caps, stop placement,
+regime gating — that have nothing to do with whether the forecast was any good,
+so a change in the equity curve never told you which of the two had moved.
+
+This routes around the engine rather than decomposing it. The engine stays
+intact for the day a portfolio question is genuinely asked; research asks a
+forecasting question and gets a forecasting answer.
+
+The two seams
+-------------
+`build_forecast_panel` turns a strategy and a universe into tidy
+`(date, symbol, score, forward_return)` rows. `evaluate_panel` turns those rows
+into metrics and knows nothing about strategies. Splitting there is what makes
+the harness testable: a panel whose scores *are* the future returns must score
+near-perfect IC, and a panel of noise must not — neither of which requires a
+strategy, a checkpoint or a cache to assert.
+
+Features are built once, not once per date
+------------------------------------------
+`BacktestEngine` rebuilds every ticker's features from scratch on every date,
+which is most of why a backtest is slow. Every registered feature is causal —
+rolling and EWM windows, nothing that reads forward — so building once over the
+full history and slicing to `.loc[:date]` gives bit-identical values at a
+fraction of the cost. That is a property, not an assumption, and
+`test_forecast_harness.py` asserts it directly for every feature the strategies
+use. If a non-causal feature is ever registered, that test fails rather than
+this module silently leaking.
+
+Point-in-time discipline
+------------------------
+A strategy is handed `frame.loc[:date]` — inclusive of the decision date and
+nothing after it. The label is the return from that date's close forward, so
+the value being predicted is unknown at the moment of the prediction, by
+construction. Two things that would break it and do not happen here: the
+feature frames are sliced, never passed whole; and the forward return is
+computed from the price series, never from a column that was already in the
+feature block.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Optional, Sequence
+
+import numpy as np
+import pandas as pd
+
+from .metrics import (
+    MIN_CROSS_SECTION_NAMES,
+    BucketAnalysis,
+    ErrorSummary,
+    ICSummary,
+    bucket_analysis,
+    directional_hit_rate,
+    rank_error_summary,
+    rank_ic_series,
+    score_dispersion,
+    summarize_ic,
+    validate_panel,
+)
+
+logger = logging.getLogger(__name__)
+
+#: Rows a ticker needs before it can be scored at all. The long-lookback
+#: features (a 9-month momentum formation skipping the most recent month) are
+#: NaN until their window fills, and a strategy handed NaNs ranks them somewhere
+#: arbitrary rather than refusing.
+DEFAULT_MIN_HISTORY = 252
+
+
+@dataclass(frozen=True)
+class FoldEvaluation:
+    """One walk-forward fold's IC, so stability is visible rather than assumed.
+
+    A single pooled IC hides the shape that matters most: a mean of 0.04 made
+    of one fold at 0.15 and four at 0.01 is a different object from five folds
+    at 0.04, and only the per-fold numbers tell them apart.
+    """
+
+    index: int
+    test_start: Any
+    test_end: Any
+    n_dates: int
+    n_train_dates: int
+    n_purged: int
+    n_embargoed: int
+    ic: ICSummary
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "fold": self.index,
+            "test_start": str(self.test_start),
+            "test_end": str(self.test_end),
+            "n_dates": self.n_dates,
+            "n_train_dates": self.n_train_dates,
+            "n_purged": self.n_purged,
+            "n_embargoed": self.n_embargoed,
+            **self.ic.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class ForecastEvaluation:
+    """Everything measured about one signal, in one renderable object."""
+
+    strategy: str
+    horizon: int
+    n_dates: int
+    n_symbols: int
+    n_observations: int
+    ic: ICSummary
+    buckets: BucketAnalysis
+    hit_rate: float
+    errors: ErrorSummary
+    dispersion: float
+    ic_series: pd.Series = field(repr=False, default_factory=lambda: pd.Series(dtype=float))
+    folds: List[FoldEvaluation] = field(default_factory=list)
+    universe_fingerprint: Optional[str] = None
+    notes: List[str] = field(default_factory=list)
+
+    def worst_dates(self, n: int = 5) -> pd.Series:
+        """The dates the ordering was most wrong, for looking at what happened."""
+        return self.ic_series.nsmallest(n)
+
+    def best_dates(self, n: int = 5) -> pd.Series:
+        return self.ic_series.nlargest(n)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Flat enough for a JSON manifest, nested only where nesting is real."""
+        document: Dict[str, Any] = {
+            "strategy": self.strategy,
+            "horizon": self.horizon,
+            "n_dates": self.n_dates,
+            "n_symbols": self.n_symbols,
+            "n_observations": self.n_observations,
+            "hit_rate": self.hit_rate,
+            "score_dispersion": self.dispersion,
+            "universe_fingerprint": self.universe_fingerprint,
+            **self.ic.to_dict(),
+            **self.buckets.to_dict(),
+            **self.errors.to_dict(),
+        }
+        if self.folds:
+            document["folds"] = [fold.to_dict() for fold in self.folds]
+        if self.notes:
+            document["notes"] = list(self.notes)
+        return document
+
+    def to_frame(self) -> pd.DataFrame:
+        """One row, for stacking several evaluations into a comparison table."""
+        row = {
+            key: value
+            for key, value in self.to_dict().items()
+            if not isinstance(value, (list, dict))
+        }
+        return pd.DataFrame([row])
+
+    def render(self) -> str:
+        """A fixed-width report, which is what gets pasted into a PR."""
+        significance = "significant" if self.ic.significant else "not significant"
+        lines = [
+            f"Forecast evaluation — {self.strategy} @ {self.horizon}d",
+            "=" * 62,
+            f"  dates {self.n_dates}   symbols {self.n_symbols}   "
+            f"observations {self.n_observations}",
+        ]
+        if self.universe_fingerprint:
+            lines.append(f"  universe {self.universe_fingerprint}")
+        lines += [
+            "",
+            "  Information coefficient",
+            f"    mean rank IC     {self.ic.mean:+.4f}",
+            f"    ICIR             {self.ic.icir:+.3f}   (std {self.ic.std:.4f})",
+            f"    Newey-West t     {self.ic.t_stat:+.2f}   p={self.ic.p_value:.4f}"
+            f"  [{significance}, {self.ic.newey_west_lags} lags]",
+            f"    dates positive   {self.ic.positive_share:.1%}",
+            "",
+            "  Cross-section",
+            f"    decile spread    {self.buckets.spread:+.4%}",
+            f"    monotonicity     {self.buckets.monotonicity:+.3f}   "
+            f"({self.buckets.monotone_steps:.0%} of steps rise)",
+            f"    hit rate         {self.hit_rate:.1%}",
+            f"    score dispersion {self.dispersion:.1%} of names distinctly scored",
+            "",
+            "  Bucket mean forward return (low score -> high)",
+        ]
+        for index, value in enumerate(self.buckets.mean_returns):
+            bar = "" if not np.isfinite(value) else _bar(value, self.buckets.mean_returns)
+            shown = "     n/a" if not np.isfinite(value) else f"{value:+8.4%}"
+            lines.append(f"    {index:>2}  {shown}  {bar}")
+
+        lines += [
+            "",
+            "  Rank error (predicted percentile - realized percentile)",
+            f"    mean |error|     {self.errors.mean_abs_error:.4f}",
+        ]
+        if self.errors.quantiles:
+            quantiles = "  ".join(
+                f"{name} {value:+.3f}" for name, value in self.errors.quantiles.items()
+            )
+            lines.append(f"    quantiles        {quantiles}")
+
+        if self.folds:
+            lines += ["", "  Walk-forward folds"]
+            for fold in self.folds:
+                lines.append(
+                    f"    {fold.index:>2}  {fold.test_start} .. {fold.test_end}  "
+                    f"IC {fold.ic.mean:+.4f}  t {fold.ic.t_stat:+.2f}  "
+                    f"({fold.n_dates} dates, {fold.n_purged} purged, "
+                    f"{fold.n_embargoed} embargoed)"
+                )
+        for note in self.notes:
+            lines += ["", f"  Note: {note}"]
+        return "\n".join(lines)
+
+
+def _bar(value: float, values: Sequence[float], width: int = 24) -> str:
+    """A crude magnitude bar, so the shape of the bucket profile is visible."""
+    finite = [v for v in values if np.isfinite(v)]
+    scale = max(abs(v) for v in finite) if finite else 0.0
+    if scale <= 0.0:
+        return ""
+    filled = int(round(abs(value) / scale * width))
+    return ("+" if value >= 0 else "-") * max(filled, 1)
+
+
+# --------------------------------------------------------------------------
+# Scoring a panel
+# --------------------------------------------------------------------------
+
+
+def evaluate_panel(
+    panel: pd.DataFrame,
+    *,
+    horizon: int,
+    strategy: str = "signal",
+    n_buckets: int = 10,
+    min_names: int = MIN_CROSS_SECTION_NAMES,
+    stride: int = 1,
+    splitter: Any = None,
+    universe_fingerprint: Optional[str] = None,
+) -> ForecastEvaluation:
+    """Score a tidy `(date, symbol, score, forward_return)` panel.
+
+    Args:
+        panel: The observations. Rows with a non-finite score or label are
+            dropped; a missing column raises.
+        horizon: Label horizon in sessions. Sets the Newey–West lag.
+        strategy: Name for the report header.
+        n_buckets: Buckets for the spread and monotonicity checks.
+        min_names: Minimum cross-section width for a date to count.
+        stride: Sessions between consecutive observations. Sets the Newey-West
+            lag together with the horizon; leave at 1 for a daily panel.
+        splitter: Optional `validation.purged.PurgedWalkForward`. When given,
+            per-fold IC is reported on each fold's *test* dates — which is the
+            only place an out-of-sample number can come from — and the fold's
+            purge and embargo counts travel into the report so the exclusions
+            stay visible.
+        universe_fingerprint: Provenance, carried into the result.
+
+    Returns:
+        A `ForecastEvaluation`.
+    """
+    clean = validate_panel(panel)
+    ic = rank_ic_series(clean, min_names)
+
+    folds: List[FoldEvaluation] = []
+    notes: List[str] = []
+    if splitter is not None and not clean.empty:
+        folds = _evaluate_folds(clean, splitter, horizon, min_names, stride)
+        if getattr(splitter, "embargo", 0) and not any(f.n_embargoed for f in folds):
+            # Not a bug, and worth saying so before someone concludes it is. An
+            # expanding walk-forward only ever trains on dates *before* its test
+            # block, and the embargo excludes dates *after* it — so there is
+            # nothing for it to remove. It bites on a scheme that trains on both
+            # sides of a fold; here the purge is doing all the work.
+            notes.append(
+                f"embargo={splitter.embargo} removed nothing: an expanding "
+                "walk-forward has no training dates after its test block for an "
+                "embargo to exclude. The purge counts above are the real "
+                "exclusions."
+            )
+
+    return ForecastEvaluation(
+        strategy=strategy,
+        horizon=int(horizon),
+        n_dates=int(clean["date"].nunique()),
+        n_symbols=int(clean["symbol"].nunique()),
+        n_observations=int(len(clean)),
+        ic=summarize_ic(ic, horizon, stride),
+        buckets=bucket_analysis(clean, n_buckets, min_names),
+        hit_rate=directional_hit_rate(clean, min_names),
+        errors=rank_error_summary(clean, n_buckets, min_names),
+        dispersion=score_dispersion(clean, min_names),
+        ic_series=ic,
+        folds=folds,
+        universe_fingerprint=universe_fingerprint,
+        notes=notes,
+    )
+
+
+def _evaluate_folds(
+    panel: pd.DataFrame, splitter: Any, horizon: int, min_names: int, stride: int = 1
+) -> List[FoldEvaluation]:
+    """Per-fold IC on the test blocks of a purged walk-forward split.
+
+    The split is asserted leak-free before it is used. That assertion is cheap
+    and the alternative is a number that looks like out-of-sample skill and is
+    not — the single most expensive mistake available in this codebase.
+    """
+    from portfolio_agent.validation.purged import assert_no_leakage
+
+    dates = pd.DatetimeIndex(pd.to_datetime(panel["date"]).unique()).sort_values()
+    evaluations: List[FoldEvaluation] = []
+
+    for index, fold in enumerate(splitter.split(dates)):
+        assert_no_leakage(fold, dates, horizon)
+        block = panel[pd.to_datetime(panel["date"]).isin(fold.test)]
+        if block.empty:
+            continue
+        fold_ic = rank_ic_series(block, min_names)
+        evaluations.append(
+            FoldEvaluation(
+                index=index,
+                test_start=fold.test.min().date(),
+                test_end=fold.test.max().date(),
+                n_dates=int(len(fold_ic)),
+                n_train_dates=fold.n_train,
+                n_purged=len(fold.purged),
+                n_embargoed=len(fold.embargoed),
+                ic=summarize_ic(fold_ic, horizon, stride),
+            )
+        )
+    return evaluations
+
+
+# --------------------------------------------------------------------------
+# Producing a panel from a registered strategy
+# --------------------------------------------------------------------------
+
+
+def forward_return(close: pd.Series, horizon: int) -> pd.Series:
+    """Realized return from `t` to `t + horizon`, dated at `t`.
+
+    Dated at the decision point on purpose: the row's features are what was
+    known then, and the value is what happened after. The final `horizon` rows
+    are NaN because their outcome has not occurred, and they are dropped rather
+    than filled.
+    """
+    close = pd.Series(close, dtype=float)
+    return close.shift(-horizon) / close - 1.0
+
+
+def build_forecast_panel(
+    app_config: Any,
+    strategy: Any,
+    universe: Sequence[str],
+    *,
+    horizon: int = 5,
+    stride: int = 1,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    min_history: int = DEFAULT_MIN_HISTORY,
+    min_names: int = MIN_CROSS_SECTION_NAMES,
+    max_dates: Optional[int] = None,
+    use_benchmark: bool = True,
+) -> pd.DataFrame:
+    """Run a strategy across a universe and collect what it predicted.
+
+    Args:
+        app_config: Loaded AppConfig, supplying risk parameters and the
+            benchmark symbol.
+        strategy: An instantiated `BaseStrategy`.
+        universe: Tickers to score. Pinned by the caller so two evaluations
+            compare.
+        horizon: Forward-return horizon in sessions.
+        stride: Score every `stride`-th date. 1 evaluates daily, which is what
+            the Newey–West adjustment is there to handle; a larger stride
+            trades statistical power for wall-clock time and is honest about it
+            because the reduced date count travels into the result.
+        start_date: ISO lower bound on the evaluation window.
+        end_date: ISO upper bound.
+        min_history: Rows a ticker needs before it is eligible on a date.
+        min_names: Dates with a thinner cross-section are skipped entirely.
+        max_dates: Hard cap, applied to the most recent dates. A guard for
+            interactive use; leave None for a full run.
+        use_benchmark: Pass the cached benchmark index into the strategy
+            context. The crash and regime filters read it, so turning it off
+            changes what several strategies emit.
+
+    Returns:
+        A tidy `(date, symbol, score, forward_return)` frame, plus a `signal`
+        column carrying the strategy's own verdict for callers that want to
+        score only the names it would actually have bought.
+
+    Raises:
+        ValueError: If no ticker yielded usable history, or no date had a wide
+            enough cross-section. Both are configuration problems, and an empty
+            panel scores as "no skill" rather than announcing itself.
+    """
+    from portfolio_agent.features.pipeline import build_features
+    from portfolio_agent.src.data_store import load_ticker_data
+    from portfolio_agent.strategies.types import RiskParams, StrategyContext
+
+    feature_names = list(strategy.required_features())
+    features_by_ticker: Dict[str, pd.DataFrame] = {}
+    labels_by_ticker: Dict[str, pd.Series] = {}
+
+    for ticker in universe:
+        try:
+            raw = load_ticker_data(ticker, start_date=start_date, end_date=end_date)
+        except Exception as exc:  # pragma: no cover - depends on cache state
+            logger.debug("Failed to load %s: %s", ticker, exc)
+            continue
+        if raw is None or len(raw) < min_history:
+            continue
+
+        raw = raw.copy()
+        raw.columns = [str(column).lower() for column in raw.columns]
+        try:
+            # Built once over the whole history. Every registered feature is
+            # causal, so slicing this is identical to rebuilding from the
+            # truncated history — asserted in the tests, not assumed here.
+            built = build_features(
+                raw,
+                feature_names,
+                normalize=app_config.features.normalize,
+                normalize_window=app_config.features.normalize_window,
+            )
+        except (KeyError, ValueError) as exc:
+            logger.warning("Feature build failed for %s: %s", ticker, exc)
+            continue
+
+        features_by_ticker[ticker] = built
+        labels_by_ticker[ticker] = forward_return(raw["close"], horizon)
+
+    if not features_by_ticker:
+        raise ValueError(
+            f"No ticker in a universe of {len(universe)} produced usable history. "
+            "Run `portfolio-agent download-data` if the parquet cache is empty."
+        )
+
+    dates = _evaluation_dates(
+        features_by_ticker, labels_by_ticker, min_history, stride, max_dates
+    )
+    if not len(dates):
+        raise ValueError(
+            "No date had both enough history and a realized forward return. "
+            f"Check horizon={horizon} and min_history={min_history} against the "
+            "cached span."
+        )
+
+    risk = RiskParams.from_app_config(app_config)
+    benchmark = _load_benchmark(app_config) if use_benchmark else None
+
+    rows: List[Dict[str, Any]] = []
+    skipped_thin = 0
+
+    for date in dates:
+        eligible: Dict[str, pd.DataFrame] = {}
+        for ticker, frame in features_by_ticker.items():
+            if date not in frame.index:
+                continue
+            window = frame.loc[:date]
+            if len(window) < min_history:
+                continue
+            label = labels_by_ticker[ticker].get(date, np.nan)
+            if not np.isfinite(label):
+                continue
+            eligible[ticker] = window
+
+        if len(eligible) < min_names:
+            skipped_thin += 1
+            continue
+
+        context = StrategyContext(
+            risk=risk,
+            benchmark_close=(
+                benchmark["close"].loc[:date] if benchmark is not None else None
+            ),
+            benchmark_ohlcv=benchmark.loc[:date] if benchmark is not None else None,
+        )
+        signals = strategy.score_batch(eligible, context)
+
+        for ticker, signal in signals.items():
+            rows.append(
+                {
+                    "date": date,
+                    "symbol": ticker,
+                    "score": float(signal.score),
+                    "forward_return": float(labels_by_ticker[ticker][date]),
+                    "signal": signal.signal,
+                }
+            )
+
+    if not rows:
+        raise ValueError(
+            f"No date produced a cross-section of at least {min_names} names "
+            f"({skipped_thin} dates were too thin). Widen the universe."
+        )
+
+    logger.info(
+        "Scored %d observations across %d dates and %d tickers (%d thin dates skipped)",
+        len(rows), len({row["date"] for row in rows}), len(features_by_ticker), skipped_thin,
+    )
+    return pd.DataFrame(rows)
+
+
+def _evaluation_dates(
+    features_by_ticker: Dict[str, pd.DataFrame],
+    labels_by_ticker: Dict[str, pd.Series],
+    min_history: int,
+    stride: int,
+    max_dates: Optional[int],
+) -> pd.DatetimeIndex:
+    """Dates on which at least one ticker is both mature and has an outcome.
+
+    The per-date eligibility check runs again inside the loop, per ticker; this
+    is only to avoid walking thousands of dates on which nothing could possibly
+    qualify.
+    """
+    if stride < 1:
+        raise ValueError(f"stride must be at least 1, got {stride}")
+
+    candidates: set = set()
+    for ticker, frame in features_by_ticker.items():
+        if len(frame) < min_history:
+            continue
+        labelled = labels_by_ticker[ticker].dropna().index
+        candidates.update(frame.index[min_history - 1:].intersection(labelled))
+
+    dates = pd.DatetimeIndex(sorted(candidates))
+    if stride > 1:
+        dates = dates[::stride]
+    if max_dates is not None and len(dates) > max_dates:
+        # Keep the most recent window: a truncated evaluation should describe
+        # the regime the model would be deployed into, not the oldest data.
+        dates = dates[-max_dates:]
+    return dates
+
+
+def _load_benchmark(app_config: Any) -> Optional[pd.DataFrame]:
+    """The cached benchmark index, or None when it was never downloaded."""
+    from portfolio_agent.src.data_store import load_ticker_data
+
+    symbol = getattr(app_config.data, "benchmark_symbol", None)
+    if not symbol:
+        return None
+    try:
+        frame = load_ticker_data(symbol)
+    except Exception as exc:  # pragma: no cover - depends on cache state
+        logger.debug("Benchmark %s unavailable: %s", symbol, exc)
+        return None
+    if frame is None or frame.empty:
+        logger.info(
+            "Benchmark %s is not cached; regime-aware strategies will fall back "
+            "to their composite proxy.", symbol,
+        )
+        return None
+    frame = frame.copy()
+    frame.columns = [str(column).lower() for column in frame.columns]
+    return frame
+
+
+def evaluate_forecast(
+    app_config: Any,
+    strategy: Any,
+    *,
+    universe: Optional[Sequence[str]] = None,
+    universe_size: Optional[int] = None,
+    snapshot: Optional[str] = None,
+    horizon: int = 5,
+    n_buckets: int = 10,
+    stride: int = 1,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    min_history: int = DEFAULT_MIN_HISTORY,
+    min_names: int = MIN_CROSS_SECTION_NAMES,
+    max_dates: Optional[int] = None,
+    use_benchmark: bool = True,
+    splitter: Any = None,
+    buys_only: bool = False,
+) -> ForecastEvaluation:
+    """Measure one strategy's forecast skill, end to end.
+
+    Args:
+        app_config: Loaded AppConfig.
+        strategy: A registered strategy name, or an instantiated strategy.
+        universe: Explicit tickers. Otherwise a pinned universe is resolved the
+            same way training resolves one, so a model and its evaluation can
+            be run on identical names.
+        universe_size: Size for a fresh draw.
+        snapshot: Path to a saved universe snapshot.
+        horizon: Forward-return horizon in sessions.
+        n_buckets: Buckets for spread and monotonicity.
+        stride: Evaluate every `stride`-th date.
+        start_date / end_date: ISO bounds on the window.
+        min_history / min_names / max_dates: See `build_forecast_panel`.
+        use_benchmark: Pass the cached index into the strategy context.
+        splitter: Optional `PurgedWalkForward` for per-fold reporting.
+        buys_only: Score only the names the strategy would have bought. Off by
+            default, and the default is the meaningful one: restricting to buys
+            measures the screen *and* the forecast together, and a screen that
+            emits four names a day has no cross-section left to rank.
+
+    Returns:
+        A `ForecastEvaluation`.
+    """
+    resolved, name = _resolve_strategy(app_config, strategy)
+
+    snap = None
+    if universe is None:
+        from portfolio_agent.training.universe import resolve_universe
+
+        snap = resolve_universe(
+            app_config, snapshot=snapshot, size=universe_size, name=f"eval:{name}"
+        )
+        universe = list(snap.tickers)
+
+    panel = build_forecast_panel(
+        app_config, resolved, universe,
+        horizon=horizon, stride=stride, start_date=start_date, end_date=end_date,
+        min_history=min_history, min_names=min_names, max_dates=max_dates,
+        use_benchmark=use_benchmark,
+    )
+
+    notes: List[str] = []
+    if buys_only:
+        before = len(panel)
+        panel = panel[panel["signal"] == "BUY"]
+        notes.append(
+            f"Restricted to BUY signals: {len(panel)}/{before} observations. "
+            "The IC below describes the screen and the forecast together."
+        )
+        if panel.empty:
+            raise ValueError("buys_only left no observations to score")
+
+    evaluation = evaluate_panel(
+        panel, horizon=horizon, strategy=name, n_buckets=n_buckets,
+        min_names=min_names, stride=stride, splitter=splitter,
+        universe_fingerprint=snap.fingerprint if snap is not None else None,
+    )
+    if notes:
+        evaluation.notes.extend(notes)
+    return evaluation
+
+
+def _resolve_strategy(app_config: Any, strategy: Any) -> tuple:
+    """Accept a registered name or an already-built strategy object."""
+    if not isinstance(strategy, str):
+        return strategy, getattr(strategy, "name", type(strategy).__name__)
+
+    from portfolio_agent.strategies.registry import load_strategy
+
+    for candidate in getattr(app_config, "strategies", []) or []:
+        if getattr(candidate, "type", None) == strategy or getattr(candidate, "name", None) == strategy:
+            return load_strategy(candidate), strategy
+
+    # Not configured in this AppConfig: build it from a minimal StrategyConfig
+    # so an unconfigured strategy can still be measured. Its own defaults apply,
+    # which is what someone asking "how good is momentum" means.
+    from portfolio_agent.config.schema import StrategyConfig
+
+    return load_strategy(StrategyConfig(name=strategy, type=strategy)), strategy
+
+
+def compare_forecasts(evaluations: Iterable[ForecastEvaluation]) -> pd.DataFrame:
+    """Stack several evaluations into one table, best mean IC first."""
+    frames = [evaluation.to_frame() for evaluation in evaluations]
+    if not frames:
+        return pd.DataFrame()
+    table = pd.concat(frames, ignore_index=True)
+    return table.sort_values("mean_ic", ascending=False).reset_index(drop=True)

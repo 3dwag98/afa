@@ -8,9 +8,9 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from src.models import Recommendation
-from src.outcomes import simulate_outcome, mark_outcome_manual, update_outcomes_from_market
-from src.storage import init_db, save_recommendations, save_trade_outcome, get_open_trades
+from portfolio_agent.src.models import Recommendation
+from .outcomes import simulate_outcome, mark_outcome_manual, update_outcomes_from_market
+from .storage import init_db, save_recommendations, save_trade_outcome, get_open_trades
 
 
 class TestSimulateOutcome:

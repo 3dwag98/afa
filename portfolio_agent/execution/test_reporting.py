@@ -7,9 +7,9 @@ from datetime import datetime, timedelta
 import pytest
 
 from portfolio_agent.config.schema import AppConfig
-from src.models import Recommendation, IndicatorSnapshot, AgentBrain
-from src.monte_carlo import MonteCarloResult
-from src.reporting import export_excel_report
+from portfolio_agent.src.models import Recommendation, IndicatorSnapshot, AgentBrain
+from portfolio_agent.src.monte_carlo import MonteCarloResult
+from .reporting import export_excel_report
 
 
 def _create_test_config(tmp_path: str) -> AppConfig:

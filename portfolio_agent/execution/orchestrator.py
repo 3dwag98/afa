@@ -15,49 +15,26 @@ from portfolio_agent.features.pipeline import build_features
 from portfolio_agent.strategies.registry import load_strategy
 from portfolio_agent.strategies.types import RiskParams, StrategyContext, StrategySignal
 
-# Use absolute imports for CLI execution
-try:
-    from .storage import (
-        init_db, save_recommendations,
-        save_trade_outcome, log_run, get_trade_history,
-        load_brain, save_brain
-    )
-    from .data_store import load_or_fetch_data, load_ticker_data
-    from .indicators import calculate_indicators
-    from .monte_carlo import MonteCarloResult, MonteCarloSettings
-    from .risk import calculate_position_quantity, to_net_realized_trades
-    from .execution_sim import cost_fraction_per_side
-    from .compliance import run_compliance_checks
-    from .learning import evaluate_and_learn
-    from .regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
-    from .reporting import export_excel_report
-    from .models import Recommendation
-    from .outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
-    from .sectors import (
-        load_sector_map, sector_cap_is_enforceable, sector_capacity_inr, sector_of,
-    )
-    from .logging_utils import get_logger, ContextualLogger
-except ImportError:
-    from storage import (
-        init_db, save_recommendations,
-        save_trade_outcome, log_run, get_trade_history,
-        load_brain, save_brain
-    )
-    from data_store import load_or_fetch_data, load_ticker_data
-    from indicators import calculate_indicators
-    from monte_carlo import MonteCarloResult, MonteCarloSettings
-    from risk import calculate_position_quantity, to_net_realized_trades
-    from execution_sim import cost_fraction_per_side
-    from compliance import run_compliance_checks
-    from learning import evaluate_and_learn
-    from regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
-    from reporting import export_excel_report
-    from models import Recommendation
-    from outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
-    from sectors import (
-        load_sector_map, sector_cap_is_enforceable, sector_capacity_inr, sector_of,
-    )
-    from logging_utils import get_logger, ContextualLogger
+from .storage import (
+    init_db, save_recommendations,
+    save_trade_outcome, log_run, get_trade_history,
+    load_brain, save_brain
+)
+from portfolio_agent.src.data_store import load_or_fetch_data, load_ticker_data
+from portfolio_agent.src.indicators import calculate_indicators
+from portfolio_agent.src.monte_carlo import MonteCarloResult, MonteCarloSettings
+from portfolio_agent.src.risk import calculate_position_quantity, to_net_realized_trades
+from portfolio_agent.src.execution_sim import cost_fraction_per_side
+from portfolio_agent.src.compliance import run_compliance_checks
+from portfolio_agent.src.learning import evaluate_and_learn
+from portfolio_agent.src.regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
+from .reporting import export_excel_report
+from portfolio_agent.src.models import Recommendation
+from .outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
+from portfolio_agent.src.sectors import (
+    load_sector_map, sector_cap_is_enforceable, sector_capacity_inr, sector_of,
+)
+from portfolio_agent.src.logging_utils import get_logger, ContextualLogger
 
 
 def _setup_logging(log_file: str, run_id: str) -> ContextualLogger:

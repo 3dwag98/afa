@@ -10,6 +10,13 @@ This is a decision-support system that:
 
 IMPORTANT: This system does NOT execute real trades.
 It operates in paper trading / decision support mode only.
+
+**This entry point drives frozen code.** The daily run lives in
+`portfolio_agent/execution/`, which is not maintained under the platform's
+current premise — it forecasts on historical data and places no trades. See
+`portfolio_agent/execution/README.md` for what would need checking before
+relying on any of it, and `portfolio-agent --help` for the research commands
+that are maintained.
 """
 
 import sys
@@ -21,7 +28,7 @@ app_path = Path(__file__).parent
 sys.path.insert(0, str(app_path))
 
 from portfolio_agent.config.loader import load_config as get_config
-from portfolio_agent.src.orchestrator import run_orchestrator
+from portfolio_agent.execution.orchestrator import run_orchestrator
 
 
 def main():
