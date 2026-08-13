@@ -52,6 +52,12 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
+from portfolio_agent.data_quality.membership import (
+    SURVIVORSHIP_NOTE,
+    apply_membership,
+    load_membership,
+)
+
 from .costs import CostModel, NetSpread, cost_notes, evaluate_net
 from .metrics import (
     MIN_CROSS_SECTION_NAMES,
@@ -134,6 +140,10 @@ class ForecastEvaluation:
     #: every construction site for two fields nobody passes by hand.
     run_id: Optional[str] = None
     manifest_path: Optional[str] = None
+    #: What the point-in-time membership filter removed, when one was applied.
+    #: Empty means no membership data was supplied, which `notes` states
+    #: explicitly — the two are different claims and the report keeps them so.
+    membership: Dict[str, Any] = field(default_factory=dict)
 
     def worst_dates(self, n: int = 5) -> pd.Series:
         """The dates the ordering was most wrong, for looking at what happened."""
@@ -160,6 +170,8 @@ class ForecastEvaluation:
         }
         if self.costs is not None:
             document.update(self.costs.to_dict())
+        if self.membership:
+            document.update(self.membership)
         if self.folds:
             document["folds"] = [fold.to_dict() for fold in self.folds]
         if self.notes:
@@ -680,6 +692,8 @@ def evaluate_forecast(
     runs_dir: Optional[str] = None,
     charge_costs: bool = True,
     slippage_per_side: Optional[float] = None,
+    membership: Optional[str] = None,
+    index_name: Optional[str] = None,
 ) -> ForecastEvaluation:
     """Measure one strategy's forecast skill, end to end.
 
@@ -710,6 +724,10 @@ def evaluate_forecast(
             schedule, with the signal's measured turnover. On by default.
         slippage_per_side: Slippage assumption per leg, as a fraction of
             turnover. Defaults to the 25 bps in `execution_sim`.
+        membership: Path to a point-in-time index membership CSV. Without one
+            every date is ranked against the names that survived to be
+            downloaded, and the result says so in its notes.
+        index_name: Narrow a multi-index membership file to one index.
 
     Returns:
         A `ForecastEvaluation`, carrying `run_id` when a manifest was written.
@@ -736,6 +754,27 @@ def evaluate_forecast(
     )
 
     notes: List[str] = []
+    membership_metrics: Dict[str, Any] = {}
+
+    # Applied before every other filter: which names existed in the index is a
+    # fact about the date, not a preference about the sample, and restricting
+    # after a bucket has been formed would rank against a universe the book
+    # could not have held.
+    resolved_membership = load_membership(membership, index_name)
+    if resolved_membership is None:
+        notes.append(SURVIVORSHIP_NOTE)
+    else:
+        outcome = apply_membership(panel, resolved_membership)
+        panel = outcome.panel
+        membership_metrics = outcome.to_dict()
+        notes.append(outcome.note())
+        if panel.empty:
+            raise ValueError(
+                "point-in-time membership left no observations to score — the "
+                f"membership file {resolved_membership.source} and the "
+                "evaluation universe may not overlap"
+            )
+
     if buys_only:
         before = len(panel)
         panel = panel[panel["signal"] == "BUY"]
@@ -754,6 +793,12 @@ def evaluate_forecast(
     )
     if notes:
         evaluation.notes.extend(notes)
+    if membership_metrics:
+        # Same frozen-dataclass compromise as run_id above, and for the same
+        # reason: the filter runs before `evaluate_panel` sees the panel, so
+        # the alternative is a membership-shaped parameter on a function whose
+        # job is scoring a panel it is handed.
+        object.__setattr__(evaluation, "membership", membership_metrics)
 
     if manifest:
         _record_manifest(
@@ -763,6 +808,13 @@ def evaluate_forecast(
                 "min_history": min_history, "min_names": min_names,
                 "max_dates": max_dates, "use_benchmark": use_benchmark,
                 "buys_only": buys_only, "start_date": start_date, "end_date": end_date,
+                # Provenance, not a metric: which membership file a number was
+                # computed against is the first thing to check when two runs
+                # of the "same" strategy disagree.
+                "membership": (
+                    resolved_membership.source if resolved_membership else None
+                ),
+                "index_name": index_name,
             },
             splitter=splitter,
             seconds=time.monotonic() - started,
