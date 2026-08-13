@@ -266,25 +266,99 @@ def test_no_module_imports_the_flat_path():
     assert offenders == []
 
 
+def test_no_test_puts_the_src_directory_on_sys_path():
+    """The last holdout, and the reason a fallback survived in shipped code.
+
+    Five test modules did `sys.path.insert(0, .../portfolio_agent/src)` and then
+    `from data_store import ...`. That loads the same file a *second* time under
+    a bare top-level name, so `portfolio_agent.src.data_store` and `data_store`
+    were two distinct modules with two sets of module state — exactly what
+    removing the `src` symlink was meant to end.
+
+    It was not merely untidy. A `monkeypatch.setattr("data_store.…")` patched
+    the copy the code under test was not using, so the test passed without the
+    patch having any effect. And because the flat copy has no parent package,
+    its relative imports fail — which is why `data_store.py` carried a
+    `try/except ImportError` fallback whose only purpose, once T10 was done, was
+    to keep these test modules importable.
+    """
+    import re
+
+    pattern = re.compile(r"sys\.path\.insert\([^)]*['\"]src['\"]", re.M)
+    offenders = [
+        str(path.relative_to(REPO))
+        for path in (REPO / "portfolio_agent" / "tests").rglob("*.py")
+        if pattern.search(path.read_text())
+    ]
+    assert offenders == [], offenders
+
+
+def test_no_test_imports_a_src_module_by_its_bare_name():
+    """The other half: the import that the sys.path hack existed to enable."""
+    import re
+
+    modules = [p.stem for p in (REPO / "portfolio_agent" / "src").glob("*.py")]
+    modules = [m for m in modules if m != "__init__"]
+    bare = re.compile(
+        r"^\s*(?:from\s+(?:%s)\s+import|import\s+(?:%s)\s+as)"
+        % ("|".join(modules), "|".join(modules)),
+        re.M,
+    )
+    offenders = [
+        str(path.relative_to(REPO))
+        for path in (REPO / "portfolio_agent" / "tests").rglob("*.py")
+        if bare.search(path.read_text())
+    ]
+    assert offenders == [], offenders
+
+
 def test_no_module_keeps_a_flat_import_fallback():
     """`try: from .x import y / except ImportError: from x import y` is the shape.
 
     It exists to let a module be run as a loose script from inside its own
     directory, and the cost of that convenience was a package that could not be
     installed.
+
+    **The first version of this test only matched at module scope.** It
+    hard-coded four spaces of indentation and required the `try` branch to be a
+    *relative* import, so three survivors went unnoticed until T17 read the
+    modules by hand: two fallbacks nested inside functions, and one in
+    `strategies/weighting.py` whose two branches imported the identical
+    absolute path — a fallback that could never have fallen back. The pattern
+    below keys on the structure that matters instead: an ImportError handler
+    that re-imports the same *name*.
     """
     import re
 
     pattern = re.compile(
-        r"try:\n(?:    from \.[\w.]+ import [^\n]*\n)+except ImportError:[^\n]*\n"
-        r"(?:    from [\w][\w.]* import [^\n]*\n)+"
+        r"^(?P<indent>[ \t]*)try:\s*\n"
+        r"(?P<body>(?:(?P=indent)[ \t]+from [\w.]+ import [^\n]*\n)+)"
+        r"(?P=indent)except ImportError:[^\n]*\n"
+        r"(?P<fallback>(?:(?P=indent)[ \t]+from [\w.]+ import [^\n]*\n)+)",
+        re.M,
     )
-    offenders = [
-        str(path.relative_to(REPO))
-        for path in (REPO / "portfolio_agent").rglob("*.py")
-        if "tests" not in path.parts and pattern.search(path.read_text())
-    ]
-    assert offenders == []
+
+    def imported_names(block: str) -> set:
+        return {
+            name.strip()
+            for line in block.splitlines()
+            for name in line.split(" import ", 1)[1].split(",")
+        }
+
+    offenders = []
+    for path in (REPO / "portfolio_agent").rglob("*.py"):
+        if "tests" in path.parts:
+            continue
+        for match in pattern.finditer(path.read_text()):
+            # An optional-dependency guard imports a *different* thing in its
+            # handler, or nothing at all — `except ImportError: HAS_TORCH =
+            # False`. A layout fallback re-imports the same names from a
+            # different path, and that is the shape that has to stay gone.
+            if imported_names(match.group("body")) & imported_names(
+                match.group("fallback")
+            ):
+                offenders.append(f"{path.relative_to(REPO)}:{match.group('body').strip()}")
+    assert offenders == [], offenders
 
 
 # --------------------------------------------------------------------------

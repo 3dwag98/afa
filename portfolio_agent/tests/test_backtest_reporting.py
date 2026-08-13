@@ -10,9 +10,8 @@ import numpy as np
 import pytest
 
 # Add src to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
-from backtest_reporting import (
+from portfolio_agent.src.backtest_reporting import (
     export_backtest_excel,
     _normalize_trade_log,
     EXPECTED_COLUMNS,

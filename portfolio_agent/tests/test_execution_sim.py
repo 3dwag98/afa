@@ -12,10 +12,8 @@ import sys
 from pathlib import Path
 
 # Add src to path
-src_path = Path(__file__).parent.parent / 'src'
-sys.path.insert(0, str(src_path))
 
-from execution_sim import (
+from portfolio_agent.src.execution_sim import (
     DEFAULT_SLIPPAGE_PCT_PER_SIDE,
     ExecutionSimulator,
     cost_fraction_per_side,

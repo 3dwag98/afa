@@ -157,12 +157,8 @@ def check_risk_reward_ratio(entry_price: float, target_price: float,
     if stop_loss_price >= entry_price:
         return False
 
-    try:
-        from .execution_sim import cost_fraction_per_side
-        from .risk import net_reward_risk
-    except ImportError:  # pragma: no cover - script-style import path
-        from execution_sim import cost_fraction_per_side
-        from risk import net_reward_risk
+    from .execution_sim import cost_fraction_per_side
+    from .risk import net_reward_risk
 
     if buy_cost_pct is None:
         buy_cost_pct = cost_fraction_per_side('BUY')

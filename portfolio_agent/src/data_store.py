@@ -276,10 +276,7 @@ def fetch_and_cache(
     source = getattr(config.data, "source", "yfinance")
 
     if source == "huggingface":
-        try:
-            from .hf_dataset import sync_hf_to_cache
-        except ImportError:  # pragma: no cover - script-style import path
-            from hf_dataset import sync_hf_to_cache
+        from .hf_dataset import sync_hf_to_cache
 
         try:
             written = sync_hf_to_cache(

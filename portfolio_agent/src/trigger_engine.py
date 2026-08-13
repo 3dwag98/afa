@@ -41,10 +41,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Sequence
 
-try:
-    from portfolio_agent.strategies.types import ModelVerdict
-except ImportError:  # pragma: no cover - direct-module execution fallback
-    from strategies.types import ModelVerdict
+from portfolio_agent.strategies.types import ModelVerdict
 
 TriggerMode = Literal["strong_single", "consensus", "strong_or_consensus"]
 
