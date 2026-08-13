@@ -76,7 +76,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 
 import numpy as np
 import pandas as pd
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from ...evaluation.metrics import MIN_CROSS_SECTION_NAMES, rank_ic_from_arrays
 from ..base import BaseTrainer, TrainerConfig, TrainingArtifact, TrainingData
@@ -94,6 +94,9 @@ DEFAULT_GBM_FEATURES = [
     "sma_20", "sma_50", "rsi_14", "macd",
     "bollinger_pct_b", "atr_14", "return_1d", "return_5d",
 ]
+
+#: What early stopping may optimize. `rank_ic` is maximized, `mse` minimized.
+SELECTION_METRICS = ("rank_ic", "mse")
 
 _MISSING_SKLEARN = (
     "The 'gbm' trainer needs scikit-learn, which is not installed.\n"
@@ -236,6 +239,24 @@ class GBMTrainerConfig(TrainerConfig):
         default=20, gt=0,
         description="Iterations without improvement before early stopping fires.",
     )
+    selection_metric: str = Field(
+        default="rank_ic",
+        description="What early stopping optimizes: 'rank_ic' (maximized) or "
+        "'mse' (minimized). Defaults to rank IC because that is the metric this "
+        "model is reported and compared on — selecting on MSE and reporting IC "
+        "means the choice of which iteration ships never looked at the number "
+        "anyone reads. 'mse' is kept so the difference stays measurable.",
+    )
+
+    @field_validator("selection_metric")
+    @classmethod
+    def _known_selection_metric(cls, value: str) -> str:
+        if value not in SELECTION_METRICS:
+            raise ValueError(
+                f"selection_metric must be one of {list(SELECTION_METRICS)}, "
+                f"got {value!r}"
+            )
+        return value
 
     # -- reporting --------------------------------------------------------
     importance_repeats: int = Field(
@@ -585,17 +606,26 @@ class GBMTrainer(BaseTrainer):
     def _fit_with_early_stopping(
         self, model: Any, panel: GBMPanel, cfg: GBMTrainerConfig
     ) -> int:
-        """Grow the ensemble, stopping when held-out loss stops improving.
+        """Grow the ensemble, stopping when the held-out score stops improving.
 
         `warm_start` refits incrementally: raising `max_iter` and calling `fit`
         again continues from the trees already grown rather than starting over,
         so scoring between checkpoints costs one prediction pass and not a
         retrain. The step is `n_iter_no_change`, which makes the worst-case
         overshoot exactly one patience window.
+
+        **What "improving" means is a choice, and it used to be MSE while the
+        summary table showed rank IC.** Squared error on a cross-sectional rank
+        label is minimized by predicting each name's conditional mean rank —
+        excellent for the loss, close to constant for the ordering — so the two
+        criteria can select very different iteration counts. `selection_metric`
+        now decides, and defaults to the metric the model is judged on.
         """
         model.set_params(warm_start=True)
         step = cfg.n_iter_no_change
-        best_loss = np.inf
+        # One sign convention: `score` is always maximized, and MSE enters it
+        # negated. The alternative is two loops that must stay in step.
+        best_score = -np.inf
         best_iter = 0
         grown = 0
 
@@ -603,17 +633,24 @@ class GBMTrainer(BaseTrainer):
             grown = min(grown + step, cfg.epochs)
             model.set_params(max_iter=grown)
             model.fit(panel.x_train, panel.y_train)
-            loss = float(
-                np.mean((model.predict(panel.x_val) - panel.y_val) ** 2)
+
+            predictions = model.predict(panel.x_val)
+            if cfg.selection_metric == "rank_ic":
+                ic = rank_ic_by_date(predictions, panel.y_val, panel.val_dates)
+                score = float(ic.mean()) if not ic.empty else -np.inf
+            else:
+                score = -float(np.mean((predictions - panel.y_val) ** 2))
+
+            logger.debug(
+                "iterations=%d val_%s=%.6f", grown, cfg.selection_metric, score
             )
-            logger.debug("iterations=%d val_mse=%.6f", grown, loss)
-            if loss < best_loss:
-                best_loss = loss
+            if score > best_score:
+                best_score = score
                 best_iter = grown
                 continue
             logger.info(
-                "Early stop at %d iterations; best validation MSE %.6f at %d.",
-                grown, best_loss, best_iter,
+                "Early stop at %d iterations; best validation %s %.6f at %d.",
+                grown, cfg.selection_metric, best_score, best_iter,
             )
             break
 

@@ -652,8 +652,11 @@ def test_the_whole_gbm_path_runs_without_pytorch(tmp_path):
     assert result.returncode == 0, result.stderr
 
     lines = dict(line.split(" ", 1) for line in result.stdout.strip().splitlines())
-    # sac needs torch and is correctly absent; the other two are not affected.
-    assert lines["TRAINERS"] == "gbm,supervised"
+    # sac needs torch and is correctly absent; the rest are not affected.
+    # `rank_ic` shares gbm's panel builder and, like it, needs only
+    # scikit-learn — so a torch-less install gets both baselines and can
+    # compare objectives without the gpu extra.
+    assert lines["TRAINERS"] == "gbm,rank_ic,supervised"
     assert lines["OK"].startswith("True")
     assert lines["CHECKPOINT"] == "gbm_best.joblib"
     assert lines["TORCH_IMPORTED"] == "False"

@@ -51,3 +51,12 @@ except ImportError as exc:  # pragma: no cover - depends on optional extras
     logger.debug("gbm trainer unavailable: %s", exc)
 else:
     __all__.append("GBMTrainer")
+
+# Shares gbm's panel builder, so it is guarded on the same extra.
+try:
+    from .rank_ic import RankICTrainer  # noqa: F401
+except ImportError as exc:  # pragma: no cover - depends on optional extras
+    UNAVAILABLE["rank_ic"] = f"needs scikit-learn (uv sync --extra gbm): {exc}"
+    logger.debug("rank_ic trainer unavailable: %s", exc)
+else:
+    __all__.append("RankICTrainer")
