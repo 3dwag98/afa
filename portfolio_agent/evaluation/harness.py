@@ -124,6 +124,11 @@ class ForecastEvaluation:
     folds: List[FoldEvaluation] = field(default_factory=list)
     universe_fingerprint: Optional[str] = None
     notes: List[str] = field(default_factory=list)
+    #: Set when a manifest was written. Frozen dataclass, so the writer uses
+    #: object.__setattr__ — the alternative is threading provenance through
+    #: every construction site for two fields nobody passes by hand.
+    run_id: Optional[str] = None
+    manifest_path: Optional[str] = None
 
     def worst_dates(self, n: int = 5) -> pd.Series:
         """The dates the ordering was most wrong, for looking at what happened."""
@@ -143,6 +148,7 @@ class ForecastEvaluation:
             "hit_rate": self.hit_rate,
             "score_dispersion": self.dispersion,
             "universe_fingerprint": self.universe_fingerprint,
+            "run_id": self.run_id,
             **self.ic.to_dict(),
             **self.buckets.to_dict(),
             **self.errors.to_dict(),
@@ -613,6 +619,8 @@ def evaluate_forecast(
     use_benchmark: bool = True,
     splitter: Any = None,
     buys_only: bool = False,
+    manifest: bool = True,
+    runs_dir: Optional[str] = None,
 ) -> ForecastEvaluation:
     """Measure one strategy's forecast skill, end to end.
 
@@ -635,10 +643,17 @@ def evaluate_forecast(
             default, and the default is the meaningful one: restricting to buys
             measures the screen *and* the forecast together, and a screen that
             emits four names a day has no cross-section left to rank.
+        manifest: Record what produced this evaluation under `runs/`. On by
+            default — a metric whose universe, config and commit are unrecorded
+            is one nobody can check later, including the person who ran it.
+        runs_dir: Where the manifest goes.
 
     Returns:
-        A `ForecastEvaluation`.
+        A `ForecastEvaluation`, carrying `run_id` when a manifest was written.
     """
+    import time
+
+    started = time.monotonic()
     resolved, name = _resolve_strategy(app_config, strategy)
 
     snap = None
@@ -675,7 +690,82 @@ def evaluate_forecast(
     )
     if notes:
         evaluation.notes.extend(notes)
+
+    if manifest:
+        _record_manifest(
+            app_config, evaluation, name, list(universe), snap,
+            settings={
+                "horizon": horizon, "stride": stride, "n_buckets": n_buckets,
+                "min_history": min_history, "min_names": min_names,
+                "max_dates": max_dates, "use_benchmark": use_benchmark,
+                "buys_only": buys_only, "start_date": start_date, "end_date": end_date,
+            },
+            splitter=splitter,
+            seconds=time.monotonic() - started,
+            runs_dir=runs_dir,
+        )
     return evaluation
+
+
+def _record_manifest(
+    app_config: Any,
+    evaluation: "ForecastEvaluation",
+    name: str,
+    universe: List[str],
+    snap: Any,
+    *,
+    settings: Dict[str, Any],
+    splitter: Any,
+    seconds: float,
+    runs_dir: Optional[str],
+) -> None:
+    """Write this evaluation's manifest, and never let doing so break it.
+
+    Provenance is worth a file and is not worth losing a result over. A failure
+    here is logged and swallowed — the evaluation is already computed, and
+    raising would throw it away to protect a record of it.
+    """
+    try:
+        from portfolio_agent.provenance import DEFAULT_RUNS_DIR, build_manifest
+
+        split: Dict[str, Any] = {"horizon": evaluation.horizon}
+        if splitter is not None:
+            for field_name in ("n_splits", "horizon", "embargo", "min_train_fraction"):
+                if hasattr(splitter, field_name):
+                    split[field_name] = getattr(splitter, field_name)
+            split["scheme"] = type(splitter).__name__
+        else:
+            split["scheme"] = "single window (no walk-forward split)"
+
+        metrics = {
+            key: value for key, value in evaluation.to_dict().items()
+            if isinstance(value, (int, float, bool))
+        }
+        extras: Dict[str, Any] = {}
+        if evaluation.folds:
+            extras["folds"] = [fold.to_dict() for fold in evaluation.folds]
+
+        record = build_manifest(
+            "evaluate",
+            app_config=app_config,
+            strategy=name,
+            universe=universe,
+            universe_fingerprint=(
+                snap.fingerprint if snap is not None else evaluation.universe_fingerprint
+            ),
+            universe_name=snap.name if snap is not None else None,
+            settings=settings,
+            split=split,
+            metrics=metrics,
+            timings={"total": seconds},
+            notes=list(evaluation.notes),
+            extras=extras,
+        )
+        path = record.save(runs_dir if runs_dir is not None else DEFAULT_RUNS_DIR)
+        object.__setattr__(evaluation, "run_id", record.run_id)
+        object.__setattr__(evaluation, "manifest_path", str(path))
+    except Exception:  # pragma: no cover - provenance must never break a result
+        logger.exception("Could not write a run manifest; the evaluation is unaffected")
 
 
 def _resolve_strategy(app_config: Any, strategy: Any) -> tuple:
