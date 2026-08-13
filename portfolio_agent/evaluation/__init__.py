@@ -14,6 +14,13 @@ module scope — a rule-based screen can be evaluated on an install that has
 neither.
 """
 
+from .costs import (
+    CostModel,
+    NetSpread,
+    cost_notes,
+    evaluate_net,
+    one_way_turnover,
+)
 from .decay import DecayCurve, DecayPoint, decay_curve, decay_from_panel
 from .harness import (
     ForecastEvaluation,
@@ -50,14 +57,19 @@ from .metrics import (
 
 __all__ = [
     "BucketAnalysis",
+    "CostModel",
     "DecayCurve",
     "DecayPoint",
+    "NetSpread",
     "NeutralizationResult",
     "SIZE_PROXY_NOTE",
     "add_exposures",
+    "cost_notes",
     "decay_curve",
     "decay_from_panel",
+    "evaluate_net",
     "evaluate_neutralized",
+    "one_way_turnover",
     "neutralize_panel",
     "neutralized_ic",
     "residualize",

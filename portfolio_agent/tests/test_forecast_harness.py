@@ -179,7 +179,20 @@ def test_two_runs_of_one_configuration_agree_exactly(noise_panel):
     panel = noise_panel.assign(score=rng.normal(0.0, 1.0, len(noise_panel)))
     first = evaluate_panel(panel, horizon=5, strategy="s")
     again = evaluate_panel(panel, horizon=5, strategy="s")
-    assert first.to_dict() == again.to_dict()
+
+    # NaN-aware, because some metrics are legitimately undefined and `nan !=
+    # nan`. On a noise panel the gross decile spread comes out negative, which
+    # makes "what share of it did costs eat" a ratio with no readable sign —
+    # reported as NaN. Two runs producing the same NaN *is* agreement; plain
+    # dict equality would call it a reproducibility failure.
+    left, right = first.to_dict(), again.to_dict()
+    assert left.keys() == right.keys()
+    for key in left:
+        a, b = left[key], right[key]
+        if isinstance(a, float) and isinstance(b, float) and math.isnan(a) and math.isnan(b):
+            continue
+        assert a == b, key
+
     pd.testing.assert_series_equal(first.ic_series, again.ic_series)
 
 

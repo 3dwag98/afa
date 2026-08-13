@@ -202,6 +202,11 @@ def cmd_evaluate(args) -> int:
         max_dates=args.max_dates,
         use_benchmark=not args.no_benchmark,
         runs_dir=args.output,
+        charge_costs=not getattr(args, "gross", False),
+        slippage_per_side=(
+            None if getattr(args, "slippage_bps", None) is None
+            else args.slippage_bps / 1e4
+        ),
     )
 
     try:
@@ -542,6 +547,13 @@ def add_forecast_commands(subparsers) -> None:
                             help="Cap on evaluation dates, most recent kept")
         parser.add_argument("--no-benchmark", action="store_true",
                             help="Do not pass the cached index into the strategy context")
+        parser.add_argument("--gross", action="store_true",
+                            help="Report the spread gross of costs (default: net, "
+                                 "charging the NSE delivery schedule at the signal's "
+                                 "own measured turnover)")
+        parser.add_argument("--slippage-bps", type=float, default=None,
+                            help="Slippage per side in basis points (default: 25, "
+                                 "conservative for mid-caps)")
         parser.add_argument("--seed", type=int, default=None,
                             help="Seed numpy's global stream before scoring")
         parser.add_argument("--output", type=str, default=None,
