@@ -54,3 +54,4 @@ htmlcov/
 .ipynb_checkpoints/
 notebooks/**/data_cache/
 data_cache/
+.claude/worktrees/
