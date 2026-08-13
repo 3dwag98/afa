@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.liquidity import (
+from portfolio_agent.src.liquidity import (
     circuit_locked_days,
     lower_circuit_locked_days,
     operator_trap_days,

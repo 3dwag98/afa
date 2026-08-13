@@ -4,7 +4,7 @@ import math
 
 import pytest
 
-from src.sectors import (
+from portfolio_agent.src.sectors import (
     UNKNOWN_SECTOR,
     load_sector_map,
     normalize_ticker,

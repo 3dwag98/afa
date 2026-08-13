@@ -6,7 +6,7 @@ import numpy as np
 from datetime import datetime, timedelta
 
 try:
-    from src.risk_analytics import RiskAnalyzer
+    from portfolio_agent.src.risk_analytics import RiskAnalyzer
 except ImportError:
     from portfolio_agent.src.risk_analytics import RiskAnalyzer
 
@@ -551,7 +551,7 @@ class TestRiskFreeRateIsSuppliedNotAssumed:
             RiskAnalyzer(self._curve(), [])
 
     def test_reads_a_treasury_bill_series_from_csv(self, tmp_path):
-        from src.risk_analytics import load_risk_free_series
+        from portfolio_agent.src.risk_analytics import load_risk_free_series
 
         path = tmp_path / "tbill.csv"
         path.write_text(
@@ -570,7 +570,7 @@ class TestRiskFreeRateIsSuppliedNotAssumed:
     def test_accepts_percent_units_and_normalizes_them(self, tmp_path):
         """A T-bill series published as 6.8 rather than 0.068 is the common
         case; reading it raw would report a 680% risk-free rate."""
-        from src.risk_analytics import load_risk_free_series
+        from portfolio_agent.src.risk_analytics import load_risk_free_series
 
         path = tmp_path / "tbill.csv"
         path.write_text(
@@ -582,7 +582,7 @@ class TestRiskFreeRateIsSuppliedNotAssumed:
         assert series.loc["2023-01-01"] == pytest.approx(0.068)
 
     def test_missing_file_returns_none_rather_than_raising(self, tmp_path):
-        from src.risk_analytics import load_risk_free_series
+        from portfolio_agent.src.risk_analytics import load_risk_free_series
 
         assert load_risk_free_series(tmp_path / "absent.csv") is None
 

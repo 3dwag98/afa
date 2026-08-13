@@ -11,14 +11,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.backtest_engine import BacktestEngine
-from src.backtest_reporting import (
+from portfolio_agent.src.backtest_engine import BacktestEngine
+from portfolio_agent.src.backtest_reporting import (
     SUMMARY_METRICS,
     export_backtest_excel,
     _create_monthly_heatmap_df,
     _prepare_equity_curve_df,
 )
-from src.risk_analytics import RiskAnalyzer
+from portfolio_agent.src.risk_analytics import RiskAnalyzer
 
 
 @pytest.fixture
@@ -39,7 +39,7 @@ def rising_market(monkeypatch):
     )
 
     monkeypatch.setattr(
-        "src.backtest_engine.load_ticker_data",
+        "portfolio_agent.src.backtest_engine.load_ticker_data",
         lambda ticker, start_date=None, end_date=None: df.copy() if ticker == "UP.NS" else None,
     )
     return {'dates': dates, 'df': df}

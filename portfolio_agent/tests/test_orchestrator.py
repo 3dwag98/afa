@@ -11,8 +11,8 @@ import pandas as pd
 import pytest
 
 from portfolio_agent.config.schema import AppConfig
-from src.orchestrator import run_orchestrator
-from src.storage import init_db, get_trade_history
+from portfolio_agent.src.orchestrator import run_orchestrator
+from portfolio_agent.src.storage import init_db, get_trade_history
 
 TEST_TICKERS = ["TEST1.NS", "TEST2.NS", "TEST3.NS"]
 
@@ -89,7 +89,7 @@ def test_orchestrator_with_synthetic_data(temp_config):
     """Test orchestrator runs successfully with synthetic data."""
     synthetic_data = generate_synthetic_data(temp_config.data.tickers)
 
-    with patch('src.orchestrator.load_or_fetch_data', return_value=synthetic_data):
+    with patch('portfolio_agent.src.orchestrator.load_or_fetch_data', return_value=synthetic_data):
         excel_path = run_orchestrator(
             force_refresh=False,
             simulate_outcome=True,
@@ -106,7 +106,7 @@ def test_orchestrator_creates_sqlite_recommendations(temp_config):
 
     synthetic_data = generate_synthetic_data(temp_config.data.tickers)
 
-    with patch('src.orchestrator.load_or_fetch_data', return_value=synthetic_data):
+    with patch('portfolio_agent.src.orchestrator.load_or_fetch_data', return_value=synthetic_data):
         run_orchestrator(
             force_refresh=False,
             simulate_outcome=True,
@@ -127,7 +127,7 @@ def test_orchestrator_creates_brain_file(temp_config):
     """Test that orchestrator creates/updates brain file."""
     synthetic_data = generate_synthetic_data(temp_config.data.tickers)
 
-    with patch('src.orchestrator.load_or_fetch_data', return_value=synthetic_data):
+    with patch('portfolio_agent.src.orchestrator.load_or_fetch_data', return_value=synthetic_data):
         run_orchestrator(
             force_refresh=False,
             simulate_outcome=True,
@@ -148,7 +148,7 @@ def test_orchestrator_without_simulation(temp_config):
     """Test orchestrator runs without simulated outcomes."""
     synthetic_data = generate_synthetic_data(temp_config.data.tickers)
 
-    with patch('src.orchestrator.load_or_fetch_data', return_value=synthetic_data):
+    with patch('portfolio_agent.src.orchestrator.load_or_fetch_data', return_value=synthetic_data):
         excel_path = run_orchestrator(
             force_refresh=False,
             simulate_outcome=False,

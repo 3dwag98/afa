@@ -603,15 +603,26 @@ class TestLoadOrFetchData:
         assert "NEVERCACHED.NS" in result
         assert len(result["NEVERCACHED.NS"]) > 0
 
-    def test_returns_empty_when_unavailable_and_fallback_disabled(self, clean_data_dir, monkeypatch):
+    def test_raises_when_unavailable_and_fallback_disabled(self, clean_data_dir, monkeypatch):
+        """No data is an error, not an empty dict.
+
+        Returning `{}` left every caller to decide what "no data" meant, and
+        the usual decision was to carry on and produce an empty-looking but
+        otherwise ordinary result. The message names the two commands that fix
+        it and says what the synthetic switch actually does.
+        """
         monkeypatch.setattr(
-            "data_store.batch_download_and_cache", lambda *a, **k: False
+            "portfolio_agent.src.data_store.batch_download_and_cache",
+            lambda *a, **k: False,
         )
         config = _make_config(tickers=["NEVERCACHED.NS"], allow_synthetic_fallback=False)
 
-        result = load_or_fetch_data(config, force_refresh=False, use_auto_discovery=False)
+        with pytest.raises(RuntimeError) as excinfo:
+            load_or_fetch_data(config, force_refresh=False, use_auto_discovery=False)
 
-        assert result == {}
+        message = str(excinfo.value)
+        assert "download-data" in message
+        assert "random-number generator" in message
 
 
 def _make_config(tickers, allow_synthetic_fallback: bool, min_history_days: int = 250):

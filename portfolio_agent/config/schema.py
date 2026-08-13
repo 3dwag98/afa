@@ -11,9 +11,6 @@ class DataConfig(BaseModel):
     """Configuration for data paths and settings."""
 
     data_dir: str = Field(default="data", description="Base directory for data files")
-    market_data_dir: str = Field(
-        default="data/market_data", description="Directory for market data"
-    )
     source: Literal["huggingface", "yfinance"] = Field(
         default="huggingface",
         description="Where historical OHLCV comes from. 'huggingface' pulls a versioned Hub "
@@ -84,7 +81,12 @@ class DataConfig(BaseModel):
         default=250, description="Minimum number of historical days required to consider a ticker tradeable"
     )
     allow_synthetic_fallback: bool = Field(
-        default=True, description="Whether to fall back to synthetic OHLCV data when real data is unavailable"
+        default=False,
+        description="Substitute generated random-walk bars when no real data is "
+        "available. Off by default, and the default is the point: a research "
+        "platform that silently swaps in synthetic data will eventually publish "
+        "a number describing a random-number generator. Turn it on only for "
+        "offline plumbing tests, where the numbers are not the output.",
     )
     download_workers: int = Field(
         default=4,
@@ -107,27 +109,11 @@ class DataConfig(BaseModel):
 class FeaturesConfig(BaseModel):
     """Configuration for feature engineering."""
 
-    lookbacks: Dict[str, int] = Field(
-        default_factory=lambda: {
-            "short": 5,
-            "medium": 20,
-            "long": 60,
-        },
-        description="Lookback periods for different feature types",
-    )
     normalize: bool = Field(
         default=True, description="Whether to normalize features"
     )
     normalize_window: int = Field(
         default=252, description="Window size for feature normalization"
-    )
-    feature_sets: Dict[str, List[str]] = Field(
-        default_factory=lambda: {
-            "price": ["open", "high", "low", "close", "volume"],
-            "technical": ["rsi", "macd", "bollinger"],
-            "fundamental": ["pe_ratio", "market_cap", "dividend_yield"],
-        },
-        description="Named sets of features to compute",
     )
 
 
@@ -691,8 +677,6 @@ class PathsConfig(BaseModel):
         "count, there is no way to tell that from a real result.",
     )
     log_file: str = Field(default="logs/agent.log", description="Path to the log file")
-    log_dir: str = Field(default="logs", description="Directory for log files")
-    output_dir: str = Field(default="output", description="Directory for generated reports")
 
 
 class AppConfig(BaseModel):

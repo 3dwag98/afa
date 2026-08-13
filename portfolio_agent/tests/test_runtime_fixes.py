@@ -387,11 +387,11 @@ class TestGapAwareStopFills:
         def loader(ticker, start_date=None, end_date=None):
             return frames[ticker].copy() if ticker in frames else None
 
-        monkeypatch.setattr("src.backtest_engine.load_ticker_data", loader)
+        monkeypatch.setattr("portfolio_agent.src.backtest_engine.load_ticker_data", loader)
         return {"tickers": tickers, "frames": frames, "dates": dates}
 
     def _engine(self, tickers, **kwargs):
-        from src.backtest_engine import BacktestEngine
+        from portfolio_agent.src.backtest_engine import BacktestEngine
 
         params = dict(
             start_date="2023-01-02", end_date="2023-06-30",

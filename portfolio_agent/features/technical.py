@@ -423,3 +423,113 @@ def lower_circuit_locked_today(df: pd.DataFrame) -> pd.Series:
         Series of 0.0/1.0 flags (lagged by 1 period).
     """
     return lower_circuit_locked_days(df).astype(float).shift(1)
+
+
+# ---------------------------------------------------------------------------
+# ADX
+# ---------------------------------------------------------------------------
+#
+# Moved here from the deleted src/indicators.py, which held a second copy of
+# SMA, RSI, MACD, Bollinger and ATR alongside the ones above. That was not
+# merely duplication: the two families disagreed on the thing that matters
+# most. Everything in this module shifts its inputs by one bar so a feature
+# cannot read the session it is used to decide; the indicators.py copies did
+# not. Which implementation produced a published number therefore depended on
+# the call path, and nothing anywhere said so.
+#
+# ADX was the one function with no counterpart here, so it moves rather than
+# being deleted. It is kept as a plain parameterised function *and* exposed as
+# a registered feature, because its two callers want different things:
+#
+#   - src/regime.py passes a frame it has already truncated to the decision
+#     date, and calls with an explicit period. Shifting inside would lag it
+#     twice, so `calculate_adx` keeps its original semantics exactly.
+#   - the training pipeline needs the same lag discipline as every other
+#     registered feature, which `adx_14` supplies by shifting first.
+
+
+def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Wilder's Average Directional Index — trend *strength*, ignoring direction.
+
+    ADX is what separates a market grinding sideways from one trending, at the
+    same distance from its moving average. Below ~20 the directional movement
+    is not persistent enough to call a trend, which is precisely the state that
+    punishes momentum (whipsaw entries, no follow-through) and rewards mean
+    reversion.
+
+    The construction, per Wilder:
+
+        +DM = up_move   if up_move > down_move and up_move > 0   else 0
+        -DM = down_move if down_move > up_move and down_move > 0 else 0
+        +DI = 100 * smoothed(+DM) / ATR,   -DI = 100 * smoothed(-DM) / ATR
+        DX  = 100 * |+DI - -DI| / (+DI + -DI)
+        ADX = smoothed(DX)
+
+    where up_move = high_t - high_{t-1} and down_move = low_{t-1} - low_t.
+
+    **Close-only degradation.** When the frame carries no high/low — an index
+    series cached as closes alone — high and low both fall back to the close.
+    The formulas stay well defined: true range collapses to |close_t -
+    close_{t-1}|, and each day contributes its whole move to +DM or -DM
+    according to sign. The result is a genuine directional index computed on a
+    coarser measure of range, so it reads somewhat higher than the OHLC version
+    on the same market. It is a proxy, and callers that can supply high/low
+    should.
+
+    Args:
+        df: Frame with 'close', and ideally 'high' and 'low'.
+        period: Wilder smoothing period.
+
+    Returns:
+        Series of ADX values in [0, 100]; NaN until the smoothing warms up.
+    """
+    if 'close' not in df.columns or len(df) < 2:
+        return pd.Series(np.nan, index=df.index, dtype=float)
+
+    close = pd.to_numeric(df['close'], errors='coerce')
+    high = pd.to_numeric(df['high'], errors='coerce') if 'high' in df.columns else close
+    low = pd.to_numeric(df['low'], errors='coerce') if 'low' in df.columns else close
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    true_range = pd.concat(
+        [high - low, (high - close.shift()).abs(), (low - close.shift()).abs()],
+        axis=1,
+    ).max(axis=1)
+
+    # Wilder's smoothing is an EMA with alpha = 1/period.
+    def _smooth(series: pd.Series) -> pd.Series:
+        return series.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+
+    atr = _smooth(true_range)
+    # A dead-flat stretch has zero range and no directional information; NaN
+    # says "unmeasurable" where 0/0 would otherwise say "no trend, confidently".
+    atr = atr.replace(0.0, np.nan)
+
+    plus_di = 100.0 * _smooth(plus_dm) / atr
+    minus_di = 100.0 * _smooth(minus_dm) / atr
+
+    di_sum = (plus_di + minus_di).replace(0.0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / di_sum
+    return _smooth(dx)
+
+
+@register_feature('adx_14')
+def adx_14(df: pd.DataFrame) -> pd.Series:
+    """14-period ADX, lagged one bar like every other feature here.
+
+    The shift is what makes this safe to train on: without it the value at row
+    t is computed from row t's own high, low and close, which is information a
+    decision made at t does not have.
+
+    Args:
+        df: DataFrame with 'close', and ideally 'high' and 'low'.
+
+    Returns:
+        Series with ADX values in [0, 100], lagged by 1 period.
+    """
+    return calculate_adx(df.shift(1), period=14)

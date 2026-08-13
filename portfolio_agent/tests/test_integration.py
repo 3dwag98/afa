@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from src.orchestrator import run_orchestrator
+from portfolio_agent.src.orchestrator import run_orchestrator
 from portfolio_agent.config.schema import AppConfig
 
 

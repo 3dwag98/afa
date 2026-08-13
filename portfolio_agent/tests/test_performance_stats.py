@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.performance_stats import (
+from portfolio_agent.src.performance_stats import (
     TRADING_DAYS_PER_YEAR,
     Trial,
     deflated_sharpe_ratio,
@@ -373,14 +373,14 @@ class TestConfigHashAndDistinctTrials:
     """
 
     def test_hash_is_stable_across_calls(self):
-        from src.performance_stats import config_hash
+        from portfolio_agent.src.performance_stats import config_hash
 
         payload = {"b": 2, "a": {"nested": [1, 2, 3]}}
         assert config_hash(payload) == config_hash(payload)
 
     def test_hash_does_not_depend_on_key_order(self):
         """Two spellings of the same configuration are the same trial."""
-        from src.performance_stats import config_hash
+        from portfolio_agent.src.performance_stats import config_hash
 
         assert config_hash({"a": 1, "b": 2}) == config_hash({"b": 2, "a": 1})
 
@@ -395,12 +395,12 @@ class TestConfigHashAndDistinctTrials:
         import subprocess
         import sys
 
-        from src.performance_stats import config_hash
+        from portfolio_agent.src.performance_stats import config_hash
 
         expected = config_hash({"strategy": "rule_based", "stop": 2.5})
         program = (
             "import sys; sys.path.insert(0, 'portfolio_agent');"
-            "from src.performance_stats import config_hash;"
+            "from portfolio_agent.src.performance_stats import config_hash;"
             "print(config_hash({'strategy': 'rule_based', 'stop': 2.5}))"
         )
         out = subprocess.run(
@@ -417,7 +417,7 @@ class TestConfigHashAndDistinctTrials:
         hand-written parameter list. Under the old scheme those two runs
         recorded identical trials.
         """
-        from src.performance_stats import config_hash
+        from portfolio_agent.src.performance_stats import config_hash
 
         base = {"simulation": {"method": "gaussian", "use_empirical_drift_prior": True}}
         changed = {"simulation": {"method": "gaussian", "use_empirical_drift_prior": False}}
@@ -425,7 +425,7 @@ class TestConfigHashAndDistinctTrials:
         assert config_hash(base) != config_hash(changed)
 
     def test_trial_round_trips_its_config_hash(self, tmp_path):
-        from src.performance_stats import Trial, log_trial, read_trials
+        from portfolio_agent.src.performance_stats import Trial, log_trial, read_trials
 
         path = tmp_path / "trials.jsonl"
         log_trial(path, Trial(label="a", sharpe=0.5, config_hash="deadbeef"))
@@ -439,7 +439,7 @@ class TestConfigHashAndDistinctTrials:
         counting it twice inflates N and deflates the reported Sharpe against a
         search that never happened.
         """
-        from src.performance_stats import distinct_trials
+        from portfolio_agent.src.performance_stats import distinct_trials
 
         trials = [
             {"label": "a", "sharpe": 0.5, "config_hash": "aaa"},
@@ -457,7 +457,7 @@ class TestConfigHashAndDistinctTrials:
         which is the opposite of what the deflation is for. They fall back to
         their parameters dict, and entries with neither are kept as distinct.
         """
-        from src.performance_stats import distinct_trials
+        from portfolio_agent.src.performance_stats import distinct_trials
 
         trials = [
             {"label": "old", "sharpe": 0.4, "parameters": {"stop": 2.0}},
@@ -473,7 +473,7 @@ class TestConfigHashAndDistinctTrials:
         Five recordings of two configurations is a two-trial search, and has to
         deflate exactly as hard as two recordings of those same two.
         """
-        from src.performance_stats import (
+        from portfolio_agent.src.performance_stats import (
             Trial, distinct_trials, log_trial, read_trials, trial_sharpe_variance,
         )
 

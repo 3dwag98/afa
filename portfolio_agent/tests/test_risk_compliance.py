@@ -2,7 +2,7 @@
 
 import pytest
 from portfolio_agent.config.schema import AppConfig
-from src.risk import (
+from portfolio_agent.src.risk import (
     MAX_KELLY_FRACTION,
     calculate_quantity,
     calculate_stop_target,
@@ -13,7 +13,7 @@ from src.risk import (
     estimate_kelly_inputs,
     kelly_allocation_fraction,
 )
-from src.compliance import run_compliance_checks, estimate_capital_gains_tax
+from portfolio_agent.src.compliance import run_compliance_checks, estimate_capital_gains_tax
 
 
 def _make_config(
@@ -829,7 +829,7 @@ class TestNetRealizedReturn:
     flip marginal winners into losers."""
 
     def test_costs_are_charged_to_both_legs(self):
-        from src.risk import net_realized_return_pct
+        from portfolio_agent.src.risk import net_realized_return_pct
 
         gross = net_realized_return_pct(100.0, 110.0, buy_cost_pct=0.0, sell_cost_pct=0.0)
         net = net_realized_return_pct(100.0, 110.0, buy_cost_pct=0.004, sell_cost_pct=0.004)
@@ -840,14 +840,14 @@ class TestNetRealizedReturn:
         assert net < gross
 
     def test_an_unusable_entry_price_returns_zero(self):
-        from src.risk import net_realized_return_pct
+        from portfolio_agent.src.risk import net_realized_return_pct
 
         assert net_realized_return_pct(0.0, 110.0, 0.004, 0.004) == 0.0
 
     def test_a_marginal_gross_win_is_reclassified_as_a_net_loss(self):
         """The bias that matters: counting this as a WIN adds a phantom win to
         p *and* drags the average win magnitude down, inflating f* twice."""
-        from src.risk import to_net_realized_trades
+        from portfolio_agent.src.risk import to_net_realized_trades
 
         restated = to_net_realized_trades(
             [{"entry_price": 100.0, "exit_price": 100.3, "outcome": "WIN", "return_pct": 0.3}],
@@ -859,7 +859,7 @@ class TestNetRealizedReturn:
         assert restated[0]["return_pct"] < 0
 
     def test_other_keys_survive_the_restatement(self):
-        from src.risk import to_net_realized_trades
+        from portfolio_agent.src.risk import to_net_realized_trades
 
         restated = to_net_realized_trades(
             [{"entry_price": 100.0, "exit_price": 120.0, "signal_trigger": "Trend",
@@ -872,7 +872,7 @@ class TestNetRealizedReturn:
         assert restated[0]["outcome"] == "WIN"
 
     def test_open_and_unpriced_trades_are_dropped_not_guessed_at(self):
-        from src.risk import to_net_realized_trades
+        from portfolio_agent.src.risk import to_net_realized_trades
 
         restated = to_net_realized_trades(
             [
@@ -888,7 +888,7 @@ class TestNetRealizedReturn:
     def test_kelly_sizes_smaller_off_net_history_than_gross(self):
         """The DoD for the calibration task: identical trades, costed, produce
         a smaller position."""
-        from src.risk import calculate_kelly_quantity, estimate_kelly_inputs, to_net_realized_trades
+        from portfolio_agent.src.risk import calculate_kelly_quantity, estimate_kelly_inputs, to_net_realized_trades
 
         gross_history = [
             {

@@ -4,7 +4,7 @@ import math
 
 import pytest
 import numpy as np
-from src.monte_carlo import run_monte_carlo, MonteCarloResult
+from portfolio_agent.src.monte_carlo import run_monte_carlo, MonteCarloResult
 
 
 class TestMonteCarlo:
@@ -262,7 +262,7 @@ class TestSimulationMethods:
         """Contiguous blocks must travel together: a series of strictly
         alternating returns resampled in blocks keeps alternating, while
         independent draws would not."""
-        from src.monte_carlo import _block_bootstrap_shocks
+        from portfolio_agent.src.monte_carlo import _block_bootstrap_shocks
 
         source = np.array([0.01, -0.01] * 50)
         rng = np.random.default_rng(3)
@@ -289,7 +289,7 @@ class TestMonteCarloSettings:
 
     def test_from_simulation_config_round_trips_every_option(self):
         from portfolio_agent.config.schema import AppConfig
-        from src.monte_carlo import MonteCarloSettings
+        from portfolio_agent.src.monte_carlo import MonteCarloSettings
 
         config = AppConfig()
         settings = MonteCarloSettings.from_simulation_config(config.simulation)
@@ -302,7 +302,7 @@ class TestMonteCarloSettings:
         assert settings.jump_mean == config.simulation.jump_mean
 
     def test_run_dispatches_to_the_configured_method(self):
-        from src.monte_carlo import MonteCarloSettings
+        from portfolio_agent.src.monte_carlo import MonteCarloSettings
 
         returns = list(np.random.default_rng(5).normal(0.0005, 0.012, 400))
         settings = MonteCarloSettings(
@@ -316,7 +316,7 @@ class TestMonteCarloSettings:
 
     def test_settings_are_picklable_for_worker_dispatch(self):
         import pickle
-        from src.monte_carlo import MonteCarloSettings
+        from portfolio_agent.src.monte_carlo import MonteCarloSettings
 
         settings = MonteCarloSettings(method="jump_diffusion", seed=7)
 
@@ -336,7 +336,7 @@ class TestStudentTInnovations:
         """Student-t variance is nu/(nu-2); without dividing it out, switching
         to t-innovations would inflate volatility as well as widening tails,
         and the two effects would be indistinguishable."""
-        from src.monte_carlo import _standardized_shocks
+        from portfolio_agent.src.monte_carlo import _standardized_shocks
 
         rng = np.random.default_rng(0)
         for df in (3.0, 5.0, 30.0):
@@ -344,7 +344,7 @@ class TestStudentTInnovations:
             assert shocks.std() == pytest.approx(1.0, abs=0.05)
 
     def test_lower_degrees_of_freedom_means_fatter_tails(self):
-        from src.monte_carlo import _standardized_shocks
+        from portfolio_agent.src.monte_carlo import _standardized_shocks
 
         rng = np.random.default_rng(1)
         fat = _standardized_shocks(rng, (200_000,), 3.0)
@@ -356,7 +356,7 @@ class TestStudentTInnovations:
         assert _kurtosis(fat) > _kurtosis(thin)
 
     def test_none_degrees_of_freedom_draws_gaussian(self):
-        from src.monte_carlo import _standardized_shocks
+        from portfolio_agent.src.monte_carlo import _standardized_shocks
 
         rng = np.random.default_rng(2)
         shocks = _standardized_shocks(rng, (200_000,), None)
@@ -366,7 +366,7 @@ class TestStudentTInnovations:
 
     def test_degenerate_degrees_of_freedom_falls_back_to_gaussian(self):
         """Below nu = 2 the variance is infinite, so the draw is unusable."""
-        from src.monte_carlo import _standardized_shocks
+        from portfolio_agent.src.monte_carlo import _standardized_shocks
 
         rng = np.random.default_rng(3)
         shocks = _standardized_shocks(rng, (50_000,), 1.5)
@@ -387,8 +387,8 @@ class TestStudentTInnovations:
     def test_garch_wrapper_passes_its_fitted_nu_to_the_simulation(self, monkeypatch):
         """The regression: the fit produced nu, the dataclass dropped it, and
         the simulation drew normals regardless."""
-        from src.volatility_models import GarchForecast
-        import src.monte_carlo as mc
+        from portfolio_agent.src.volatility_models import GarchForecast
+        import portfolio_agent.src.monte_carlo as mc
 
         seen = {}
         real_run = mc.run_monte_carlo
@@ -399,7 +399,7 @@ class TestStudentTInnovations:
 
         monkeypatch.setattr(mc, "run_monte_carlo", spy)
         monkeypatch.setattr(
-            "src.volatility_models.forecast_volatility",
+            "portfolio_agent.src.volatility_models.forecast_volatility",
             lambda returns, horizon: GarchForecast(
                 daily_sigma=np.full(5, 0.02), leverage_gamma=0.1,
                 persistence=0.9, distribution_df=4.2,
@@ -418,7 +418,7 @@ class TestDriftShrinkage:
     as estimated rather than known (src/monte_carlo.py::shrink_drift)."""
 
     def test_posterior_sits_between_the_sample_mean_and_the_prior(self):
-        from src.monte_carlo import shrink_drift
+        from portfolio_agent.src.monte_carlo import shrink_drift
 
         sample_mu = 0.001  # 0.1%/day, a very large drift for a daily series
         posterior, sd = shrink_drift(sample_mu, sample_sigma=0.02, n_observations=1250)
@@ -429,7 +429,7 @@ class TestDriftShrinkage:
     def test_shrinks_harder_when_the_estimate_is_noisier(self):
         """Weight on the sample mean is tau^2 / (tau^2 + sigma^2/T): more
         history, or a quieter series, earns more credibility."""
-        from src.monte_carlo import shrink_drift
+        from portfolio_agent.src.monte_carlo import shrink_drift
 
         short, _ = shrink_drift(0.001, sample_sigma=0.02, n_observations=250)
         long, _ = shrink_drift(0.001, sample_sigma=0.02, n_observations=2500)
@@ -440,7 +440,7 @@ class TestDriftShrinkage:
         assert noisy < quiet
 
     def test_zero_prior_dispersion_credits_no_drift_edge(self):
-        from src.monte_carlo import shrink_drift
+        from portfolio_agent.src.monte_carlo import shrink_drift
 
         posterior, sd = shrink_drift(
             0.001, sample_sigma=0.02, n_observations=1250, prior_annual_drift_std=0.0
@@ -451,7 +451,7 @@ class TestDriftShrinkage:
     def test_a_wide_prior_recovers_the_raw_sample_mean(self):
         """The old plug-in behaviour has to remain reachable, so the change is
         a defensible default rather than an unremovable opinion."""
-        from src.monte_carlo import shrink_drift
+        from portfolio_agent.src.monte_carlo import shrink_drift
 
         posterior, _ = shrink_drift(
             0.001, sample_sigma=0.02, n_observations=1250, prior_annual_drift_std=1e9
@@ -521,7 +521,7 @@ class TestDriftShrinkage:
         )
 
     def test_settings_carry_the_drift_prior_through_to_the_simulation(self):
-        from src.monte_carlo import MonteCarloSettings
+        from portfolio_agent.src.monte_carlo import MonteCarloSettings
 
         returns = list(np.random.default_rng(5).normal(0.002, 0.02, size=1500))
         # Guard the premise: shrinking toward zero only lowers the probability
@@ -580,7 +580,7 @@ class TestCrossSectionalDriftPrior:
         shrinkage intensity measures. The clamp itself is pinned separately in
         test_negative_moment_difference_is_floored_at_zero.
         """
-        from src.monte_carlo import (
+        from portfolio_agent.src.monte_carlo import (
             drift_observation_from_returns,
             estimate_cross_sectional_drift_prior,
         )
@@ -606,7 +606,7 @@ class TestCrossSectionalDriftPrior:
         negative: identical sample means give Var(mu_hat) = 0 against a
         strictly positive noise floor.
         """
-        from src.monte_carlo import (
+        from portfolio_agent.src.monte_carlo import (
             DriftObservation,
             estimate_cross_sectional_drift_prior,
         )
@@ -632,7 +632,7 @@ class TestCrossSectionalDriftPrior:
         error, so the observed cross-sectional variance is about 3x the noise
         floor and the difference is real rather than sampling slack.
         """
-        from src.monte_carlo import (
+        from portfolio_agent.src.monte_carlo import (
             drift_observation_from_returns,
             estimate_cross_sectional_drift_prior,
         )
@@ -659,7 +659,7 @@ class TestCrossSectionalDriftPrior:
         common level: shrinking it to zero would throw away the one thing the
         cross-section actually evidences.
         """
-        from src.monte_carlo import (
+        from portfolio_agent.src.monte_carlo import (
             drift_observation_from_returns,
             estimate_cross_sectional_drift_prior,
             shrink_drift,
@@ -688,7 +688,7 @@ class TestCrossSectionalDriftPrior:
         assert posterior > 0.0
 
     def test_estimator_is_deterministic(self):
-        from src.monte_carlo import (
+        from portfolio_agent.src.monte_carlo import (
             drift_observation_from_returns,
             estimate_cross_sectional_drift_prior,
         )
@@ -702,7 +702,7 @@ class TestCrossSectionalDriftPrior:
         assert first == second
 
     def test_insufficient_cross_section_returns_none(self):
-        from src.monte_carlo import (
+        from portfolio_agent.src.monte_carlo import (
             drift_observation_from_returns,
             estimate_cross_sectional_drift_prior,
         )
@@ -741,7 +741,7 @@ class TestCrossSectionalDriftPrior:
         panel, and would equally have found dispersion had there been any (see
         test_method_of_moments_recovers_a_genuine_drift_spread).
         """
-        from src.monte_carlo import (
+        from portfolio_agent.src.monte_carlo import (
             drift_observation_from_returns,
             estimate_cross_sectional_drift_prior,
         )

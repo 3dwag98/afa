@@ -25,34 +25,19 @@ from portfolio_agent.strategies.types import RiskParams, StrategyContext, Strate
 from portfolio_agent.strategies.weighting import evaluate_and_learn
 
 # Import from src module
-try:
-    from .data_store import load_ticker_data
-    from .liquidity import lower_circuit_locked_days
-    from .models import AgentBrain
-    from .regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
-    from .execution_sim import ExecutionSimulator
-    from .monte_carlo import CrossSectionalDriftPrior, MonteCarloSettings
-    from .portfolio import (
-        ledoit_wolf_covariance, portfolio_volatility, summarize_book_risk,
-    )
-    from .risk import MAX_KELLY_FRACTION, calculate_kelly_quantity, estimate_kelly_inputs
-    from .sectors import (
-        load_sector_map, sector_cap_is_enforceable, sector_capacity_inr, sector_of,
-    )
-except ImportError:
-    from data_store import load_ticker_data
-    from liquidity import lower_circuit_locked_days
-    from models import AgentBrain
-    from regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
-    from execution_sim import ExecutionSimulator
-    from monte_carlo import CrossSectionalDriftPrior, MonteCarloSettings
-    from portfolio import (
-        ledoit_wolf_covariance, portfolio_volatility, summarize_book_risk,
-    )
-    from risk import MAX_KELLY_FRACTION, calculate_kelly_quantity, estimate_kelly_inputs
-    from sectors import (
-        load_sector_map, sector_cap_is_enforceable, sector_capacity_inr, sector_of,
-    )
+from .data_store import load_ticker_data
+from .liquidity import lower_circuit_locked_days
+from .models import AgentBrain
+from .regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
+from .execution_sim import ExecutionSimulator
+from .monte_carlo import CrossSectionalDriftPrior, MonteCarloSettings
+from .portfolio import (
+    ledoit_wolf_covariance, portfolio_volatility, summarize_book_risk,
+)
+from .risk import MAX_KELLY_FRACTION, calculate_kelly_quantity, estimate_kelly_inputs
+from .sectors import (
+    load_sector_map, sector_cap_is_enforceable, sector_capacity_inr, sector_of,
+)
 
 
 logger = logging.getLogger(__name__)

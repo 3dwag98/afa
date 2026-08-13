@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.portfolio import (
+from portfolio_agent.src.portfolio import (
     AllocationResult,
     correlation_risk_multiple,
     diversification_ratio,
@@ -508,7 +508,7 @@ class TestShrunkEwmaCovariance:
         )
 
     def test_result_is_positive_semi_definite(self):
-        from src.portfolio import shrunk_ewma_covariance
+        from portfolio_agent.src.portfolio import shrunk_ewma_covariance
 
         returns = self._wide_panel()
         cov, _ = shrunk_ewma_covariance(returns)
@@ -521,7 +521,7 @@ class TestShrunkEwmaCovariance:
     def test_result_is_strictly_positive_definite_where_the_sample_is_singular(self):
         """N > T makes the sample covariance rank-deficient, so it has exact
         zero eigenvalues and no inverse. Shrinkage is what buys invertibility."""
-        from src.portfolio import shrunk_ewma_covariance
+        from portfolio_agent.src.portfolio import shrunk_ewma_covariance
 
         returns = self._wide_panel(n_assets=60, n_periods=40)
         raw = np.asarray(sample_covariance(returns))
@@ -540,7 +540,7 @@ class TestShrunkEwmaCovariance:
         small enough that optimizer weights are a function of the data rather
         than of the noise in the smallest eigenvalue.
         """
-        from src.portfolio import shrunk_ewma_covariance
+        from portfolio_agent.src.portfolio import shrunk_ewma_covariance
 
         returns = self._wide_panel()
         raw_condition = np.linalg.cond(np.asarray(sample_covariance(returns)))
@@ -559,7 +559,7 @@ class TestShrunkEwmaCovariance:
         otherwise this silently changes every number the platform already
         reports.
         """
-        from src.portfolio import shrunk_ewma_covariance
+        from portfolio_agent.src.portfolio import shrunk_ewma_covariance
 
         returns = self._wide_panel(n_assets=12, n_periods=250)
         composed, composed_intensity = shrunk_ewma_covariance(
@@ -579,7 +579,7 @@ class TestShrunkEwmaCovariance:
         must be estimated as correlated *now*. An equally-weighted window
         averages the two regimes and is wrong about both.
         """
-        from src.portfolio import shrunk_ewma_covariance
+        from portfolio_agent.src.portfolio import shrunk_ewma_covariance
 
         # Three half-lives of shock, so it carries 1 - 2^-3 = 87.5% of the
         # weight. The threshold below follows from that rather than being
@@ -601,7 +601,7 @@ class TestShrunkEwmaCovariance:
         assert correlation(recent) > 0.8
 
     def test_preserves_asset_labels(self):
-        from src.portfolio import shrunk_ewma_covariance
+        from portfolio_agent.src.portfolio import shrunk_ewma_covariance
 
         returns = self._wide_panel(n_assets=5, n_periods=80)
         cov, _ = shrunk_ewma_covariance(returns)
@@ -611,7 +611,7 @@ class TestShrunkEwmaCovariance:
         assert list(cov.index) == list(returns.columns)
 
     def test_is_deterministic(self):
-        from src.portfolio import shrunk_ewma_covariance
+        from portfolio_agent.src.portfolio import shrunk_ewma_covariance
 
         returns = self._wide_panel()
         first, first_intensity = shrunk_ewma_covariance(returns)

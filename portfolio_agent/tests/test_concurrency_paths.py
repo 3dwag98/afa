@@ -17,8 +17,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 import data_store as data_store_module
 from data_store import DataStore
 from portfolio_agent.config.schema import AppConfig
-from src.monte_carlo import MonteCarloSettings
-from src.orchestrator import _prepare_all_tickers, _prepare_one_ticker
+from portfolio_agent.src.monte_carlo import MonteCarloSettings
+from portfolio_agent.src.orchestrator import _prepare_all_tickers, _prepare_one_ticker
 
 
 @pytest.fixture

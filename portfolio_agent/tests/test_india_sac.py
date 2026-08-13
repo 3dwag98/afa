@@ -121,7 +121,7 @@ class TestUnitsAreNotConfused:
         assert "prob=n/a" in signal.rationale
 
     def test_the_monte_carlo_supplies_the_probability_when_present(self, tmp_path):
-        from src.monte_carlo import MonteCarloResult
+        from portfolio_agent.src.monte_carlo import MonteCarloResult
 
         _train_a_checkpoint(tmp_path, bias=2.0)
         strategy = IndiaSACStrategy(_config(models_dir=str(tmp_path)))

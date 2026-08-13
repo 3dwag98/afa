@@ -6,7 +6,7 @@ import math
 import numpy as np
 import pytest
 
-from src.markov_regime import (
+from portfolio_agent.src.markov_regime import (
     GaussianHMM,
     assess_markov_regime,
     current_regime_state,

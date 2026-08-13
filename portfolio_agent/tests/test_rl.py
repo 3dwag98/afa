@@ -7,7 +7,7 @@ is actually given" test. Everything else is scaffolding.
 import numpy as np
 import pytest
 
-from src.rl import (
+from portfolio_agent.src.rl import (
     DEFAULT_EXPOSURE_LEVELS,
     EnvironmentConfig,
     ExposureEnvironment,

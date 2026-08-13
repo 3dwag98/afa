@@ -4,9 +4,9 @@ import pytest
 from datetime import datetime
 from typing import Dict, Any
 
-from src.models import AgentBrain
+from portfolio_agent.src.models import AgentBrain
 from portfolio_agent.config.schema import AppConfig
-from src.learning import evaluate_and_learn
+from portfolio_agent.src.learning import evaluate_and_learn
 
 
 def make_config(

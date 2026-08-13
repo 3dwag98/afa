@@ -37,10 +37,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-try:
-    from .portfolio import AllocationResult, portfolio_volatility
-except ImportError:  # running from inside src/ as a flat package
-    from portfolio import AllocationResult, portfolio_volatility
+from .portfolio import AllocationResult, portfolio_volatility
 
 # Bucket for tickers absent from the sector map. They get a row of their own
 # rather than being exempted: an unmapped name that escapes every group limit

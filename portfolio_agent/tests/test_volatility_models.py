@@ -8,13 +8,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 import numpy as np
 import pytest
 
-from src.volatility_models import (
+from portfolio_agent.src.volatility_models import (
     forecast_volatility,
     forecast_volatility_gap_aware,
     GarchForecast,
     MIN_OBSERVATIONS,
 )
-from src.monte_carlo import run_monte_carlo, run_monte_carlo_garch, MonteCarloResult
+from portfolio_agent.src.monte_carlo import run_monte_carlo, run_monte_carlo_garch, MonteCarloResult
 
 
 try:  # the gap-aware tests need a real GJR-GARCH fit

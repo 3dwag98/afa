@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.backtest_engine import BacktestEngine
+from portfolio_agent.src.backtest_engine import BacktestEngine
 
 
 @pytest.fixture
@@ -33,7 +33,7 @@ def synthetic_data(monkeypatch):
     def mock_load_ticker_data(ticker, start_date=None, end_date=None):
         return data_dict[ticker].copy() if ticker in data_dict else None
 
-    monkeypatch.setattr("src.backtest_engine.load_ticker_data", mock_load_ticker_data)
+    monkeypatch.setattr("portfolio_agent.src.backtest_engine.load_ticker_data", mock_load_ticker_data)
     return list(data_dict)
 
 
@@ -54,7 +54,7 @@ class TestProgressBars:
         appears after loading finishes leaves the longest silence uncovered."""
         created = []
 
-        import src.backtest_engine as engine_module
+        import portfolio_agent.src.backtest_engine as engine_module
         real_tqdm = engine_module.tqdm
 
         def spy_tqdm(iterable, **kwargs):
@@ -105,7 +105,7 @@ class TestProgressBars:
         monkeypatch.setattr(engine, "_execute_pending_orders", boom)
 
         closed = []
-        import src.backtest_engine as engine_module
+        import portfolio_agent.src.backtest_engine as engine_module
         real_tqdm = engine_module.tqdm
 
         def tracking_tqdm(iterable, **kwargs):

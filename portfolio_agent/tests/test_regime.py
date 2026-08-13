@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.regime import (
+from portfolio_agent.src.regime import (
     BEAR_CRASH_RISK,
     BULL_RISK_ON,
     DEFAULT_TREND_WINDOW,

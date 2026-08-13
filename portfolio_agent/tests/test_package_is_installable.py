@@ -76,7 +76,7 @@ def first_attempt_flat_imports(path: pathlib.Path) -> list[tuple[int, str]]:
 def test_no_module_imports_internals_flatly_as_its_first_attempt(path):
     """`A1`: this is what makes an installed copy fail to load any strategy.
 
-    `strategies/rule_based.py` tried `from src.risk`, then `from risk`, and
+    `strategies/rule_based.py` tried `from portfolio_agent.src.risk`, then `from risk`, and
     never `from portfolio_agent.src.risk` — which works. Since
     `strategies/__init__.py` imports the registry eagerly, that one chain took
     down the registry, the backtester and the engine together.

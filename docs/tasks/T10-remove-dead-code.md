@@ -1,6 +1,6 @@
 # T10 — Remove dead, duplicated and misleading code
 
-**Status:** not started · **Effort:** ~1 day · **Depends on:** T07 (import fixes) for the symlink removal
+**Status:** done · **Effort:** ~1 day · **Depends on:** T07 (import fixes) for the symlink removal
 **Plan reference:** `docs/forecasting_plan.html` Part 5 (delete)
 
 ## Goal
@@ -36,14 +36,48 @@ them means rebuilding them in three weeks.
 
 ## Acceptance criteria
 
-- [ ] No `.pyc` or `__pycache__` tracked.
-- [ ] `src/indicators.py` gone, ADX available from the feature registry, tests
+- [x] No `.pyc` or `__pycache__` tracked.
+- [x] `src/indicators.py` gone, ADX available from the feature registry, tests
       migrated.
-- [ ] Synthetic data requires an explicit opt-in; a missing-data run fails
-      loudly.
-- [ ] Data and checkpoints untracked, with a documented way to obtain them.
-- [ ] The five unread settings removed from schema and YAML.
-- [ ] Full test suite still passes.
+- [x] Synthetic data requires an explicit opt-in; a missing-data run raises.
+- [x] Data and checkpoints untracked, documented in `docs/OBTAINING_DATA.md`.
+- [x] The five unread settings removed from schema and YAML.
+- [x] Full test suite still passes — 1328 passed, 1 skipped.
+
+## What the duplicate module actually was
+
+Worse than the spec's framing. `features/technical.py` shifts every input by
+one bar so a feature cannot read the session it is used to decide.
+`src/indicators.py` did not. So `calculate_rsi` and `rsi_14` were not two
+spellings of one calculation — one was lag-safe and one read today's close, and
+which produced a published number depended on which module the caller imported.
+
+The migration keeps both behaviours where each is correct:
+
+- `calculate_adx` moved verbatim into `features/technical.py`. `regime.py`
+  passes a frame already truncated to the decision date, so shifting inside
+  would lag it twice.
+- `adx_14` is registered beside it as the lag-safe wrapper, for training.
+- `calculate_indicators` / `calculate_all_indicators` moved into
+  `orchestrator.py`, their only caller. They are deliberately unshifted — a
+  live snapshot describes the state as of the latest bar — and under the T11
+  freeze they keep that behaviour exactly. Having both conventions importable
+  under one module name was the hazard; having them in the two modules whose
+  jobs differ is not.
+
+## Also removed
+
+Six flat-import fallbacks (`try: from .x / except ImportError: from x`) and the
+`src` symlink, with 34 files rewritten from `src.` to `portfolio_agent.src.`.
+The fallbacks existed to let a module run as a loose script from inside its own
+directory; the cost of that convenience was a package that could not be
+installed, and two module objects with separate state for one file.
+
+## Not done, and named rather than implied
+
+The ~80 MB already in the pack is still there. Untracking stops the growth; it
+does not reclaim history. That needs a rewrite which invalidates every clone
+and open branch — a separate decision, noted in `docs/OBTAINING_DATA.md`.
 
 ## Risk
 

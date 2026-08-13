@@ -17,8 +17,8 @@ import pandas as pd
 import pytest
 
 # Import modules under test
-from src.universe import UniverseManager
-from src.data_store import DataStore
+from portfolio_agent.src.universe import UniverseManager
+from portfolio_agent.src.data_store import DataStore
 
 
 class TestUniverseManager:
@@ -83,7 +83,7 @@ class TestUniverseManager:
         assert len(loaded) == 3
         assert "RELIANCE.NS" in loaded
     
-    @patch('src.universe.requests.get')
+    @patch('portfolio_agent.src.universe.requests.get')
     def test_fetch_from_url_success(self, mock_get):
         """Test fetching ticker list from URL."""
         mock_response = MagicMock()
@@ -97,7 +97,7 @@ class TestUniverseManager:
         assert len(tickers) == 3
         assert "RELIANCE.NS" in tickers
     
-    @patch('src.universe.requests.get')
+    @patch('portfolio_agent.src.universe.requests.get')
     def test_fetch_from_url_failure(self, mock_get):
         """Test URL fetch failure handling."""
         mock_get.side_effect = Exception("Network error")
@@ -285,7 +285,7 @@ class TestDataStore:
         results = self.store._fetch_chunk(["RELIANCE.NS"], "2024-01-01", "2024-01-02")
         assert results.get("RELIANCE.NS") is None
     
-    @patch('src.data_store.time.sleep')
+    @patch('portfolio_agent.src.data_store.time.sleep')
     @patch('yfinance.download')
     def test_fetch_chunk_retry_logic(self, mock_download, mock_sleep):
         """Test retry logic with exponential backoff."""

@@ -297,10 +297,11 @@ def _benchmark_adx(
     close-only proxy. Returns None when ADX cannot be computed at all, which
     disables the chop test rather than guessing at it.
     """
-    try:
-        from .indicators import calculate_adx
-    except ImportError:  # pragma: no cover - direct-module execution fallback
-        from indicators import calculate_adx
+    # Moved out of src/indicators.py, which held a second, unshifted copy of
+    # half this module's neighbours. `calculate_adx` keeps its exact original
+    # semantics — the frame here is already truncated to the decision date, so
+    # the lag-safe `adx_14` wrapper beside it would lag this twice.
+    from portfolio_agent.features.technical import calculate_adx
 
     frame = market_ohlcv
     if frame is None or "close" not in getattr(frame, "columns", []):

@@ -7,6 +7,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 
 from portfolio_agent.config.schema import AppConfig
@@ -16,48 +17,30 @@ from portfolio_agent.strategies.registry import load_strategy
 from portfolio_agent.strategies.types import RiskParams, StrategyContext, StrategySignal
 
 # Use absolute imports for CLI execution
-try:
-    from .storage import (
-        init_db, save_recommendations,
-        save_trade_outcome, log_run, get_trade_history,
-        load_brain, save_brain
-    )
-    from .data_store import load_or_fetch_data, load_ticker_data
-    from .indicators import calculate_indicators
-    from .monte_carlo import MonteCarloResult, MonteCarloSettings
-    from .risk import calculate_position_quantity, to_net_realized_trades
-    from .execution_sim import cost_fraction_per_side
-    from .compliance import run_compliance_checks
-    from .learning import evaluate_and_learn
-    from .regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
-    from .reporting import export_excel_report
-    from .models import Recommendation
-    from .outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
-    from .sectors import (
-        load_sector_map, sector_cap_is_enforceable, sector_capacity_inr, sector_of,
-    )
-    from .logging_utils import get_logger, ContextualLogger
-except ImportError:
-    from storage import (
-        init_db, save_recommendations,
-        save_trade_outcome, log_run, get_trade_history,
-        load_brain, save_brain
-    )
-    from data_store import load_or_fetch_data, load_ticker_data
-    from indicators import calculate_indicators
-    from monte_carlo import MonteCarloResult, MonteCarloSettings
-    from risk import calculate_position_quantity, to_net_realized_trades
-    from execution_sim import cost_fraction_per_side
-    from compliance import run_compliance_checks
-    from learning import evaluate_and_learn
-    from regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
-    from reporting import export_excel_report
-    from models import Recommendation
-    from outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
-    from sectors import (
-        load_sector_map, sector_cap_is_enforceable, sector_capacity_inr, sector_of,
-    )
-    from logging_utils import get_logger, ContextualLogger
+from .storage import (
+    init_db, save_recommendations,
+    save_trade_outcome, log_run, get_trade_history,
+    load_brain, save_brain
+)
+from .data_store import load_or_fetch_data, load_ticker_data
+from .monte_carlo import MonteCarloResult, MonteCarloSettings
+from .risk import calculate_position_quantity, to_net_realized_trades
+from .execution_sim import cost_fraction_per_side
+from .compliance import run_compliance_checks
+from .learning import evaluate_and_learn
+from .regime import DEFAULT_TREND_WINDOW, assess_market_regime, build_market_proxy
+from .reporting import export_excel_report
+from .models import IndicatorSnapshot, Recommendation
+from .outcomes import simulate_outcome as simulate_outcome_fn, update_outcomes_from_market
+from .sectors import (
+    load_sector_map, sector_cap_is_enforceable, sector_capacity_inr, sector_of,
+)
+from .logging_utils import get_logger, ContextualLogger
+
+# A plain module logger alongside the contextual one. The indicator-snapshot
+# helpers moved in from the deleted src/indicators.py log per-ticker skips, and
+# they run before any run_id exists to give a ContextualLogger.
+logger = logging.getLogger(__name__)
 
 
 def _setup_logging(log_file: str, run_id: str) -> ContextualLogger:
@@ -635,3 +618,141 @@ def run_orchestrator(
             recommendations_count=0
         )
         raise
+
+
+# ---------------------------------------------------------------------------
+# Indicator snapshots
+# ---------------------------------------------------------------------------
+#
+# Moved here from the deleted src/indicators.py. This orchestrator is the only
+# caller, and under the freeze (T11) the live path keeps its behaviour exactly
+# — so the code travels with it rather than being rewritten against
+# features/technical.py.
+#
+# Note these are deliberately *unshifted*, unlike everything in
+# features/technical.py. That is correct here and only here: a live snapshot
+# describes the state as of the latest bar, and the orchestrator is deciding
+# what to do given today's close. The registered features shift because they
+# are trained on, where reading today's bar to predict today's move is the
+# whole failure mode. Two different jobs, two different conventions — which is
+# exactly why having both under one importable name was a hazard.
+
+
+def calculate_indicators(symbol: str, df: pd.DataFrame) -> IndicatorSnapshot:
+    """Calculate technical indicators for a ticker DataFrame.
+
+    Args:
+        symbol: Ticker symbol.
+        df: DataFrame with columns: open, high, low, close, volume.
+
+    Returns:
+        IndicatorSnapshot with latest indicator values.
+    """
+    # Work on a copy to avoid mutating input
+    df = df.copy()
+    
+    # Calculate SMA20, SMA50, SMA200
+    sma20_series = df['close'].rolling(window=20).mean()
+    sma50_series = df['close'].rolling(window=50).mean()
+    sma200_series = df['close'].rolling(window=200).mean()
+    
+    # Calculate Donchian Upper 20 (20-day rolling max of high)
+    donchian_upper_20_series = df['high'].rolling(window=20).max()
+    prev_donchian_upper_20_series = donchian_upper_20_series.shift(1)
+    
+    # Calculate Avg Volume 20
+    avg_volume_20_series = df['volume'].rolling(window=20).mean()
+    
+    # Calculate Volume Ratio = latest volume / avg volume 20
+    volume_ratio_series = df['volume'] / avg_volume_20_series
+    
+    # Calculate ATR14
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr14_series = true_range.rolling(window=14).mean()
+    
+    # Calculate daily log returns = ln(close / previous_close)
+    log_returns = np.log(df['close'] / df['close'].shift(1))
+    
+    # Get latest row values
+    latest_idx = len(df) - 1
+    
+    # Extract values, handling None cases
+    sma20 = float(sma20_series.iloc[latest_idx]) if not pd.isna(sma20_series.iloc[latest_idx]) else None
+    sma50 = float(sma50_series.iloc[latest_idx]) if not pd.isna(sma50_series.iloc[latest_idx]) else None
+    sma200_val = sma200_series.iloc[latest_idx]
+    sma200 = float(sma200_val) if not pd.isna(sma200_val) else None
+    
+    donchian_upper_20_val = donchian_upper_20_series.iloc[latest_idx]
+    donchian_upper_20 = float(donchian_upper_20_val) if not pd.isna(donchian_upper_20_val) else None
+    
+    prev_donchian_upper_20_val = prev_donchian_upper_20_series.iloc[latest_idx]
+    prev_donchian_upper_20 = float(prev_donchian_upper_20_val) if not pd.isna(prev_donchian_upper_20_val) else None
+    
+    avg_volume_20_val = avg_volume_20_series.iloc[latest_idx]
+    avg_volume_20 = float(avg_volume_20_val) if not pd.isna(avg_volume_20_val) else None
+    
+    # Volume ratio: None if volume missing or zero
+    latest_volume = df['volume'].iloc[latest_idx]
+    if pd.isna(latest_volume) or latest_volume == 0:
+        volume_ratio = None
+    else:
+        volume_ratio_val = volume_ratio_series.iloc[latest_idx]
+        volume_ratio = float(volume_ratio_val) if not pd.isna(volume_ratio_val) else None
+    
+    # ATR14: None if cannot be computed
+    atr14_val = atr14_series.iloc[latest_idx]
+    atr14 = float(atr14_val) if not pd.isna(atr14_val) else None
+    
+    # Daily log return
+    log_return_val = log_returns.iloc[latest_idx]
+    daily_log_return = float(log_return_val) if not pd.isna(log_return_val) else None
+    
+    return IndicatorSnapshot(
+        symbol=symbol,
+        sma20=sma20,
+        sma50=sma50,
+        sma200=sma200,
+        donchian_upper_20=donchian_upper_20,
+        prev_donchian_upper_20=prev_donchian_upper_20,
+        avg_volume_20=avg_volume_20,
+        volume_ratio=volume_ratio,
+        atr14=atr14,
+        daily_log_return=daily_log_return
+    )
+
+
+def calculate_all_indicators(data: Dict[str, pd.DataFrame]) -> List[IndicatorSnapshot]:
+    """Calculate indicators for all tickers in the data dictionary.
+
+    Args:
+        data: Dictionary mapping ticker symbols to DataFrames.
+
+    Returns:
+        List of IndicatorSnapshot objects.
+    """
+    results = []
+    
+    for symbol, df in data.items():
+        try:
+            # Validate required columns
+            required_columns = {'open', 'high', 'low', 'close', 'volume'}
+            if not required_columns.issubset(set(df.columns)):
+                logger.warning(f"Skipping ticker {symbol}: missing required columns")
+                continue
+            
+            # Skip if DataFrame is empty
+            if df.empty:
+                logger.warning(f"Skipping ticker {symbol}: empty DataFrame")
+                continue
+            
+            snapshot = calculate_indicators(symbol, df)
+            results.append(snapshot)
+            
+        except Exception as e:
+            logger.warning(f"Skipping ticker {symbol}: error computing indicators - {e}")
+            continue
+    
+    return results

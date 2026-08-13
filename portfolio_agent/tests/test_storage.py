@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from src.models import AgentBrain, Recommendation, TradeOutcome
-from src.storage import (
+from portfolio_agent.src.models import AgentBrain, Recommendation, TradeOutcome
+from portfolio_agent.src.storage import (
     load_brain,
     save_brain,
     init_db,
