@@ -1,0 +1,549 @@
+<title>The Third Rank IC</title>
+<style>
+  :root {
+    --ground: #FAFBFB;
+    --raised: #FFFFFF;
+    --ink: #12171A;
+    --muted: #5A666C;
+    --faint: #8A959B;
+    --rule: #DFE5E7;
+    --accent: #0D6068;
+    --accent-soft: #E4F0F1;
+    --critical: #9E2B34;
+    --critical-soft: #FBEDEE;
+    --caution: #8A6212;
+    --caution-soft: #FAF3E4;
+    --ok: #2A6B4F;
+    --ok-soft: #EAF3EE;
+    --code-bg: #F2F5F6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0E1214;
+      --raised: #151B1E;
+      --ink: #E6ECEE;
+      --muted: #97A4AA;
+      --faint: #6E7C82;
+      --rule: #242D31;
+      --accent: #5FBFC4;
+      --accent-soft: #12292C;
+      --critical: #E8868D;
+      --critical-soft: #2A1618;
+      --caution: #D6A94E;
+      --caution-soft: #262013;
+      --ok: #6FBF95;
+      --ok-soft: #14241C;
+      --code-bg: #131A1D;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #0E1214;
+    --raised: #151B1E;
+    --ink: #E6ECEE;
+    --muted: #97A4AA;
+    --faint: #6E7C82;
+    --rule: #242D31;
+    --accent: #5FBFC4;
+    --accent-soft: #12292C;
+    --critical: #E8868D;
+    --critical-soft: #2A1618;
+    --caution: #D6A94E;
+    --caution-soft: #262013;
+    --ok: #6FBF95;
+    --ok-soft: #14241C;
+    --code-bg: #131A1D;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 3.5rem 1.5rem 6rem;
+    background: var(--ground);
+    color: var(--ink);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 54rem; margin: 0 auto; display: flex; flex-direction: column; gap: 3.25rem; }
+  section { display: flex; flex-direction: column; gap: 1rem; }
+
+  h1, h2, h3 { font-family: Georgia, "Iowan Old Style", "Times New Roman", serif; font-weight: 600; text-wrap: balance; margin: 0; }
+  h1 { font-size: clamp(2rem, 5vw, 2.9rem); line-height: 1.12; letter-spacing: -0.015em; }
+  h2 { font-size: 1.5rem; line-height: 1.25; padding-bottom: .5rem; border-bottom: 2px solid var(--rule); }
+  h3 { font-size: 1.12rem; line-height: 1.35; }
+  p { margin: 0; max-width: 42em; }
+  ul { margin: 0; padding-left: 1.15rem; display: flex; flex-direction: column; gap: .45rem; max-width: 42em; }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+
+  .eyebrow {
+    font-size: .72rem; letter-spacing: .13em; text-transform: uppercase;
+    color: var(--faint); font-weight: 600;
+  }
+  .lede { font-size: 1.14rem; color: var(--muted); max-width: 40em; }
+
+  .meta {
+    display: flex; flex-wrap: wrap; gap: .4rem 1.5rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: .8rem; color: var(--muted);
+    padding-top: 1rem; border-top: 1px solid var(--rule);
+  }
+  .meta b { color: var(--ink); font-weight: 600; }
+
+  .finding {
+    background: var(--raised);
+    border: 1px solid var(--rule);
+    border-left: 4px solid var(--sev, var(--accent));
+    border-radius: 3px;
+    padding: 1.15rem 1.35rem;
+    display: flex; flex-direction: column; gap: .8rem;
+  }
+  .finding.critical { --sev: var(--critical); }
+  .finding.caution  { --sev: var(--caution); }
+  .finding.ok       { --sev: var(--ok); }
+  .finding-head { display: flex; align-items: baseline; gap: .75rem; flex-wrap: wrap; }
+  .chip {
+    font-size: .68rem; letter-spacing: .1em; text-transform: uppercase; font-weight: 700;
+    padding: .2rem .5rem; border-radius: 2px; white-space: nowrap;
+    background: var(--accent-soft); color: var(--accent);
+  }
+  .chip.critical { background: var(--critical-soft); color: var(--critical); }
+  .chip.caution  { background: var(--caution-soft);  color: var(--caution); }
+  .chip.ok       { background: var(--ok-soft);       color: var(--ok); }
+
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .86em; }
+  code { background: var(--code-bg); padding: .1em .35em; border-radius: 2px; }
+  pre {
+    margin: 0; background: var(--code-bg); border: 1px solid var(--rule); border-radius: 3px;
+    padding: .9rem 1.05rem; overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .82rem; line-height: 1.6;
+    font-variant-numeric: tabular-nums;
+  }
+  pre b { color: var(--critical); font-weight: 600; }
+  pre i { color: var(--faint); font-style: normal; }
+
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: .89rem; }
+  th, td { text-align: left; padding: .55rem .8rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { font-size: .7rem; letter-spacing: .09em; text-transform: uppercase; color: var(--faint); font-weight: 700; white-space: nowrap; }
+  td.num { text-align: right; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tbody tr:last-child td { border-bottom: none; }
+
+  .verdict {
+    font-size: .93rem; padding: .6rem .85rem; border-radius: 3px;
+    background: var(--accent-soft); color: var(--ink); border-left: 2px solid var(--accent);
+  }
+  .verdict.critical { background: var(--critical-soft); border-left-color: var(--critical); }
+  .verdict.caution  { background: var(--caution-soft);  border-left-color: var(--caution); }
+  .verdict.ok       { background: var(--ok-soft);       border-left-color: var(--ok); }
+  .verdict b { font-weight: 700; }
+
+  .strategy { border-top: 1px solid var(--rule); padding-top: 1.25rem; display: flex; flex-direction: column; gap: .7rem; }
+  .strategy:first-of-type { border-top: none; padding-top: 0; }
+  .pair { display: grid; grid-template-columns: 7.5rem 1fr; gap: .35rem .9rem; font-size: .93rem; }
+  .pair dt { color: var(--faint); font-size: .72rem; letter-spacing: .09em; text-transform: uppercase; font-weight: 700; padding-top: .22rem; }
+  .pair dd { margin: 0; }
+  @media (max-width: 34rem) { .pair { grid-template-columns: 1fr; gap: .15rem; } .pair dd { margin-bottom: .5rem; } }
+
+  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 1rem; }
+  .card { background: var(--raised); border: 1px solid var(--rule); border-radius: 3px; padding: 1rem 1.1rem; display: flex; flex-direction: column; gap: .5rem; }
+  .card h3 { font-size: .95rem; }
+
+  ol.next { counter-reset: step; list-style: none; padding: 0; display: flex; flex-direction: column; gap: .9rem; margin: 0; }
+  ol.next li { counter-increment: step; display: grid; grid-template-columns: 2rem 1fr; gap: .9rem; align-items: start; max-width: 44em; }
+  ol.next li::before {
+    content: counter(step); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: .82rem; font-weight: 700; color: var(--accent);
+    background: var(--accent-soft); border-radius: 2px; text-align: center; padding: .2rem 0;
+  }
+  footer { border-top: 1px solid var(--rule); padding-top: 1.25rem; color: var(--muted); font-size: .85rem; display: flex; flex-direction: column; gap: .6rem; }
+  .src { font-size: .82rem; color: var(--muted); }
+  .src a { color: var(--muted); }
+</style>
+
+<main>
+
+<header>
+  <p class="eyebrow">Architecture review · second pass</p>
+  <h1>The third rank IC</h1>
+  <p class="lede">
+    The eleven-task forecasting pivot landed. This is what a fresh read of the merged
+    tree finds — starting with the fact that this codebase now computes its headline
+    metric three different ways, and two of them disagree about the sign.
+  </p>
+  <div class="meta">
+    <span><b>main</b> c2cc86c</span>
+    <span><b>1763</b> tests passing</span>
+    <span><b>34k</b> lines, 13 packages</span>
+    <span><b>reviewed</b> 13 Aug 2026</span>
+  </div>
+</header>
+
+<section>
+  <h2>The headline</h2>
+
+  <div class="finding critical">
+    <div class="finding-head">
+      <span class="chip critical">Critical</span>
+      <h3>Three implementations of rank IC. A perfect signal scores +1.00 and −0.9988.</h3>
+    </div>
+    <p>
+      T04 built <code>evaluation/metrics.py</code> as the correct per-date Spearman IC.
+      It did not replace the two that already existed. All three are called “rank IC”
+      and all three are reachable today.
+    </p>
+    <p>
+      I ran the same panel through them — a signal that orders <em>every single date
+      perfectly</em>, on a market whose level drifts up while the signal's level drifts down:
+    </p>
+<pre><i># 60 dates × 20 names. Signal ranks each date's cross-section perfectly.</i>
+evaluation/metrics.py   (per date, Spearman)          <b>+1.0000</b>
+agents/trainer.py       (pooled, Pearson-on-ranks)    <b>-0.9988</b>
+src/performance_stats.py (per date, Spearman)          +1.0000</pre>
+    <p>
+      <code>agents/trainer.py</code> pools every observation into one correlation, so it
+      measures whether the signal tracks the market's <em>level</em> rather than whether it
+      orders the cross-section. That is precisely the mistake
+      <code>evaluation/metrics.py</code> carries a dedicated test against
+      (<code>test_ic_is_computed_within_a_date_not_across_the_pool</code>) — and it is the
+      number the supervised trainer writes into its checkpoint metadata and prints when
+      training finishes.
+    </p>
+    <p>
+      The third one agrees on the mean but not the ratio:
+      <code>src/performance_stats.py</code> annualises ICIR by
+      <code>√(periods/horizon)</code> where the evaluation layer reports it raw, and it still
+      returns <code>0.0</code> for the zero-dispersion case that T04 identified and fixed —
+      a constant non-zero IC series is the <em>strongest</em> possible evidence, and reporting
+      it as zero inverts the conclusion.
+    </p>
+    <div class="verdict critical">
+      <b>This is the two-RSI hazard recurring one layer up.</b> T10 deleted a duplicate
+      indicator module because “which implementation produced a published number depended on
+      which module the caller imported.” The same sentence is now true of the metric the
+      whole pivot was built to measure. Delete two of the three; keep
+      <code>evaluation/metrics.py</code>.
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Architecture</h2>
+
+  <div class="finding caution">
+    <div class="finding-head">
+      <span class="chip caution">High</span>
+      <h3>The evaluation layer has no cost model, and costs are where Indian factor premia die</h3>
+    </div>
+    <p>
+      <code>evaluation/</code> mentions costs only in prose. It computes gross IC, gross decile
+      spread, gross everything. Meanwhile <code>src/execution_sim.py</code> holds a genuinely
+      accurate Indian cost model — STT at 0.1% on <em>both</em> legs of a delivery trade, with a
+      comment correctly noting the cheaper intraday rate never applies because positions are
+      held overnight. That matches the published rates exactly.
+    </p>
+    <p>
+      The literature is blunt about what this omission hides: on the NSE, most of the gross
+      factor premium dies in transaction costs, and momentum — the platform's flagship — has
+      the highest turnover of any standard factor by a wide margin, running straight into an
+      unavoidable turnover tax.
+    </p>
+    <div class="verdict caution">
+      An accurate cost model exists in the repo and the layer that decides whether a strategy is
+      any good cannot see it. A net-of-cost IC and a net decile spread, at the platform's own
+      friction assumptions, would change which strategies look viable.
+    </div>
+  </div>
+
+  <div class="finding caution">
+    <div class="finding-head">
+      <span class="chip caution">High</span>
+      <h3>Models train on the wrong objective for the metric they are judged by</h3>
+    </div>
+    <p>
+      The supervised path fits pinball loss over quantiles; the GBM baseline fits squared error.
+      The platform then ranks everything by rank IC. Regression loss and rank IC are not the
+      same objective, and the gap is not academic — it is the subject of
+      <a href="https://arxiv.org/abs/2605.00501">LambdaRankIC</a> (May 2026), which derives
+      closed-form lambda gradients for pairwise rank swaps to optimise an upper bound on rank
+      IC directly, and reports the best out-of-sample rank IC, ICIR, return and Sharpe against
+      regression and NDCG-oriented baselines under exactly the low signal-to-noise, heavy-tailed
+      conditions equity returns present.
+    </p>
+    <div class="verdict caution">
+      It ships as a custom XGBoost objective, and this repo already has a gradient-boosting
+      trainer behind a registry seam built for exactly this kind of swap. It is a contained
+      experiment with a clear falsification: does the neutralized IC go up?
+    </div>
+  </div>
+
+  <div class="finding caution">
+    <div class="finding-head">
+      <span class="chip caution">Medium</span>
+      <h3><code>src/</code> is still an undifferentiated 14,000-line bucket</h3>
+    </div>
+    <p>
+      T11 carved <code>execution/</code> out and the boundary holds — 67 tests enforce it. The
+      rest never got the same treatment. Twenty-five modules sit in one namespace with no
+      internal structure, and 24 other modules import from it:
+    </p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Module</th><th class="num">Lines</th><th>What it actually is</th></tr></thead>
+        <tbody>
+          <tr><td><code>backtest_engine.py</code></td><td class="num">2,397</td><td>47 methods — router, tax lots, sizing, reporting</td></tr>
+          <tr><td><code>data_store.py</code></td><td class="num">1,217</td><td>Cache, download, quality report, three loaders</td></tr>
+          <tr><td><code>backtest_reporting.py</code></td><td class="num">956</td><td>Presentation</td></tr>
+          <tr><td><code>monte_carlo.py</code></td><td class="num">863</td><td>Simulation</td></tr>
+          <tr><td><code>portfolio.py</code> / <code>portfolio_optimizer.py</code></td><td class="num">1,100</td><td>Two allocators</td></tr>
+          <tr><td><code>risk.py</code> / <code>risk_analytics.py</code></td><td class="num">1,495</td><td>Two risk modules</td></tr>
+          <tr><td><code>markov_regime.py</code> / <code>regime.py</code></td><td class="num">1,165</td><td>Two regime models</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      The pairs are the tell. Three of them — two allocators, two risk modules, two regime
+      models — are the same shape of ambiguity that produced three rank ICs.
+    </p>
+  </div>
+
+  <div class="finding caution">
+    <div class="finding-head">
+      <span class="chip caution">Medium</span>
+      <h3>Two training paths</h3>
+    </div>
+    <p>
+      <code>agents/trainer.py</code> is 1,476 lines of supervised pipeline. <code>training/</code>
+      is the registry that was built to make training pluggable — and the supervised trainer in
+      it is an <em>adapter</em> that calls back into <code>agents/trainer.py</code>, keeping its
+      <code>writes_own_checkpoint</code> escape hatch alive. That is why the wrong rank IC is
+      still reachable: the new seam wraps the old path rather than replacing it.
+    </p>
+  </div>
+</section>
+
+<section>
+  <h2>The strategies, against current work</h2>
+  <p class="lede" style="font-size:1rem">
+    Each entry: what the code actually computes, what the literature currently says, and whether
+    the two agree. The platform's own measurements (from T05) are quoted where they exist —
+    several of them are more informative than the papers.
+  </p>
+
+  <div class="strategy">
+    <div class="finding-head"><span class="chip ok">Sound</span><h3>Momentum</h3></div>
+    <dl class="pair">
+      <dt>Code</dt>
+      <dd><code>P(t−21d) / P(t−210d) − 1</code>, top decile, plus volatility targeting and a
+        market-regime crash filter. Jegadeesh–Titman skip-month convention, 9-month formation.</dd>
+      <dt>Literature</dt>
+      <dd>The formulation is textbook and the crash controls are the right ones — momentum's
+        payoff is option-like and negatively skewed, with crashes concentrated in a detectable
+        bear-rebound state. Formation-period choice is actively studied
+        (<a href="https://www.tandfonline.com/doi/full/10.1080/13504851.2025.2472032?af=R">Applied Economics Letters, 2025</a>);
+        Indian evidence ties momentum tightly to liquidity
+        (<a href="https://www.sciencedirect.com/science/article/abs/pii/S0927538X23002640">Pacific-Basin Finance Journal</a>).</dd>
+      <dt>Measured</dt>
+      <dd>Raw IC <span class="mono">+0.061</span> → <span class="mono">+0.026</span> neutralized.
+        58% of it is beta and size. IC rises to day 3 and is flat to day 21 — a slow signal.</dd>
+    </dl>
+    <div class="verdict ok">
+      The one thing missing is the cost side. A slow decay curve is good news here: it means a
+      monthly rebalance keeps most of the edge, which is exactly the lever that decides whether
+      the highest-turnover factor survives an unavoidable turnover tax. Measure it net.
+    </div>
+  </div>
+
+  <div class="strategy">
+    <div class="finding-head"><span class="chip caution">Reformulate</span><h3>Low volatility</h3></div>
+    <dl class="pair">
+      <dt>Code</dt>
+      <dd>Rank ascending by trailing 60-day <em>total</em> realized volatility, long the bottom decile.</dd>
+      <dt>Literature</dt>
+      <dd>The anomaly is alive and still not fully explained — a
+        <a href="https://www.sciencedirect.com/science/article/abs/pii/S0304405X25000029">2025 JFE paper</a>
+        finds none of the leading theories explains why low-risk stocks do well in low-risk
+        times. But the sorting variable matters: a
+        <a href="https://www.tandfonline.com/doi/full/10.1080/00036846.2025.2497563?af=R">2025 Nordic study</a>
+        finds <em>idiosyncratic</em>-volatility sorts strongest and beta sorts weakest. Leverage
+        constraints and benchmark mandates are the leading explanations
+        (<a href="https://www.aqr.com/-/media/AQR/Documents/Insights/Journal-Article/The-Limits-to-Arbitrage-and-the-Low-Volatility-Anomaly.pdf">AQR</a>,
+        <a href="https://pages.stern.nyu.edu/~jwurgler/papers/faj-benchmarks.pdf">Baker–Bradley–Wurgler</a>).</dd>
+      <dt>Measured</dt>
+      <dd>Raw IC <span class="mono">+0.061</span> → <span class="mono">+0.018</span> neutralized —
+        <b>71% is beta and size</b>. And the decile spread is <b>negative</b>.</dd>
+    </dl>
+    <div class="verdict caution">
+      The platform's own numbers say this is mostly a beta bet, which is what sorting on total
+      volatility <em>is</em>. Switching the sort to idiosyncratic volatility — residual vol after
+      removing the market factor — is the literature-indicated fix and is a small change: the
+      rolling-beta machinery for it already exists in <code>evaluation/neutralize.py</code>.
+      The negative decile spread alongside a positive IC is the sharper finding, and it is the
+      one an equity curve would never have separated.
+    </div>
+  </div>
+
+  <div class="strategy">
+    <div class="finding-head"><span class="chip caution">Objective mismatch</span><h3>LSTM / supervised</h3></div>
+    <dl class="pair">
+      <dt>Code</dt>
+      <dd>Sequence model on eight technical features, pinball loss over quantiles,
+        cross-sectional rank label, walk-forward with purge.</dd>
+      <dt>Literature</dt>
+      <dd><a href="https://academic.oup.com/rfs/article/33/5/2223/5758276">Gu, Kelly &amp; Xiu (RFS 2020)</a>
+        remains the reference: trees and neural nets both win, and both trace their gains to
+        nonlinear interactions. Critically, they use <b>94 stock-level characteristics</b>.
+        This platform uses eight, all price-derived.</dd>
+    </dl>
+    <div class="verdict caution">
+      Two gaps, and the feature one is larger. A sequence model over eight technical indicators
+      is being asked to find interactions that mostly are not there; GKX's result is about
+      breadth of <em>characteristics</em>, not depth of architecture. The platform's own
+      measurement already points the same way — gradient boosting matched momentum, and neither
+      needed a recurrent network.
+    </div>
+  </div>
+
+  <div class="strategy">
+    <div class="finding-head"><span class="chip caution">Unevaluated</span><h3>india_sac (deep RL)</h3></div>
+    <dl class="pair">
+      <dt>Code</dt>
+      <dd>Soft Actor-Critic, twin critics, differential-Sortino reward net of turnover,
+        <code>gamma=0</code> treating allocation as a contextual bandit.</dd>
+      <dt>Literature</dt>
+      <dd>The construction is defensible and the <code>gamma=0</code> reasoning is right for a
+        price-taking book. But the field's own reviews name the risks this shape of work runs:
+        overfitting under low signal-to-noise, regime shift, backtest overfitting, and
+        sensitivity to inputs and initialisation
+        (<a href="https://www.sciencedirect.com/science/article/pii/S1044028324000887">JBEF</a>,
+        <a href="https://arxiv.org/abs/2602.17098">comparative study vs mean-variance</a>).
+        Results against simple baselines are genuinely mixed.</dd>
+    </dl>
+    <div class="verdict caution">
+      It has never been scored by the evaluation harness — it is an allocator, not a ranker, so
+      <code>evaluate</code> has nothing to rank. That is the real gap: the one strategy whose
+      literature most demands sceptical measurement is the one the new measurement layer cannot
+      reach. Either give it a ranking projection or judge it on realized net Sortino against an
+      equal-weight baseline, and do it before tuning anything.
+    </div>
+  </div>
+
+  <div class="strategy">
+    <div class="finding-head"><span class="chip ok">Sound</span><h3>Ensemble / rule-based</h3></div>
+    <dl class="pair">
+      <dt>Code</dt>
+      <dd>Ensemble refuses cross-sectional members under averaging methods — correct, since
+        ranking degenerates when a ranker is handed a universe of one.</dd>
+      <dt>Measured</dt>
+      <dd><code>rule_based</code> scores <span class="mono">0.016</span> score dispersion: one
+        floor value for 98% of the universe, and <b>zero rankable dates</b>.</dd>
+    </dl>
+    <div class="verdict ok">
+      Nothing wrong with the ensemble's construction. But <code>rule_based</code> is not a weak
+      signal — it is barely a signal at all, and any ensemble weighting it is averaging in a
+      constant. Worth knowing before it is tuned.
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Is the data sufficient?</h2>
+  <p>
+    For measuring price-derived signals, yes — and T01/T02 made it considerably better. For a
+    best-in-class Indian forecasting engine, no, and the gap is characteristics rather than
+    history.
+  </p>
+
+  <div class="cols">
+    <div class="card">
+      <h3 style="color:var(--ok)">What exists now</h3>
+      <ul>
+        <li>OHLCV per ticker, versioned and pinnable</li>
+        <li>Adjustment provenance — raw legs, <code>adj_factor</code>, dividends, splits (T01)</li>
+        <li>History default raised 5y → 20y, so the sample can span a crash</li>
+        <li>Invariants enforced at ingest, with an inferred trading calendar (T02)</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="color:var(--critical)">What is missing</h3>
+      <ul>
+        <li><b>Point-in-time index membership</b> — the largest single gap</li>
+        <li><b>Fundamentals</b> — GKX's 94 characteristics are mostly these</li>
+        <li><b>Sector map</b> — nothing is sector-neutralized without it</li>
+        <li><b>Free float / market cap</b> — size is currently a traded-value proxy</li>
+        <li>Delivery %, F&amp;O open interest, ASM/GSM surveillance flags</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="finding critical">
+    <div class="finding-head">
+      <span class="chip critical">Quantified</span>
+      <h3>Survivorship bias is a docstring, and it has a number</h3>
+    </div>
+    <p>
+      Finding D9 lives as a prose caveat in <code>src/universe.py</code>: the names present are
+      the names that survived to be downloaded. Recent India-specific work puts a figure on what
+      that costs — reconstructing historical Nifty composition and comparing current-constituent
+      portfolios against all historical members, survivor-only backtesting <b>overstates annual
+      returns by 4.94 percentage points and Sharpe by 0.097</b>, against an 82.5% membership
+      turnover rate.
+    </p>
+    <div class="verdict critical">
+      That is larger than every alpha this platform has measured. Point-in-time constituent lists
+      for Nifty 50/100/200/500 are now obtainable, so this is a data-acquisition task rather than
+      a research one — and until it is done, the neutralized ICs above are upper bounds.
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>What I would do next</h2>
+  <ol class="next">
+    <li><div><b>Delete two of the three rank ICs.</b> Route <code>agents/trainer.py</code> and
+      <code>src/performance_stats.py</code> at <code>evaluation/metrics.py</code>. One test
+      asserting a single definition, exactly as T10 did for RSI. Cheap, and it stops the platform
+      contradicting itself about its own headline number.</div></li>
+    <li><div><b>Net the evaluation layer of costs.</b> The model exists; wire
+      <code>execution_sim</code> into <code>evaluate</code> and report gross and net IC and decile
+      spread side by side — the same raw-versus-neutralized pattern T05 already established.</div></li>
+    <li><div><b>Acquire point-in-time index membership.</b> Everything else is refinement inside a
+      sample that overstates returns by ~5pp a year.</div></li>
+    <li><div><b>Re-sort low volatility on idiosyncratic vol.</b> Small change, literature-indicated,
+      and the rolling-beta machinery is already written.</div></li>
+    <li><div><b>Try LambdaRankIC in the GBM trainer.</b> Contained, falsifiable, and the registry
+      seam exists precisely so this costs a config change rather than a refactor.</div></li>
+    <li><div><b>Give <code>src/</code> the <code>execution/</code> treatment.</b> The duplicate pairs
+      first — two allocators, two risk modules, two regime models.</div></li>
+  </ol>
+</section>
+
+<footer>
+  <p>
+    <b>On sourcing.</b> The network here blocks arXiv, SSRN and Scholar directly, so papers were
+    located via search and read through abstracts and publisher pages rather than full PDFs. The
+    survivorship figures are as reported in that summary and are worth confirming against the
+    paper before they are quoted onward. Every claim about <em>this codebase</em> was verified by
+    running it — the three-way rank IC comparison is reproducible from the commands in this
+    review's session.
+  </p>
+  <p class="src">
+    Sources:
+    <a href="https://www.tandfonline.com/doi/full/10.1080/13504851.2025.2472032?af=R">Cross-sectional factor momentum (2025)</a> ·
+    <a href="https://www.sciencedirect.com/science/article/abs/pii/S0927538X23002640">Momentum, reversals and liquidity: Indian evidence</a> ·
+    <a href="https://rohanrathod.ai/writing/factor-investing-indian-equities">The factor zoo doesn't travel</a> ·
+    <a href="https://www.sciencedirect.com/science/article/abs/pii/S0304405X25000029">The volatility puzzle of the beta anomaly (JFE 2025)</a> ·
+    <a href="https://www.tandfonline.com/doi/full/10.1080/00036846.2025.2497563?af=R">Low-risk anomalies: Nordic evidence (2025)</a> ·
+    <a href="https://www.aqr.com/-/media/AQR/Documents/Insights/Journal-Article/The-Limits-to-Arbitrage-and-the-Low-Volatility-Anomaly.pdf">The limits to arbitrage and the low-volatility anomaly</a> ·
+    <a href="https://pages.stern.nyu.edu/~jwurgler/papers/faj-benchmarks.pdf">Benchmarks as limits to arbitrage</a> ·
+    <a href="https://academic.oup.com/rfs/article/33/5/2223/5758276">Empirical asset pricing via machine learning (RFS 2020)</a> ·
+    <a href="https://arxiv.org/abs/2605.00501">LambdaRankIC (2026)</a> ·
+    <a href="https://www.sciencedirect.com/science/article/pii/S1044028324000887">Deep RL for portfolio selection</a> ·
+    <a href="https://arxiv.org/abs/2602.17098">DRL vs mean-variance optimization</a> ·
+    <a href="https://www.nseindia.com/static/invest/first-time-investor-sebi-turnover-fees-stt-other-levies">NSE: STT and other levies</a> ·
+    <a href="https://openalgo.in/quant/cost-of-trading">The true cost of a trade</a> ·
+    <a href="https://arxiv.org/abs/2603.19380">Survivorship bias in Nifty indices</a> ·
+    <a href="https://niftyhistory.in/">Nifty historical constituents</a>
+  </p>
+</footer>
+
+</main>

@@ -78,6 +78,7 @@ import numpy as np
 import pandas as pd
 from pydantic import Field
 
+from ...evaluation.metrics import MIN_CROSS_SECTION_NAMES, rank_ic_from_arrays
 from ..base import BaseTrainer, TrainerConfig, TrainingArtifact, TrainingData
 from ..data import prepare_panel
 from ..registry import register_trainer
@@ -441,7 +442,10 @@ def build_gbm_panel(
 
 
 def rank_ic_by_date(
-    predictions: np.ndarray, labels: np.ndarray, dates: np.ndarray, min_names: int = 5
+    predictions: np.ndarray,
+    labels: np.ndarray,
+    dates: np.ndarray,
+    min_names: int = MIN_CROSS_SECTION_NAMES,
 ) -> pd.Series:
     """Spearman correlation of prediction against label, one value per date.
 
@@ -451,20 +455,12 @@ def rank_ic_by_date(
     measure whether the model tracks the market's day-to-day level, which a
     long-only ranking strategy cannot trade.
 
-    Dates with fewer than `min_names` names are dropped — a correlation over
-    three names is noise with a decimal point.
+    Kept as a name because the trainer and its tests read well with it, but the
+    arithmetic lives in `evaluation/metrics.py` — one definition of IC, so a
+    change to how thin dates or constant columns are handled reaches the
+    trainer and the evaluation harness together instead of one of them.
     """
-    frame = pd.DataFrame({"date": dates, "pred": predictions, "label": labels})
-    scores: Dict[Any, float] = {}
-    for date, group in frame.groupby("date", sort=True):
-        if len(group) < min_names:
-            continue
-        if group["pred"].nunique() < 2 or group["label"].nunique() < 2:
-            # A constant column has no rank order; Spearman is undefined and
-            # pandas returns NaN. Skipping is honest, 0.0 would not be.
-            continue
-        scores[date] = float(group["pred"].corr(group["label"], method="spearman"))
-    return pd.Series(scores, dtype=float).dropna()
+    return rank_ic_from_arrays(predictions, labels, dates, min_names=min_names)
 
 
 @register_trainer("gbm")

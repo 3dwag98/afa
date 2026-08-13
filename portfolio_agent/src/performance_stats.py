@@ -467,6 +467,7 @@ def rank_information_coefficient(
     dates: Optional[Sequence[Any]] = None,
     horizon_days: int = 1,
     periods_per_year: int = TRADING_DAYS_PER_YEAR,
+    min_names: int = 2,
 ) -> Dict[str, float]:
     """Spearman rank IC per date, and its information ratio.
 
@@ -477,63 +478,72 @@ def rank_information_coefficient(
     things cannot tell whether a disappointing backtest is a bad signal or bad
     portfolio construction.
 
-        IC_t   = spearman( prediction_i,t , realized_i,t )
-        ICIR   = mean(IC) / sd(IC) * sqrt(periods_per_year / horizon_days)
+        IC_t             = spearman( prediction_i,t , realized_i,t )
+        icir             = mean(IC) / sd(IC)
+        icir_annualized  = icir * sqrt(periods_per_year / horizon_days)
+
+    **`icir` used to be the annualized figure**, while `evaluation/metrics.py`
+    reported the raw ratio under the same name — so the same signal had two
+    ICIRs depending on which module the caller reached for, differing by a
+    factor of 16 at a daily horizon. The raw ratio wins the name because it is
+    what the literature quotes; the annualized figure keeps its own key rather
+    than being dropped.
+
+    The per-date arithmetic lives in `evaluation/metrics.py`. This function is
+    the two-array adapter and the `hit_rate` convention, nothing more.
 
     Args:
         predictions: Predicted scores, indexed to match `realized`.
         realized: Realized forward returns over the same horizon.
         dates: Grouping key per observation. Defaults to the shared index,
             which is the common case for a date-indexed panel.
-        horizon_days: Label horizon, used only to annualize the ICIR.
+        horizon_days: Label horizon, used only for `icir_annualized`.
         periods_per_year: Trading periods per year.
+        min_names: Dates with fewer names than this are dropped rather than
+            scored. Defaults to 2 — the loosest value at which a rank
+            correlation is defined — to keep this entry point usable on the
+            small hand-built cross-sections its callers pass. Panel evaluation
+            uses `MIN_CROSS_SECTION_NAMES`, which is stricter.
 
     Returns:
-        Dict of mean_ic, ic_std, icir, hit_rate (share of dates with IC > 0)
-        and n_dates.
+        Dict of mean_ic, ic_std, icir, icir_annualized, hit_rate (share of
+        dates with IC > 0) and n_dates.
     """
-    empty = {"mean_ic": 0.0, "ic_std": 0.0, "icir": 0.0, "hit_rate": 0.0, "n_dates": 0.0}
+    empty = {
+        "mean_ic": 0.0, "ic_std": 0.0, "icir": 0.0, "icir_annualized": 0.0,
+        "hit_rate": 0.0, "n_dates": 0.0,
+    }
 
-    frame = pd.DataFrame(
-        {
-            "prediction": np.asarray(predictions, dtype=float),
-            "realized": np.asarray(realized, dtype=float),
-        }
+    # Imported here rather than at module scope: `evaluation.metrics` reaches
+    # back into this module for `newey_west_standard_error`, and a pair of
+    # module-level imports would be a cycle. `_ratio` comes along so the
+    # zero-dispersion case reads the same here as it does there: an oracle
+    # signal scoring IC 1.0 on every date has infinite stability, and the 0.0
+    # this used to return called the strongest possible evidence "no signal".
+    from portfolio_agent.evaluation.metrics import _ratio, rank_ic_from_arrays
+
+    keys = list(dates) if dates is not None else list(pd.Series(predictions).index)
+    predicted = np.asarray(predictions, dtype=float).ravel()
+    if predicted.size == 0:
+        return empty
+
+    ic_series = rank_ic_from_arrays(
+        predicted, realized, keys, min_names=max(2, int(min_names))
     )
-    frame["date"] = list(dates) if dates is not None else list(pd.Series(predictions).index)
-    frame = frame.replace([np.inf, -np.inf], np.nan).dropna()
-    if frame.empty:
+    if ic_series.empty:
         return empty
 
-    ics: List[float] = []
-    for _, group in frame.groupby("date", sort=True):
-        # A single name has no cross-section to rank, and a constant column has
-        # no rank variation — both are undefined rather than zero.
-        if len(group) < 2:
-            continue
-        pred_rank = group["prediction"].rank()
-        real_rank = group["realized"].rank()
-        if pred_rank.nunique() < 2 or real_rank.nunique() < 2:
-            continue
-        ics.append(float(np.corrcoef(pred_rank.to_numpy(), real_rank.to_numpy())[0, 1]))
-
-    if not ics:
-        return empty
-
-    ic_array = np.asarray(ics, dtype=float)
-    ic_array = ic_array[np.isfinite(ic_array)]
-    if ic_array.size == 0:
-        return empty
-
+    ic_array = ic_series.to_numpy(dtype=float)
     mean_ic = float(np.mean(ic_array))
     ic_std = float(np.std(ic_array, ddof=1)) if ic_array.size > 1 else 0.0
+    icir = _ratio(mean_ic, ic_std)
     annualization = math.sqrt(periods_per_year / max(1, horizon_days))
-    icir = float(mean_ic / ic_std * annualization) if ic_std > 0 else 0.0
 
     return {
         "mean_ic": mean_ic,
         "ic_std": ic_std,
         "icir": icir,
+        "icir_annualized": icir * annualization,
         "hit_rate": float(np.mean(ic_array > 0)),
         "n_dates": float(ic_array.size),
     }

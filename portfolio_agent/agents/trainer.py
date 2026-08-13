@@ -7,7 +7,7 @@ import math
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -18,7 +18,12 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from portfolio_agent.config.schema import AppConfig, TrainingConfig
-from portfolio_agent.data.dataset import TimeSeriesDataset, create_dataloaders
+from portfolio_agent.data.dataset import (
+    TimeSeriesDataset,
+    create_dataloaders,
+    test_split_dates,
+)
+from portfolio_agent.evaluation.metrics import MIN_CROSS_SECTION_NAMES
 from portfolio_agent.features.pipeline import build_features
 # Re-exported, not merely used: the label definition moved to features/labels.py
 # so a trainer that is not this one can predict the identical target without
@@ -445,6 +450,7 @@ def evaluate_predictions(
     actuals: np.ndarray,
     horizon_days: int = 5,
     relative_target: bool = False,
+    dates: Optional[Sequence[Any]] = None,
 ) -> Dict[str, float]:
     """Score out-of-sample predictions on the terms a trader cares about.
 
@@ -477,10 +483,26 @@ def evaluate_predictions(
       error by roughly sqrt(H) — in the direction that manufactures
       significance. The Sharpe is still the right point estimate; what the
       naive error gets wrong is how much to believe it.
-    - ``rank_ic`` — Spearman correlation between the predicted and realized
-      ordering. This is the metric a ranking system should be judged on: it is
-      far less noisy than a backtested P&L and it does not confound signal
-      quality with position sizing, costs or the covariance of the book.
+    - ``rank_ic`` — mean per-date Spearman correlation between the predicted
+      and realized ordering. This is the metric a ranking system should be
+      judged on: it is far less noisy than a backtested P&L and it does not
+      confound signal quality with position sizing, costs or the covariance of
+      the book. **It requires `dates`**, and is NaN without them — see below.
+
+    Why rank IC needs dates
+    -----------------------
+    This function used to rank every row in one pool and correlate that, which
+    is a different quantity wearing the same name. Pooled, the correlation is
+    dominated by whether the model's level tracks the market's from day to day;
+    per date, it asks whether the model ordered *that day's* cross-section. The
+    two can have opposite signs: on a signal that orders every date perfectly
+    but whose level runs against the market's, the pooled figure is -0.99 and
+    the per-date figure is +1.00. `relative_target` runs promote rank IC to the
+    headline metric, so the pooled version was the number model selection read.
+
+    Without `dates` there is no cross-section to correlate within and the
+    honest answer is "not measured" — reported as NaN rather than as a pooled
+    number that looks like an IC.
 
     Args:
         predictions: Model outputs, shape (n,).
@@ -492,9 +514,13 @@ def evaluate_predictions(
             +0.4 is not 40% — so they are reported as zero rather than as a
             confident number about the wrong quantity, and rank IC carries the
             evaluation instead.
+        dates: Observation date per row, aligned to `predictions`. Required for
+            `rank_ic`; everything else is computed without it.
 
     Returns:
-        Dictionary of metrics; zeros when there is nothing to score.
+        Dictionary of metrics; zeros when there is nothing to score. `rank_ic`
+        is NaN when `dates` is None and `n_ic_dates` records how many dates
+        carried a scorable cross-section.
     """
     predictions = np.asarray(predictions, dtype=float).ravel()
     actuals = np.asarray(actuals, dtype=float).ravel()
@@ -502,26 +528,38 @@ def evaluate_predictions(
     empty = {
         "n_samples": 0, "mse": 0.0, "directional_accuracy": 0.0,
         "strategy_sharpe": 0.0, "benchmark_sharpe": 0.0, "excess_sharpe": 0.0,
-        "strategy_t_stat": 0.0, "rank_ic": 0.0,
+        "strategy_t_stat": 0.0, "rank_ic": float("nan"), "n_ic_dates": 0,
         "relative_target": float(relative_target),
     }
     if predictions.size == 0 or predictions.size != actuals.size:
         return empty
 
+    date_keys = None if dates is None else np.asarray(list(dates)).ravel()
+    if date_keys is not None and date_keys.size != predictions.size:
+        raise ValueError(
+            f"dates has {date_keys.size} entries but there are "
+            f"{predictions.size} predictions; a misaligned date array would "
+            "group rows into the wrong cross-sections silently"
+        )
+
     finite = np.isfinite(predictions) & np.isfinite(actuals)
     predictions, actuals = predictions[finite], actuals[finite]
+    if date_keys is not None:
+        date_keys = date_keys[finite]
     if predictions.size == 0:
         return empty
 
     mse = float(np.mean((predictions - actuals) ** 2))
     directional_accuracy = float(np.mean(np.sign(predictions) == np.sign(actuals)))
 
-    rank_ic = 0.0
-    if predictions.size > 1:
-        predicted_rank = pd.Series(predictions).rank().to_numpy()
-        realized_rank = pd.Series(actuals).rank().to_numpy()
-        if np.std(predicted_rank) > 0 and np.std(realized_rank) > 0:
-            rank_ic = float(np.corrcoef(predicted_rank, realized_rank)[0, 1])
+    rank_ic, n_ic_dates = float("nan"), 0
+    if date_keys is not None:
+        from portfolio_agent.evaluation.metrics import rank_ic_from_arrays
+
+        ic_series = rank_ic_from_arrays(predictions, actuals, date_keys)
+        n_ic_dates = int(ic_series.size)
+        if n_ic_dates:
+            rank_ic = float(ic_series.mean())
 
     annualization = math.sqrt(TRADING_DAYS_PER_YEAR / max(1, horizon_days))
 
@@ -566,6 +604,7 @@ def evaluate_predictions(
         # anything drawn from a wide search, which this is.
         "strategy_t_stat": strategy_t_stat,
         "rank_ic": rank_ic,
+        "n_ic_dates": n_ic_dates,
         "relative_target": float(relative_target),
     }
 
@@ -825,6 +864,26 @@ def _stack_blocks(blocks: List[pd.DataFrame]) -> Optional[Tuple[np.ndarray, np.n
     return panel.iloc[:, :-1].values, panel.iloc[:, -1].values
 
 
+def _stacked_dates(blocks: List[pd.DataFrame], sequence_length: int) -> np.ndarray:
+    """Dates aligned to what a `TimeSeriesDataset` over the same blocks predicts.
+
+    The dataset slides a window of `sequence_length` rows and targets the row
+    *after* it, so sample `i` scores the concatenated panel's row
+    `i + sequence_length`. The first `sequence_length` rows are consumed as
+    history for the first prediction and have no prediction of their own.
+
+    Kept next to `_stack_blocks` because the two must agree on ordering: both
+    concatenate `usable` in the same order, so row `k` means the same row in
+    both. If one grows a sort the other does not, the IC silently scores
+    predictions against the wrong dates.
+    """
+    usable = [b for b in blocks if b is not None and not b.empty]
+    if not usable:
+        return np.asarray([])
+    index = pd.concat(usable).index
+    return np.asarray(index[sequence_length:])
+
+
 def _fit_confidence_calibration(
     predictions: np.ndarray,
     actuals: np.ndarray,
@@ -1073,8 +1132,21 @@ def run_walk_forward_validation(
         predictions, actuals = _predict(model, test_loader, device, median_index)
         oos_predictions.append(predictions)
         oos_actuals.append(actuals)
+        # Aligned to the same concatenation `_stack_blocks` fed the loader, so
+        # rank IC groups each prediction into the cross-section it belongs to.
+        test_dates = _stacked_dates(test_blocks, training.sequence_length)
+        if test_dates.size != predictions.size:
+            # Should not happen — both come from the same block list — but
+            # scoring predictions against misaligned dates would produce a
+            # confident wrong number, so drop the metric and say why.
+            print(
+                f"  Fold {fold + 1}: {test_dates.size} dates for "
+                f"{predictions.size} predictions; rank IC not measured"
+            )
+            test_dates = None
         metrics = evaluate_predictions(
-            predictions, actuals, horizon_days, relative_target=relative_target
+            predictions, actuals, horizon_days,
+            relative_target=relative_target, dates=test_dates,
         )
         metrics.update({
             "fold": fold + 1,
@@ -1105,6 +1177,17 @@ def run_walk_forward_validation(
     def _mean(key: str) -> float:
         return float(np.mean([m[key] for m in fold_metrics]))
 
+    # A fold that could not group its rows into cross-sections reports NaN
+    # rather than a pooled stand-in, so the fold ICs are averaged over the
+    # folds that measured one. `folds_with_ic` says how many that was, which is
+    # the number that makes a mean IC over 2 of 5 folds readable as such.
+    fold_ics = np.asarray(
+        [m["rank_ic"] for m in fold_metrics if not math.isnan(m["rank_ic"])],
+        dtype=float,
+    )
+    mean_rank_ic = float(fold_ics.mean()) if fold_ics.size else float("nan")
+    ic_dispersion = float(fold_ics.std(ddof=1)) if fold_ics.size > 1 else 0.0
+
     summary = {
         "n_folds": len(fold_metrics),
         "epochs_per_fold": epochs,
@@ -1114,16 +1197,14 @@ def run_walk_forward_validation(
         "target_transform": training.target_transform,
         "mean_mse": _mean("mse"),
         "mean_directional_accuracy": _mean("directional_accuracy"),
-        "mean_rank_ic": _mean("rank_ic"),
+        "mean_rank_ic": mean_rank_ic,
+        "folds_with_ic": int(fold_ics.size),
         # Information ratio of the fold ICs: a mean IC is only as good as its
         # consistency across folds, and this is the ratio that says so.
         "rank_icir": (
-            float(_mean("rank_ic") / np.std([m["rank_ic"] for m in fold_metrics], ddof=1))
-            if len(fold_metrics) > 1
-            and np.std([m["rank_ic"] for m in fold_metrics], ddof=1) > 0
-            else 0.0
+            float(mean_rank_ic / ic_dispersion) if ic_dispersion > 0 else 0.0
         ),
-        "folds_with_positive_ic": sum(1 for m in fold_metrics if m["rank_ic"] > 0),
+        "folds_with_positive_ic": int((fold_ics > 0).sum()),
     }
 
     if not relative_target:
@@ -1146,14 +1227,23 @@ def run_walk_forward_validation(
 
     print("-" * 60)
     if relative_target:
+        measured = summary["folds_with_ic"]
         print(
             f"Mean across {summary['n_folds']} folds: "
             f"dir_acc={summary['mean_directional_accuracy']:.3f} | "
-            f"rank_IC={summary['mean_rank_ic']:+.4f} | "
+            f"rank_IC={summary['mean_rank_ic']:+.4f} "
+            f"(over {measured}/{summary['n_folds']} folds) | "
             f"ICIR={summary['rank_icir']:+.2f} | "
-            f"positive IC in {summary['folds_with_positive_ic']}/{summary['n_folds']} folds"
+            f"positive IC in {summary['folds_with_positive_ic']}/{measured} folds"
         )
-        if summary["mean_rank_ic"] <= 0:
+        if not measured:
+            print(
+                "  WARNING: rank IC was not measured on any fold. The label is "
+                "cross-sectional, so this run has no primary metric — check that the "
+                "test blocks carry dates with at least "
+                f"{MIN_CROSS_SECTION_NAMES} names."
+            )
+        elif summary["mean_rank_ic"] <= 0:
             print(
                 "  WARNING: out-of-sample rank IC is not positive. The model orders the "
                 "cross-section no better than chance — do not trade it without changing "
@@ -1254,7 +1344,10 @@ def run_training(
         train_parts.append(frame.iloc[:int(n * 0.70)])
         val_parts.append(frame.iloc[int(n * 0.70):int(n * 0.85)])
         test_parts.append(frame.iloc[int(n * 0.85):])
-    feature_df = pd.concat(train_parts + val_parts + test_parts, ignore_index=True)
+    # The index is kept rather than reset: it carries the dates that rank IC
+    # groups by, and `test_split_dates` re-derives the test slice from it using
+    # the same boundaries `create_dataloaders` slices the arrays with.
+    feature_df = pd.concat(train_parts + val_parts + test_parts)
     print(f"Built training panel from {len(panel_by_ticker)} tickers: {len(feature_df)} total rows")
 
     # Extract feature and target names for metadata
@@ -1393,9 +1486,13 @@ def run_training(
 
     # The 15% test tail was never touched by training or early stopping, so
     # this is the single-split counterpart to the walk-forward numbers above.
+    test_predictions, test_actuals = _predict(model, test_loader, device, median_index)
+    test_dates = test_split_dates(feature_df.index, config.training.sequence_length)
     test_metrics = evaluate_predictions(
-        *_predict(model, test_loader, device, median_index),
+        test_predictions,
+        test_actuals,
         horizon_days=_target_horizon_days(target_name),
+        dates=test_dates if test_dates.size == test_predictions.size else None,
     )
 
     # =========================================================================

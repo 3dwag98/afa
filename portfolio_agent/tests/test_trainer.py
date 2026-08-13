@@ -224,10 +224,31 @@ class TestEvaluatePredictions:
     def test_a_relative_target_reports_no_t_statistic(self):
         """A rank is not a return, so neither is its mean."""
         actuals = np.array([0.5, -0.5, 0.25, -0.25, 1.0, -1.0])
-        metrics = evaluate_predictions(actuals, actuals, horizon_days=5, relative_target=True)
+        one_date = ["2024-01-02"] * 6
+        metrics = evaluate_predictions(
+            actuals, actuals, horizon_days=5, relative_target=True, dates=one_date
+        )
 
         assert metrics["strategy_t_stat"] == 0.0
         assert metrics["rank_ic"] == pytest.approx(1.0)
+
+    def test_rank_ic_needs_the_dates_to_group_by(self):
+        """Six observations with no dates are not a cross-section.
+
+        The version this replaced ranked all six in one pool and reported the
+        correlation as an IC. Pooled, that number is dominated by whether the
+        score tracks the market's level rather than by whether it ordered any
+        day's names — opposite signs are reachable — so the answer without
+        dates is "not measured", not a number.
+        """
+        actuals = np.array([0.5, -0.5, 0.25, -0.25, 1.0, -1.0])
+        metrics = evaluate_predictions(actuals, actuals, horizon_days=5)
+
+        assert math.isnan(metrics["rank_ic"])
+        assert metrics["n_ic_dates"] == 0
+        # Everything that does not need a cross-section is still reported.
+        assert metrics["n_samples"] == 6
+
 
 class TestTargetHorizon:
     def test_parses_the_horizon_from_the_target_name(self):
@@ -253,8 +274,14 @@ class TestWalkForwardValidation:
             setattr(config.training, key, value)
         return config
 
-    def _panel_by_ticker(self, config, n=1000, n_tickers=2):
-        """Per-ticker frames, each with its own DatetimeIndex."""
+    def _panel_by_ticker(self, config, n=1000, n_tickers=6):
+        """Per-ticker frames, each with its own DatetimeIndex.
+
+        Six tickers rather than two because rank IC needs a cross-section:
+        below `MIN_CROSS_SECTION_NAMES` names on a date there is nothing to
+        rank, and a fixture that never clears the bar would assert on a metric
+        that is NaN in every fold.
+        """
         return {
             f"SYM{i}.NS": prepare_features(
                 _generate_synthetic_ohlcv(n, seed=i), config, verbose=False
@@ -288,11 +315,31 @@ class TestWalkForwardValidation:
         )
 
         assert result["target_transform"] == "cross_sectional_rank"
-        for key in ("mean_rank_ic", "rank_icir", "folds_with_positive_ic"):
+        for key in ("mean_rank_ic", "rank_icir", "folds_with_positive_ic", "folds_with_ic"):
             assert key in result
         for key in ("mean_strategy_sharpe", "mean_benchmark_sharpe", "mean_excess_sharpe"):
             assert key not in result
+
+        # Every fold measured one, and each is a correlation.
+        assert result["folds_with_ic"] == result["n_folds"]
         assert all(-1.0 <= fold["rank_ic"] <= 1.0 for fold in result["folds"])
+        assert all(fold["n_ic_dates"] > 0 for fold in result["folds"])
+
+    def test_a_universe_too_thin_to_rank_reports_no_ic_rather_than_a_number(self):
+        """Two names is not a cross-section, and the honest output says so.
+
+        This is the shape the pooled implementation hid: it returned a
+        confident correlation for a "cross-section" of two, and the walk-forward
+        summary reported it as the model's headline skill.
+        """
+        config = self._config()
+        result = run_walk_forward_validation(
+            self._panel_by_ticker(config, n_tickers=2), config, get_device("cpu")
+        )
+
+        assert result["folds_with_ic"] == 0
+        assert math.isnan(result["mean_rank_ic"])
+        assert all(math.isnan(fold["rank_ic"]) for fold in result["folds"])
 
     def test_training_windows_expand_and_never_reach_the_test_period(self):
         config = self._config()
