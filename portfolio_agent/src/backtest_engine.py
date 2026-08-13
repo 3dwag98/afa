@@ -123,9 +123,11 @@ def _score_one_ticker_in_worker(
 class BacktestEngine:
     """
     Event-Driven Backtesting Engine.
-    
+
     Simulates historical trading with strict look-ahead bias prevention.
-    At date T, the agent can ONLY see data up to T-1.
+    At date T the agent sees bars through T's close and trades at T+1's open —
+    the live sequence. See `_history_through` for why that is the decision
+    point, and for what stops it being look-ahead.
     """
     
     def __init__(
@@ -534,30 +536,42 @@ class BacktestEngine:
         
         return None
     
-    def _get_historical_data_up_to(self, ticker: str, up_to_date: pd.Timestamp) -> Optional[pd.DataFrame]:
-        """
-        Get historical data for a ticker up to (but not including) a specific date.
-        
-        This is CRITICAL for avoiding look-ahead bias.
-        
-        Args:
-            ticker: Ticker symbol.
-            up_to_date: The date up to which data should be returned (exclusive).
-            
-        Returns:
-            DataFrame with data up to up_to_date - 1 day.
+    def _history_through(self, ticker: str, decision_date: pd.Timestamp) -> Optional[pd.DataFrame]:
+        """Bars up to and **including** `decision_date`.
+
+        Renamed from `_get_historical_data_up_to`, which sliced strictly
+        *before* the decision date. That was one session tighter than every
+        other path in the package and it was not a look-ahead guard — it was an
+        off-by-one against this engine's own loop.
+
+        Signals are generated in step E, after step D has already marked the
+        book to market at `decision_date`'s close. The engine is standing at
+        the end of that session; the close it just valued the portfolio with is
+        knowable. Orders from these signals fill at the *next* session's open
+        (`_create_pending_orders` -> `_execute_pending_orders`), so including
+        the decision date's bar reproduces the live sequence — decide after the
+        close, trade the next morning — rather than deciding on stale data and
+        then waiting an extra day to act on it.
+
+        What actually prevents look-ahead is unchanged and lives elsewhere:
+        every feature in `features/technical.py` shifts its own inputs by a
+        bar, so a value at row `t` is a function of bars before `t`. The one
+        deliberate exception is `close`, which is the decision date's reference
+        price and is knowable at that session's close by construction.
+
+        `evaluation/harness.py` slices `frame.loc[:date]` — inclusive — and the
+        trainers label row `t` with a forward return measured from `t`. This
+        now matches both, which is what lets a rank IC measured by `evaluate`
+        describe the signal this engine trades.
         """
         if ticker in self.untradeable_tickers:
             return None
-        
+
         if ticker not in self.ticker_data:
             return None
-        
-        df = self.ticker_data[ticker].copy()
-        
-        # Filter to dates strictly before up_to_date
-        mask = df.index < up_to_date
-        return df[mask].copy()
+
+        df = self.ticker_data[ticker]
+        return df[df.index <= decision_date].copy()
     
     def _mark_to_market(self, current_date: pd.Timestamp) -> float:
         """
@@ -866,9 +880,11 @@ class BacktestEngine:
     
     def _generate_signals(self, current_date: pd.Timestamp) -> Dict[str, StrategySignal]:
         """
-        Run the configured strategy's signal generation using data up to T-1.
+        Run the configured strategy's signal generation on data through T.
 
-        CRITICAL: Only uses data up to current_date - 1 day to avoid look-ahead bias.
+        CRITICAL: uses bars through `current_date` and nothing after it. The
+        orders these signals produce fill at T+1's open, so T's close is
+        knowable here; `_history_through` states the full argument.
 
         Uses the SAME strategy code path as the live orchestrator (via
         strategies/registry.py), so backtest and live decisions can never
@@ -886,7 +902,7 @@ class BacktestEngine:
         for ticker in self.universe_tickers:
             if ticker in self.untradeable_tickers:
                 continue
-            hist_data = self._get_historical_data_up_to(ticker, current_date)
+            hist_data = self._history_through(ticker, current_date)
             if hist_data is None or len(hist_data) < 20:
                 continue
             eligible[ticker] = hist_data
@@ -917,8 +933,8 @@ class BacktestEngine:
             context = StrategyContext(
                 risk=self.risk_params,
                 weights=weights,
-                # Strictly before T, exactly like every other input: the
-                # regime filter must not see the day it is deciding on.
+                # Through T, exactly like every other input: the regime state
+                # and the signals it gates must be read off the same session.
                 benchmark_close=benchmark_close,
                 benchmark_ohlcv=benchmark_ohlcv,
                 # Classified once per round and shared, so every model in the
@@ -957,21 +973,30 @@ class BacktestEngine:
         return signals
 
     def _benchmark_up_to(self, current_date: pd.Timestamp) -> Optional[pd.Series]:
-        """Benchmark closes strictly before `current_date`.
+        """Benchmark closes through `current_date`, inclusive.
 
-        Same look-ahead rule as every other input: the regime filter must not
-        see the bar for the day it is deciding on.
+        Same rule as `_history_through`, and for the same reason: the regime
+        filter decides at the end of the session, so the index close it is
+        deciding against is knowable. Slicing this one exclusively while the
+        ticker panel was inclusive would put the regime state a session behind
+        the signals it gates.
         """
         if self.benchmark_close is None:
             return None
-        truncated = self.benchmark_close[self.benchmark_close.index < current_date]
+        truncated = self.benchmark_close[self.benchmark_close.index <= current_date]
         return truncated if not truncated.empty else None
 
     def _benchmark_ohlcv_up_to(self, current_date: pd.Timestamp) -> Optional[pd.DataFrame]:
-        """Benchmark OHLC bars strictly before `current_date`."""
+        """Benchmark OHLC bars through `current_date`, inclusive.
+
+        Kept in step with `_benchmark_up_to`: the two are handed to the same
+        regime call, and a close series one bar longer than its own high/low
+        range would have `assess_market_regime` reading a trend from one
+        session and an ADX from the session before it.
+        """
         if self.benchmark_ohlcv is None:
             return None
-        truncated = self.benchmark_ohlcv[self.benchmark_ohlcv.index < current_date]
+        truncated = self.benchmark_ohlcv[self.benchmark_ohlcv.index <= current_date]
         return truncated if not truncated.empty else None
 
     def _classify_regime(
@@ -1896,7 +1921,7 @@ class BacktestEngine:
         with 82% of exits at the stop.
 
         **Distances, not levels.** The signal's stop and target were computed
-        off T-1's close; the fill lands at T+1's open plus slippage. Copying the
+        off T's close; the fill lands at T+1's open plus slippage. Copying the
         absolute levels across would put a gapped-up entry immediately through
         its own target, so the *fractional* distances are preserved and
         re-applied to the price actually paid.
@@ -2118,7 +2143,7 @@ class BacktestEngine:
         2. Check stops/targets against T's intraday high/low.
         3. Liquidate anything that stopped trading.
         4. Mark to market at T's close -> that day's equity point.
-        5. Score the universe using data strictly before T.
+        5. Score the universe on bars through T — the close step 4 just used.
         6. Queue tomorrow's orders, sized off T's end-of-day equity.
 
         The mark-to-market deliberately comes *after* the day's fills: it used
@@ -2213,7 +2238,9 @@ class BacktestEngine:
                     'notes': 'EOD valuation'
                 })
 
-                # Step E: Run the agent's signal generation using data up to T-1
+                # Step E: Signals on bars through T. Step D just marked the
+                # book at T's close, so that bar is knowable here; the orders
+                # step F queues fill at T+1's open.
                 signals = self._generate_signals(current_date)
 
                 for ticker in sorted(signals):
