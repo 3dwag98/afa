@@ -85,6 +85,29 @@ class TimeSeriesDataset(Dataset):
         return sequence, target
 
 
+def chronological_split_bounds(n_samples: int) -> Tuple[int, int]:
+    """Row offsets where train ends and validation ends, for a 70/15/15 split.
+
+    Stated once because two callers need to agree on it: `create_dataloaders`
+    slices the arrays here, and anything that wants to know *which dates* the
+    test predictions cover has to slice the index identically. Two copies of
+    `int(n * 0.70)` drift the moment one of them is tuned.
+    """
+    return int(n_samples * 0.70), int(n_samples * 0.85)
+
+
+def test_split_dates(index: pd.Index, sequence_length: int) -> np.ndarray:
+    """Dates that `create_dataloaders`' test loader actually predicts.
+
+    The test slice starts at the validation boundary, and within it a
+    `TimeSeriesDataset` spends its first `sequence_length` rows as history for
+    the first prediction. So the dates line up with the test predictions only
+    after both cuts are applied, in that order.
+    """
+    _, val_end = chronological_split_bounds(len(index))
+    return np.asarray(index[val_end:][sequence_length:])
+
+
 def create_dataloaders(
     df: pd.DataFrame, config: TrainingConfig
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
@@ -130,9 +153,7 @@ def create_dataloaders(
     targets = df[target_col].values
 
     # Chronological split: 70% train, 15% val, 15% test
-    n_samples = len(df)
-    train_end = int(n_samples * 0.70)
-    val_end = int(n_samples * 0.85)
+    train_end, val_end = chronological_split_bounds(len(df))
 
     # Split features and targets
     train_features = features[:train_end]

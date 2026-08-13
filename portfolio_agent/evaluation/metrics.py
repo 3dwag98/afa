@@ -134,6 +134,62 @@ def rank_ic_series(
     return pd.Series(scores, dtype=float).sort_index()
 
 
+def rank_ic_from_arrays(
+    scores: Sequence[float],
+    labels: Sequence[float],
+    dates: Sequence[Any],
+    min_names: int = MIN_CROSS_SECTION_NAMES,
+) -> pd.Series:
+    """`rank_ic_series` for callers holding three parallel arrays, not a panel.
+
+    Trainers carry predictions, labels and dates as aligned arrays and have no
+    panel to hand. Before this existed each of them grew its own grouping loop,
+    and the copies drifted: one pooled every row into a single correlation,
+    which measures whether the score tracks the market's level rather than
+    whether it ordered the cross-section — on a signal that ranks every date
+    perfectly but is anticorrelated with the market's level, the pooled version
+    reported -0.99 where this one reports +1.00.
+
+    Non-finite rows are dropped before grouping, so a NaN prediction removes one
+    observation rather than poisoning its whole date.
+
+    Args:
+        scores: Predicted values.
+        labels: Realized forward returns or ranks, aligned to `scores`.
+        dates: Grouping key per observation, aligned to both.
+        min_names: Dates thinner than this are dropped, not scored as zero.
+
+    Returns:
+        Per-date IC, sorted by date. Empty when nothing was scorable.
+
+    Raises:
+        ValueError: If the three arrays are not the same length.
+    """
+    score_array = np.asarray(scores, dtype=float).ravel()
+    label_array = np.asarray(labels, dtype=float).ravel()
+    date_array = np.asarray(list(dates)).ravel()
+    if not (score_array.size == label_array.size == date_array.size):
+        raise ValueError(
+            "scores, labels and dates must be the same length, got "
+            f"{score_array.size}, {label_array.size}, {date_array.size}"
+        )
+    if score_array.size == 0:
+        return pd.Series(dtype=float)
+
+    finite = np.isfinite(score_array) & np.isfinite(label_array)
+    panel = pd.DataFrame(
+        {
+            "date": date_array[finite],
+            # IC never reads the symbol; it is here because the panel contract
+            # names it, and a positional stand-in keeps every row distinct.
+            "symbol": np.arange(int(finite.sum())),
+            "score": score_array[finite],
+            "forward_return": label_array[finite],
+        }
+    )
+    return rank_ic_series(panel, min_names)
+
+
 @dataclass(frozen=True)
 class ICSummary:
     """The IC series reduced to the numbers a decision gets made on."""

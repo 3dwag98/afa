@@ -288,6 +288,14 @@ class TestRankInformationCoefficient:
         assert result["n_dates"] == 200
 
     def test_icir_annualizes_by_the_label_horizon(self):
+        """The annualization moved to its own key.
+
+        `icir` used to be the annualized figure here while the evaluation layer
+        reported the raw ratio under the same name — a factor of 16 apart at a
+        daily horizon, on the number that decides which model ships. The raw
+        ratio took the name because that is what the literature quotes; the
+        annualized one is still computed, under `icir_annualized`.
+        """
         dates, realized = self._panel(n_dates=200, seed=3)
         signal = realized + np.random.default_rng(4).normal(0, 0.05, size=realized.size)
 
@@ -298,8 +306,24 @@ class TestRankInformationCoefficient:
             pd.Series(signal), pd.Series(realized), dates=dates, horizon_days=5
         )
 
-        assert daily["icir"] > weekly["icir"] > 0
-        assert daily["icir"] / weekly["icir"] == pytest.approx(math.sqrt(5), rel=1e-6)
+        assert daily["icir_annualized"] > weekly["icir_annualized"] > 0
+        assert daily["icir_annualized"] / weekly["icir_annualized"] == pytest.approx(
+            math.sqrt(5), rel=1e-6
+        )
+
+    def test_the_raw_icir_does_not_move_with_the_horizon(self):
+        """It is mean/sd of the same IC series either way — the horizon is not in it."""
+        dates, realized = self._panel(n_dates=200, seed=3)
+        signal = realized + np.random.default_rng(4).normal(0, 0.05, size=realized.size)
+
+        daily = rank_information_coefficient(
+            pd.Series(signal), pd.Series(realized), dates=dates, horizon_days=1
+        )
+        weekly = rank_information_coefficient(
+            pd.Series(signal), pd.Series(realized), dates=dates, horizon_days=5
+        )
+
+        assert daily["icir"] == pytest.approx(weekly["icir"])
 
     def test_dates_with_no_cross_section_are_skipped(self):
         result = rank_information_coefficient(
