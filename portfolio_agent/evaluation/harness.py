@@ -371,6 +371,8 @@ def build_forecast_panel(
     min_names: int = MIN_CROSS_SECTION_NAMES,
     max_dates: Optional[int] = None,
     use_benchmark: bool = True,
+    extra_horizons: Optional[Sequence[int]] = None,
+    keep_prices: bool = False,
 ) -> pd.DataFrame:
     """Run a strategy across a universe and collect what it predicted.
 
@@ -394,6 +396,12 @@ def build_forecast_panel(
         use_benchmark: Pass the cached benchmark index into the strategy
             context. The crash and regime filters read it, so turning it off
             changes what several strategies emit.
+        extra_horizons: Additional forward-return horizons to attach as
+            `forward_return_<h>` columns. Scoring is by far the expensive part
+            and does not depend on the horizon at all, so a decay curve over
+            six horizons costs one pass rather than six.
+        keep_prices: Also emit `close` and `volume` at the decision date. Needed
+            to build size and beta exposures without re-reading the cache.
 
     Returns:
         A tidy `(date, symbol, score, forward_return)` frame, plus a `signal`
@@ -410,8 +418,11 @@ def build_forecast_panel(
     from portfolio_agent.strategies.types import RiskParams, StrategyContext
 
     feature_names = list(strategy.required_features())
+    horizons = [int(h) for h in (extra_horizons or []) if int(h) != int(horizon)]
     features_by_ticker: Dict[str, pd.DataFrame] = {}
     labels_by_ticker: Dict[str, pd.Series] = {}
+    prices_by_ticker: Dict[str, pd.DataFrame] = {}
+    extra_labels: Dict[int, Dict[str, pd.Series]] = {h: {} for h in horizons}
 
     for ticker in universe:
         try:
@@ -440,6 +451,9 @@ def build_forecast_panel(
 
         features_by_ticker[ticker] = built
         labels_by_ticker[ticker] = forward_return(raw["close"], horizon)
+        prices_by_ticker[ticker] = raw
+        for extra in horizons:
+            extra_labels[extra][ticker] = forward_return(raw["close"], extra)
 
     if not features_by_ticker:
         raise ValueError(
@@ -490,15 +504,27 @@ def build_forecast_panel(
         signals = strategy.score_batch(eligible, context)
 
         for ticker, signal in signals.items():
-            rows.append(
-                {
-                    "date": date,
-                    "symbol": ticker,
-                    "score": float(signal.score),
-                    "forward_return": float(labels_by_ticker[ticker][date]),
-                    "signal": signal.signal,
-                }
-            )
+            row = {
+                "date": date,
+                "symbol": ticker,
+                "score": float(signal.score),
+                "forward_return": float(labels_by_ticker[ticker][date]),
+                "signal": signal.signal,
+            }
+            for extra in horizons:
+                # NaN where the outcome has not occurred yet. Left in rather
+                # than dropped, so every horizon is scored on the widest set of
+                # dates it can support instead of on the intersection with the
+                # longest one — which would silently shorten the whole curve to
+                # whatever the 21-day horizon could reach.
+                row[f"forward_return_{extra}"] = float(
+                    extra_labels[extra][ticker].get(date, np.nan)
+                )
+            if keep_prices:
+                bars = prices_by_ticker[ticker]
+                row["close"] = float(bars["close"].get(date, np.nan))
+                row["volume"] = float(bars["volume"].get(date, np.nan)) if "volume" in bars else np.nan
+            rows.append(row)
 
     if not rows:
         raise ValueError(
