@@ -13,7 +13,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from .artifacts import save_artifact
 from .base import TrainerConfig, TrainingArtifact
 from .config import resolve_training_config
 from .universe import UniverseSnapshot, resolve_universe
@@ -73,6 +72,7 @@ def checkpoint_path_for(
     *,
     models_dir: Path | str = DEFAULT_MODELS_DIR,
     model_name: Optional[str] = None,
+    suffix: str = ".pt",
 ) -> Path:
     """Where a run's weights go.
 
@@ -80,9 +80,14 @@ def checkpoint_path_for(
     loaders already look for: `IndiaSACStrategy` builds
     `models/india_sac_best.pt` from its `model_name` param, and `MLStrategy`
     builds `models/<architecture>_best.pt`.
+
+    `suffix` comes from the trainer, because not every payload is a torch file
+    — the boosting baseline writes `.joblib`. It is the trainer's
+    `checkpoint_suffix`, so the reported path and the written path cannot
+    disagree.
     """
     name = model_name or strategy or trainer_name
-    return Path(models_dir) / f"{name}_best.pt"
+    return Path(models_dir) / f"{name}_best{suffix}"
 
 
 def run_training_job(
@@ -167,17 +172,20 @@ def run_training_job(
     artifact.metadata.setdefault("n_tickers", len(snap))
 
     checkpoint: Optional[Path] = None
-    if save and not instance.writes_own_checkpoint:
-        checkpoint = save_artifact(
-            artifact,
-            checkpoint_path_for(
-                strategy, trainer_name, models_dir=models_dir, model_name=model_name
-            ),
-        )
-    elif instance.writes_own_checkpoint:
+    if instance.writes_own_checkpoint:
+        # `fit` already persisted; report where, do not write over it.
         checkpoint = checkpoint_path_for(
             strategy, trainer_name, models_dir=models_dir,
             model_name=model_name or artifact.metadata.get("model_architecture"),
+            suffix=instance.checkpoint_suffix,
+        )
+    elif save:
+        checkpoint = instance.write_checkpoint(
+            artifact,
+            checkpoint_path_for(
+                strategy, trainer_name, models_dir=models_dir,
+                model_name=model_name, suffix=instance.checkpoint_suffix,
+            ),
         )
 
     return TrainingRun(

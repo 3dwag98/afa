@@ -155,10 +155,8 @@ def cmd_train(args) -> int:
     try:
         from portfolio_agent.training import run_training_job
         from portfolio_agent.training.config import parse_overrides
-        from portfolio_agent.utils.device import get_device
     except ImportError as e:
-        print(f"Error: training requires PyTorch, which is not installed ({e}).")
-        print("Install it with: uv sync --extra gpu")
+        print(f"Error: could not load the training package ({e}).")
         return 1
 
     config = get_config()
@@ -173,8 +171,21 @@ def cmd_train(args) -> int:
     # accelerator to CPU itself, so passing the resolved type down guarantees
     # every later consumer (dataloaders, mixed precision, the checkpoint
     # metadata) agrees with what was printed.
+    #
+    # Imported inside the branch rather than above, because resolving a device
+    # needs PyTorch and the gbm trainer does not. Hoisting it would make
+    # `train --trainer gbm` refuse to start on an install that can run it
+    # perfectly well.
     if args.device:
-        overrides.setdefault("device", get_device(args.device).type)
+        try:
+            from portfolio_agent.utils.device import get_device
+        except ImportError:
+            print(
+                f"Warning: PyTorch is not installed, so --device {args.device} is "
+                "ignored. Trainers that need it will say so."
+            )
+        else:
+            overrides.setdefault("device", get_device(args.device).type)
 
     tickers = (
         [t.strip() for t in args.tickers.split(",") if t.strip()]
@@ -209,8 +220,13 @@ def cmd_train(args) -> int:
         run.universe.save(args.save_snapshot)
         print(f"Universe snapshot written to {args.save_snapshot}")
 
+    # "(supervised default)" is only true when the supervised trainer is what
+    # actually ran; with an explicit --trainer and no --strategy it is a lie.
+    strategy_label = run.strategy or (
+        "(supervised default)" if run.trainer == "supervised" else "-"
+    )
     print("\nTraining complete!")
-    print(f"  Strategy:   {run.strategy or '(supervised default)'}")
+    print(f"  Strategy:   {strategy_label}")
     print(f"  Trainer:    {run.trainer}")
     print(f"  Universe:   {len(run.universe)} tickers (fingerprint {run.universe.fingerprint})")
     print(f"  Duration:   {run.duration_seconds:.1f}s")
@@ -229,8 +245,7 @@ def cmd_train_bulk(args) -> int:
         from portfolio_agent.training.bulk import BulkJob, sweep
         from portfolio_agent.training.config import parse_overrides
     except ImportError as e:
-        print(f"Error: training requires PyTorch, which is not installed ({e}).")
-        print("Install it with: uv sync --extra gpu")
+        print(f"Error: could not load the training package ({e}).")
         return 1
 
     config = get_config()
@@ -317,15 +332,21 @@ def _parse_sweep_grid(specs: list[str]) -> dict:
 def cmd_list_trainers(args) -> int:
     """List registered training procedures and their hyperparameters."""
     from portfolio_agent.training import get_trainer, list_trainers
+    from portfolio_agent.training.registry import unavailable_trainers
 
     names = list_trainers()
+    missing = unavailable_trainers()
     if not names:
-        print("No trainers are registered — PyTorch is probably not installed.")
-        print("Install it with: uv sync --extra gpu")
+        print("No trainers are registered, which means the training package "
+              "failed to import.")
         return 1
 
     if args.name:
         if args.name not in names:
+            if args.name in missing:
+                print(f"Trainer {args.name!r} is installed but unavailable: "
+                      f"{missing[args.name]}")
+                return 1
             print(f"Unknown trainer: {args.name!r}. Available: {names}")
             return 1
         trainer_class = get_trainer(args.name)
@@ -333,6 +354,9 @@ def cmd_list_trainers(args) -> int:
         print(f"{args.name}  ({trainer_class.__name__})")
         if trainer_class.strategy_name:
             print(f"  trains: {trainer_class.strategy_name}")
+        reason = trainer_class.availability()
+        if reason:
+            print(f"  UNAVAILABLE: {reason}")
         print("  settings:")
         for field_name, field in schema.model_fields.items():
             default = field.default
@@ -346,7 +370,13 @@ def cmd_list_trainers(args) -> int:
     for name in names:
         trainer_class = get_trainer(name)
         target = f" -> {trainer_class.strategy_name}" if trainer_class.strategy_name else ""
-        print(f"  - {name}{target}")
+        reason = trainer_class.availability()
+        suffix = f"   [unavailable: {reason}]" if reason else ""
+        print(f"  - {name}{target}{suffix}")
+    # Absence and unavailability read very differently to someone scanning this
+    # list; a trainer whose module would not import is not a typo.
+    for name, reason in sorted(missing.items()):
+        print(f"  - {name}   [not loaded: {reason}]")
     print("\nUse --name <trainer> to see its settings, and set them with")
     print("  portfolio-agent train --strategy <s> --set key=value")
     return 0
@@ -804,7 +834,9 @@ def create_parser() -> argparse.ArgumentParser:
         "--model-name",
         type=str,
         default=None,
-        help="Checkpoint basename, written as <name>_best.pt (default: the strategy name)"
+        help="Checkpoint basename, written as <name>_best<ext> where the extension "
+             "is the trainer's (.pt for the neural trainers, .joblib for gbm). "
+             "Default: the strategy name."
     )
     train_parser.set_defaults(func=cmd_train)
 

@@ -60,6 +60,14 @@ hf = [
 optimize = [
     "cvxpy>=1.4",
 ]
+# Gradient-boosted-tree baseline (training/trainers/gbm.py). Separate from
+# `gpu` on purpose: boosting is the trainer that needs no PyTorch at all, so
+# `--extra gbm` alone is enough to train, score and persist a forecasting
+# model. scikit-learn brings joblib, which is what the .joblib checkpoints and
+# their JSON sidecars are written with.
+gbm = [
+    "scikit-learn>=1.3",
+]
 
 # The CUDA extras and the plain `gpu` extra all name `torch`, and only one of
 # them can be installed at a time.
