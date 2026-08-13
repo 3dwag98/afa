@@ -5,8 +5,13 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 
-from src.indicators import calculate_adx, calculate_indicators, calculate_all_indicators
-from src.models import IndicatorSnapshot
+# src/indicators.py is gone (T10): it held a second, unshifted copy of half
+# of features/technical.py. ADX moved to the feature module — it was the one
+# function with no counterpart there — and the IndicatorSnapshot helpers
+# moved into the orchestrator, their only caller, which is frozen.
+from portfolio_agent.features.technical import calculate_adx
+from portfolio_agent.src.orchestrator import calculate_indicators, calculate_all_indicators
+from portfolio_agent.src.models import IndicatorSnapshot
 
 
 def generate_synthetic_data(rows: int = 300, seed: int = 42) -> pd.DataFrame:

@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.backtest_engine import BacktestEngine
+from portfolio_agent.src.backtest_engine import BacktestEngine
 from portfolio_agent.strategies.registry import load_strategy
 from portfolio_agent.strategies.types import RiskParams
 from portfolio_agent.config.schema import StrategyConfig
@@ -42,7 +42,7 @@ def synthetic_data(monkeypatch):
             return df
         return None
 
-    monkeypatch.setattr("src.backtest_engine.load_ticker_data", mock_load_ticker_data)
+    monkeypatch.setattr("portfolio_agent.src.backtest_engine.load_ticker_data", mock_load_ticker_data)
 
     return {'tickers': tickers, 'data': data_dict, 'dates': dates}
 
@@ -228,7 +228,7 @@ class TestCorporateActions:
                 'low': [99] * len(dates), 'close': [103] * len(dates), 'volume': [1000] * len(dates)
             }, index=dates)
 
-        monkeypatch.setattr("src.backtest_engine.load_ticker_data", mock_load_ticker_data)
+        monkeypatch.setattr("portfolio_agent.src.backtest_engine.load_ticker_data", mock_load_ticker_data)
 
         engine = BacktestEngine(
             start_date="2023-01-02", end_date="2023-03-31",
@@ -348,7 +348,7 @@ class TestPortfolioRiskCap:
             (capped * 100.0 / engine.portfolio_value) if n == ticker else 0.0
             for n in names
         ])
-        from src.portfolio import portfolio_volatility
+        from portfolio_agent.src.portfolio import portfolio_volatility
         assert portfolio_volatility(weights, covariance) <= 0.05 + 1e-9
 
     def test_leaves_a_buy_alone_when_the_book_stays_inside_the_target(self, synthetic_data):
@@ -675,14 +675,14 @@ class TestBenchmarkWiring:
     StrategyContext, look-ahead safe."""
 
     def _engine_with_benchmark(self, monkeypatch, synthetic_data, series):
-        real_loader = __import__("src.backtest_engine", fromlist=["x"]).load_ticker_data
+        real_loader = __import__("portfolio_agent.src.backtest_engine", fromlist=["x"]).load_ticker_data
 
         def loader(ticker, start_date=None, end_date=None):
             if ticker == "^NSEI":
                 return pd.DataFrame({"close": series.values}, index=series.index)
             return real_loader(ticker, start_date=start_date, end_date=end_date)
 
-        monkeypatch.setattr("src.backtest_engine.load_ticker_data", loader)
+        monkeypatch.setattr("portfolio_agent.src.backtest_engine.load_ticker_data", loader)
         return BacktestEngine(
             start_date="2023-01-02", end_date="2023-03-31",
             initial_capital=1_000_000.0, universe_tickers=synthetic_data['tickers'],
@@ -781,7 +781,7 @@ class TestKellyUsesNetReturns:
         net_quantity = engine._kelly_quantity(entry_price=100.0)
 
         # Same history scored off the gross column, as the code used to.
-        from src.risk import calculate_kelly_quantity, estimate_kelly_inputs
+        from portfolio_agent.src.risk import calculate_kelly_quantity, estimate_kelly_inputs
         gross_inputs = estimate_kelly_inputs(
             [
                 {"outcome": "WIN" if t["net_pnl"] > 0 else "LOSS", "return_pct": t["return_pct"]}
@@ -1296,7 +1296,7 @@ class TestGapAwareStopFills:
         def _load(ticker, start_date=None, end_date=None):
             return frame.copy() if ticker == "GAP.NS" else None
 
-        monkeypatch.setattr("src.backtest_engine.load_ticker_data", _load)
+        monkeypatch.setattr("portfolio_agent.src.backtest_engine.load_ticker_data", _load)
 
         engine = BacktestEngine(
             start_date="2024-01-01", end_date="2024-01-02",

@@ -24,20 +24,12 @@ logger = logging.getLogger(__name__)
 # every Sharpe deeply negative rather than failing.
 _PERCENT_UNIT_THRESHOLD = 1.0
 
-try:
-    from .performance_stats import (
-        TRADING_DAYS_PER_YEAR,
-        evaluate_sharpe,
-        excess_returns,
-        sharpe_ratio as arithmetic_sharpe_ratio,
-    )
-except ImportError:  # running from inside src/ as a flat package
-    from performance_stats import (
-        TRADING_DAYS_PER_YEAR,
-        evaluate_sharpe,
-        excess_returns,
-        sharpe_ratio as arithmetic_sharpe_ratio,
-    )
+from .performance_stats import (
+    TRADING_DAYS_PER_YEAR,
+    evaluate_sharpe,
+    excess_returns,
+    sharpe_ratio as arithmetic_sharpe_ratio,
+)
 
 # Keys that may carry a trade's realized profit, most specific first.
 # BacktestEngine writes 'net_pnl' (P&L after costs and taxes); older/simpler

@@ -11,9 +11,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.backtest_engine import BacktestEngine
-from src.backtest_reporting import export_backtest_excel
-from src.risk_analytics import RiskAnalyzer
+from portfolio_agent.src.backtest_engine import BacktestEngine
+from portfolio_agent.src.backtest_reporting import export_backtest_excel
+from portfolio_agent.src.risk_analytics import RiskAnalyzer
 
 
 @pytest.fixture
@@ -50,7 +50,7 @@ def market_data(monkeypatch):
             df = df[df.index <= pd.to_datetime(end_date)]
         return df
 
-    monkeypatch.setattr("src.backtest_engine.load_ticker_data", fake_load)
+    monkeypatch.setattr("portfolio_agent.src.backtest_engine.load_ticker_data", fake_load)
     return {'tickers': tickers, 'dates': dates}
 
 

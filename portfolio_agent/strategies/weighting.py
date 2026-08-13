@@ -15,7 +15,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 try:
     from portfolio_agent.src.risk import shrink_win_probability
 except ImportError:  # flat `src` layout
-    from src.risk import shrink_win_probability
+    from portfolio_agent.src.risk import shrink_win_probability
 
 # Minimum realized trades attributed to a single component before its win rate
 # is allowed to move that component's weight. The platform's own Kelly path

@@ -372,8 +372,27 @@ def load_or_fetch_data(
             if df is not None and len(df) > 0:
                 result[ticker] = df
 
-    if not result and config.data.allow_synthetic_fallback:
-        logger.info("No real data available; generating synthetic fallback data")
+    if not result:
+        if not config.data.allow_synthetic_fallback:
+            # Loudly, and as an exception. Returning an empty dict let every
+            # caller decide for itself what "no data" meant, and the usual
+            # decision was to carry on and produce an empty-looking but
+            # otherwise normal result.
+            raise RuntimeError(
+                f"No market data available for any of {len(tickers_to_use)} ticker(s) "
+                f"and synthetic fallback is off.\n"
+                f"  Run `portfolio-agent download-data` to populate the cache, then "
+                f"`portfolio-agent data status` to confirm what arrived.\n"
+                f"  Set data.allow_synthetic_fallback=true only for offline plumbing "
+                f"tests — it substitutes random-walk bars, and any number computed "
+                f"from them describes a random-number generator."
+            )
+        logger.warning(
+            "No real data available; generating SYNTHETIC random-walk bars for %d "
+            "ticker(s). Every number downstream of this describes a random-number "
+            "generator, not a market.",
+            len(tickers_to_use),
+        )
         for ticker in tickers_to_use:
             result[ticker] = generate_synthetic_ohlcv(
                 ticker, days=config.data.min_history_days, seed=config.simulation.random_seed

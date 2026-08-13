@@ -5,7 +5,6 @@
 # Data configuration
 data:
   data_dir: data
-  market_data_dir: data/market_data
   # huggingface | yfinance. The Hub dataset downloads once as a columnar file
   # and is reproducible when hf_revision is pinned; yfinance fetches per ticker
   # and returns whatever it has today. Both land in the same parquet cache.
@@ -41,7 +40,9 @@ data:
   universe_size: 4000
   tickers: []
   min_history_days: 250
-  allow_synthetic_fallback: true
+  # Substitutes random-walk bars when no real data is present. Off:
+  # any number computed from them describes a random-number generator.
+  allow_synthetic_fallback: false
   # Concurrent chunk downloads (network-bound work -> threads). Set to 1 if
   # the data provider rate-limits you.
   download_workers: 4
@@ -54,21 +55,6 @@ data:
 features:
   normalize: false
   normalize_window: 252
-  feature_sets:
-    core:
-      - sma_20
-      - sma_50
-      - sma_200
-    momentum:
-      - rsi_14
-      - macd
-      - return_1d
-      - return_5d
-    volatility:
-      - atr_14
-      - bollinger_pct_b
-      - donchian_upper_20
-
 # Strategy configuration
 strategy:
   enabled: true
@@ -333,5 +319,3 @@ paths:
   # gets max_unknown_sector_pct.
   sector_map_csv: data/sector_map.csv
   log_file: logs/agent.log
-  log_dir: logs
-  output_dir: output

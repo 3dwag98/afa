@@ -14,7 +14,7 @@ import pandas as pd
 import pytest
 
 from portfolio_agent.config.schema import AppConfig
-from src.hf_dataset import (
+from portfolio_agent.src.hf_dataset import (
     DEFAULT_HF_DATASET_ID,
     SchemaError,
     hub_symbol,
@@ -321,7 +321,7 @@ class TestSyncHfToCache:
 
         assert written == ["INFY.NS", "TCS.NS"]
 
-        import src.data_store as data_store
+        import portfolio_agent.src.data_store as data_store
 
         monkeypatch.setattr(data_store, "DATA_DIR", cache_dir)
         df = data_store.load_ticker_data("TCS.NS")
@@ -366,7 +366,7 @@ class TestSyncHfToCache:
 
         sync_hf_to_cache(cache_dir=cache_dir, start_date="2024-01-03", end_date="2024-01-05")
 
-        import src.data_store as data_store
+        import portfolio_agent.src.data_store as data_store
 
         monkeypatch.setattr(data_store, "DATA_DIR", cache_dir)
         assert len(data_store.load_ticker_data("TCS.NS")) == 3
@@ -377,11 +377,11 @@ class TestFetchAndCacheSourceSelection:
     used by both the CLI and the live agent's missing-ticker top-up."""
 
     def test_huggingface_source_uses_the_hub(self, monkeypatch):
-        import src.data_store as data_store
+        import portfolio_agent.src.data_store as data_store
 
         calls = []
         monkeypatch.setattr(
-            "src.hf_dataset.sync_hf_to_cache",
+            "portfolio_agent.src.hf_dataset.sync_hf_to_cache",
             lambda **kwargs: calls.append(kwargs) or ["TCS.NS"],
         )
 
@@ -398,7 +398,7 @@ class TestFetchAndCacheSourceSelection:
         assert calls[0]["start_date"] == "2020-01-01"
 
     def test_yfinance_source_uses_the_download_path(self, monkeypatch):
-        import src.data_store as data_store
+        import portfolio_agent.src.data_store as data_store
 
         calls = []
         monkeypatch.setattr(
@@ -418,12 +418,12 @@ class TestFetchAndCacheSourceSelection:
         """A run must not end with no data because the Hub was unreachable —
         but the switch is logged, since silently changing source mid-experiment
         is how two 'identical' backtests end up disagreeing."""
-        import src.data_store as data_store
+        import portfolio_agent.src.data_store as data_store
 
         def boom(**kwargs):
             raise RuntimeError("hub unreachable")
 
-        monkeypatch.setattr("src.hf_dataset.sync_hf_to_cache", boom)
+        monkeypatch.setattr("portfolio_agent.src.hf_dataset.sync_hf_to_cache", boom)
         fallback = []
         monkeypatch.setattr(
             data_store, "batch_download_and_cache",
@@ -440,9 +440,9 @@ class TestFetchAndCacheSourceSelection:
         assert len(fallback) == 1
 
     def test_tickers_absent_from_the_dataset_are_reported(self, monkeypatch):
-        import src.data_store as data_store
+        import portfolio_agent.src.data_store as data_store
 
-        monkeypatch.setattr("src.hf_dataset.sync_hf_to_cache", lambda **kwargs: ["TCS.NS"])
+        monkeypatch.setattr("portfolio_agent.src.hf_dataset.sync_hf_to_cache", lambda **kwargs: ["TCS.NS"])
 
         config = AppConfig()
         config.data.source = "huggingface"
@@ -500,7 +500,7 @@ class TestBenchmarkCacheRoundTrip:
         # suffixed file would be written and then never found.
         assert written == ["^NSEI"]
 
-        import src.data_store as data_store
+        import portfolio_agent.src.data_store as data_store
 
         monkeypatch.setattr(data_store, "DATA_DIR", cache_dir)
         assert data_store.load_ticker_data("^NSEI") is not None
@@ -520,6 +520,6 @@ class TestBenchmarkCacheRoundTrip:
         sync_hf_to_cache(cache_dir=cache_dir, tickers=["TCS"], asset_dir="stocks")
         sync_hf_to_cache(cache_dir=cache_dir, tickers=["^NSEI"], asset_dir="indices")
 
-        import src.data_store as data_store
+        import portfolio_agent.src.data_store as data_store
 
         assert data_store.get_cached_tickers(cache_dir) == ["TCS.NS"]

@@ -15,7 +15,7 @@ import pytest
 
 cvxpy = pytest.importorskip("cvxpy", reason="the QP optimizer is an optional extra")
 
-from src.portfolio_optimizer import optimize_mean_variance_qp, sector_constraint_matrix
+from portfolio_agent.src.portfolio_optimizer import optimize_mean_variance_qp, sector_constraint_matrix
 
 
 def _universe(n_per_sector=5, sectors=("TECH", "BANK", "PHARM", "AUTO")):

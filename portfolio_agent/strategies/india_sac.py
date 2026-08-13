@@ -53,7 +53,7 @@ from portfolio_agent.utils.device import resolve_device
 try:
     from portfolio_agent.src.risk import calculate_stop_target, net_reward_risk
 except ImportError:  # running from inside src/ as a flat package
-    from src.risk import calculate_stop_target, net_reward_risk
+    from portfolio_agent.src.risk import calculate_stop_target, net_reward_risk
 
 logger = logging.getLogger(__name__)
 

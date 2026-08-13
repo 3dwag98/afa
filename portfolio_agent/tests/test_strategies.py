@@ -13,7 +13,7 @@ from portfolio_agent.strategies.registry import load_strategy, register_strategy
 from portfolio_agent.strategies.rule_based import RuleBasedStrategy
 from portfolio_agent.strategies.types import RiskParams, StrategyContext
 from portfolio_agent.strategies.weighting import normalize_weights, combine_weighted, evaluate_and_learn
-from src.monte_carlo import MonteCarloResult
+from portfolio_agent.src.monte_carlo import MonteCarloResult
 
 
 def _strategy_config() -> StrategyConfig:

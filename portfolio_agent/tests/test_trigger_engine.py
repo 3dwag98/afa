@@ -8,7 +8,7 @@ strong models point in opposite directions, the answer is "stand aside", not
 import pytest
 
 from portfolio_agent.strategies.types import ModelVerdict, StrategySignal
-from src.trigger_engine import TriggerConfig, TriggerDecision, TriggerEngine
+from portfolio_agent.src.trigger_engine import TriggerConfig, TriggerDecision, TriggerEngine
 
 
 def _verdict(name, action="BUY", confidence=0.8, ev=5.0, **kwargs):

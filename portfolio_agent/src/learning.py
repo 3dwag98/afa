@@ -14,12 +14,8 @@ from portfolio_agent.config.schema import AppConfig
 from portfolio_agent.strategies.weighting import evaluate_and_learn as _evaluate_and_learn
 
 # Use absolute imports for CLI execution
-try:
-    from .models import AgentBrain
-    from .logging_utils import get_logger, ContextualLogger
-except ImportError:
-    from models import AgentBrain
-    from logging_utils import get_logger, ContextualLogger
+from .models import AgentBrain
+from .logging_utils import get_logger, ContextualLogger
 
 
 def _get_logger(run_id: Optional[str] = None, log_file: str = "logs/afa_pipeline.log") -> ContextualLogger:
