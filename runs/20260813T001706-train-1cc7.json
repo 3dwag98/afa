@@ -1,0 +1,88 @@
+{
+  "run_id": "20260813T001706-train-1cc7",
+  "kind": "train",
+  "created_at": "2026-08-13T00:17:06+00:00",
+  "strategy": null,
+  "trainer": "gbm",
+  "config_fingerprint": "60287ac2c1f2",
+  "universe_fingerprint": "ac3c77db339c",
+  "universe_name": "gbm",
+  "n_symbols": 8,
+  "settings": {
+    "epochs": 20,
+    "batch_size": 128,
+    "learning_rate": 0.003,
+    "device": "auto",
+    "seed": 42,
+    "train_fraction": 0.8,
+    "target": "return_5d",
+    "target_transform": "cross_sectional_rank",
+    "feature_normalization": "cross_sectional",
+    "features": null,
+    "purge_days": null,
+    "min_history": 260,
+    "max_leaf_nodes": 31,
+    "max_depth": null,
+    "min_samples_leaf": 100,
+    "l2_regularization": 1.0,
+    "max_bins": 255,
+    "early_stopping": true,
+    "n_iter_no_change": 10,
+    "importance_repeats": 1
+  },
+  "split": {},
+  "metrics": {
+    "train_loss": 0.2568982779853663,
+    "val_loss": 0.2588869933959883,
+    "val_rank_ic": 0.07440435443436257,
+    "val_rank_ic_std": 0.40839351437042404,
+    "val_icir": 0.18218789431331614,
+    "val_ic_hit_rate": 0.6136363636363636,
+    "val_ic_dates": 88,
+    "n_iterations": 20,
+    "n_train_rows": 2776,
+    "n_val_rows": 704,
+    "n_purged_rows": 40
+  },
+  "timings": {
+    "total": 0.30978995300029055
+  },
+  "artifacts": {
+    "checkpoint": "/tmp/pytest-of-root/pytest-44/test_end_to_end_run_writes_a_l0/gbm_best.joblib"
+  },
+  "git": {
+    "commit": "9cd1f513f529858ad3dceba8dadfdf60e8213ffe",
+    "branch": "claude/t08-cli-forecasting",
+    "dirty": true,
+    "dirty_files": [
+      "ortfolio_agent/cli.py",
+      "portfolio_agent/cli_forecast.py",
+      "portfolio_agent/tests/test_cli.py",
+      "runs/20260813T001659-evaluate-momentum-bcfa.json",
+      "runs/20260813T001659-evaluate-recording-16b6.json"
+    ]
+  },
+  "data": {
+    "cache_dir": "data/market_data",
+    "n_symbols": 0,
+    "n_missing": 8,
+    "fingerprint": "4f53cda18c2b",
+    "method": "size+mtime per file, not a content hash"
+  },
+  "libraries": {
+    "numpy": "2.4.6",
+    "pandas": "3.0.5",
+    "scipy": "1.17.1",
+    "torch": "2.13.0",
+    "scikit-learn": "1.9.0",
+    "pyarrow": "25.0.1"
+  },
+  "environment": {
+    "python": "3.11.15",
+    "platform": "Linux-6.18.5-fc-v20-x86_64-with-glibc2.39"
+  },
+  "notes": [
+    "The working tree had uncommitted changes when this ran, so the code that produced these numbers is not recoverable from the recorded commit."
+  ],
+  "extras": {}
+}
