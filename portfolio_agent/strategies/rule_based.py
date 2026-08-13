@@ -32,6 +32,28 @@ from portfolio_agent.src.risk import calculate_stop_target, net_reward_risk
 # rank transform and the score both walk the same set.
 COMPONENT_NAMES = ("Trend", "Breakout", "Volume", "MC_Prob")
 
+# The rules file names components the way a reader would; the scoring code
+# names them the way the learned-weight record does. Stated here because the
+# two vocabularies meet in exactly one place and a silent mismatch drops a
+# component's weight to zero rather than raising.
+_YAML_WEIGHT_KEYS = {
+    "trend": "Trend",
+    "breakout": "Breakout",
+    "volume": "Volume",
+    "model_probability": "MC_Prob",
+}
+
+# Used when neither the rules file nor the caller supplies weights. Equal to
+# `src/models.py::AgentBrain`'s defaults, which is what the backtest starts a
+# run from — so an evaluation and the first day of a backtest weigh the
+# components identically instead of by accident of which path ran.
+DEFAULT_COMPONENT_WEIGHTS = {
+    "Trend": 25.0,
+    "Breakout": 25.0,
+    "Volume": 20.0,
+    "MC_Prob": 30.0,
+}
+
 SCORING_MODES = ("weighted_sum", "rank_composite", "probit_composite")
 
 # Modes whose score is a statement about the cross-section, so a per-ticker
@@ -112,6 +134,55 @@ class RuleBasedStrategy(BaseStrategy):
                 f"expected one of {SCORING_MODES}"
             )
         self._scoring = scoring
+        self._weights = self._load_weights(scoring_block)
+
+    def _load_weights(self, scoring_block: Any) -> Dict[str, float]:
+        """The component weights this strategy scores with on its own.
+
+        The docstring above has always claimed the rules file supplies "the
+        weights the method is applied to". It did not: only `scoring.method`
+        was read, and every weight came from `context.weights`, which **only
+        the backtest populates** — from `AgentBrain`, whose defaults happen to
+        duplicate the YAML's. So `scoring.weights` was dead config, and under
+        any caller that did not fill the context the weighted sum ran over an
+        empty mapping and returned 0.0 for every name.
+
+        That is not a hypothetical. `evaluation/harness.py` builds a
+        `StrategyContext` with `risk` and the two benchmark fields and nothing
+        else, so every `rule_based` score it ever measured was identically
+        zero — and the resulting "score dispersion 0.016, no cross-section left
+        to rank" was published as a property of the strategy.
+
+        A strategy that cannot score without a field one caller happens to set
+        is not pluggable. This reads the rules file, so the configured weights
+        finally do something, and `context.weights` becomes an *override* for
+        the learned values the backtest evolves rather than the only source.
+        """
+        weights = dict(DEFAULT_COMPONENT_WEIGHTS)
+        block = scoring_block.get("weights") if isinstance(scoring_block, dict) else None
+        if not isinstance(block, dict):
+            return weights
+
+        unknown = sorted(set(block) - set(_YAML_WEIGHT_KEYS))
+        if unknown:
+            raise ValueError(
+                f"{self._yaml_path}: scoring.weights has unknown key(s) {unknown}; "
+                f"expected any of {sorted(_YAML_WEIGHT_KEYS)}. A misspelled key "
+                "would silently weight that component at zero."
+            )
+        for key, component in _YAML_WEIGHT_KEYS.items():
+            if key in block:
+                weights[component] = float(block[key])
+        return weights
+
+    def _effective_weights(self, context: StrategyContext) -> Dict[str, float]:
+        """`context.weights` when the caller has them, else the configured set.
+
+        The backtest evolves weights across a run and passes them down; the
+        evaluation harness and any notebook do not have a learning loop to
+        evolve anything, and should score the strategy as configured.
+        """
+        return dict(context.weights) if context.weights else dict(self._weights)
 
     def _load_rules(self) -> Dict[str, Any]:
         """Load rules from the YAML configuration file."""
@@ -204,9 +275,10 @@ class RuleBasedStrategy(BaseStrategy):
         # _build_signal — the composite is computed for the whole batch first
         # and handed down.
         scored = self._probit_components(usable)
+        weights = self._effective_weights(context)
         composites = {
             symbol: combine_weighted(
-                scored[symbol], context.weights, unavailable=read.unavailable
+                scored[symbol], weights, unavailable=read.unavailable
             )[0]
             for symbol, read in usable.items()
         }
@@ -494,7 +566,7 @@ The weighted sum this replaces adds four incommensurable quantities: an
 
         if final_score is None:
             final_score, _ = combine_weighted(
-                score_inputs, context.weights, unavailable=unavailable
+                score_inputs, self._effective_weights(context), unavailable=unavailable
             )
         trigger = select_trigger(component_scores)
 
