@@ -45,52 +45,36 @@ from .base import BaseStrategy
 from .types import StrategyContext, StrategySignal
 from portfolio_agent.config.schema import StrategyConfig
 from portfolio_agent.features.market_relative import (
-    DEFAULT_VOL_WINDOW,
+    # Aliased because `src.regime` exports a `DEFAULT_VOL_WINDOW` too, and its
+    # import below would otherwise shadow this one. Both are 60 today, which is
+    # what makes the collision worth naming rather than leaving: they measure
+    # different things — one is the residual-estimation window, the other the
+    # market's own volatility lookback — so the day either moves, the
+    # idiosyncratic sort would silently start using the regime filter's number.
+    DEFAULT_VOL_WINDOW as DEFAULT_IDIOSYNCRATIC_WINDOW,
     idiosyncratic_vol_from_closes,
 )
 
-try:
-    from portfolio_agent.src.risk import calculate_stop_target, net_reward_risk
-    from portfolio_agent.src.liquidity import (
-        DEFAULT_MAX_CIRCUIT_LOCK_FRACTION,
-        DEFAULT_MAX_OPERATOR_TRAP_FRACTION,
-        DEFAULT_MAX_ZERO_RETURN_FRACTION,
-        DEFAULT_MIN_TRADED_VALUE_INR,
-    )
-    from portfolio_agent.src.regime import (
-        DEFAULT_CRASH_VOL_MULTIPLE,
-        DEFAULT_MAX_SCALE,
-        DEFAULT_MIN_SCALE,
-        DEFAULT_TARGET_VOLATILITY,
-        DEFAULT_TREND_WINDOW,
-        DEFAULT_VOL_WINDOW,
-        MarketRegime,
-        assess_market_regime,
-        build_market_proxy,
-        neutral_regime,
-        volatility_target_scalar,
-    )
-except ImportError:
-    from risk import calculate_stop_target, net_reward_risk
-    from liquidity import (
-        DEFAULT_MAX_CIRCUIT_LOCK_FRACTION,
-        DEFAULT_MAX_OPERATOR_TRAP_FRACTION,
-        DEFAULT_MAX_ZERO_RETURN_FRACTION,
-        DEFAULT_MIN_TRADED_VALUE_INR,
-    )
-    from regime import (
-        DEFAULT_CRASH_VOL_MULTIPLE,
-        DEFAULT_MAX_SCALE,
-        DEFAULT_MIN_SCALE,
-        DEFAULT_TARGET_VOLATILITY,
-        DEFAULT_TREND_WINDOW,
-        DEFAULT_VOL_WINDOW,
-        MarketRegime,
-        assess_market_regime,
-        build_market_proxy,
-        neutral_regime,
-        volatility_target_scalar,
-    )
+from portfolio_agent.src.risk import calculate_stop_target, net_reward_risk
+from portfolio_agent.src.liquidity import (
+    DEFAULT_MAX_CIRCUIT_LOCK_FRACTION,
+    DEFAULT_MAX_OPERATOR_TRAP_FRACTION,
+    DEFAULT_MAX_ZERO_RETURN_FRACTION,
+    DEFAULT_MIN_TRADED_VALUE_INR,
+)
+from portfolio_agent.src.regime import (
+    DEFAULT_CRASH_VOL_MULTIPLE,
+    DEFAULT_MAX_SCALE,
+    DEFAULT_MIN_SCALE,
+    DEFAULT_TARGET_VOLATILITY,
+    DEFAULT_TREND_WINDOW,
+    DEFAULT_VOL_WINDOW,
+    MarketRegime,
+    assess_market_regime,
+    build_market_proxy,
+    neutral_regime,
+    volatility_target_scalar,
+)
 
 # Decile ranking is a statistical statement about a cross-section. Below ~30
 # names a "top 10%" selection is 1-3 stocks chosen from a sample far too small
@@ -662,7 +646,14 @@ class LowVolatilityStrategy(BaseStrategy):
                 f"sort_on must be one of {list(VOLATILITY_SORTS)}, got {sort_on!r}"
             )
         self._sort_on = sort_on
-        self._vol_window = int(params.get("vol_window", DEFAULT_VOL_WINDOW))
+        # `idiosyncratic_window`, not `vol_window`. `CrashProtection` already
+        # reads `vol_window` for the *market's* volatility lookback, so sharing
+        # the key would make one setting move two unrelated windows — the
+        # regime filter's view of market stress and the length of the CAPM
+        # regression — with no indication that it had.
+        self._vol_window = int(
+            params.get("idiosyncratic_window", DEFAULT_IDIOSYNCRATIC_WINDOW)
+        )
 
     @property
     def name(self) -> str:

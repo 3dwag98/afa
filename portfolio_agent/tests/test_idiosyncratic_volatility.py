@@ -361,6 +361,36 @@ class TestTheStrategy:
         with pytest.raises(ValueError, match="sort_on must be one of"):
             self._load("low_volatility", sort_on="downside")
 
+    def test_the_idiosyncratic_window_has_its_own_param_key(self):
+        """`vol_window` already belongs to the regime filter.
+
+        Sharing it would make one setting move two unrelated windows — the
+        market-stress lookback and the length of the CAPM regression — with
+        nothing in the output indicating that it had.
+        """
+        strategy = self._load("low_volatility_idio", idiosyncratic_window=120)
+        rules = strategy.entry_rules()
+        assert rules["vol_window"] == 120
+        assert rules["crash_protection"]["volatility_target"] is not None
+
+    def test_setting_the_regime_window_does_not_move_the_capm_window(self):
+        idio = self._load("low_volatility_idio", vol_window=15)
+        assert idio.entry_rules()["vol_window"] == DEFAULT_VOL_WINDOW
+
+    def test_the_two_constants_are_not_the_same_name_in_this_module(self):
+        """`src.regime` and `features.market_relative` both export a
+        `DEFAULT_VOL_WINDOW`, and the second import would shadow the first.
+
+        They are equal today, which is exactly what makes the collision worth a
+        test: nothing would fail on the day one of them moves.
+        """
+        import portfolio_agent.strategies.cross_sectional as module
+
+        from portfolio_agent.src.regime import DEFAULT_VOL_WINDOW as regime_window
+
+        assert module.DEFAULT_IDIOSYNCRATIC_WINDOW == DEFAULT_VOL_WINDOW
+        assert module.DEFAULT_VOL_WINDOW == regime_window
+
     def test_the_two_sorts_pick_different_names(self):
         """The end-to-end version of the decomposition test."""
         features, context = _features(), _context()

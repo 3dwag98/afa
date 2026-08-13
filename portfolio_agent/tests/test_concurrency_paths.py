@@ -12,10 +12,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-import data_store as data_store_module
-from data_store import DataStore
+import portfolio_agent.src.data_store as data_store_module
+from portfolio_agent.src.data_store import DataStore
 from portfolio_agent.config.schema import AppConfig
 from portfolio_agent.src.monte_carlo import MonteCarloSettings
 from portfolio_agent.execution.orchestrator import _prepare_all_tickers, _prepare_one_ticker

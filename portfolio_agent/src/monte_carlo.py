@@ -417,10 +417,7 @@ class MonteCarloSettings:
 
         intraday = overnight = None
         if self.separate_overnight_gaps and ohlcv is not None:
-            try:
-                from .liquidity import split_intraday_and_overnight
-            except ImportError:
-                from liquidity import split_intraday_and_overnight
+            from .liquidity import split_intraday_and_overnight
             split = split_intraday_and_overnight(ohlcv)
             if split is not None:
                 intraday, overnight = split
@@ -826,10 +823,7 @@ def run_monte_carlo_garch(
     Falls back to run_monte_carlo()'s constant-volatility path whenever
     there isn't enough history to fit GARCH reliably or the fit fails.
     """
-    try:
-        from .volatility_models import forecast_volatility, forecast_volatility_gap_aware
-    except ImportError:
-        from volatility_models import forecast_volatility, forecast_volatility_gap_aware
+    from .volatility_models import forecast_volatility, forecast_volatility_gap_aware
 
     forecast = None
     if intraday_returns is not None and overnight_returns is not None:

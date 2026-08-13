@@ -9,9 +9,8 @@ from datetime import datetime, timedelta
 
 # Import from src
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from data_store import (
+from portfolio_agent.src.data_store import (
     DataStore,
     DATA_DIR,
     _ticker_filename,
@@ -34,7 +33,7 @@ def clean_data_dir(tmp_path, monkeypatch):
     (thousands of parquet files) from the working tree. Never operate
     destructively on a real, non-tmp-path directory from a test fixture.
     """
-    import data_store as data_store_module
+    import portfolio_agent.src.data_store as data_store_module
 
     test_dir = tmp_path / "market_data"
     test_dir.mkdir(parents=True, exist_ok=True)
@@ -594,7 +593,7 @@ class TestLoadOrFetchData:
 
     def test_falls_back_to_synthetic_when_nothing_available(self, clean_data_dir, monkeypatch):
         monkeypatch.setattr(
-            "data_store.batch_download_and_cache", lambda *a, **k: False
+            "portfolio_agent.src.data_store.batch_download_and_cache", lambda *a, **k: False
         )
         config = _make_config(tickers=["NEVERCACHED.NS"], allow_synthetic_fallback=True)
 

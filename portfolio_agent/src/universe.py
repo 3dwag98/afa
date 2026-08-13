@@ -38,10 +38,8 @@ def discover_available_tickers(data_dir: str = "data/market_data") -> list[str]:
     Returns:
         Sorted list of unique ticker symbols. Empty list if no parquet files exist.
     """
-    try:
-        from .data_store import get_cached_tickers
-    except ImportError:
-        from data_store import get_cached_tickers
+    from .data_store import get_cached_tickers
+
     return get_cached_tickers(Path(data_dir))
 
 

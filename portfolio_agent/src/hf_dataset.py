@@ -457,10 +457,7 @@ def sync_hf_to_cache(
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    try:
-        from .data_store import DATA_DIR, DataStore
-    except ImportError:  # pragma: no cover - script-style import path
-        from data_store import DATA_DIR, DataStore
+    from .data_store import DATA_DIR, DataStore
 
     if tickers is None:
         symbols = list_hub_symbols(dataset_id, revision, asset_dir)
