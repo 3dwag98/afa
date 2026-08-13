@@ -1,8 +1,14 @@
-# The forecasting pivot: eleven tasks
+# The forecasting pivot: eighteen tasks, in two rounds
 
-All eleven are done and merged. Each task's own file carries its spec, its
+All eighteen are done and merged. Each task's own file carries its spec, its
 acceptance criteria, and what actually shipped — including the places where the
 spec turned out to be wrong.
+
+**Round one (T01–T11)** built the evaluation layer: measure forecast skill
+directly, without simulating a book. **Round two (T12–T18)** came out of
+[`docs/architecture_review_2.html`](../architecture_review_2.html), which read
+the merged tree against current literature and found that the platform
+contradicted itself about its own headline number.
 
 The premise behind all of them: **no trades will ever be executed, so tracking
 error is acceptable and forecast skill is the thing worth measuring.** That
@@ -24,7 +30,49 @@ and why the data work is about provenance rather than latency.
 | [T10](T10-remove-dead-code.md) | Delete what is actively misleading | 26 |
 | [T11](T11-freeze-execution.md) | Freeze the live-trading namespace | 67 |
 
-## What the work found
+## Round two: what the review produced
+
+| Task | What it did | Tests added |
+| --- | --- | --- |
+| [T12](T12-one-rank-ic.md) | One rank IC instead of four, two of which disagreed about the sign | 21 |
+| [T13](T13-net-of-costs.md) | Charge the Indian cost schedule against a forecast | 39 |
+| [T14](T14-idiosyncratic-volatility.md) | Sort low volatility on the CAPM residual, not the total | 26 |
+| [T15](T15-point-in-time-membership.md) | Rank each date against who was actually in the index | 39 |
+| [T16](T16-rank-ic-objective.md) | Train on the metric the model is judged on | 31 |
+| [T17](T17-src-restructure.md) | Resolve where `src/` answers one question twice | 23 |
+| [T18](T18-sequence-boundaries.md) | Stop training sequences straddling ticker boundaries | 22 |
+
+## What round two found
+
+**The platform reported the information coefficient four different ways, and
+the one driving model selection had the wrong sign.** `agents/trainer.py`
+pooled every observation into a single rank correlation, which measures whether
+a score tracks the market's level rather than whether it ordered any day's
+cross-section. On a signal that orders every date perfectly while its level
+runs against the market's, the pooled figure is −0.99 and the per-date figure
+is +1.00.
+
+**Every decile spread published so far was gross of costs** — while an accurate
+NSE model sat unused in `execution_sim.py`. The round trip is 0.79% at 25
+bps/side slippage, and the signal's own measured turnover is what decides
+whether an edge survives it.
+
+**The default configuration could not build one clean validation sample.** Each
+ticker's 15% split of `min_history_days=250` is ~37 rows against a 60-row
+sequence window, so *every* validation and test sequence spanned two stocks.
+The held-out metrics were computed on histories no single stock experienced.
+
+**Two families of risk arithmetic disagreed by 2.5x on position size**, and the
+dead one understated portfolio volatility 4.1x by assuming zero correlation —
+next to a module that already exposed `correlation_risk_multiple` to measure
+exactly that error.
+
+**The biggest number in the pipeline is still unmeasured.** Survivorship bias
+in Indian indices runs to ~4.94pp of annual return overstatement, larger than
+either strategy's neutralized alpha. T15 built the mechanism; the data itself
+needs NSE circulars or a paid vendor, and every run without it now says so.
+
+## What round one found
 
 These are the results, not the mechanics. Each is in the relevant task file with
 its numbers.
@@ -54,7 +102,10 @@ is not low because its claims are wrong.
 nine symbols with one-session moves between +63% and +90%, which no NSE price
 band permits and which are splits that escaped adjustment.
 
-## Two things deliberately left undone
+## Deliberately left undone
+
+Each of these is stated on the output it affects, not only here — a caveat that
+lives in a document is one people stop reading.
 
 **The ~80 MB of market data already in git history is not reclaimed.** T10 stops
 the growth; reclaiming the history needs a rewrite that invalidates every clone
@@ -67,6 +118,18 @@ that runs without one says in its printed notes that it is *not* sector-neutral.
 Indian momentum concentrates hard by sector, so this is exactly where an
 apparent alpha most often turns out to be a sector bet.
 
+**No point-in-time membership file ships either (T15).** It is the one input
+here that cannot be reconstructed from prices: NSE circulars are authoritative
+but are days of manual assembly, and the alternative is a paid vendor. Every
+evaluation without one prints the bias and its magnitude.
+
+**Nothing in round two has been run against real market data.** The numbers
+above are measured — the four-way IC comparison, the 0.79% round trip, the
+100%-contaminated validation split, the 2.5x and 4.1x risk disagreements — but
+they are measured on the code and on synthetic panels built to have the
+relevant shape. Whether Indian equity data has that shape is the next thing to
+find out, and it needs the cache.
+
 ## Getting started
 
 ```bash
@@ -74,4 +137,19 @@ uv sync --extra hf --extra gbm
 portfolio-agent data build --years 20      # download, then check what arrived
 portfolio-agent evaluate --strategy momentum --baseline gbm --neutralize beta,size
 portfolio-agent report --run <id>
+```
+
+The comparisons round two made possible, each one command:
+
+```bash
+# Does the residual sort survive where the total-volatility sort did not?
+portfolio-agent compare --strategies low_volatility,low_volatility_idio \
+    --neutralize beta,size
+
+# Does the spread survive its own turnover?
+portfolio-agent evaluate --strategy momentum --slippage-bps 40
+
+# Does optimizing IC beat optimizing squared error?
+portfolio-agent train --trainer gbm
+portfolio-agent train --trainer rank_ic
 ```
