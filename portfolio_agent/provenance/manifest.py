@@ -191,9 +191,16 @@ class RunManifest:
     timings: Dict[str, float] = field(default_factory=dict)
     artifacts: Dict[str, str] = field(default_factory=dict)
 
-    git: Dict[str, Any] = field(default_factory=git_state)
+    # Both look up the function through the module at call time rather than
+    # capturing it here. `default_factory=git_state` binds the function object
+    # when the class is defined, so monkeypatching the module attribute has no
+    # effect and a test that thinks it is substituting the git state is in fact
+    # reading the real one. That is not hypothetical: the dirty-note test passed
+    # for months only because the working tree happened to be dirty during every
+    # run, and failed the moment it was clean.
+    git: Dict[str, Any] = field(default_factory=lambda: git_state())
     data: Dict[str, Any] = field(default_factory=dict)
-    libraries: Dict[str, str] = field(default_factory=library_versions)
+    libraries: Dict[str, str] = field(default_factory=lambda: library_versions())
     environment: Dict[str, str] = field(default_factory=lambda: {
         "python": sys.version.split()[0],
         "platform": platform.platform(),
