@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class DataConfig(BaseModel):
@@ -122,6 +122,32 @@ class FeaturesConfig(BaseModel):
     normalize_window: int = Field(
         default=252, description="Window size for feature normalization"
     )
+    training_set: str = Field(
+        default="default",
+        description=(
+            "Which named feature set the trainers build. 'default' is the eight "
+            "price features the supervised pipeline has always used; "
+            "'cross_sectional' is what the momentum and low-volatility "
+            "strategies actually rank on; 'all' is every registered feature. "
+            "See features/sets.py. Until this existed the set was hardcoded in "
+            "two modules, so a model could not be trained on the inputs its own "
+            "strategies read."
+        ),
+    )
+
+    @field_validator("training_set")
+    @classmethod
+    def _known_feature_set(cls, value: str) -> str:
+        from portfolio_agent.features.sets import list_feature_sets
+
+        available = list_feature_sets()
+        if value not in available:
+            raise ValueError(
+                f"features.training_set must be one of {available}, got {value!r}. "
+                "A typo that fell back to the default would train on eight "
+                "columns while the manifest recorded a different intent."
+            )
+        return value
 
 
 class StrategyConfig(BaseModel):

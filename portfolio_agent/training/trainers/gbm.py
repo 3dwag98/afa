@@ -79,21 +79,20 @@ import pandas as pd
 from pydantic import Field, field_validator
 
 from ...evaluation.metrics import MIN_CROSS_SECTION_NAMES, rank_ic_from_arrays
+from ...features.sets import DEFAULT_TRAINING_FEATURES, resolve_feature_set
 from ..base import BaseTrainer, TrainerConfig, TrainingArtifact, TrainingData
 from ..data import prepare_panel
 from ..registry import register_trainer
 
 logger = logging.getLogger(__name__)
 
-#: Features the supervised pipeline is hardcoded against. Duplicated as a
-#: fallback rather than imported at module scope, because
-#: `agents.trainer.TRAINING_FEATURE_NAMES` lives behind `import torch` and the
-#: point of this trainer is that it does not need one. The two are asserted
-#: equal in the tests, so a change to either is caught rather than diverging.
-DEFAULT_GBM_FEATURES = [
-    "sma_20", "sma_50", "rsi_14", "macd",
-    "bollinger_pct_b", "atr_14", "return_1d", "return_5d",
-]
+#: Re-exported from `features/sets.py`, which neither PyTorch nor
+#: scikit-learn gates. This used to be a second hardcoded copy of the
+#: supervised pipeline's list, kept in step by a test asserting the two equal —
+#: the duplication existed because the supervised list lived behind
+#: `import torch` and the point of this trainer is that it needs none. A shared
+#: torch-free home removes the reason for the copy rather than the copy alone.
+DEFAULT_GBM_FEATURES = DEFAULT_TRAINING_FEATURES
 
 #: What early stopping may optimize. `rank_ic` is maximized, `mse` minimized.
 SELECTION_METRICS = ("rank_ic", "mse")
@@ -354,7 +353,16 @@ def build_gbm_panel(
     )
     from portfolio_agent.features.scaling import apply_cross_sectional_scaling
 
-    feature_names = list(cfg.features or DEFAULT_GBM_FEATURES)
+    # An explicit `features` on the trainer config wins; otherwise the named
+    # set from `features.training_set`, so `--trainer gbm` and the supervised
+    # pipeline build the same columns for the same config rather than each
+    # falling back to its own constant.
+    feature_names = list(
+        cfg.features
+        or resolve_feature_set(
+            getattr(getattr(app_config, "features", None), "training_set", "default")
+        )
+    )
     horizon = horizon_from_target(cfg.target)
     target_column = target_column_name(cfg.target)
 

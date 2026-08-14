@@ -37,6 +37,7 @@ from portfolio_agent.features.labels import (  # noqa: F401
     target_column_name,
 )
 from portfolio_agent.features.scaling import FeatureScaler, apply_cross_sectional_scaling
+from portfolio_agent.features.sets import DEFAULT_TRAINING_FEATURES, resolve_feature_set
 from portfolio_agent.models.pytorch_models import PointLoss, QuantileLoss, sorted_quantiles
 from portfolio_agent.models.registry import get_model
 from portfolio_agent.src.calibration import IsotonicCalibrator, calibration_error
@@ -48,10 +49,11 @@ from portfolio_agent.utils.workers import (
     describe_worker_plan, resolve_dataloader_workers, resolve_process_workers,
 )
 
-TRAINING_FEATURE_NAMES = [
-    'sma_20', 'sma_50', 'rsi_14', 'macd',
-    'bollinger_pct_b', 'atr_14', 'return_1d', 'return_5d'
-]
+#: Re-exported, not defined here. The list moved to `features/sets.py`, which
+#: neither PyTorch nor scikit-learn gates, so the boosting trainer can share it
+#: instead of keeping a second copy in step by a test. Everything that imported
+#: this name — tests included — keeps working unchanged.
+TRAINING_FEATURE_NAMES = DEFAULT_TRAINING_FEATURES
 
 TRADING_DAYS_PER_YEAR = 252
 
@@ -395,7 +397,7 @@ def prepare_features(df: pd.DataFrame, config: AppConfig, verbose: bool = True) 
     """
     feature_df = build_features(
         df,
-        TRAINING_FEATURE_NAMES,
+        resolve_feature_set(getattr(config.features, "training_set", "default")),
         normalize=config.features.normalize,
         normalize_window=config.features.normalize_window
     )
