@@ -410,6 +410,7 @@ def add_exposures(
     beta_window: int = DEFAULT_BETA_WINDOW,
     size_window: int = DEFAULT_SIZE_WINDOW,
     sector_map: Optional[Mapping[str, str]] = None,
+    free_float: Any = None,
     stride: int = 1,
 ) -> tuple:
     """Attach beta, size-proxy and (optionally) sector exposures to a panel.
@@ -427,6 +428,10 @@ def add_exposures(
             does not have 252 strided rows.
         sector_map: Symbol to sector. None means no sector neutralization is
             possible, which is reported rather than silently omitted.
+        free_float: A `data_quality.reference.FreeFloatStore`. When supplied,
+            size becomes real free-float market capitalisation and the proxy
+            note is replaced with one saying so. When absent the traded-value
+            proxy is used, as before.
 
     Returns:
         `(panel_with_exposures, exposure_columns, notes)`. The notes travel into
@@ -471,7 +476,27 @@ def add_exposures(
         )
         panel = panel.drop(columns=["beta"])
 
-    if "volume" in panel.columns and panel["volume"].notna().any():
+    size: Optional[pd.DataFrame] = None
+    size_note = SIZE_PROXY_NOTE
+
+    if free_float is not None:
+        from portfolio_agent.data_quality.reference import SIZE_PROXY_REPLACED_NOTE
+
+        # The real thing, when the caller has it. No blending with the proxy
+        # for names the float file misses: a size column built from two
+        # definitions ranks partly on which definition applied, which is the
+        # mixed-measure failure T14 removed from the volatility sort.
+        capitalisation = free_float.market_cap(wide_close).replace(0.0, np.nan)
+        if capitalisation.notna().any().any():
+            size = np.log(capitalisation)
+            size_note = SIZE_PROXY_REPLACED_NOTE
+        else:
+            notes.append(
+                "a free-float store was supplied but covered none of this "
+                "universe, so size fell back to the traded-value proxy"
+            )
+
+    if size is None and "volume" in panel.columns and panel["volume"].notna().any():
         wide_volume = panel.pivot_table(
             index="date", columns="symbol", values="volume", aggfunc="last"
         ).sort_index()
@@ -479,12 +504,14 @@ def add_exposures(
         size = np.log(
             traded_value.rolling(size_rows, min_periods=max(2, size_rows // 4)).median()
         )
+
+    if size is not None:
         long_size = size.stack(future_stack=True).rename("size").reset_index()
         long_size.columns = ["date", "symbol", "size"]
         panel = panel.merge(long_size, on=["date", "symbol"], how="left")
         if panel["size"].notna().any():
             columns.append("size")
-            notes.append(SIZE_PROXY_NOTE)
+            notes.append(size_note)
         else:
             panel = panel.drop(columns=["size"])
     else:
