@@ -595,13 +595,12 @@ class BacktestEngine:
         if self._required_rows is None:
             from portfolio_agent.features.pipeline import warmup_rows
 
-            # `strategy` is optional on this constructor, and a run without one
-            # scores nothing — so it needs no warm-up rather than a guessed
-            # default that would quietly widen every load.
-            features = (
-                self.strategy.required_features() if self.strategy is not None else []
+            # `strategy` is optional on the *signature* only: the constructor
+            # substitutes the default strategy before this can run, so there is
+            # no run without one to defend against.
+            self._required_rows = max(
+                warmup_rows(self.strategy.required_features()), 1
             )
-            self._required_rows = max(warmup_rows(features), 1)
         return self._required_rows
 
     def _history_through(self, ticker: str, decision_date: pd.Timestamp) -> Optional[pd.DataFrame]:
