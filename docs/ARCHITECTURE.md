@@ -357,7 +357,7 @@ flowchart LR
     T6 --> META[("models/metadata.json<br/>feature_names, target, sequence_length,<br/>quantiles, n_outputs,<br/>confidence_calibration")]
     CAL --> META
 
-    subgraph infer["backtest / run-agent with --strategy lstm"]
+    subgraph infer["backtest / evaluate with --strategy lstm"]
         direction TB
         L["ModelLoader.load_model()"] --> RF["required_features()<br/>= metadata feature_names"]
         RF --> BF["build_features per ticker"]
@@ -501,7 +501,7 @@ straight back over the trip threshold.
 
 ```mermaid
 flowchart TD
-    A["run-agent"] --> B["init SQLite, load brain"]
+    A["execution/ (frozen since T11)"] --> B["init SQLite, load brain"]
     B --> C["load trade outcomes -> brain.trade_history"]
     C --> D["evaluate_and_learn() -> updated weights"]
     D --> E["load_strategy(config.strategy)"]
@@ -701,7 +701,7 @@ each estimator above has its own determinism test.
 ```
 portfolio_agent/
 ├── cli.py                  entry point: download-data, train, backtest,
-│                           run-agent, list-strategies, gpu-check
+│                           evaluate, compare, list-strategies, gpu-check
 ├── config/
 │   ├── schema.py           pydantic AppConfig (the full settings surface)
 │   ├── loader.py           config.yaml + AFA_* env overrides

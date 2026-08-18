@@ -78,6 +78,12 @@ and why the data work is about provenance rather than latency.
 | [T31](T31-fundamentals-adapter.md) | Point-in-time fundamentals keyed on the report date; six characteristics | 42 |
 | [T32](T32-reference-data.md) | Free float, sector coverage and FII/DII flows; closes Phase 4 | 39 |
 
+## Phase five: documentation and notebooks
+
+| Task | What it did | Tests added |
+| --- | --- | --- |
+| [T33](T33-documentation-pass.md) | Docs describe what shipped; `compare` stops dropping four flags | 6 |
+
 ## What round two found
 
 **The platform reported the information coefficient four different ways, and

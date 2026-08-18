@@ -6,7 +6,7 @@
 > **Scope note.** The plan's T21 bundled the feature list with the panel-builder
 > merge. They are separable — `prepare_panel` already takes `feature_names` as
 > an argument — and the list is the base the builder consumes, so it ships
-> first. The builder merge is [T23](T23-one-panel-builder.md).
+> first. The builder merge is [T23](T23-one-panel-policy.md).
 
 ## Goal
 

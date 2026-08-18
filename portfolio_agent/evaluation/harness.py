@@ -52,7 +52,6 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-from portfolio_agent.data_quality.fundamentals import FUNDAMENTALS_NOTE
 from portfolio_agent.data_quality.membership import (
     SURVIVORSHIP_NOTE,
     apply_membership,

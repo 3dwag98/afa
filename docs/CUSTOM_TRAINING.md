@@ -43,21 +43,54 @@ themselves:
 
 This package closes both.
 
-## The four seams
+## The five seams
 
 | What | Registry | Registered thing |
 | --- | --- | --- |
-| Features | `features/registry.py` | a function on an OHLCV frame |
+| Features (per ticker) | `features/registry.py` | `Series = f(one ticker's OHLCV)` |
+| Features (cross-sectional) | `features/cross_section.py` | `DataFrame(date x symbol) = f(panel)` |
 | Architectures | `models/registry.py` | an `nn.Module` |
 | Strategies | `strategies/registry.py` | a `BaseStrategy` |
 | **Training procedures** | **`training/registry.py`** | **a `BaseTrainer`** |
+
+The second was added in T24 and is the one to reach for when a feature is
+*peer-relative* — an idiosyncratic volatility, a beta, a book-to-price rank.
+The per-ticker registry cannot express those: it binds one shape, and that
+shape has no date and no universe in it.
+
+## What ships
+
+```
+portfolio-agent list-trainers
+```
+
+| Trainer | Optimizes | Needs | Use it when |
+| --- | --- | --- | --- |
+| `supervised` | squared error on a forward return | `torch` | The original LSTM/PatchTST pipeline. No `--strategy` runs it. |
+| `gbm` | squared error, gradient-boosted trees | `scikit-learn` | **The baseline to beat.** Fast, no GPU, and round one found momentum does not beat it on identical features and splits. |
+| `rank_ic` | **rank IC directly** | nothing beyond the base install | The model is judged on rank IC, so this trains on it rather than on a proxy. See below. |
+| `sac` | discounted exposure reward | `torch` | The `india_sac` strategy's reinforcement-learning trainer. |
+
+### Why `rank_ic` exists
+
+Every other trainer here minimizes squared error on a forward return, and the
+platform then reports **rank IC** — whether the score ordered the day's
+cross-section. Those are different objectives, and a model can improve one
+while getting worse at the other: squared error rewards getting the *level*
+right on the names that move most, and rank IC does not care about the level at
+all.
+
+`rank_ic` optimizes the reported metric directly, through a differentiable
+surrogate for the per-date correlation. It is also the only trainer that needs
+no optional extra, which makes it the one to reach for on a machine without
+`torch` or `scikit-learn`.
 
 ## Quick start
 
 ```bash
 # What can train, and with what settings
 portfolio-agent list-trainers
-portfolio-agent list-trainers --name sac
+portfolio-agent list-trainers --name gbm
 
 # Train a strategy through its declared trainer
 portfolio-agent train --strategy india_sac
