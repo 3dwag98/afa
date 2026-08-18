@@ -218,22 +218,12 @@ def _classify_market_regime(
 def _scaled_quantity(quantity: int, signal: StrategySignal) -> int:
     """Apply a signal's `position_scale` to a sized quantity.
 
-    Mirrors BacktestEngine._apply_position_scale so live and backtested
-    sizing cannot drift: strategies that measure their own risk environment
-    (cross-sectional momentum's volatility targeting and market-regime filter,
-    src/regime.py) publish a multiplier in [0, 1], and every sizing rule
-    honours it here rather than each strategy applying it itself.
+    This and `BacktestEngine._apply_position_scale` used to be byte-for-byte
+    identical, kept in step by a comment saying so. Both now call the one
+    implementation on `StrategySignal`, so live and backtested sizing cannot
+    drift rather than merely being asked not to.
     """
-    scale = signal.extra.get("position_scale") if signal.extra else None
-    if scale is None:
-        return quantity
-    try:
-        scale = float(scale)
-    except (TypeError, ValueError):
-        return quantity
-    if scale >= 1.0:
-        return quantity
-    return int(quantity * max(0.0, scale))
+    return signal.scaled_quantity(quantity)
 
 
 def _sector_capped_quantity(

@@ -122,7 +122,10 @@ class BacktesterAgent:
             Dictionary with backtest results and metrics.
         """
         strategy = load_strategy(self.strategy_config)
-        if hasattr(strategy, "load") and not strategy.load():
+        # `load()` is declared on BaseStrategy with a default of True since
+        # T25, so the `hasattr` probe this used to carry is gone: a strategy
+        # with nothing to load says so rather than not having the method.
+        if not strategy.load():
             raise RuntimeError(_load_failure_message(strategy, self.config))
 
         risk_params = RiskParams.from_app_config(self.config)

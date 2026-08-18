@@ -45,6 +45,7 @@ import torch
 import torch.nn as nn
 
 from .base import TrainableStrategy
+from .registry import register_strategy
 from .types import StrategyContext, StrategySignal
 from portfolio_agent.config.schema import StrategyConfig
 from portfolio_agent.features.scaling import FeatureScaler
@@ -103,6 +104,7 @@ class SACActorNetwork(nn.Module):
         return torch.sigmoid(self.mean_head(self.net(state)))
 
 
+@register_strategy("india_sac")
 class IndiaSACStrategy(TrainableStrategy):
     """Continuous-allocation RL strategy, scored in one batched forward pass."""
 

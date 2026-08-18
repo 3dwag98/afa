@@ -6,15 +6,63 @@ and the backtest engine — eliminating the historical drift between them.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, TYPE_CHECKING
 
 import pandas as pd
 
 from .types import StrategyContext, StrategySignal
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    # Imported under TYPE_CHECKING because `config.schema` imports nothing from
+    # here today and there is no reason to make it able to.
+    from portfolio_agent.config.schema import StrategyConfig
+
 
 class BaseStrategy(ABC):
-    """Abstract base class for trading strategies."""
+    """Abstract base class for trading strategies.
+
+    Three members are abstract — `name`, `required_features`, `score`. Two more
+    are part of the contract every caller already relies on and were declared
+    nowhere until T25:
+
+    - **`__init__(config)`.** `registry.load_strategy` constructs every strategy
+      as `cls(config)`. Each subclass happened to accept one; nothing said it
+      had to, so a strategy written with a different signature would fail at
+      the call site rather than at the class.
+    - **`load()`.** `agents/backtester.py` and `EnsembleStrategy` both probed
+      for it with `hasattr(strategy, "load")` — the shape of a contract that
+      exists in practice and not in the type. Declared here with a default,
+      the probe is unnecessary and a strategy that needs a checkpoint overrides
+      it.
+    """
+
+    def __init__(self, config: "StrategyConfig") -> None:
+        """Construct from the configuration block that selected this strategy.
+
+        Args:
+            config: The `StrategyConfig` naming this strategy and carrying its
+                `params`. Subclasses that read params override this and are
+                free not to call up; the base implementation only records it,
+                so `self._config` is available to code that wants the raw
+                block.
+        """
+        self._config = config
+
+    def load(self) -> bool:
+        """Prepare the strategy to score, returning whether it can.
+
+        Called once by the caller before scoring begins. A strategy with no
+        checkpoint has nothing to prepare and is ready as constructed, which is
+        why the default is `True` rather than abstract — a rule-based strategy
+        should not have to implement a method to say it needs nothing.
+
+        Returns:
+            True when the strategy can score. False means a required artifact
+            was missing or unreadable, and the caller must not proceed —
+            `agents/backtester.py` raises with the checkpoint path rather than
+            silently backtesting an untrained model.
+        """
+        return True
 
     @property
     @abstractmethod

@@ -42,7 +42,13 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from .base import BaseStrategy
-from .types import StrategyContext, StrategySignal
+from .registry import register_strategy
+from .types import (
+    POSITION_SCALE_KEY,
+    TRADABILITY_REJECT_KEY,
+    StrategyContext,
+    StrategySignal,
+)
 from portfolio_agent.config.schema import StrategyConfig
 from portfolio_agent.features.cross_section import build_cross_section, latest_values
 from portfolio_agent.features.market_relative import (
@@ -315,7 +321,7 @@ def _assess_regime(
     )
 
 
-def _rank_and_select_decile(
+def rank_and_select(
     metric_by_symbol: Dict[str, float],
     latest_by_symbol: Dict[str, pd.Series],
     context: StrategyContext,
@@ -329,6 +335,19 @@ def _rank_and_select_decile(
     rejected: Dict[str, str],
 ) -> Dict[str, StrategySignal]:
     """Rank symbols by `metric_by_symbol` and go long the extreme decile.
+
+    **Public since T25, and the reason is the point.** Everything a new
+    cross-sectional strategy needs is here: the tradability rejections, the
+    minimum-universe abstention, the percentile score, the volatility-targeted
+    `position_scale`, the reward:risk gate. It was module-private, so the four
+    strategies Phase 3 adds — residual momentum, betting-against-beta,
+    short-term reversal, pairs — would each have had to either import a
+    underscore-prefixed name or reimplement 175 lines of selection logic, and
+    the second is how two strategies come to disagree about what "top decile"
+    means.
+
+    A new strategy therefore reduces to: compute one number per symbol, and
+    call this with `higher_is_better` set the right way.
 
     Shared ranking machinery for MomentumStrategy (higher_is_better=True:
     highest formation return wins) and LowVolatilityStrategy
@@ -365,7 +384,7 @@ def _rank_and_select_decile(
             entry_price=close or 0.0, stop_price=0.0, target_price=0.0,
             reward_risk=0.0, probability_profit=0.0,
             component_scores={}, rationale=f"Not tradable — {reason}",
-            extra={"position_scale": 0.0, "tradability_reject_reason": reason},
+            extra={POSITION_SCALE_KEY: 0.0, TRADABILITY_REJECT_KEY: reason},
         )
 
     if len(metric_by_symbol) < min_universe:
@@ -381,7 +400,7 @@ def _rank_and_select_decile(
                     f"Universe too small for reliable cross-sectional ranking "
                     f"({len(metric_by_symbol)} < {min_universe} eligible tickers)"
                 ),
-                extra={"position_scale": 0.0},
+                extra={POSITION_SCALE_KEY: 0.0},
             )
         return signals
 
@@ -477,7 +496,7 @@ def _rank_and_select_decile(
             component_scores={component_name: metric},
             rationale=rationale,
             extra={
-                "position_scale": position_scale if signal == "BUY" else 0.0,
+                POSITION_SCALE_KEY: position_scale if signal == "BUY" else 0.0,
                 "regime": regime.label,
                 "regime_exposure_scalar": round(regime.exposure_scalar, 4),
                 "volatility_scalar": round(stock_scalar, 4),
@@ -492,6 +511,7 @@ def _rank_and_select_decile(
     return signals
 
 
+@register_strategy("momentum")
 class MomentumStrategy(BaseStrategy):
     """Cross-sectional momentum: long the top decile by 9-month (skip
     1-month) formation return (docs/QUANT_RESEARCH.md section 1), with
@@ -582,7 +602,7 @@ class MomentumStrategy(BaseStrategy):
             context.benchmark_close, context.benchmark_ohlcv,
         )
 
-        return _rank_and_select_decile(
+        return rank_and_select(
             metric_by_symbol=metric_by_symbol,
             latest_by_symbol=latest_by_symbol,
             context=context,
@@ -603,6 +623,7 @@ class MomentumStrategy(BaseStrategy):
 VOLATILITY_SORTS = ("total", "idiosyncratic")
 
 
+@register_strategy("low_volatility")
 class LowVolatilityStrategy(BaseStrategy):
     """Low-volatility anomaly: long the bottom decile by trailing volatility
     (docs/QUANT_RESEARCH.md section 2).
@@ -742,7 +763,7 @@ class LowVolatilityStrategy(BaseStrategy):
             context.benchmark_close, context.benchmark_ohlcv,
         )
 
-        return _rank_and_select_decile(
+        return rank_and_select(
             metric_by_symbol=metric_by_symbol,
             latest_by_symbol=latest_by_symbol,
             context=context,
@@ -814,6 +835,7 @@ class LowVolatilityStrategy(BaseStrategy):
         return latest_values(built.get(name, pd.DataFrame()))
 
 
+@register_strategy("low_volatility_idio")
 class IdiosyncraticLowVolatilityStrategy(LowVolatilityStrategy):
     """`LowVolatilityStrategy` with the residual sort as its default.
 

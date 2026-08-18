@@ -2041,16 +2041,7 @@ class BacktestEngine:
         or a future one — picks it up automatically. A signal that carries no
         scale is left untouched.
         """
-        scale = signal.extra.get("position_scale") if signal.extra else None
-        if scale is None:
-            return quantity
-        try:
-            scale = float(scale)
-        except (TypeError, ValueError):
-            return quantity
-        if scale >= 1.0:
-            return quantity
-        return int(quantity * max(0.0, scale))
+        return signal.scaled_quantity(quantity)
 
     def _apply_sector_cap(
         self,

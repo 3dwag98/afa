@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 
 from .base import BaseStrategy
+from .registry import register_strategy
 from .types import StrategyContext, StrategySignal
 from portfolio_agent.config.schema import StrategyConfig
 from portfolio_agent.features.scaling import FeatureScaler, apply_cross_sectional_scaling
@@ -214,6 +215,7 @@ def _predicted_value_to_probability(value: float) -> float:
     return min(max(prob, 0.0), 1.0)
 
 
+@register_strategy("lstm")
 class MLStrategy(BaseStrategy):
     """Strategy backed by a trained sequence-forecasting model (e.g. LSTM)."""
 
