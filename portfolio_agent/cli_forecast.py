@@ -193,25 +193,7 @@ def cmd_evaluate(args) -> int:
 
     from portfolio_agent.evaluation import evaluate_forecast
 
-    shared = dict(
-        universe=tickers,
-        horizon=args.horizon,
-        stride=args.stride,
-        n_buckets=args.buckets,
-        start_date=args.start_date,
-        end_date=args.end_date,
-        min_history=args.min_history,
-        max_dates=args.max_dates,
-        use_benchmark=not args.no_benchmark,
-        runs_dir=args.output,
-        charge_costs=not getattr(args, "gross", False),
-        slippage_per_side=(
-            None if getattr(args, "slippage_bps", None) is None
-            else args.slippage_bps / 1e4
-        ),
-        membership=getattr(args, "membership", None),
-        index_name=getattr(args, "index_name", None),
-    )
+    shared = shared_evaluation_kwargs(args, tickers)
 
     try:
         result = evaluate_forecast(config, args.strategy, splitter=splitter, **shared)
@@ -344,6 +326,40 @@ def _run_decay(config, args, tickers, horizons: List[int]):
         return None
 
 
+def shared_evaluation_kwargs(args, tickers) -> Dict[str, Any]:
+    """Every `shared_evaluation_args` flag, turned into `evaluate_forecast` kwargs.
+
+    One builder for `evaluate` and `compare`, because they had drifted and the
+    drift was silent in the worst way: `compare` declared `--membership`,
+    `--gross` and `--slippage-bps` through the shared parser and then built its
+    own kwargs without them. argparse accepted the flags, so a user asking for
+    a membership-filtered, cost-charged comparison got an unfiltered gross one
+    and no indication that anything had been ignored.
+
+    A flag that is accepted and dropped is worse than one that does not exist.
+    """
+    return dict(
+        universe=tickers,
+        horizon=args.horizon,
+        stride=args.stride,
+        n_buckets=args.buckets,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        min_history=args.min_history,
+        max_dates=args.max_dates,
+        use_benchmark=not args.no_benchmark,
+        runs_dir=args.output,
+        charge_costs=not getattr(args, "gross", False),
+        slippage_per_side=(
+            None if getattr(args, "slippage_bps", None) is None
+            else args.slippage_bps / 1e4
+        ),
+        membership=getattr(args, "membership", None),
+        index_name=getattr(args, "index_name", None),
+        fundamentals=getattr(args, "fundamentals", None),
+    )
+
+
 def cmd_compare(args) -> int:
     """Score several strategies on one universe and print one table.
 
@@ -386,12 +402,8 @@ def cmd_compare(args) -> int:
     for name in names:
         try:
             results.append(evaluate_forecast(
-                config, name, universe=tickers, horizon=args.horizon,
-                stride=args.stride, n_buckets=args.buckets,
-                start_date=args.start_date, end_date=args.end_date,
-                min_history=args.min_history, max_dates=args.max_dates,
-                use_benchmark=not args.no_benchmark, splitter=splitter,
-                runs_dir=args.output,
+                config, name, splitter=splitter,
+                **shared_evaluation_kwargs(args, tickers),
             ))
         except (ValueError, KeyError, RuntimeError) as error:
             # One bad strategy must not discard the others' results.
@@ -564,6 +576,11 @@ def add_forecast_commands(subparsers) -> None:
                                  "survived to be downloaded")
         parser.add_argument("--index-name", type=str, default=None,
                             help="Narrow a multi-index membership file to one index")
+        parser.add_argument("--fundamentals", type=str, default=None,
+                            help="Point-in-time fundamentals CSV, keyed on the "
+                                 "report date. Without one the result controls "
+                                 "for no accounting characteristic. See "
+                                 "docs/OBTAINING_DATA.md")
         parser.add_argument("--seed", type=int, default=None,
                             help="Seed numpy's global stream before scoring")
         parser.add_argument("--output", type=str, default=None,
