@@ -54,6 +54,12 @@ and why the data work is about provenance rather than latency.
 | [T21](T21-one-feature-set.md) | One feature set, derived from the strategy rather than hardcoded twice | 21 |
 | [T23](T23-one-panel-policy.md) | Warm-up derived from the features, and actually loaded | 25 |
 
+## Phase two: making it pluggable
+
+| Task | What it did | Tests added |
+| --- | --- | --- |
+| [T24](T24-cross-sectional-features.md) | A feature registry that can see the universe, not one ticker | 36 |
+
 ## What round two found
 
 **The platform reported the information coefficient four different ways, and

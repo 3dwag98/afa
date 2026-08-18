@@ -394,15 +394,14 @@ def rolling_beta(
     Returns:
         Wide (date x symbol) betas, NaN until the window fills.
     """
-    from portfolio_agent.features.market_relative import market_composite
+    # The implementation moved to the feature layer, where it belongs: beta is
+    # a characteristic of a stock, this module was already importing
+    # `market_composite` from there to compute it, and `betting-against-beta`
+    # ranks on beta rather than neutralizing by it. This name stays so the
+    # evaluation layer's callers and tests are unchanged.
+    from portfolio_agent.features.market_relative import rolling_beta as _rolling_beta
 
-    market = market_composite(returns)
-    market_variance = market.rolling(window, min_periods=window // 2).var()
-    betas = {}
-    for symbol in returns.columns:
-        covariance = returns[symbol].rolling(window, min_periods=window // 2).cov(market)
-        betas[symbol] = covariance / market_variance.replace(0.0, np.nan)
-    return pd.DataFrame(betas, index=returns.index)
+    return _rolling_beta(returns, window=window)
 
 
 def add_exposures(

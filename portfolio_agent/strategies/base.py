@@ -29,6 +29,26 @@ class BaseStrategy(ABC):
         and passes the resulting DataFrame into score()/score_batch().
         """
 
+    def required_cross_sectional_features(self) -> List[str]:
+        """Names from `features/cross_section.py` this strategy needs.
+
+        Separate from `required_features` because the two registries have
+        different shapes: one is `Series = f(one_ticker_ohlcv)`, the other
+        `DataFrame(date x symbol) = f(panel)`. Keeping them apart means a
+        caller never has to guess which registry a name belongs to, and
+        `features/sets.py` and `pipeline.warmup_rows` keep operating on
+        per-ticker names only.
+
+        A strategy that declares any of these must implement `score_batch` and
+        report `requires_full_batch`: a cross-sectional feature scored one
+        ticker at a time degenerates to a universe of one, which is the failure
+        `requires_full_batch` exists to prevent.
+
+        Returns:
+            Empty by default — most strategies rank on per-ticker features.
+        """
+        return []
+
     @abstractmethod
     def score(self, symbol: str, features: pd.DataFrame, context: StrategyContext) -> StrategySignal:
         """Score the latest available (lag-safe) row of features for one ticker."""
