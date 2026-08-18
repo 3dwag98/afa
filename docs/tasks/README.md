@@ -60,6 +60,7 @@ and why the data work is about provenance rather than latency.
 | --- | --- | --- |
 | [T24](T24-cross-sectional-features.md) | A feature registry that can see the universe, not one ticker | 36 |
 | [T25](T25-strategy-ergonomics.md) | Declare the strategy contract callers were already relying on | 32 |
+| [T26](T26-signal-to-portfolio.md) | From a ranking to a cost-charged book; four weighting schemes | 38 |
 
 ## What round two found
 
