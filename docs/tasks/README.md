@@ -62,6 +62,12 @@ and why the data work is about provenance rather than latency.
 | [T25](T25-strategy-ergonomics.md) | Declare the strategy contract callers were already relying on | 32 |
 | [T26](T26-signal-to-portfolio.md) | From a ranking to a cost-charged book; four weighting schemes | 38 |
 
+## Phase three: strategies the seams had to support
+
+| Task | What it did | Tests added |
+| --- | --- | --- |
+| [T27](T27-residual-momentum.md) | Momentum on the CAPM residual; corrects `QUANT_RESEARCH.md` §12(c) | 25 |
+
 ## What round two found
 
 **The platform reported the information coefficient four different ways, and
