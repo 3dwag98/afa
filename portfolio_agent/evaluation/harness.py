@@ -58,6 +58,7 @@ from portfolio_agent.data_quality.membership import (
     load_membership,
 )
 
+from .allocation import BookPerformance, build_book, evaluate_book
 from .costs import CostModel, NetSpread, cost_notes, evaluate_net
 from .metrics import (
     MIN_CROSS_SECTION_NAMES,
@@ -142,6 +143,11 @@ class ForecastEvaluation:
     #: every construction site for two fields nobody passes by hand.
     run_id: Optional[str] = None
     manifest_path: Optional[str] = None
+    #: The weighted book, when one was constructed. The decile spread already
+    #: implies a book — an equal-weighted basket of the top bucket — so this is
+    #: not a new claim so much as the same claim with its allocation rule made
+    #: explicit and, optionally, changed.
+    book: Optional[BookPerformance] = None
     #: What the point-in-time membership filter removed, when one was applied.
     #: Empty means no membership data was supplied, which `notes` states
     #: explicitly — the two are different claims and the report keeps them so.
@@ -172,6 +178,8 @@ class ForecastEvaluation:
         }
         if self.costs is not None:
             document.update(self.costs.to_dict())
+        if self.book is not None:
+            document.update(self.book.to_dict())
         if self.membership:
             document.update(self.membership)
         if self.folds:
@@ -305,6 +313,9 @@ def evaluate_panel(
     universe_fingerprint: Optional[str] = None,
     charge_costs: bool = True,
     slippage_per_side: Optional[float] = None,
+    weighting: Optional[str] = None,
+    returns: Optional[pd.DataFrame] = None,
+    **book_kwargs: Any,
 ) -> ForecastEvaluation:
     """Score a tidy `(date, symbol, score, forward_return)` panel.
 
@@ -328,6 +339,14 @@ def evaluate_panel(
             best and means least.
         slippage_per_side: Slippage assumption. Defaults to the 25 bps/side in
             `execution_sim`, deliberately conservative for mid-caps.
+        weighting: Build a weighted book alongside the spread — one of
+            `allocation.WEIGHTING_SCHEMES`. None reports the spread only, which
+            is what every prior release did; "equal" reproduces the spread's own
+            implicit allocation as an explicit equity curve.
+        returns: Wide `(date x symbol)` trailing daily returns, required by
+            every weighting scheme except "equal".
+        **book_kwargs: Forwarded to `allocation.build_book` (max_weight,
+            covariance_window, risk_aversion, ...).
 
     Returns:
         A `ForecastEvaluation`.
@@ -349,6 +368,18 @@ def evaluate_panel(
             stride=stride,
         )
         notes.extend(cost_notes(net))
+    book: Optional[BookPerformance] = None
+    if weighting is not None and not clean.empty:
+        weights = build_book(
+            clean, scheme=weighting, returns=returns,
+            n_buckets=n_buckets, min_names=min_names, **book_kwargs,
+        )
+        book = evaluate_book(
+            weights, clean,
+            costs=CostModel.from_execution_sim(slippage_per_side), stride=stride,
+        )
+        notes.extend(book.notes)
+
     if splitter is not None and not clean.empty:
         folds = _evaluate_folds(clean, splitter, horizon, min_names, stride)
         if getattr(splitter, "embargo", 0) and not any(f.n_embargoed for f in folds):
@@ -373,6 +404,7 @@ def evaluate_panel(
         ic=summarize_ic(ic, horizon, stride),
         buckets=bucket_analysis(clean, n_buckets, min_names),
         hit_rate=directional_hit_rate(clean, min_names),
+        book=book,
         errors=rank_error_summary(clean, n_buckets, min_names),
         dispersion=score_dispersion(clean, min_names),
         ic_series=ic,

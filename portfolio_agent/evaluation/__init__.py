@@ -14,6 +14,16 @@ module scope — a rule-based screen can be evaluated on an install that has
 neither.
 """
 
+from .allocation import (
+    WEIGHTING_SCHEMES,
+    BookPerformance,
+    BookWeights,
+    build_book,
+    cap_is_binding,
+    compare_schemes,
+    evaluate_book,
+    weight_turnover,
+)
 from .costs import (
     CostModel,
     NetSpread,
@@ -61,6 +71,14 @@ __all__ = [
     "DecayCurve",
     "DecayPoint",
     "NetSpread",
+    "WEIGHTING_SCHEMES",
+    "BookPerformance",
+    "BookWeights",
+    "build_book",
+    "cap_is_binding",
+    "compare_schemes",
+    "evaluate_book",
+    "weight_turnover",
     "NeutralizationResult",
     "SIZE_PROXY_NOTE",
     "add_exposures",
