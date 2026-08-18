@@ -511,7 +511,7 @@ Standalone: no `portfolio_agent` import.
         md("## Setup"), SETUP, UNIVERSE_CELL, INGEST, FEATURES, CONFIG,
         md("## Signal"),
         code('''
-low_volatility_scores = L.low_volatility_scores(feature_panel, top_fraction=0.25)
+low_volatility_scores = L.low_volatility_scores(feature_panel, close, top_fraction=0.25)
 
 held = (low_volatility_scores > 0).sum(axis=1)
 print(f"names held: mean {held.mean():.1f}")
@@ -856,7 +856,7 @@ members = {}
 
 members["rule_based"] = L.rule_based_scores(feature_panel, panel, use_monte_carlo=False)
 members["momentum"] = L.momentum_scores(feature_panel, top_fraction=0.25)
-members["low_volatility"] = L.low_volatility_scores(feature_panel, top_fraction=0.25)
+members["low_volatility"] = L.low_volatility_scores(feature_panel, close, top_fraction=0.25)
 
 if L.TORCH_AVAILABLE:
     supervised = L.build_supervised_panel(feature_panel, close,

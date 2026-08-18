@@ -265,7 +265,10 @@ def train_lstm(
         with torch.no_grad():
             val_pred = model(X_val) if len(X_val) else torch.zeros(0, device=torch_device)
             val_loss = float(F.mse_loss(val_pred, y_val).item()) if len(X_val) else math.nan
-            ic = _rank_ic(val_pred, y_val) if len(X_val) > 2 else math.nan
+            ic = (
+                _rank_ic(val_pred, y_val, _dates_of(panel.get("keys_val")))
+                if len(X_val) > 2 else math.nan
+            )
 
         scheduler.step(val_loss if math.isfinite(val_loss) else 0.0)
         history.append({
@@ -305,21 +308,68 @@ def train_lstm(
     }
 
 
-def _rank_ic(predictions: torch.Tensor, targets: torch.Tensor) -> float:
-    """Spearman correlation — the metric that matches how the output is used.
+def _dates_of(keys: Optional[Sequence]) -> Optional[List]:
+    """The date half of a panel's `(date, symbol)` keys."""
+    return None if not keys else [key[0] for key in keys]
 
-    The model's predictions are turned into a ranking, so what matters is
-    monotone agreement with the realized ordering, not squared error.
+
+#: Names below which a date's cross-section is too thin to rank. Matches
+#: `evaluation/metrics.MIN_CROSS_SECTION_NAMES` in the package.
+MIN_CROSS_SECTION_NAMES = 5
+
+
+def _rank_ic(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    dates: Optional[Sequence] = None,
+) -> float:
+    """Mean per-date Spearman correlation — the metric the ranking is used as.
+
+    **Per date, not pooled**, and the difference is not a detail. Pooling every
+    validation observation into one rank correlation measures whether the score
+    tracks the market's *level* over time; the model is used to order *one
+    day's* cross-section, and those are different questions with different
+    answers. On a signal that orders every date perfectly while its level runs
+    against the market, the pooled figure is -0.99 and the per-date figure is
+    +1.00.
+
+    The package carried the pooled version until T12, where it was driving
+    model selection with the wrong sign. This file kept it afterwards, which is
+    the drift `test_standalone_agrees.py` now exists to catch.
+
+    Args:
+        predictions, targets: Aligned validation tensors.
+        dates: The decision date of each observation, from the panel's
+            `keys_val`. **Required in practice**: without it there is no
+            cross-section to correlate within, so the function refuses rather
+            than silently pooling.
+
+    Returns:
+        Mean of the per-date correlations, or NaN when no date had a wide
+        enough cross-section.
     """
     p = predictions.detach().cpu().numpy().ravel()
     t = targets.detach().cpu().numpy().ravel()
     if len(p) < 3:
         return float("nan")
-    pr = pd.Series(p).rank().to_numpy()
-    tr = pd.Series(t).rank().to_numpy()
-    if pr.std() < 1e-12 or tr.std() < 1e-12:
+
+    if dates is None:
+        # Refusing rather than pooling. A pooled number here is not a worse
+        # estimate of the same quantity — it is an estimate of a different one.
         return float("nan")
-    return float(np.corrcoef(pr, tr)[0, 1])
+
+    frame = pd.DataFrame({"date": list(dates), "score": p, "label": t})
+    per_date: List[float] = []
+    for _date, group in frame.groupby("date", sort=True):
+        if len(group) < MIN_CROSS_SECTION_NAMES:
+            continue
+        sr = group["score"].rank().to_numpy()
+        lr = group["label"].rank().to_numpy()
+        if sr.std() < 1e-12 or lr.std() < 1e-12:
+            continue
+        per_date.append(float(np.corrcoef(sr, lr)[0, 1]))
+
+    return float(np.mean(per_date)) if per_date else float("nan")
 
 
 def lstm_scores(

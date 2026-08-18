@@ -957,10 +957,62 @@ def momentum_scores(
 # -- 3. Cross-sectional low volatility ----------------------------------------
 
 
+TRADING_DAYS_PER_YEAR = 252
+
+
+def idiosyncratic_volatility(
+    close: pd.DataFrame, window: int = 60, lag: int = 1
+) -> pd.DataFrame:
+    """Volatility of the CAPM residual, per symbol, per date.
+
+    **The residual, not the total**, and the distinction is the whole point of
+    the sort. Total volatility mixes two things a cross-sectional book should
+    keep apart: how much a stock moves *with* the market, and how much it moves
+    on its own. Ranking on the sum puts high-beta names and
+    idiosyncratically-wild names in the same bucket, and the 2025 work on the
+    low-risk anomaly finds those two sorts behave very differently out of
+    sample — idiosyncratic-volatility sorts survive where beta sorts largely do
+    not.
+
+    No regression loop is needed. For an OLS fit on a window,
+
+        var(residual) = var(r_i) - beta^2 * var(r_m),  beta = cov(r_i, r_m) / var(r_m)
+
+    and every term on the right is a `rolling` operation. Causality comes from
+    `rolling` rather than being argued about: a window ends at the row it
+    labels.
+
+    The market is the equal-weighted composite of the cross-section itself,
+    which is what this file has available and what the package falls back to.
+    """
+    returns = (close.shift(lag) if lag else close).pct_change()
+    market = returns.mean(axis=1)
+
+    floor = max(2, window // 2)
+    market_var = market.rolling(window, min_periods=floor).var()
+    safe_var = market_var.replace(0.0, np.nan)
+
+    residual = {}
+    for symbol in returns.columns:
+        series = returns[symbol]
+        own_var = series.rolling(window, min_periods=floor).var()
+        covariance = series.rolling(window, min_periods=floor).cov(market)
+        beta = covariance / safe_var
+        variance = own_var - beta.pow(2) * market_var
+        # Where the market was flat it explains nothing, so the residual is the
+        # whole return rather than an undefined quantity.
+        variance = variance.where(market_var.notna() & (market_var > 0), own_var)
+        residual[symbol] = np.sqrt(variance.clip(lower=0.0))
+
+    return pd.DataFrame(residual, index=returns.index) * np.sqrt(TRADING_DAYS_PER_YEAR)
+
+
 def low_volatility_scores(
     feature_panel: Dict[str, pd.DataFrame],
+    close: Optional[pd.DataFrame] = None,
     top_fraction: float = 0.25,
     min_history_vol: float = 1e-6,
+    sort_on: str = "idiosyncratic",
 ) -> pd.DataFrame:
     """Hold the least volatile quartile, weighted by inverse volatility.
 
@@ -968,10 +1020,44 @@ def low_volatility_scores(
     and among the few that survive transaction costs at this turnover. Weighting
     by inverse vol rather than equally pushes the portfolio further along the
     same axis the selection is made on.
+
+    `sort_on` defaults to `"idiosyncratic"` — the CAPM residual — matching the
+    package since T14. `"total"` reproduces the original realized-volatility
+    sort, which is worth keeping precisely so the two can be compared: they
+    select different names, and the comparison is the finding.
+
+    Args:
+        feature_panel: Per-symbol feature frames. `realized_vol_60` is read for
+            the total sort.
+        close: Wide `(date x symbol)` closes. Required for the idiosyncratic
+            sort, which needs the cross-section to residualize against.
+        top_fraction: Quartile by default.
+        min_history_vol: Floor before inverting, so a near-zero vol does not
+            produce an unbounded weight.
+        sort_on: `"idiosyncratic"` or `"total"`.
+
+    Raises:
+        ValueError: On an unknown `sort_on`, or the idiosyncratic sort without
+            `close`. Falling back to the total sort would report one measure
+            under the other's name.
     """
-    vol = pd.DataFrame(
-        {s: f["realized_vol_60"] for s, f in feature_panel.items()}
-    ).sort_index()
+    if sort_on not in ("idiosyncratic", "total"):
+        raise ValueError(
+            f"sort_on must be 'idiosyncratic' or 'total', got {sort_on!r}"
+        )
+
+    if sort_on == "idiosyncratic":
+        if close is None:
+            raise ValueError(
+                "the idiosyncratic sort needs `close` — a residual is defined "
+                "against a cross-section. Falling back to the total sort would "
+                "report one measure under the other's name."
+            )
+        vol = idiosyncratic_volatility(close).sort_index()
+    else:
+        vol = pd.DataFrame(
+            {s: f["realized_vol_60"] for s, f in feature_panel.items()}
+        ).sort_index()
 
     ranked = vol.rank(axis=1, pct=True)
     selected = (ranked <= top_fraction).astype(float)
@@ -1288,7 +1374,10 @@ def train_lstm(
         with torch.no_grad():
             val_pred = model(X_val) if len(X_val) else torch.zeros(0, device=torch_device)
             val_loss = float(F.mse_loss(val_pred, y_val).item()) if len(X_val) else math.nan
-            ic = _rank_ic(val_pred, y_val) if len(X_val) > 2 else math.nan
+            ic = (
+                _rank_ic(val_pred, y_val, _dates_of(panel.get("keys_val")))
+                if len(X_val) > 2 else math.nan
+            )
 
         scheduler.step(val_loss if math.isfinite(val_loss) else 0.0)
         history.append({
@@ -1328,21 +1417,68 @@ def train_lstm(
     }
 
 
-def _rank_ic(predictions: torch.Tensor, targets: torch.Tensor) -> float:
-    """Spearman correlation — the metric that matches how the output is used.
+def _dates_of(keys: Optional[Sequence]) -> Optional[List]:
+    """The date half of a panel's `(date, symbol)` keys."""
+    return None if not keys else [key[0] for key in keys]
 
-    The model's predictions are turned into a ranking, so what matters is
-    monotone agreement with the realized ordering, not squared error.
+
+#: Names below which a date's cross-section is too thin to rank. Matches
+#: `evaluation/metrics.MIN_CROSS_SECTION_NAMES` in the package.
+MIN_CROSS_SECTION_NAMES = 5
+
+
+def _rank_ic(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    dates: Optional[Sequence] = None,
+) -> float:
+    """Mean per-date Spearman correlation — the metric the ranking is used as.
+
+    **Per date, not pooled**, and the difference is not a detail. Pooling every
+    validation observation into one rank correlation measures whether the score
+    tracks the market's *level* over time; the model is used to order *one
+    day's* cross-section, and those are different questions with different
+    answers. On a signal that orders every date perfectly while its level runs
+    against the market, the pooled figure is -0.99 and the per-date figure is
+    +1.00.
+
+    The package carried the pooled version until T12, where it was driving
+    model selection with the wrong sign. This file kept it afterwards, which is
+    the drift `test_standalone_agrees.py` now exists to catch.
+
+    Args:
+        predictions, targets: Aligned validation tensors.
+        dates: The decision date of each observation, from the panel's
+            `keys_val`. **Required in practice**: without it there is no
+            cross-section to correlate within, so the function refuses rather
+            than silently pooling.
+
+    Returns:
+        Mean of the per-date correlations, or NaN when no date had a wide
+        enough cross-section.
     """
     p = predictions.detach().cpu().numpy().ravel()
     t = targets.detach().cpu().numpy().ravel()
     if len(p) < 3:
         return float("nan")
-    pr = pd.Series(p).rank().to_numpy()
-    tr = pd.Series(t).rank().to_numpy()
-    if pr.std() < 1e-12 or tr.std() < 1e-12:
+
+    if dates is None:
+        # Refusing rather than pooling. A pooled number here is not a worse
+        # estimate of the same quantity — it is an estimate of a different one.
         return float("nan")
-    return float(np.corrcoef(pr, tr)[0, 1])
+
+    frame = pd.DataFrame({"date": list(dates), "score": p, "label": t})
+    per_date: List[float] = []
+    for _date, group in frame.groupby("date", sort=True):
+        if len(group) < MIN_CROSS_SECTION_NAMES:
+            continue
+        sr = group["score"].rank().to_numpy()
+        lr = group["label"].rank().to_numpy()
+        if sr.std() < 1e-12 or lr.std() < 1e-12:
+            continue
+        per_date.append(float(np.corrcoef(sr, lr)[0, 1]))
+
+    return float(np.mean(per_date)) if per_date else float("nan")
 
 
 def lstm_scores(
