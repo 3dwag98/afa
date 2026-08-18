@@ -70,12 +70,34 @@ $$
 \sigma_i(t) = \sqrt{\frac{252}{W-1}\sum_{k=0}^{W-1}\big(r_i(t-k) - \bar r_i\big)^2}
 $$
 
-Rank ascending; long the bottom decile (lowest realized volatility). This is the mirror image of momentum's ranking machinery, so both strategies share a `_rank_and_select_decile()` helper.
+Rank ascending; long the bottom decile (lowest realized volatility). This is the mirror image of momentum's ranking machinery, so both strategies share the `rank_and_select()` helper in `strategies/cross_sectional.py` (public since T25 — it was `_rank_and_select_decile`).
+
+**Three sorts, not one.** Total volatility mixes two things a cross-sectional book should keep apart: how much a stock moves *with* the market, and how much it moves on its own. The formula above is the total, and the platform now implements all three decompositions as separate strategies so the comparison is one command rather than an argument:
+
+| strategy | ranks on | registry feature |
+| --- | --- | --- |
+| `low_volatility` | total realized volatility (the formula above) | `realized_vol_60` |
+| `low_volatility_idio` | volatility of the CAPM **residual** (T14) | `idiosyncratic_vol_60` |
+| `bab` | rolling market **beta** (T28) | `market_beta_252` |
+
+```bash
+portfolio-agent compare --strategies low_volatility,low_volatility_idio,bab
+```
+
+T14 recorded the reason the second exists: 2025 work on the low-risk anomaly finds idiosyncratic-volatility sorts survive out of sample where beta sorts largely do not. `bab` is included so that claim is measured on this data rather than assumed from it.
+
+**Betting against beta (`bab`).** Frazzini & Pedersen's account is a funding-constraint one: investors who want more risk than they can borrow to obtain bid up high-beta stocks instead, so beta is overpriced and the security market line is flatter than CAPM predicts. Indian evidence is favourable and specific — NSE 2001–2016 finds the effect positive across capitalizations *after controlling for size, value and momentum*, which matters because the naive objection to a low-beta sort is that it is a size bet wearing a different name.
+
+**It is conditional, and must be reported that way.** 2025 Asian work finds the effect concentrated in downturns. A pooled IC made of a strong down-market number and a flat up-market one describes neither state, so `evaluation/conditional.py` splits IC and decile spread by market state. Two conditioners, and conflating them turns an attribution into an imaginary timing rule:
+
+- `realized` splits on the market's return **over the label horizon** — it says *when the signal paid*, and is not tradable, because on the decision date nobody knows which bucket the date will land in.
+- `trailing` splits on the market's state **as of the decision date** — tradable, and a weaker conditioner for exactly that reason.
 
 **Sources:**
 - [The Volatility Effect: Recent Evidence from Indian Markets](https://www.scirp.org/html/28-1501934_94780.htm)
 - [An Investigation of Low Volatility Anomaly in Indian Stock Market](https://www.researchgate.net/publication/305621746_An_Investigation_of_Low_Volatility_Anomaly_in_Indian_Stock_Market)
 - [Low-Risk Anomaly: Evidence from India](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4398656)
+- Frazzini & Pedersen, ["Betting Against Beta"](https://www.sciencedirect.com/science/article/abs/pii/S0304405X13002675), *Journal of Financial Economics* 111(1), 2014
 
 ---
 

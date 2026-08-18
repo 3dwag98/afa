@@ -1,15 +1,40 @@
-"""Cross-sectional momentum and low-volatility strategies.
+"""Cross-sectional strategies: rank the eligible universe, hold one decile.
 
-Both rank all eligible tickers against each other in a single score_batch()
-call and go long the extreme decile:
+All of them rank every eligible ticker against every other in a single
+`score_batch()` call and go long the extreme decile. They divide into two
+families by what they rank on.
 
-- MomentumStrategy: top decile by 9-month (skip 1-month) formation return
-  (Jegadeesh-Titman convention), with crash protection layered on top.
-- LowVolatilityStrategy: bottom decile by trailing 60-day realized volatility
-  (the low-volatility anomaly).
+**Return-based**
 
-See docs/QUANT_RESEARCH.md sections 1, 2 and 12 for the academic basis (with
-an emphasis on India-specific studies) and exact formulation.
+- `MomentumStrategy` — top decile by 9-month (skip 1-month) formation return,
+  the Jegadeesh-Titman convention, with crash protection layered on top.
+- `ResidualMomentumStrategy` — the same formation window measured on the CAPM
+  residual and standardized by its own dispersion (Blitz-Huij-Martens). Price
+  momentum's return is substantially a bet on whatever the market has been
+  rewarding; round two measured this platform's momentum at 58% factor loading.
+
+**Risk-based** — three decompositions of one anomaly, kept separate so the
+comparison between them is a command rather than an argument:
+
+- `LowVolatilityStrategy` — bottom decile by *total* realized volatility.
+- `IdiosyncraticLowVolatilityStrategy` — by the volatility of the CAPM
+  residual, which is the sort the 2025 literature finds survives.
+- `BettingAgainstBetaStrategy` — by rolling market beta (Frazzini-Pedersen).
+
+Total volatility mixes beta and idiosyncratic volatility together; the second
+and third sort on the halves.
+
+Everything except the ranking metric and its direction is shared. A new
+cross-sectional strategy overrides `_formation_metric` and, if it ranks on a
+risk measure rather than a return, `higher_metric_is_better` — the tradability
+screen, regime assessment, decile selection, volatility targeting and
+reward:risk gate all come from `rank_and_select`.
+
+See docs/QUANT_RESEARCH.md sections 1, 2 and 12 for the academic basis, with an
+emphasis on India-specific studies. Section 2 gives the *total*-volatility
+formula and then the table of all three risk sorts; the residual and beta
+formulations live in `features/market_relative.py`, which is where they are
+computed.
 
 Unlike strategies/rule_based.py, a ticker's signal here depends on where it
 ranks *within the batch*, not on its own history alone. score() (single

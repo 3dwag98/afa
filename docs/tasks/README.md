@@ -67,6 +67,7 @@ and why the data work is about provenance rather than latency.
 | Task | What it did | Tests added |
 | --- | --- | --- |
 | [T27](T27-residual-momentum.md) | Momentum on the CAPM residual; corrects `QUANT_RESEARCH.md` §12(c) | 25 |
+| [T28](T28-betting-against-beta.md) | Long the low-beta decile, and an IC split by market state | 33 |
 
 ## What round two found
 
