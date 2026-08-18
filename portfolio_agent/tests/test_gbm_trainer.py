@@ -682,3 +682,65 @@ def test_absent_sklearn_names_the_extra_to_install(monkeypatch):
     message = str(excinfo.value)
     assert "--extra gbm" in message
     assert "list-trainers" in message
+
+
+# --------------------------------------------------------------------------
+# The outlier filter this fork never had (T23)
+# --------------------------------------------------------------------------
+
+
+def test_a_split_that_escaped_adjustment_is_dropped_not_trained_on(
+    app_config, monkeypatch
+):
+    """The defect T23 closed, reproduced end to end.
+
+    `agents/trainer.prepare_features` has dropped labels beyond ±5.0 since a
+    run was poisoned by one bad bar. This trainer assembles its label in
+    `build_gbm_panel` rather than going through `prepare_features`, so it kept
+    them — and a single eleven-million-percent "return" dominates a
+    squared-error objective completely.
+    """
+    frames = {f"T{i}": _ohlcv(seed=i) for i in range(8)}
+    # A 1:10 split the adjustment missed: the close divides by ten for one bar
+    # and comes back. The forward return out of the prior bar is -0.9, and the
+    # one out of the split bar is roughly +9.
+    victim = frames["T3"]
+    split_at = victim.index[300]
+    victim.loc[split_at, "close"] = victim.loc[split_at, "close"] / 100.0
+
+    monkeypatch.setattr(
+        "portfolio_agent.src.data_store.load_ticker_data",
+        lambda ticker, start_date=None, end_date=None: frames.get(ticker),
+        raising=True,
+    )
+
+    panel, _ = build_gbm_panel(app_config, list(frames), tiny_config())
+
+    labels = np.concatenate([panel.y_train, panel.y_val])
+    assert np.abs(labels).max() <= app_config.training.max_abs_target
+
+
+def test_the_survivable_rows_around_it_are_kept(app_config, monkeypatch):
+    """Only the absurd rows go — the filter is not a date-range blacklist."""
+    clean = {f"T{i}": _ohlcv(seed=i) for i in range(8)}
+    dirty = {k: v.copy() for k, v in clean.items()}
+    dirty["T3"].loc[dirty["T3"].index[300], "close"] /= 100.0
+
+    def serve(frames):
+        return lambda ticker, start_date=None, end_date=None: frames.get(ticker)
+
+    monkeypatch.setattr(
+        "portfolio_agent.src.data_store.load_ticker_data", serve(clean), raising=True
+    )
+    baseline, _ = build_gbm_panel(app_config, list(clean), tiny_config())
+
+    monkeypatch.setattr(
+        "portfolio_agent.src.data_store.load_ticker_data", serve(dirty), raising=True
+    )
+    filtered, _ = build_gbm_panel(app_config, list(dirty), tiny_config())
+
+    lost = len(baseline.y_train) + len(baseline.y_val) - (
+        len(filtered.y_train) + len(filtered.y_val)
+    )
+    # The horizon's worth of rows whose window spans the bad bar, and no more.
+    assert 0 < lost <= 2 * horizon_from_target(tiny_config().target)

@@ -1,10 +1,96 @@
 """Feature pipeline for building feature matrices from OHLCV data."""
 
+from functools import lru_cache
+
 import pandas as pd
 import numpy as np
-from typing import Optional
+from typing import Optional, Sequence
 
 from .registry import get_feature, list_features
+
+#: Rows a feature is allowed to need before `warmup_rows` gives up on it. Every
+#: registered feature warms up far inside this; the cap only bounds the probe.
+_WARMUP_PROBE_ROWS = 600
+
+
+def warmup_rows(feature_names: Sequence[str]) -> int:
+    """Rows of history before every named feature is defined.
+
+    **Measured, not declared.** Four modules carried a minimum-history
+    threshold and all four disagreed — 20 in the backtest, 252 in the
+    evaluation harness, 252 again in the trainer panel builder, and
+    `data.min_history_days` in the supervised path. They were guessing at one
+    number: how much history the *longest lookback among the requested
+    features* needs. That is a property of the request, so it is computed from
+    the request.
+
+    Each feature is built once on a synthetic probe series and the first row
+    where it is defined is its warm-up; the answer for a set is the largest. A
+    feature added tomorrow with a three-year lookback raises this
+    automatically, where a constant would silently start scoring NaNs.
+
+    The cost this replaces is not theoretical. At the backtest's 20-row
+    threshold, six of the ten features `momentum` requires are NaN — including
+    `mom_9m_skip1m`, the value it ranks on — so the opening months of every
+    backtest ranked the universe on undefined numbers while the harness refused
+    those same dates.
+
+    Raises:
+        KeyError: If a name is not registered — surfaced here rather than as a
+            failure part-way through a run.
+    """
+    return max((_warmup_for(name) for name in feature_names), default=0)
+
+
+def effective_min_history(feature_names: Sequence[str], requested: int) -> int:
+    """A caller's minimum-history setting, raised to what the features need.
+
+    `min_history` answers two questions that were being conflated. One is
+    statistical — a year of history before a name is eligible is a judgement
+    about sample adequacy, and it is the caller's to make. The other is
+    mechanical: below the warm-up the feature is *NaN*, and no setting makes
+    that a reasonable thing to rank on.
+
+    So the caller's number is honored as a floor and never as a ceiling. Both
+    `DEFAULT_MIN_HISTORY` constants (252, in the harness and in
+    `training/data.py`) document themselves as standing in for "the longest
+    default lookback" — they were reaching for this, and they happened to be
+    large enough for today's registry.
+    """
+    return max(int(requested), warmup_rows(feature_names))
+
+
+@lru_cache(maxsize=None)
+def _warmup_for(name: str) -> int:
+    """First row at which one feature is defined, on a synthetic probe series.
+
+    Cached because the probe costs a feature evaluation and the answer is a
+    property of the code, not of the data. A geometric random walk rather than
+    a straight line: a constant series makes several features degenerate (zero
+    true range, zero variance) and would report them as never warming up.
+    """
+    rng = np.random.default_rng(0)
+    n = _WARMUP_PROBE_ROWS
+    close = 100.0 * np.exp(np.cumsum(rng.normal(0.0004, 0.012, n)))
+    probe = pd.DataFrame(
+        {
+            "open": close * (1 + rng.normal(0, 0.002, n)),
+            "high": close * (1 + np.abs(rng.normal(0, 0.006, n))),
+            "low": close * (1 - np.abs(rng.normal(0, 0.006, n))),
+            "close": close,
+            "volume": rng.integers(1e5, 1e6, n).astype(float),
+        },
+        index=pd.bdate_range("2020-01-01", periods=n),
+    )
+
+    series = pd.Series(get_feature(name)(probe)).reset_index(drop=True)
+    defined = series.notna()
+    if not defined.any():
+        # A feature that never resolves on 600 clean rows will not resolve on a
+        # ticker's cache either; nothing is gained by pretending otherwise.
+        return _WARMUP_PROBE_ROWS
+    # +1 because a value at position p means p+1 rows were needed to produce it.
+    return int(defined.idxmax()) + 1
 
 
 def build_features(

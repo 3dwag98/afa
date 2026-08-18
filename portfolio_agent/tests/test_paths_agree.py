@@ -212,3 +212,180 @@ def test_the_label_keeps_the_first_rows_of_the_sample(ohlcv, horizon):
     assert label.head(horizon).notna().all()
     assert label.tail(horizon).isna().all()
     assert label.notna().sum() == len(ohlcv) - horizon
+
+
+class TestTheEngineLoadsItsOwnWarmup:
+    """Raising the eligibility bar exposed why it had been low.
+
+    `_load_all_data` requested data from `start_date`, so a run beginning
+    2023-01-02 had no bar before it. `sma_200` was undefined for the first 200
+    sessions regardless of what the cache held, and `mom_9m_skip1m` for the
+    first 211 — and the 20-row bar let those tickers through, which is how the
+    opening months of every backtest came to rank the universe on NaN.
+    """
+
+    def _engine(self, monkeypatch, ohlcv, strategy=None, **kwargs):
+        from portfolio_agent.src import backtest_engine as module
+
+        requested = {}
+
+        def fake_load(ticker, start_date=None, end_date=None):
+            requested["start"] = start_date
+            return ohlcv.copy()
+
+        monkeypatch.setattr(module, "load_ticker_data", fake_load)
+        engine = module.BacktestEngine(
+            start_date="2022-06-01", end_date="2022-12-30",
+            initial_capital=1_000_000.0, universe_tickers=["A.NS"],
+            strategy=strategy, **kwargs,
+        )
+        return engine, requested
+
+    def test_it_reaches_back_before_the_window(self, monkeypatch, ohlcv):
+        from portfolio_agent.config.schema import StrategyConfig
+        from portfolio_agent.strategies.cross_sectional import MomentumStrategy
+
+        strategy = MomentumStrategy(StrategyConfig(type="momentum", params={}))
+        engine, requested = self._engine(monkeypatch, ohlcv, strategy=strategy)
+
+        assert pd.Timestamp(requested["start"]) < engine.start_date
+
+    def test_the_reach_covers_the_warm_up_in_sessions(self, monkeypatch, ohlcv):
+        """211 sessions of warm-up cannot be 211 calendar days."""
+        from portfolio_agent.config.schema import StrategyConfig
+        from portfolio_agent.strategies.cross_sectional import MomentumStrategy
+
+        strategy = MomentumStrategy(StrategyConfig(type="momentum", params={}))
+        engine, requested = self._engine(monkeypatch, ohlcv, strategy=strategy)
+
+        needed = engine._required_history_rows()
+        sessions_available = len(
+            pd.bdate_range(pd.Timestamp(requested["start"]), engine.start_date)
+        )
+        assert needed > 200
+        assert sessions_available >= needed
+
+    def test_the_scored_window_is_unchanged(self, monkeypatch, ohlcv):
+        """Extra bars are warm-up; the run must not start scoring earlier."""
+        from portfolio_agent.config.schema import StrategyConfig
+        from portfolio_agent.strategies.cross_sectional import MomentumStrategy
+
+        strategy = MomentumStrategy(StrategyConfig(type="momentum", params={}))
+        engine, _ = self._engine(monkeypatch, ohlcv, strategy=strategy)
+
+        assert engine.master_date_index.min() >= engine.start_date
+        assert engine.master_date_index.max() <= engine.end_date
+
+    def test_the_default_strategy_gets_its_own_warm_up_too(self, monkeypatch, ohlcv):
+        """Passing no strategy is not passing no features.
+
+        The constructor substitutes the default strategy, so a caller who omits
+        one still gets that strategy's warm-up — 201 rows for `rule_based`, not
+        a floor. This is the case the old 20-row bar was widest against.
+        """
+        engine, requested = self._engine(monkeypatch, ohlcv)
+
+        assert engine.strategy is not None
+        assert engine._required_history_rows() > 200
+        assert pd.Timestamp(requested["start"]) < engine.start_date
+
+    def test_the_warm_up_is_the_strategy_s_own(self, monkeypatch, ohlcv):
+        """Two strategies with different lookbacks get different reaches."""
+        from portfolio_agent.config.schema import StrategyConfig
+        from portfolio_agent.strategies.cross_sectional import (
+            LowVolatilityStrategy,
+            MomentumStrategy,
+        )
+
+        momentum, _ = self._engine(
+            monkeypatch, ohlcv,
+            strategy=MomentumStrategy(StrategyConfig(type="momentum", params={})),
+        )
+        low_vol, _ = self._engine(
+            monkeypatch, ohlcv,
+            strategy=LowVolatilityStrategy(
+                StrategyConfig(type="low_volatility_idio", params={})
+            ),
+        )
+
+        # `mom_9m_skip1m` needs three quarters of history; a 60-session
+        # volatility does not. A single constant could serve only one of them.
+        assert momentum._required_history_rows() > low_vol._required_history_rows()
+        assert low_vol._required_history_rows() > 1
+
+
+class TestBothLabelForksFilterOutliers:
+    """The ±5.0 filter sat on one side of a fork nobody noticed was a fork.
+
+    `agents/trainer.prepare_features` has dropped absurd labels since a run was
+    poisoned by one bad bar: a split that escapes adjustment produces an
+    eleven-million-percent "return", and one such row dominates a squared-error
+    objective completely. `build_gbm_panel` assembles its label itself rather
+    than going through `prepare_features`, so the boosting trainers kept them.
+    """
+
+    def _frame(self, values):
+        return pd.DataFrame(
+            {"x": range(len(values)), "target_5d": values},
+            index=pd.bdate_range("2023-01-02", periods=len(values)),
+        )
+
+    def test_it_drops_what_cannot_be_a_price_move(self):
+        from portfolio_agent.features.labels import drop_absurd_labels
+
+        frame = self._frame([0.01, -0.02, 11_000.0, 0.03])
+        kept = drop_absurd_labels(frame, "target_5d")
+
+        assert len(kept) == 3
+        assert 11_000.0 not in set(kept["target_5d"])
+
+    def test_it_keeps_moves_that_are_merely_extreme(self):
+        """+149% is five consecutive 20% upper circuits — reachable, so kept."""
+        from portfolio_agent.features.labels import drop_absurd_labels
+
+        frame = self._frame([1.49, -0.60, 2.5, 0.0])
+        assert len(drop_absurd_labels(frame, "target_5d")) == 4
+
+    def test_it_drops_rather_than_clips(self):
+        """A clip piles a spike of samples at the bound and teaches the model
+        that the bound is a common outcome — one distortion for a subtler."""
+        from portfolio_agent.features.labels import DEFAULT_MAX_ABS_LABEL, drop_absurd_labels
+
+        frame = self._frame([9.0, 9.0, 9.0, 0.02])
+        kept = drop_absurd_labels(frame, "target_5d")
+
+        assert len(kept) == 1
+        assert DEFAULT_MAX_ABS_LABEL not in set(kept["target_5d"].abs())
+
+    def test_it_cuts_both_tails(self):
+        from portfolio_agent.features.labels import drop_absurd_labels
+
+        kept = drop_absurd_labels(self._frame([-9.0, 0.01, 9.0]), "target_5d")
+        assert list(kept["target_5d"]) == [0.01]
+
+    def test_a_clean_frame_comes_back_unchanged(self):
+        from portfolio_agent.features.labels import drop_absurd_labels
+
+        frame = self._frame([0.01, -0.02, 0.03])
+        assert drop_absurd_labels(frame, "target_5d") is frame
+
+    def test_a_missing_target_is_not_an_error(self):
+        """The filter runs on panels that may not carry the column yet."""
+        from portfolio_agent.features.labels import drop_absurd_labels
+
+        frame = self._frame([0.01, 0.02]).drop(columns=["target_5d"])
+        assert drop_absurd_labels(frame, "target_5d") is frame
+
+    def test_the_supervised_pipeline_routes_through_it(self):
+        """`prepare_features` must not keep its own copy of the rule.
+
+        The filter it inlined and this one agreed on the threshold. They would
+        not have stayed agreed — which is the whole shape of this round.
+        """
+        import inspect
+
+        from portfolio_agent.agents import trainer
+
+        source = inspect.getsource(trainer.prepare_features)
+        assert "drop_absurd_labels(" in source
+        assert ".abs() > config.training.max_abs_target" not in source

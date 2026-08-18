@@ -349,7 +349,12 @@ def build_gbm_panel(
     from portfolio_agent.features.labels import (
         apply_cross_sectional_target,
         build_forward_return,
+        drop_absurd_labels,
         target_column_name,
+    )
+
+    max_abs_label = float(
+        getattr(getattr(app_config, "training", None), "max_abs_target", 5.0)
     )
     from portfolio_agent.features.scaling import apply_cross_sectional_scaling
 
@@ -385,6 +390,12 @@ def build_gbm_panel(
         labelled[target_column] = build_forward_return(close, cfg.target)
         # The last `horizon` rows have no realized label by construction.
         labelled = labelled.dropna(subset=[target_column])
+        # Same filter the supervised pipeline has applied since a run was
+        # poisoned by one bad bar. This trainer assembles its label here rather
+        # than in `prepare_features`, so the filter sat on one side of a fork
+        # nobody had noticed was a fork, and the boosting trainers kept the
+        # eleven-million-percent "returns" a split escaping adjustment makes.
+        labelled = drop_absurd_labels(labelled, target_column, max_abs_label)
         if not labelled.empty:
             panel[ticker] = labelled
 

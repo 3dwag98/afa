@@ -18,9 +18,18 @@ from portfolio_agent.src.risk_analytics import RiskAnalyzer
 
 @pytest.fixture
 def market_data(monkeypatch):
-    """Eight synthetic tickers with enough history for the rule-based strategy."""
+    """Eight synthetic tickers with enough history for the rule-based strategy.
+
+    The docstring was aspirational until T23. The series used to begin on
+    2023-01-02, the same day every backtest here starts, so no ticker ever had
+    a bar before the first scored session — `sma_200` was NaN throughout, and
+    the engine's old 20-row eligibility bar let it through anyway. These tests
+    were exercising the parallel machinery on undefined features.
+
+    It now starts two years earlier, so the warm-up the engine loads is there.
+    """
     np.random.seed(11)
-    dates = pd.bdate_range(start="2023-01-02", periods=260)
+    dates = pd.bdate_range(start="2021-01-04", periods=780)
     tickers = [f"PAR{i}.NS" for i in range(8)]
 
     data = {}

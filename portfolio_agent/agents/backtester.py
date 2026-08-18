@@ -161,6 +161,14 @@ class BacktesterAgent:
             portfolio_volatility_target=self.config.risk.portfolio_volatility_target,
             covariance_lookback_days=self.config.risk.covariance_lookback_days,
             show_progress=self.show_progress,
+            # The harness and both trainers read these; the engine took the
+            # pipeline's own default and ignored the config. They agreed only
+            # because config.yaml sets normalize false against a schema default
+            # of true — and normalization adds its own `.shift(1)`, so a
+            # divergence here is a second session of lag, which is what T19
+            # removed.
+            feature_normalize=self.config.features.normalize,
+            feature_normalize_window=self.config.features.normalize_window,
         )
 
         logger.info(f"Running backtest from {start_date} to {end_date} with strategy '{strategy.name}'")

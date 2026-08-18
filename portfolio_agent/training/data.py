@@ -36,8 +36,12 @@ from .base import TrainingData
 
 logger = logging.getLogger(__name__)
 
-#: Enough history for the longest default lookback (a 9-month momentum feature
-#: skipping the most recent month) to have filled.
+#: Rows required before a ticker is kept — a floor, not the answer. It reads
+#: as a judgement about sample adequacy (one trading year), and
+#: `effective_min_history` raises it to the requested features' warm-up
+#: whenever that is larger. It used to carry both meanings at once, and was
+#: only ever correct because 252 happens to exceed the registry's longest
+#: lookback of 211.
 DEFAULT_MIN_HISTORY = 252
 
 
@@ -85,9 +89,40 @@ def prepare_panel(
         ValueError: If no ticker yielded usable history. Callers must not
             proceed on an empty panel.
     """
+    from portfolio_agent.features.pipeline import (
+        effective_min_history,
+        validate_feature_names,
+    )
     from portfolio_agent.src.data_store import load_ticker_data
 
     feature_names = list(feature_names)
+
+    # Checked before any I/O. An unregistered name used to surface only at the
+    # end, as "no ticker produced usable history" plus a hint that *if*
+    # `missing_features` dominates, *maybe* a feature is not in the registry —
+    # after loading and featurizing the entire universe to find out. The
+    # warm-up below needs the names to resolve anyway, so the guess is no
+    # longer necessary and the failure names itself.
+    _, unknown = validate_feature_names(feature_names)
+    if unknown:
+        from portfolio_agent.features.registry import list_features
+
+        raise ValueError(
+            f"Unknown feature(s) {unknown} — not in the registry. "
+            f"Available: {sorted(list_features())}"
+        )
+
+    # Never below the warm-up: under it the feature is NaN, and `_clean_frame`
+    # would drop every such row anyway — so a too-low setting does not train on
+    # NaN here so much as quietly train on a shorter sample than asked for.
+    requested_min_history = min_history
+    min_history = effective_min_history(feature_names, min_history)
+    if min_history != requested_min_history:
+        logger.info(
+            "Raised min_history from %d to %d — the requested features are not "
+            "defined below that",
+            requested_min_history, min_history,
+        )
     features_cfg = getattr(app_config, "features", None)
     normalize = bool(getattr(features_cfg, "normalize", False))
     normalize_window = int(getattr(features_cfg, "normalize_window", 252))

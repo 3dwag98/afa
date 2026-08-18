@@ -1,14 +1,16 @@
-# The forecasting pivot: eighteen tasks, in two rounds
+# The forecasting pivot: the task log
 
-All eighteen are done and merged. Each task's own file carries its spec, its
-acceptance criteria, and what actually shipped — including the places where the
-spec turned out to be wrong.
+Each task's own file carries its spec, its acceptance criteria, and what
+actually shipped — including the places where the spec turned out to be wrong.
 
 **Round one (T01–T11)** built the evaluation layer: measure forecast skill
 directly, without simulating a book. **Round two (T12–T18)** came out of
 [`docs/architecture_review_2.html`](../architecture_review_2.html), which read
 the merged tree against current literature and found that the platform
-contradicted itself about its own headline number.
+contradicted itself about its own headline number. **Round three (T19–)** is
+the platform review: the three paths that build a feature panel — `evaluate`,
+`backtest`, `train` — disagreed on ten things, and two of those disagreements
+produced plausible numbers rather than errors.
 
 The premise behind all of them: **no trades will ever be executed, so tracking
 error is acceptable and forecast skill is the thing worth measuring.** That
@@ -41,6 +43,16 @@ and why the data work is about provenance rather than latency.
 | [T16](T16-rank-ic-objective.md) | Train on the metric the model is judged on | 31 |
 | [T17](T17-src-restructure.md) | Resolve where `src/` answers one question twice | 23 |
 | [T18](T18-sequence-boundaries.md) | Stop training sequences straddling ticker boundaries | 22 |
+
+## Round three: making the three paths agree
+
+| Task | What it did | Tests added |
+| --- | --- | --- |
+| [T19](T19-one-decision-date.md) | One decision-date convention; the backtest was a session staler | 11 |
+| [T20](T20-strategy-context-contract.md) | One `StrategyContext` contract; `rule_based` was scoring 0.0 for every name | 14 |
+| [T22](T22-one-purge-one-universe.md) | Overlap in sessions, not calendar days; `evaluate` drew the training universe | 20 |
+| [T21](T21-one-feature-set.md) | One feature set, derived from the strategy rather than hardcoded twice | 21 |
+| [T23](T23-one-panel-policy.md) | Warm-up derived from the features, and actually loaded | 25 |
 
 ## What round two found
 

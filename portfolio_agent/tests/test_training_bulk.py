@@ -331,8 +331,29 @@ def test_an_empty_panel_is_an_error_not_an_empty_run(app_config, fake_cache):
 
 
 def test_unknown_feature_names_are_reported(app_config, fake_cache):
-    with pytest.raises(ValueError, match="No ticker produced usable history"):
+    """The bad name itself, not a guess at what might have gone wrong.
+
+    This used to raise "No ticker produced usable history" with a hint that
+    *if* `missing_features` dominated the skip counts, *maybe* a feature was
+    unregistered — reached only after loading and featurizing every ticker.
+    """
+    with pytest.raises(ValueError, match="not_a_real_feature"):
         prepare_panel(app_config, ["AAA"], ["not_a_real_feature"], min_history=100)
+
+
+def test_the_unknown_name_is_caught_before_any_data_is_loaded(app_config, monkeypatch):
+    """No I/O to discover a typo in a config file."""
+    loaded = []
+    monkeypatch.setattr(
+        "portfolio_agent.src.data_store.load_ticker_data",
+        lambda ticker, start_date=None, end_date=None: loaded.append(ticker),
+        raising=True,
+    )
+
+    with pytest.raises(ValueError, match="not_a_real_feature"):
+        prepare_panel(app_config, ["AAA"], ["rsi_14", "not_a_real_feature"])
+
+    assert loaded == []
 
 
 def test_fit_scaler_false_leaves_features_raw(app_config, fake_cache):

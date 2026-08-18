@@ -532,3 +532,109 @@ class TestNormalizationIsCausal:
         # outlier at t cannot influence it.
         assert not np.isnan(normalized['x'].iloc[-1])
         assert abs(normalized['x'].iloc[-1]) < 10
+
+
+class TestWarmupRows:
+    """How much history a feature set needs, measured rather than declared.
+
+    Four modules carried a minimum-history threshold and all four disagreed —
+    20 rows in the backtest, 252 in the evaluation harness, 252 again in the
+    trainer panel builder, `data.min_history_days` in the supervised path. All
+    four were reaching for one quantity: the longest lookback among the
+    features actually requested. That is a property of the request, so it is
+    computed from the request.
+    """
+
+    def test_a_longer_lookback_needs_more_rows(self):
+        from portfolio_agent.features.pipeline import warmup_rows
+
+        assert warmup_rows(['sma_200']) > warmup_rows(['sma_50'])
+        assert warmup_rows(['sma_50']) > warmup_rows(['sma_20'])
+
+    def test_a_set_needs_what_its_slowest_member_needs(self):
+        from portfolio_agent.features.pipeline import warmup_rows
+
+        assert warmup_rows(['sma_20', 'sma_200']) == warmup_rows(['sma_200'])
+
+    def test_an_empty_request_needs_nothing(self):
+        from portfolio_agent.features.pipeline import warmup_rows
+
+        assert warmup_rows([]) == 0
+
+    def test_the_answer_is_the_row_the_feature_is_first_defined(self):
+        """Not an approximation of it — build at the boundary and check.
+
+        The contract is exact: at `warmup_rows(f)` rows the feature resolves,
+        and at one row fewer it does not. A threshold that was merely
+        *sufficient* would let an off-by-one survive here.
+        """
+        from portfolio_agent.features.pipeline import build_features, warmup_rows
+
+        needed = warmup_rows(['sma_50'])
+        rng = np.random.default_rng(3)
+        close = 100 * np.exp(np.cumsum(rng.normal(0.0004, 0.012, needed)))
+        df = pd.DataFrame(
+            {'open': close, 'high': close * 1.01, 'low': close * 0.99,
+             'close': close, 'volume': np.full(needed, 1e6)},
+            index=pd.bdate_range('2022-01-03', periods=needed),
+        )
+
+        assert not pd.isna(build_features(df, ['sma_50']).iloc[-1]['sma_50'])
+        assert pd.isna(build_features(df.iloc[:-1], ['sma_50']).iloc[-1]['sma_50'])
+
+    def test_the_backtest_s_old_bar_left_momentum_undefined(self):
+        """Why the threshold had to be derived, in one assertion.
+
+        The engine admitted any ticker with 20 rows. `mom_9m_skip1m` needs
+        three quarters, so for the opening months of every backtest the
+        strategy ranked the universe on the feature it ranks on being NaN.
+        """
+        from portfolio_agent.features.pipeline import warmup_rows
+
+        assert warmup_rows(['mom_9m_skip1m']) > 20
+
+    def test_an_unregistered_name_is_an_error_not_a_zero(self):
+        from portfolio_agent.features.pipeline import warmup_rows
+
+        with pytest.raises(KeyError):
+            warmup_rows(['no_such_feature'])
+
+
+class TestEffectiveMinHistory:
+    """The caller's threshold is a floor, never a ceiling.
+
+    `min_history` was answering two questions at once. One is statistical — a
+    year before a name is eligible is a judgement about sample adequacy, and it
+    belongs to the caller. The other is mechanical: below the warm-up the
+    feature is NaN, and no setting makes that reasonable to rank on.
+    """
+
+    def test_a_low_request_is_raised_to_the_warm_up(self):
+        from portfolio_agent.features.pipeline import effective_min_history, warmup_rows
+
+        assert effective_min_history(['sma_200'], 20) == warmup_rows(['sma_200'])
+
+    def test_a_high_request_is_left_alone(self):
+        from portfolio_agent.features.pipeline import effective_min_history
+
+        assert effective_min_history(['sma_20'], 500) == 500
+
+    def test_the_shipped_default_already_covered_the_registry(self):
+        """252 was right by luck, and this records the margin it had.
+
+        Both `DEFAULT_MIN_HISTORY` constants describe themselves as standing in
+        for the longest lookback. They were correct only because the longest
+        one is 211. A feature registered with a three-year window makes them
+        wrong, and this assertion is what would fail.
+        """
+        from portfolio_agent.evaluation.harness import DEFAULT_MIN_HISTORY
+        from portfolio_agent.features.pipeline import warmup_rows
+        from portfolio_agent.features.registry import list_features
+
+        assert warmup_rows(list_features()) <= DEFAULT_MIN_HISTORY
+
+    def test_the_two_defaults_are_the_same_number(self):
+        from portfolio_agent.evaluation.harness import DEFAULT_MIN_HISTORY as evaluation
+        from portfolio_agent.training.data import DEFAULT_MIN_HISTORY as training
+
+        assert evaluation == training
