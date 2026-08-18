@@ -42,6 +42,24 @@ def warmup_rows(feature_names: Sequence[str]) -> int:
     return max((_warmup_for(name) for name in feature_names), default=0)
 
 
+def effective_min_history(feature_names: Sequence[str], requested: int) -> int:
+    """A caller's minimum-history setting, raised to what the features need.
+
+    `min_history` answers two questions that were being conflated. One is
+    statistical — a year of history before a name is eligible is a judgement
+    about sample adequacy, and it is the caller's to make. The other is
+    mechanical: below the warm-up the feature is *NaN*, and no setting makes
+    that a reasonable thing to rank on.
+
+    So the caller's number is honored as a floor and never as a ceiling. Both
+    `DEFAULT_MIN_HISTORY` constants (252, in the harness and in
+    `training/data.py`) document themselves as standing in for "the longest
+    default lookback" — they were reaching for this, and they happened to be
+    large enough for today's registry.
+    """
+    return max(int(requested), warmup_rows(feature_names))
+
+
 @lru_cache(maxsize=None)
 def _warmup_for(name: str) -> int:
     """First row at which one feature is defined, on a synthetic probe series.

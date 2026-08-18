@@ -36,8 +36,12 @@ from .base import TrainingData
 
 logger = logging.getLogger(__name__)
 
-#: Enough history for the longest default lookback (a 9-month momentum feature
-#: skipping the most recent month) to have filled.
+#: Rows required before a ticker is kept — a floor, not the answer. It reads
+#: as a judgement about sample adequacy (one trading year), and
+#: `effective_min_history` raises it to the requested features' warm-up
+#: whenever that is larger. It used to carry both meanings at once, and was
+#: only ever correct because 252 happens to exceed the registry's longest
+#: lookback of 211.
 DEFAULT_MIN_HISTORY = 252
 
 
@@ -85,9 +89,21 @@ def prepare_panel(
         ValueError: If no ticker yielded usable history. Callers must not
             proceed on an empty panel.
     """
+    from portfolio_agent.features.pipeline import effective_min_history
     from portfolio_agent.src.data_store import load_ticker_data
 
     feature_names = list(feature_names)
+    # Never below the warm-up: under it the feature is NaN, and `_clean_frame`
+    # would drop every such row anyway — so a too-low setting does not train on
+    # NaN here so much as quietly train on a shorter sample than asked for.
+    requested_min_history = min_history
+    min_history = effective_min_history(feature_names, min_history)
+    if min_history != requested_min_history:
+        logger.info(
+            "Raised min_history from %d to %d — the requested features are not "
+            "defined below that",
+            requested_min_history, min_history,
+        )
     features_cfg = getattr(app_config, "features", None)
     normalize = bool(getattr(features_cfg, "normalize", False))
     normalize_window = int(getattr(features_cfg, "normalize_window", 252))

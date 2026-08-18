@@ -48,11 +48,11 @@ and why the data work is about provenance rather than latency.
 
 | Task | What it did | Tests added |
 | --- | --- | --- |
-| [T19](T19-one-decision-date.md) | One decision-date convention; the backtest was a session staler | 17 |
+| [T19](T19-one-decision-date.md) | One decision-date convention; the backtest was a session staler | 11 |
 | [T20](T20-strategy-context-contract.md) | One `StrategyContext` contract; `rule_based` was scoring 0.0 for every name | 14 |
-| [T22](T22-one-purge-one-universe.md) | Overlap in sessions, not calendar days; `evaluate` drew the training universe | 23 |
-| [T21](T21-one-feature-set.md) | One feature set, derived from the strategy rather than hardcoded twice | 26 |
-| [T23](T23-one-panel-policy.md) | Warm-up derived from the features, and actually loaded | 8 |
+| [T22](T22-one-purge-one-universe.md) | Overlap in sessions, not calendar days; `evaluate` drew the training universe | 20 |
+| [T21](T21-one-feature-set.md) | One feature set, derived from the strategy rather than hardcoded twice | 21 |
+| [T23](T23-one-panel-policy.md) | Warm-up derived from the features, and actually loaded | 20 |
 
 ## What round two found
 

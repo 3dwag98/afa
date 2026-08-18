@@ -27,10 +27,14 @@ differed silently.
 
 Four numbers, four modules, no agreement — and none of them derived from
 anything. All four were reaching for the same quantity: the longest lookback
-among the features actually requested. That is a property of the request, not a
-constant, so `features/pipeline.warmup_rows` now computes it. Each feature is
-built once on a synthetic probe series and the first row where it resolves is
-its warm-up; the answer for a set is the largest.
+among the features actually requested. Two of them said so outright, in
+comments describing the constant as standing in for "the longest default
+lookback (a 9-month momentum feature skipping the most recent month)".
+
+That is a property of the request, not a constant, so
+`features/pipeline.warmup_rows` now computes it. Each feature is built once on
+a synthetic probe series and the first row where it resolves is its warm-up;
+the answer for a set is the largest.
 
 Measured:
 
@@ -130,7 +134,10 @@ arithmetic that cannot be a price.
 ## What changed
 
 - `features/pipeline.py` — `warmup_rows(feature_names)` and the cached
-  per-feature probe behind it.
+  per-feature probe behind it; `effective_min_history`, which raises a caller's
+  threshold to the warm-up.
+- `evaluation/harness.py`, `training/data.py` — route `min_history` through it
+  and log when it is raised.
 - `features/labels.py` — `drop_absurd_labels`, `DEFAULT_MAX_ABS_LABEL`.
 - `src/backtest_engine.py` — `_required_history_rows`; loads from
   `start_date` minus the warm-up; eligibility uses the derived threshold rather
@@ -151,10 +158,14 @@ how much history a strategy needs to be meaningful — a 60-session volatility i
 defined at 62 rows and still noisy at 62 rows. Sample-adequacy is a separate
 question and remains the caller's.
 
-Two thresholds also survive outside the engine: the harness and
-`training/data.py` still carry their own 252. They are now redundant rather than
-wrong (252 exceeds every measured warm-up), and folding them in is left to the
-task that gives those two a shared panel builder.
+The harness and `training/data.py` keep their `DEFAULT_MIN_HISTORY = 252`, but
+it is now a *floor* rather than the answer: both route the caller's setting
+through `effective_min_history`, which raises it to the warm-up whenever the
+warm-up is larger. 252 was only ever correct because it happens to exceed the
+registry's longest lookback of 211 — and both constants said as much in their
+own comments, describing themselves as standing in for "the longest default
+lookback". A feature registered with a three-year window would have made them
+silently wrong.
 
 ## Verification
 

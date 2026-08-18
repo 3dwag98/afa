@@ -75,10 +75,12 @@ from .metrics import (
 
 logger = logging.getLogger(__name__)
 
-#: Rows a ticker needs before it can be scored at all. The long-lookback
-#: features (a 9-month momentum formation skipping the most recent month) are
-#: NaN until their window fills, and a strategy handed NaNs ranks them somewhere
-#: arbitrary rather than refusing.
+#: Rows a ticker needs before it can be scored at all — a floor, not the
+#: answer. It reads as a judgement about sample adequacy (one trading year),
+#: and `effective_min_history` raises it to the requested features' warm-up
+#: whenever that is larger. It used to carry both meanings at once, and was
+#: only ever correct because 252 happens to exceed the registry's longest
+#: lookback of 211.
 DEFAULT_MIN_HISTORY = 252
 
 
@@ -488,11 +490,21 @@ def build_forecast_panel(
             enough cross-section. Both are configuration problems, and an empty
             panel scores as "no skill" rather than announcing itself.
     """
-    from portfolio_agent.features.pipeline import build_features
+    from portfolio_agent.features.pipeline import build_features, effective_min_history
     from portfolio_agent.src.data_store import load_ticker_data
     from portfolio_agent.strategies.types import RiskParams, StrategyContext
 
     feature_names = list(strategy.required_features())
+    # Never below the warm-up: under it the feature is NaN, and a strategy
+    # handed NaNs ranks them somewhere arbitrary rather than refusing.
+    requested_min_history = min_history
+    min_history = effective_min_history(feature_names, min_history)
+    if min_history != requested_min_history:
+        logger.info(
+            "Raised min_history from %d to %d — %s needs that much history "
+            "before every feature it ranks on is defined",
+            requested_min_history, min_history, getattr(strategy, "name", "strategy"),
+        )
     horizons = [int(h) for h in (extra_horizons or []) if int(h) != int(horizon)]
     features_by_ticker: Dict[str, pd.DataFrame] = {}
     labels_by_ticker: Dict[str, pd.Series] = {}

@@ -598,3 +598,43 @@ class TestWarmupRows:
 
         with pytest.raises(KeyError):
             warmup_rows(['no_such_feature'])
+
+
+class TestEffectiveMinHistory:
+    """The caller's threshold is a floor, never a ceiling.
+
+    `min_history` was answering two questions at once. One is statistical — a
+    year before a name is eligible is a judgement about sample adequacy, and it
+    belongs to the caller. The other is mechanical: below the warm-up the
+    feature is NaN, and no setting makes that reasonable to rank on.
+    """
+
+    def test_a_low_request_is_raised_to_the_warm_up(self):
+        from portfolio_agent.features.pipeline import effective_min_history, warmup_rows
+
+        assert effective_min_history(['sma_200'], 20) == warmup_rows(['sma_200'])
+
+    def test_a_high_request_is_left_alone(self):
+        from portfolio_agent.features.pipeline import effective_min_history
+
+        assert effective_min_history(['sma_20'], 500) == 500
+
+    def test_the_shipped_default_already_covered_the_registry(self):
+        """252 was right by luck, and this records the margin it had.
+
+        Both `DEFAULT_MIN_HISTORY` constants describe themselves as standing in
+        for the longest lookback. They were correct only because the longest
+        one is 211. A feature registered with a three-year window makes them
+        wrong, and this assertion is what would fail.
+        """
+        from portfolio_agent.evaluation.harness import DEFAULT_MIN_HISTORY
+        from portfolio_agent.features.pipeline import warmup_rows
+        from portfolio_agent.features.registry import list_features
+
+        assert warmup_rows(list_features()) <= DEFAULT_MIN_HISTORY
+
+    def test_the_two_defaults_are_the_same_number(self):
+        from portfolio_agent.evaluation.harness import DEFAULT_MIN_HISTORY as evaluation
+        from portfolio_agent.training.data import DEFAULT_MIN_HISTORY as training
+
+        assert evaluation == training
