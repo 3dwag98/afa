@@ -15,6 +15,9 @@ A lightweight, CLI-first platform for training and backtesting trading strategie
 | **[docs/CUSTOM_TRAINING.md](docs/CUSTOM_TRAINING.md)** | Pluggable **training procedures**: registering a trainer, per-strategy training configs, pinned universes so runs are comparable, bulk training and hyperparameter sweeps, and the checkpoint contract |
 | **[docs/QUANT_RESEARCH.md](docs/QUANT_RESEARCH.md)** | The academic basis for every strategy and risk model |
 | **[docs/REVIEW_STATUS.md](docs/REVIEW_STATUS.md)** | Item-by-item status against the quantitative review: what is done, what is not, and what each gap is blocked on. Every "done" names the code and the test that pins it |
+| **[docs/OBTAINING_DATA.md](docs/OBTAINING_DATA.md)** | The five inputs that do not ship — index membership, fundamentals, free float, sector map, FII/DII flows — with the file format for each, what its validator checks and why, and where to get it |
+| **[docs/CHANGELOG.md](docs/CHANGELOG.md)** | Breaking changes and **retracted findings**, newest first. Read this before trusting a number from an earlier run |
+| **[docs/tasks/](docs/tasks/)** | One file per task: the spec, what actually shipped, and the places the spec turned out to be wrong |
 
 ## Table of Contents
 
@@ -25,6 +28,7 @@ A lightweight, CLI-first platform for training and backtesting trading strategie
   - [Scoring modes](#scoring-modes)
 - [UMAs — combining strategies](#umas--combining-strategies)
 - [Quant research basis](#quant-research-basis)
+- [Measuring a strategy (the evaluation layer)](#measuring-a-strategy-the-evaluation-layer)
 - [Training](#training)
   - [Custom trainers (pluggable)](#custom-trainers-pluggable)
 - [Parallelism](#parallelism)
@@ -356,9 +360,78 @@ Notes:
 - A Markov-switching regime model — a K-state Gaussian HMM by Baum-Welch with K chosen by BIC, emitting filtered state probabilities rather than a hard label (`src/markov_regime.py`)
 - Reinforcement learning for the *exposure* decision, scoped to what a single market trajectory can actually support — see §27 for why the obvious deep-RL-over-prices version does not (`src/rl.py`)
 - The original trend/breakout/volume/Monte-Carlo rule-based strategy
-- Researched-but-not-implemented strategy families (cointegration pairs trading, Fama-French factors, quality/QMJ, FII/DII flows, calendar anomalies) and exactly why each is scoped out (architectural gap vs. data gap vs. weak evidence)
+- Formerly scoped-out families, now implemented: cointegration pairs trading (`pairs`), the Fama-French characteristics and quality/QMJ (`features/characteristics.py`), and FII/DII flows as a regime conditioner (`data_quality/reference.py`). Calendar anomalies remain rejected, on the evidence rather than on a data gap — §11 gives the argument
 
 These were added in response to a quantitative review; §21–26 of the research doc set out what each was measuring wrongly and what the corrected version measures instead. **[docs/REVIEW_STATUS.md](docs/REVIEW_STATUS.md)** tracks that review item by item — what is done, what is partly done and why, and what is not started — including the finding that invalidates every cross-sectional backtest number until the universe becomes point-in-time.
+
+## Measuring a strategy (the evaluation layer)
+
+The platform's headline claim is deliberately **not** an equity curve. An
+equity curve reports the product of two things — how well a signal orders the
+cross-section, and whether that ordering survives being turned into a book —
+and it never reports their difference. Round one found a strategy that ranks
+the cross-section well and has a *negative* decile spread; a backtest shows one
+number for both facts.
+
+So `evaluate` measures forecast skill directly, without simulating a book:
+
+```bash
+portfolio-agent evaluate --strategy momentum --neutralize beta,size
+```
+
+| What it reports | What it answers |
+|---|---|
+| **Rank IC** (per date, Newey-West t) | Did the score order *this day's* cross-section? |
+| **Decile spread** | What did the top bucket earn over the bottom? |
+| **Spread net of costs** | Does the edge survive its own turnover at the Indian schedule? |
+| **Decay curve** (`--horizons`) | How fast does the signal go stale — and so how often must it rebalance? |
+| **Neutralized IC** (`--neutralize`) | How much of it is left once beta, size and sector are removed? |
+| **Per-fold IC** (`--cv`) | Is the mean made of steady folds or one lucky one? |
+
+Two of those deserve a note.
+
+**Rank IC is per date, not pooled.** A pooled rank correlation over every
+observation measures whether the score tracks the market's *level*; on a signal
+that orders every date perfectly while its level runs against the market, the
+pooled figure is −0.99 and the per-date figure is +1.00. The platform reported
+it four different ways until T12.
+
+**Costs are charged by default.** `--gross` opts out. A gross spread is the
+number that looks best and means least — the round trip is 0.79% at 25 bps a
+side, and the signal's own measured turnover decides whether an edge clears it.
+
+### Comparing, rather than reporting
+
+```bash
+portfolio-agent compare --strategies momentum,residual_momentum,bab,reversal \
+    --neutralize beta,size --slippage-bps 25
+```
+
+One universe, one set of dates, one table. The comparison is the point: "better
+than the baseline on identical splits" is the claim that matters, and any
+workflow where it takes two runs is one where it gets skipped. `evaluate
+--baseline gbm` does the same for a single pair.
+
+### What every run says about what it did not have
+
+Three inputs change what a number *means*, and a run without them says so in
+its own printed notes rather than leaving the reader to remember:
+
+| Missing | What the result then is |
+|---|---|
+| point-in-time membership (`--membership`) | ranked against the names that survived to be downloaded — worth ~4.94pp of annual return on Indian indices |
+| a sector map | not sector-neutral, and Indian momentum concentrates hard by sector |
+| fundamentals | controls for no accounting characteristic |
+
+See **[docs/OBTAINING_DATA.md](docs/OBTAINING_DATA.md)** for the formats and
+where to get each.
+
+### Provenance
+
+Every `evaluate` writes a manifest under `runs/` — the universe, the config,
+the git commit, the flags. `portfolio-agent report --run ID` renders one into a
+research note. A metric whose universe and commit are unrecorded is one nobody
+can check later, including the person who ran it.
 
 ## Training
 
@@ -738,10 +811,36 @@ afa/
 │   ├── config/                 # schema.py, loader.py, strategies/*.yaml (incl.
 │   │                           # uma_meta_orchestrator.yaml, the multi-regime UMA)
 │   ├── strategies/             # base.py, types.py (incl. ModelVerdict), rule_based.py,
-│   │                           # cross_sectional.py, ml_strategy.py, ensemble.py,
+│   │                           # cross_sectional.py (momentum, residual momentum,
+│   │                           # low-vol total/idiosyncratic, bab, reversal, pairs),
+│   │                           # ml_strategy.py, india_sac.py, ensemble.py,
 │   │                           # weighting.py, registry.py
-│   ├── features/               # lag-safe technical indicators, pipeline, and
-│   │                           # scaling.py (global + per-date cross-sectional)
+│   ├── features/               # two registries. registry.py + technical.py bind
+│   │                           # Series = f(one ticker); cross_section.py binds
+│   │                           # DataFrame(date x symbol) = f(panel), which is what
+│   │                           # anything peer-relative needs:
+│   │                           #   market_relative.py  beta, idiosyncratic vol,
+│   │                           #                       residual momentum
+│   │                           #   cointegration.py    Engle-Granger pair screening
+│   │                           #   characteristics.py  B/P, E/P, gross profitability,
+│   │                           #                       asset growth, accruals, leverage
+│   │                           # plus pipeline.py, sets.py, labels.py, scaling.py
+│   ├── evaluation/             # measure a forecast without simulating a book:
+│   │                           #   harness.py     build the panel, score it
+│   │                           #   metrics.py     one rank IC, buckets, decay
+│   │                           #   costs.py       the Indian schedule, net spread
+│   │                           #   neutralize.py  beta / size / sector residual IC
+│   │                           #   allocation.py  ranking -> weighted book
+│   │                           #   conditional.py IC split by market state
+│   ├── data_quality/           # what a run did not have, and says so:
+│   │                           #   membership.py    point-in-time index membership
+│   │                           #   fundamentals.py  report-date-keyed accounts
+│   │                           #   reference.py     free float, sector, FII/DII flows
+│   ├── validation/             # purged.py — purged & embargoed walk-forward
+│   ├── training/               # pluggable trainers: gbm, rank_ic, sac; data.py,
+│   │                           # registry.py, runner.py, universe.py
+│   ├── provenance/             # run manifests — universe, config, commit, flags
+│   ├── execution/              # the live path, frozen since T11
 │   ├── models/                 # LSTM + PatchTST, pinball loss, model registry
 │   ├── agents/                 # trainer.py, backtester.py
 │   ├── src/                    # the engine room — see docs/ARCHITECTURE.md for the
@@ -760,15 +859,22 @@ afa/
 │   │                           #   data / io    data_store.py, hf_dataset.py, universe.py,
 │   │                           #                storage.py, reporting.py,
 │   │                           #                backtest_reporting.py, indicators.py
-│   └── tests/                  # 1,111 tests (with all optional extras installed)
+│   └── tests/                  # 2,400+ tests (with all optional extras installed)
 ├── docs/
 │   ├── ARCHITECTURE.md         # how it all works, with diagrams
 │   ├── STRATEGIES.md           # create / update / delete a strategy
 │   ├── QUANT_RESEARCH.md       # research basis for every strategy/risk model
-│   └── REVIEW_STATUS.md        # item-by-item status against the quant review
+│   ├── OBTAINING_DATA.md       # membership, fundamentals, free float, sector, flows
+│   ├── CHANGELOG.md            # breaking changes, newest first
+│   ├── REVIEW_STATUS.md        # item-by-item status against the quant review
+│   └── tasks/                  # one file per task: what shipped and what the
+│                               # spec got wrong
 ├── data/                       # gitignored: market_data/*.parquet cache, agent_brain.json, sqlite db
 │                               # optional: sector_map.csv (ticker,sector) for concentration caps,
 │                               # risk_free_rate.csv (date,annualized_yield) for the Sharpe hurdle
+├── universe/                   # optional, gitignored: membership / fundamentals /
+│                               # free-float / flow CSVs — see docs/OBTAINING_DATA.md
+├── runs/                       # gitignored: one manifest per evaluate
 ├── output/                     # gitignored: Excel reports; trials.jsonl (the DSR trial log)
 ├── models/                     # gitignored: trained model checkpoints
 └── logs/                       # gitignored
