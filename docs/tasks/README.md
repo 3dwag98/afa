@@ -83,6 +83,7 @@ and why the data work is about provenance rather than latency.
 | Task | What it did | Tests added |
 | --- | --- | --- |
 | [T33](T33-documentation-pass.md) | Docs describe what shipped; `compare` stops dropping four flags | 6 |
+| [T34](T34-notebooks.md) | `afa_lab` agrees with the package again; a notebook for the evaluation layer | 22 |
 
 ## What round two found
 
