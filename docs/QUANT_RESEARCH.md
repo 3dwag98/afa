@@ -203,11 +203,34 @@ The platform's original strategy (`strategies/rule_based.py`, predating this doc
 
 ---
 
-## 7. Cointegration-based pairs trading (not yet implemented)
+## 7. Cointegration-based pairs trading
 
 **Evidence.** Strong, India-specific support: an arXiv paper "Designing Efficient Pair-Trading Strategies Using Cointegration for the Indian Stock Market" and multiple QuantInsti EPAT projects (e.g., a 25-stock market-neutral pairs strategy across Banking/IT/Pharma/Cement/Auto) validate cointegration-based (not merely correlation-based) pairs trading on NSE large-caps. Standard approach: Engle-Granger two-step cointegration test to find pairs, trade the z-scored spread \(z_t = \frac{(P_A - \beta P_B) - \mu_{\text{spread}}}{\sigma_{\text{spread}}}\), entering when \(|z_t|\) exceeds a threshold (e.g. 2) and exiting at mean reversion.
 
-**Why it isn't implemented yet — an architectural gap, not a research gap.** Every strategy in this platform (`BaseStrategy::score()`/`score_batch()`) scores *one ticker at a time* against a shared context; pairs trading fundamentally needs a *relationship between two tickers* (a rolling hedge ratio and spread) and, in its academically-standard form, a short leg — which conflicts with this platform's no-short-selling guardrail. Supporting it properly needs: (a) a pair-selection step (cointegration screening across \(O(n^2)\) candidate pairs) that doesn't fit `BaseStrategy`'s per-ticker interface, and (b) either accepting long-only spread trades (long the undervalued leg only, foregoing the short leg's hedge) or a deliberate, explicit exception to the short-selling guardrail. Flagged here as a scoped-out future strategy family rather than folded in half-implemented.
+**Implemented as the `pairs` strategy (T30).** This section previously read *"Why it isn't implemented yet — an architectural gap, not a research gap"*, and named two blockers. Both are now resolved, and one of them is resolved by *conceding* rather than solving. The original diagnosis is kept below because half of it was right and the other half was informative in being wrong.
+
+**(a) The per-ticker interface — the diagnosis was in the wrong layer.** The gap was described as `BaseStrategy::score()` scoring one ticker at a time while a pair is a relationship between two. True, and not where the obstruction was: T24's cross-sectional feature registry receives the whole `(date × symbol)` panel, so a *feature* screens pairs internally and emits a per-symbol number — how cheap each name is against its own partner. The scoring interface never had to change. It was the feature layer that could not express the question.
+
+**(b) The short leg is foregone, not solved.** Textbook pairs trading is market-neutral because it shorts the expensive leg against the cheap one. This platform does not short, so `pairs` buys the cheap leg and stops. That is a real cost rather than a technicality — the signal carries full market exposure, and **its results are not comparable with published market-neutral pairs returns.** The strategy reports `market_neutral: False` and carries that sentence in its own entry rules, so a report cannot use the words "pairs trading" and leave a reader assuming neutrality.
+
+**Two failure modes make pairs backtests famously optimistic, and both are handled in `features/cointegration.py`.**
+
+*Look-ahead through pair selection.* Screening for cointegration on the whole sample and then trading the pairs it found is severe and easy to commit without noticing: the pairs are chosen **because** their spread mean-reverted over the period being evaluated. `rolling_pair_scores` walks the panel forward — each screen sees only the formation sessions ending at its refresh point, and its pairs apply only to sessions after it. A test perturbs every price after a cut date and asserts every score before it is unchanged.
+
+*Multiple testing.* Screening every pair of an \(n\)-name universe is \(\binom{n}{2}\) hypothesis tests — 190 for 20 names, 1,225 for 50. Measured on twenty independent random walks, where nothing is cointegrated:
+
+| screen | pairs found | expected by chance |
+| --- | --- | --- |
+| uncorrected, p<0.05 | several | **9.5** |
+| Bonferroni | ≤1 | **0.05** |
+
+An uncorrected screen reliably finds cointegration in noise. The correction is on by default, and `expected_false_positives` is reported rather than merely applied, because it is the number that says whether a screen finding forty pairs found anything.
+
+The spread's z-score uses the **formation** window's mean and standard deviation, not the trading window's. A z-score computed against its own window's mean is centred at zero by construction and can never say the spread is stretched — the one thing it exists to say.
+
+```bash
+portfolio-agent evaluate --strategy pairs --slippage-bps 25
+```
 
 **Sources:**
 - [Designing Efficient Pair-Trading Strategies Using Cointegration for the Indian Stock Market (arXiv)](https://arxiv.org/abs/2211.07080)

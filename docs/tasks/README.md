@@ -69,6 +69,7 @@ and why the data work is about provenance rather than latency.
 | [T27](T27-residual-momentum.md) | Momentum on the CAPM residual; corrects `QUANT_RESEARCH.md` §12(c) | 25 |
 | [T28](T28-betting-against-beta.md) | Long the low-beta decile, and an IC split by market state | 33 |
 | [T29](T29-short-term-reversal.md) | Measure the effect momentum's skip-month exists to avoid | 18 |
+| [T30](T30-pairs-cointegration.md) | Cointegrated pairs as a per-name score; closes Phase 3 | 37 |
 
 ## What round two found
 
