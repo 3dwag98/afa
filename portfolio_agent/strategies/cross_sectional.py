@@ -88,16 +88,6 @@ from portfolio_agent.features.market_relative import (
     market_beta_feature,
 )
 
-#: Registry name of the formation measure `ResidualMomentumStrategy` ranks on.
-RESIDUAL_MOMENTUM_FEATURE = "residual_momentum_9m_skip1m"
-
-#: Beta estimation window `BettingAgainstBetaStrategy` defaults to. 252
-#: sessions rather than the registry's 60: Frazzini & Pedersen estimate
-#: correlations on five years and volatilities on one, and a one-year beta
-#: is the shortest window on which the ranking is about a stock's exposure
-#: rather than about the last quarter's news.
-DEFAULT_BAB_BETA_WINDOW = 252
-
 from portfolio_agent.src.risk import calculate_stop_target, net_reward_risk
 from portfolio_agent.src.liquidity import (
     DEFAULT_MAX_CIRCUIT_LOCK_FRACTION,
@@ -118,6 +108,21 @@ from portfolio_agent.src.regime import (
     neutral_regime,
     volatility_target_scalar,
 )
+
+#: Registry name of the formation measure `ResidualMomentumStrategy` ranks on.
+RESIDUAL_MOMENTUM_FEATURE = "residual_momentum_9m_skip1m"
+
+#: Beta estimation window `BettingAgainstBetaStrategy` defaults to. 252
+#: sessions rather than the registry's 60: Frazzini & Pedersen estimate
+#: correlations on five years and volatilities on one, and a one-year beta
+#: is the shortest window on which the ranking is about a stock's exposure
+#: rather than about the last quarter's news.
+DEFAULT_BAB_BETA_WINDOW = 252
+
+#: The formation window `ShortTermReversalStrategy` ranks on — exactly the
+#: window `mom_9m_skip1m` skips.
+REVERSAL_FEATURE = "return_21d"
+
 
 # Decile ranking is a statistical statement about a cross-section. Below ~30
 # names a "top 10%" selection is 1-3 stocks chosen from a sample far too small
@@ -858,6 +863,85 @@ class BettingAgainstBetaStrategy(MomentumStrategy):
             usable, [self._beta_feature], benchmark=context.benchmark_close,
         )
         return latest_values(built.get(self._beta_feature, pd.DataFrame()))
+
+
+@register_strategy("reversal")
+class ShortTermReversalStrategy(MomentumStrategy):
+    """Long the *worst* recent performers — the effect momentum skips over.
+
+    `mom_9m_skip1m` skips the most recent month because that month reverses
+    rather than continues (Jegadeesh 1990, Lehmann 1990). The platform has
+    applied that correction on the strength of the literature and has never
+    measured the effect it corrects for on this data. This strategy measures
+    it: same machinery, same universe, ranking on `return_21d` with the sign
+    flipped.
+
+        portfolio-agent compare --strategies momentum,reversal
+
+    A flat or negative reversal spread would mean the skip is buying nothing
+    here and those 21 sessions could be folded back into the formation return.
+    A positive one means the skip is earning its keep — which is worth more
+    than the assumption it currently rests on.
+
+    **Costs decide this one, not the spread.** Reversal is the most
+    turnover-intensive effect in the book: a one-month formation window implies
+    replacing most of the decile every month, against an Indian round trip of
+    roughly 79 bps including STT on both legs. Twelve rebalances a year at full
+    turnover is around 9.5% of capital in friction, which is larger than most
+    published gross reversal spreads. T13's `breakeven_round_trip_cost` and
+    `--slippage-bps` are the numbers that decide it, and a gross spread quoted
+    without them is not a result.
+
+    **Microstructure is the other reason to read this one carefully.** A
+    reversal sort concentrates in exactly the names T14's tradability screen
+    exists for: a stock that fell hard on no volume, or one pinned at its lower
+    circuit, prints the return this ranks highest while offering nothing to
+    buy. The screen is inherited and on by default, and turning it off makes
+    this strategy look far better than it is.
+    """
+
+    trigger_name = "Reversal"
+
+    def __init__(self, config: StrategyConfig):
+        super().__init__(config)
+        params = config.params or {}
+        self._name = params.get("name", "reversal")
+
+    def required_features(self) -> List[str]:
+        return [
+            "close", REVERSAL_FEATURE, "atr_14", "realized_vol_60"
+        ] + self._tradability.required_features()
+
+    @property
+    def higher_metric_is_better(self) -> bool:
+        """The sign flip. Long the losers."""
+        return False
+
+    def entry_rules(self) -> Dict[str, Any]:
+        rules = super().entry_rules()
+        rules["rule"] = (
+            "Long bottom decile of the eligible universe by trailing one-month "
+            "return — the window `mom_9m_skip1m` skips"
+        )
+        rules["formation_metric"] = REVERSAL_FEATURE
+        return rules
+
+    def _formation_metric(
+        self, features_by_symbol: Dict[str, pd.DataFrame], context: StrategyContext
+    ) -> Dict[str, float]:
+        """The trailing one-month return, per symbol.
+
+        A per-ticker feature, so unlike the other Phase 3 strategies this one
+        needs no cross-section to *compute* its metric — only to rank on it.
+        """
+        values: Dict[str, float] = {}
+        for symbol, features in features_by_symbol.items():
+            if features.empty:
+                continue
+            value = _clean(features.iloc[-1].get(REVERSAL_FEATURE))
+            if value is not None:
+                values[symbol] = value
+        return values
 
 
 #: How `LowVolatilityStrategy` measures risk. `total` is trailing realized

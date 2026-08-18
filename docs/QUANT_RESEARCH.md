@@ -41,6 +41,14 @@ Closing: [what to combine into a UMA](#summary-what-to-combine-into-a-uma)
 
 **Evidence.** Jegadeesh & Titman (1993) established that stocks with high returns over the past 3–12 months continue outperforming over the next 3–12 months. For India specifically: Joshipura & Mankar's NSE working paper on CNX 100 constituents found momentum profitability; a portfolio-based study of the Indian market found momentum profits over 6-month and 1-year horizons, with contrarian (reversal) returns emerging only over a 3-year horizon; sector-level studies confirm the effect is not limited to specific industries; liquidity research shows momentum is *strongest* among the most liquid stocks (favorable for backtesting realism — liquid names have less slippage). One caveat: short-term reversal coexists with momentum in India, motivating the standard skip-month convention below.
 
+**The skip is now measurable rather than assumed (T29).** The 21 sessions `mom_9m_skip1m` drops are exactly what the `reversal` strategy ranks on, so the convention this platform inherited from the literature can be checked against this data in one command:
+
+```bash
+portfolio-agent compare --strategies momentum,reversal --slippage-bps 25
+```
+
+A flat or negative reversal spread means the skip is buying nothing here and those 21 sessions could be folded back into the formation return; a positive one means it is earning its keep. **Costs decide it, not the spread.** A one-month formation window implies replacing most of the decile every month against a round trip of 79.4 bps on the shipped Indian schedule (40.5 to buy, 39.0 to sell) — 9.53% of capital a year at full monthly turnover, which is larger than most published gross reversal spreads. `breakeven_round_trip_cost` (§13, T13) is the figure that settles it. A reversal sort also concentrates in precisely the names the tradability screen exists for (§15): a stock that fell hard on no volume prints the return it ranks highest while offering nothing to buy.
+
 **Formulation.** For each stock \(i\) at formation date \(t\), with formation window \(J\) months and a skip period of 1 month (to avoid short-term reversal contamination — the most recent month's return behaves differently from the momentum-driving 2–12 month window):
 
 $$
