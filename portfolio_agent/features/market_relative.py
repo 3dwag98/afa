@@ -407,9 +407,19 @@ def residual_momentum(
     if residual.empty:
         return residual
 
-    floor = max(2, formation // 2)
-    mean = residual.rolling(formation, min_periods=floor).mean()
-    dispersion = residual.rolling(formation, min_periods=floor).std()
+    # **The full formation window, not half of it.** Everything else in this
+    # module floors `min_periods` at half the window, which is right for a
+    # *parameter estimate* — a beta or a volatility degrades gracefully as
+    # observations are lost. A formation window is not an estimate: its length
+    # is part of what the signal *is*. Allowing half would make the opening
+    # months of every evaluation rank on 4.5-month momentum under a name that
+    # says nine, and mix two formation lengths inside one backtest.
+    #
+    # The beta below keeps the half-window convention, because it is an
+    # estimate and because `market_beta_*` and `idiosyncratic_vol_*` already
+    # use it — an asymmetry, and a deliberate one.
+    mean = residual.rolling(formation, min_periods=formation).mean()
+    dispersion = residual.rolling(formation, min_periods=formation).std()
 
     # A name whose residual never moved has no risk-adjusted momentum to
     # report, and dividing by zero would rank it first or last depending only
