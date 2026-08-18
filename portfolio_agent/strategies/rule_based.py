@@ -21,6 +21,7 @@ import pandas as pd
 import yaml
 
 from .base import BaseStrategy
+from .registry import register_strategy
 from .types import StrategyContext, StrategySignal
 from .weighting import combine_weighted, select_trigger
 from portfolio_agent.config.schema import StrategyConfig
@@ -101,6 +102,7 @@ def _clean(value: Any) -> Optional[float]:
     return None if math.isnan(f) else f
 
 
+@register_strategy("rule_based")
 class RuleBasedStrategy(BaseStrategy):
     """Rule-based trading strategy configured via YAML.
 

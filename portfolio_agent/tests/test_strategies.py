@@ -610,7 +610,7 @@ class TestStrategyRegistry:
                     reward_risk=0.0, probability_profit=0.0,
                 )
 
-        register_strategy("custom", CustomStrategy)
+        register_strategy("custom")(CustomStrategy)
         assert "custom" in get_available_strategies()
 
 

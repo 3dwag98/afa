@@ -33,7 +33,7 @@ class _FixedStrategy(BaseStrategy):
         )
 
 
-register_strategy("fixed_test", _FixedStrategy)
+register_strategy("fixed_test")(_FixedStrategy)
 
 
 def _risk_params() -> RiskParams:

@@ -44,7 +44,13 @@ import pandas as pd
 import yaml
 
 from .base import BaseStrategy
-from .types import ModelVerdict, StrategyContext, StrategySignal
+from .registry import register_strategy
+from .types import (
+    POSITION_SCALE_KEY,
+    ModelVerdict,
+    StrategyContext,
+    StrategySignal,
+)
 from portfolio_agent.config.schema import StrategyConfig
 from portfolio_agent.src.trigger_engine import TriggerConfig, TriggerEngine
 
@@ -74,6 +80,7 @@ def _strength_to_signal(strength: float) -> str:
     return "HOLD"
 
 
+@register_strategy("ensemble")
 class EnsembleStrategy(BaseStrategy):
     """Combines multiple member strategies into a single "UMA" strategy.
 
@@ -219,7 +226,7 @@ class EnsembleStrategy(BaseStrategy):
         """
         self.unloadable_members: List[str] = []
         for member in self._members:
-            if hasattr(member, "load") and not member.load():
+            if not member.load():
                 self.unloadable_members.append(member.name)
 
         if not self.unloadable_members:
@@ -417,7 +424,7 @@ class EnsembleStrategy(BaseStrategy):
                 component_scores=dict(zip(self._member_names, (s.score for s in signals))),
                 rationale=rationale,
                 extra={
-                    "position_scale": 0.0,
+                    POSITION_SCALE_KEY: 0.0,
                     "trigger_decision": decision.action,
                     "trigger_vetoes": decision.vetoes,
                     "trigger_muted_models": decision.muted_models,
@@ -438,7 +445,7 @@ class EnsembleStrategy(BaseStrategy):
             component_scores=dict(zip(self._member_names, (s.score for s in signals))),
             rationale=rationale,
             extra={
-                "position_scale": decision.size_multiplier,
+                POSITION_SCALE_KEY: decision.size_multiplier,
                 "trigger_decision": decision.action,
                 "trigger_rule": decision.fired_rule,
                 "trigger_effective_confidence": decision.effective_confidence,

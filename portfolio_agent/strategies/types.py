@@ -7,6 +7,7 @@ single, canonical input/output shape.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
@@ -268,8 +269,7 @@ class ModelVerdict:
                 ev_in_r = probability * signal.reward_risk - (1.0 - probability)
                 expected_net_ev_pct = ev_in_r * risk_fraction * 100.0
 
-        extra = signal.extra or {}
-        liquidity_pass = "tradability_reject_reason" not in extra
+        liquidity_pass = signal.is_tradable
 
         return cls(
             model_name=model_name or signal.trigger or "unnamed",
@@ -282,11 +282,29 @@ class ModelVerdict:
         )
 
 
+#: `extra` key carrying a 0-1 multiplier the caller applies to the sized
+#: quantity — volatility targeting and the market-regime filter both write it.
+POSITION_SCALE_KEY = "position_scale"
+
+#: `extra` key carrying why the tradability screen removed a name. Its
+#: *presence* is the signal, so it must be absent rather than None on a name
+#: that passed.
+TRADABILITY_REJECT_KEY = "tradability_reject_reason"
+
+
 @dataclass
 class StrategySignal:
     """Canonical strategy output — the single shape both rule-based and ML
     strategies produce, consumed identically by the live orchestrator and the
-    backtest engine."""
+    backtest engine.
+
+    `extra` is the open-ended part, and two of its keys are not open-ended at
+    all: `position_scale` reaches position sizing in the backtest engine *and*
+    the live orchestrator, and `tradability_reject_reason` decides
+    `ModelVerdict.liquidity_pass`. Both were untyped strings written and read
+    in five modules. The accessors below are the contract; the constants exist
+    so a writer and a reader cannot disagree about spelling.
+    """
 
     symbol: str
     signal: str  # "BUY" | "SELL" | "HOLD" | "WATCH" | "AVOID"
@@ -300,3 +318,73 @@ class StrategySignal:
     component_scores: Dict[str, float] = field(default_factory=dict)
     rationale: str = ""
     extra: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def position_scale(self) -> Optional[float]:
+        """The sizing multiplier, or None when the strategy did not set one.
+
+        None and 1.0 are different statements — "this strategy does not scale
+        positions" versus "scale by one" — and both callers already treated
+        them the same way. Keeping them distinct here means a strategy that
+        starts emitting scales is visible rather than indistinguishable from
+        one that never did.
+
+        Returns:
+            The multiplier, or None if absent or unparseable. Both sizing call
+            sites have always treated an unparseable scale as "no scale", i.e.
+            size fully, and that behaviour is preserved here rather than
+            changed. It is arguably the wrong default — a corrupt multiplier is
+            a bug, and sizing fully on a bug is the more expensive of the two
+            failures — but tightening it is a risk decision, not an ergonomics
+            one, so it is flagged rather than made here.
+        """
+        raw = (self.extra or {}).get(POSITION_SCALE_KEY)
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    def scaled_quantity(self, quantity: int) -> int:
+        """`quantity` shrunk by this signal's `position_scale`.
+
+        One definition, called by both sizing paths. It was two: the backtest
+        engine's `_apply_position_scale` and the live orchestrator's
+        `_scaled_quantity` were byte-for-byte identical, and the second's
+        docstring said it "mirrors" the first "so live and backtested sizing
+        cannot drift" — which is a statement that nothing was preventing drift
+        except somebody noticing.
+
+        Strategies that measure their own risk environment (cross-sectional
+        momentum's volatility targeting and market-regime filter) publish a
+        multiplier in [0, 1]. Sizing honours it here rather than inside the
+        strategy, so every sizing rule — fixed-fractional, Kelly, or a future
+        one — picks it up automatically.
+
+        Returns:
+            The scaled quantity. Unchanged when there is no usable scale or the
+            scale is at least 1.0: this multiplier only ever shrinks a
+            position, so a strategy cannot lever itself up through it.
+        """
+        scale = self.position_scale
+        if scale is None or scale >= 1.0:
+            return quantity
+        return int(quantity * max(0.0, scale))
+
+    @property
+    def tradability_reject_reason(self) -> Optional[str]:
+        """Why the tradability screen removed this name, or None if it passed."""
+        raw = (self.extra or {}).get(TRADABILITY_REJECT_KEY)
+        return str(raw) if raw is not None else None
+
+    @property
+    def is_tradable(self) -> bool:
+        """Whether the liquidity / circuit-lock screen let this name through.
+
+        The screen's *marker* is the source of truth rather than the signal
+        verdict, so the engine and the strategy cannot disagree about whether a
+        name was screened out or merely not selected.
+        """
+        return TRADABILITY_REJECT_KEY not in (self.extra or {})
