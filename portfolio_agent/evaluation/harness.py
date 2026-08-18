@@ -526,11 +526,23 @@ def build_forecast_panel(
     from portfolio_agent.src.data_store import load_ticker_data
     from portfolio_agent.strategies.types import RiskParams, StrategyContext
 
+    from portfolio_agent.features.cross_section import (
+        warmup_rows as cross_sectional_warmup,
+    )
+
     feature_names = list(strategy.required_features())
     # Never below the warm-up: under it the feature is NaN, and a strategy
     # handed NaNs ranks them somewhere arbitrary rather than refusing.
+    #
+    # Both registries. A strategy can rank on a cross-sectional feature while
+    # requesting only cheap per-ticker ones — `residual_momentum` needs 242
+    # rows for its formation window and nothing per-ticker beyond 62 — so
+    # consulting one registry would score dates whose ranking key is still NaN.
     requested_min_history = min_history
-    min_history = effective_min_history(feature_names, min_history)
+    min_history = max(
+        effective_min_history(feature_names, min_history),
+        cross_sectional_warmup(strategy.required_cross_sectional_features()),
+    )
     if min_history != requested_min_history:
         logger.info(
             "Raised min_history from %d to %d — %s needs that much history "

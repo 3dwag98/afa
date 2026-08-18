@@ -286,7 +286,19 @@ The composite averages **daily returns** and cumulates them, rather than averagi
 
 Nifty VIX would be a better volatility gauge than realized volatility, but it is not in the OHLCV cache; see §10 for the flow-data equivalent.
 
-**(c) Idiosyncratic momentum** — ranking on residual rather than total returns — is the third documented fix. It needs a factor model to residualize against, which needs §8's data. Not implemented.
+**(c) Residual momentum** — ranking on residual rather than total returns — is the third documented fix, and it is **implemented** as the `residual_momentum` strategy (T27).
+
+This entry previously read *"it needs a factor model to residualize against, which needs §8's data. Not implemented."* That was wrong on the premise. A CAPM residual needs a market return and a rolling beta, and T14 built both; §8's multi-factor data would let the residual be taken against Fama-French rather than the market alone, which is a refinement rather than a prerequisite. The claim is corrected here rather than quietly deleted, because it is the kind of premise that stops work from being attempted.
+
+The ranking statistic is the residual's **information ratio** — mean residual over the formation window divided by its own dispersion — not the raw cumulated residual. Blitz, Huij & Martens attribute roughly double the risk-adjusted profit of price momentum, with materially shallower drawdowns, to that standardization: ranking on raw cumulated residuals still puts high-residual-volatility names on top, reintroducing exactly the risk exposure residualizing was meant to remove.
+
+One implementation detail is a genuine trap. If beta is fitted **with an intercept** over exactly the window the residuals are then cumulated over, the cumulative residual is *identically zero* — OLS residuals sum to zero by construction. BHM avoid it by estimating over 36 months and forming over 12. This platform estimates beta on a rolling year ending at each date and applies it without an intercept, so the residual carries the alpha rather than having it differenced away.
+
+Comparable against the incumbent in one command, since everything except the formation measure is shared:
+
+```bash
+portfolio-agent compare --strategies momentum,residual_momentum --neutralize beta,size
+```
 
 **Fail-neutral by design.** With too little history to judge the regime, exposure is left unscaled rather than blocked: there is no evidence of a panic state, and inventing one would silently disable the strategy on a short cache rather than protect it.
 

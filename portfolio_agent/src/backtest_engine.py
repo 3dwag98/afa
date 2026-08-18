@@ -593,13 +593,27 @@ class BacktestEngine:
         for no new information.
         """
         if self._required_rows is None:
+            from portfolio_agent.features.cross_section import (
+                warmup_rows as cross_sectional_warmup,
+            )
             from portfolio_agent.features.pipeline import warmup_rows
 
             # `strategy` is optional on the *signature* only: the constructor
             # substitutes the default strategy before this can run, so there is
             # no run without one to defend against.
+            #
+            # **Both registries.** A strategy can rank on a cross-sectional
+            # feature while requesting only cheap per-ticker ones —
+            # `residual_momentum` needs 242 rows for its formation window and
+            # nothing per-ticker beyond 62 — so consulting one registry would
+            # admit tickers whose ranking key is still NaN. That is exactly the
+            # defect T23 removed, and T24's second registry re-opened it.
             self._required_rows = max(
-                warmup_rows(self.strategy.required_features()), 1
+                warmup_rows(self.strategy.required_features()),
+                cross_sectional_warmup(
+                    self.strategy.required_cross_sectional_features()
+                ),
+                1,
             )
         return self._required_rows
 
