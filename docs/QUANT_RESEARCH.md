@@ -239,11 +239,29 @@ portfolio-agent evaluate --strategy pairs --slippage-bps 25
 
 ---
 
-## 8. Fama-French multi-factor models (not yet implemented)
+## 8. Fama-French multi-factor models
 
 **Evidence.** Well-validated for India: multiple studies (2005–2015, 2016–2023, CNX 500 2000–2015) find the three- and five-factor models outperform CAPM, with the market factor dominant and a documented size effect; the five-factor extension (adding profitability RMW and investment CMA) improves on the three-factor version in several studies.
 
-**Why it isn't implemented.** SMB (size) needs market capitalization (shares outstanding × price — shares outstanding isn't in OHLCV), HML (value) needs book value per share, RMW (profitability) needs operating profitability, CMA (investment) needs total asset growth — all balance-sheet/fundamental data this platform doesn't ingest. Implementing this properly requires a new fundamentals data source (e.g., NSE/BSE corporate filings, or a paid fundamentals API) and a new data-ingestion pipeline parallel to `data_store.py`'s OHLCV cache — a genuine scoping decision, not a quick add.
+**The adapter is implemented; the data is supplied by the user (T31).** This section previously read *"Why it isn't implemented"* and listed what each factor needs: SMB market capitalization, HML book value, RMW operating profitability, CMA total asset growth — none of it in OHLCV. That diagnosis was correct, and `data_quality/fundamentals.py` plus `features/characteristics.py` now close it in the shape T15 established for membership: **schema, validation and tests now; data supplied later.**
+
+| Factor | Characteristic | Registry name |
+| --- | --- | --- |
+| SMB (size) | market capitalization | `shares_outstanding` × `close` |
+| HML (value) | book-to-price | `book_to_price` |
+| RMW (profitability) | gross profitability | `gross_profitability` |
+| CMA (investment) | asset growth | `asset_growth` |
+| — | earnings yield | `earnings_to_price` |
+| — | accruals (Sloan) | `accruals` |
+| control | leverage | `leverage` |
+
+**The report date is the whole problem.** Results for the quarter ending 31 March are published in late May, so a backtest using them from 31 March has read six to eight weeks into the future on every stock, every quarter, forever. It is invisible in the output — the numbers are real, the dates are real, and the strategy simply knew them early. **It does not look like a bug; it looks like alpha.** Every fact therefore carries both a `fiscal_date` and a `report_date`, and `as_of(D)` filters on the second. `report_date` is a required column rather than an optional one, because the only available fallback is the fiscal date.
+
+Validation is calibrated to Indian filing law — SEBI LODR Regulation 33 allows 45 days for quarterly results and 60 for annual — so a lag under 15 days or over 120 is flagged, and a negative lag is an error rather than a warning: a row reporting before the period it describes is a column swap, and every value in the file is then suspect. The sharpest check is for a file whose lags are all *identical*, which means the report dates were reconstructed by adding a constant. That is worse than having no file: it has the shape of point-in-time data and none of the content.
+
+Two sign conventions are worth stating because they would look plausible backwards. `asset_growth` is signed as **growth**, so CMA's conservative leg is the *bottom* of the sort; `accruals` is signed so that **high means more accrual**, so Sloan's leg is also the bottom. Non-positive book equity is dropped from `book_to_price` (Fama and French's own screen — a negative B/P sorts a distressed firm to the extreme growth end), while `earnings_to_price` **keeps** loss-makers, because a negative earnings yield sorts where a reader would expect and screening it would be a quality filter wearing a value label.
+
+Acquisition, formats and the trap in `yfinance`'s quarterly statements are in [`docs/OBTAINING_DATA.md`](OBTAINING_DATA.md). Every run without a fundamentals file says in its notes that it controlled for no accounting characteristic.
 
 **Sources:**
 - [Empirical Applicability of the Fama-French Three-Factor Model in the Indian Equity Market](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=5010405)
@@ -252,11 +270,15 @@ portfolio-agent evaluate --strategy pairs --slippage-bps 25
 
 ---
 
-## 9. Quality (QMJ) factor (not yet implemented)
+## 9. Quality (QMJ) factor
 
 **Evidence.** "Quality Minus Junk" (profitability + safety/low-leverage) shows the highest average monthly returns among factors tested in recent Indian research (1.69% vs. 1.33% for the market factor) with *lower* volatility than the momentum factor, and a significant four-factor alpha.
 
-**Why it isn't implemented.** Same root cause as §8 — needs fundamental data (profitability ratios, leverage, balance-sheet safety metrics) not present in OHLCV. Same future path: a fundamentals data source would unlock this alongside Fama-French.
+**The adapter is implemented; the data is supplied by the user (T31).** Same root cause as §8 and the same resolution: `gross_profitability` covers the profitability leg and `leverage` the safety leg, both registered as cross-sectional characteristics and both requiring only a fundamentals file with the relevant columns.
+
+QMJ's third leg — earnings **growth** — is not implemented. It needs a multi-year history of the same field rather than one snapshot, so it is the one part of this section still genuinely blocked on data depth rather than on data existence.
+
+`leverage` is registered as a **control** rather than as a signal, and the distinction matters here. Leverage mechanically raises equity beta, so a quality sort that is silently a low-leverage sort has found `bab` (§2) with extra steps. Having it in the registry means a run can neutralize against it instead of wondering.
 
 **Sources:**
 - [Machine learning-enhanced quality minus junk (QMJ) factor and stock returns: Evidence from the Indian equity market](https://www.sciencedirect.com/science/article/pii/S3050700625000416)
