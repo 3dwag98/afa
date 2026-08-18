@@ -76,6 +76,7 @@ and why the data work is about provenance rather than latency.
 | Task | What it did | Tests added |
 | --- | --- | --- |
 | [T31](T31-fundamentals-adapter.md) | Point-in-time fundamentals keyed on the report date; six characteristics | 42 |
+| [T32](T32-reference-data.md) | Free float, sector coverage and FII/DII flows; closes Phase 4 | 39 |
 
 ## What round two found
 
