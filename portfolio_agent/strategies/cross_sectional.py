@@ -1,15 +1,40 @@
-"""Cross-sectional momentum and low-volatility strategies.
+"""Cross-sectional strategies: rank the eligible universe, hold one decile.
 
-Both rank all eligible tickers against each other in a single score_batch()
-call and go long the extreme decile:
+All of them rank every eligible ticker against every other in a single
+`score_batch()` call and go long the extreme decile. They divide into two
+families by what they rank on.
 
-- MomentumStrategy: top decile by 9-month (skip 1-month) formation return
-  (Jegadeesh-Titman convention), with crash protection layered on top.
-- LowVolatilityStrategy: bottom decile by trailing 60-day realized volatility
-  (the low-volatility anomaly).
+**Return-based**
 
-See docs/QUANT_RESEARCH.md sections 1, 2 and 12 for the academic basis (with
-an emphasis on India-specific studies) and exact formulation.
+- `MomentumStrategy` — top decile by 9-month (skip 1-month) formation return,
+  the Jegadeesh-Titman convention, with crash protection layered on top.
+- `ResidualMomentumStrategy` — the same formation window measured on the CAPM
+  residual and standardized by its own dispersion (Blitz-Huij-Martens). Price
+  momentum's return is substantially a bet on whatever the market has been
+  rewarding; round two measured this platform's momentum at 58% factor loading.
+
+**Risk-based** — three decompositions of one anomaly, kept separate so the
+comparison between them is a command rather than an argument:
+
+- `LowVolatilityStrategy` — bottom decile by *total* realized volatility.
+- `IdiosyncraticLowVolatilityStrategy` — by the volatility of the CAPM
+  residual, which is the sort the 2025 literature finds survives.
+- `BettingAgainstBetaStrategy` — by rolling market beta (Frazzini-Pedersen).
+
+Total volatility mixes beta and idiosyncratic volatility together; the second
+and third sort on the halves.
+
+Everything except the ranking metric and its direction is shared. A new
+cross-sectional strategy overrides `_formation_metric` and, if it ranks on a
+risk measure rather than a return, `higher_metric_is_better` — the tradability
+screen, regime assessment, decile selection, volatility targeting and
+reward:risk gate all come from `rank_and_select`.
+
+See docs/QUANT_RESEARCH.md sections 1, 2 and 12 for the academic basis, with an
+emphasis on India-specific studies. Section 2 gives the *total*-volatility
+formula and then the table of all three risk sorts; the residual and beta
+formulations live in `features/market_relative.py`, which is where they are
+computed.
 
 Unlike strategies/rule_based.py, a ticker's signal here depends on where it
 ranks *within the batch*, not on its own history alone. score() (single
@@ -60,10 +85,18 @@ from portfolio_agent.features.market_relative import (
     # idiosyncratic sort would silently start using the regime filter's number.
     DEFAULT_VOL_WINDOW as DEFAULT_IDIOSYNCRATIC_WINDOW,
     idiosyncratic_vol_feature,
+    market_beta_feature,
 )
 
 #: Registry name of the formation measure `ResidualMomentumStrategy` ranks on.
 RESIDUAL_MOMENTUM_FEATURE = "residual_momentum_9m_skip1m"
+
+#: Beta estimation window `BettingAgainstBetaStrategy` defaults to. 252
+#: sessions rather than the registry's 60: Frazzini & Pedersen estimate
+#: correlations on five years and volatilities on one, and a one-year beta
+#: is the shortest window on which the ranking is about a stock's exposure
+#: rather than about the last quarter's news.
+DEFAULT_BAB_BETA_WINDOW = 252
 
 from portfolio_agent.src.risk import calculate_stop_target, net_reward_risk
 from portfolio_agent.src.liquidity import (
@@ -579,6 +612,17 @@ class MomentumStrategy(BaseStrategy):
     #: than every momentum variant reporting "Momentum".
     trigger_name = "Momentum"
 
+    @property
+    def higher_metric_is_better(self) -> bool:
+        """Which end of the formation metric the book goes long.
+
+        True for momentum: the highest formation return wins. A subclass
+        ranking on a *risk* measure rather than a return flips it, and having
+        it as a property rather than a literal in `score_batch` is what lets
+        `BettingAgainstBetaStrategy` reuse everything else unchanged.
+        """
+        return True
+
     def _formation_metric(
         self, features_by_symbol: Dict[str, pd.DataFrame], context: StrategyContext
     ) -> Dict[str, float]:
@@ -637,7 +681,7 @@ class MomentumStrategy(BaseStrategy):
             latest_by_symbol=latest_by_symbol,
             context=context,
             top_fraction=self._top_fraction,
-            higher_is_better=True,
+            higher_is_better=self.higher_metric_is_better,
             trigger=self.trigger_name,
             component_name=self.trigger_name,
             min_universe=self._min_universe,
@@ -728,6 +772,92 @@ class ResidualMomentumStrategy(MomentumStrategy):
             benchmark=context.benchmark_close,
         )
         return latest_values(built.get(RESIDUAL_MOMENTUM_FEATURE, pd.DataFrame()))
+
+
+@register_strategy("bab")
+class BettingAgainstBetaStrategy(MomentumStrategy):
+    """Long the low-beta decile — the low-risk anomaly's beta form.
+
+    Frazzini & Pedersen's account is a funding-constraint one: investors who
+    want more risk than they can borrow to obtain bid up high-beta stocks
+    instead, so beta is overpriced and the security market line is flatter than
+    CAPM says. The prediction is that a beta-sorted long-short book earns a
+    positive alpha, and the long-only half of it is the low-beta decile.
+
+    **Indian evidence is favourable and specific.** NSE 2001-2016 finds the
+    effect positive across capitalizations after controlling for size, value
+    and momentum — which matters because the naive worry about a low-beta sort
+    is that it is a size bet wearing a different name.
+
+    **And it is conditional.** 2025 Asian work finds the effect concentrated in
+    downturns, which is what `evaluation/conditional.py` exists to measure: a
+    pooled IC made of a strong down-market number and a flat up-market one
+    describes neither state. Evaluate this strategy with the split, not without
+    it.
+
+    Ranked lowest-beta-first, which is `higher_is_better=False` — the same
+    direction `LowVolatilityStrategy` sorts in, and for a related reason. The
+    two are worth comparing directly: beta and idiosyncratic volatility are the
+    two halves total volatility mixes together, and T14 found the residual sort
+    survives where the total sort does not.
+
+        portfolio-agent compare --strategies bab,low_volatility_idio
+    """
+
+    trigger_name = "BettingAgainstBeta"
+
+    def __init__(self, config: StrategyConfig):
+        super().__init__(config)
+        params = config.params or {}
+        self._name = params.get("name", "bab")
+        self._beta_window = int(params.get("beta_window", DEFAULT_BAB_BETA_WINDOW))
+        # Resolved at construction so an unregistered window fails when the
+        # strategy is built rather than on the first scored date.
+        self._beta_feature = market_beta_feature(self._beta_window)
+
+    def required_features(self) -> List[str]:
+        return [
+            "close", "atr_14", "realized_vol_60"
+        ] + self._tradability.required_features()
+
+    def required_cross_sectional_features(self) -> List[str]:
+        return [self._beta_feature]
+
+    @property
+    def higher_metric_is_better(self) -> bool:
+        return False
+
+    def entry_rules(self) -> Dict[str, Any]:
+        rules = super().entry_rules()
+        rules["rule"] = (
+            f"Long bottom decile of the eligible universe by rolling "
+            f"{self._beta_window}-session market beta"
+        )
+        rules["formation_metric"] = self._beta_feature
+        rules["beta_window"] = self._beta_window
+        return rules
+
+    def _formation_metric(
+        self, features_by_symbol: Dict[str, pd.DataFrame], context: StrategyContext
+    ) -> Dict[str, float]:
+        """Rolling beta for the batch, via the cross-sectional registry.
+
+        A beta is measured against a cross-section, so below two names there is
+        no market to measure against and this returns nothing — the same
+        refusal `LowVolatilityStrategy` and `ResidualMomentumStrategy` make.
+        """
+        usable = {
+            symbol: features
+            for symbol, features in features_by_symbol.items()
+            if not features.empty and "close" in features.columns
+        }
+        if len(usable) < 2:
+            return {}
+
+        built = build_cross_section(
+            usable, [self._beta_feature], benchmark=context.benchmark_close,
+        )
+        return latest_values(built.get(self._beta_feature, pd.DataFrame()))
 
 
 #: How `LowVolatilityStrategy` measures risk. `total` is trailing realized

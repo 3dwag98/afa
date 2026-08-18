@@ -24,6 +24,15 @@ from .allocation import (
     evaluate_book,
     weight_turnover,
 )
+from .conditional import (
+    CONDITIONERS,
+    ConditionalIC,
+    conditional_ic,
+    conditional_notes,
+    market_return_by_date,
+    realized_states,
+    trailing_states,
+)
 from .costs import (
     CostModel,
     NetSpread,
@@ -71,6 +80,13 @@ __all__ = [
     "DecayCurve",
     "DecayPoint",
     "NetSpread",
+    "CONDITIONERS",
+    "ConditionalIC",
+    "conditional_ic",
+    "conditional_notes",
+    "market_return_by_date",
+    "realized_states",
+    "trailing_states",
     "WEIGHTING_SCHEMES",
     "BookPerformance",
     "BookWeights",
