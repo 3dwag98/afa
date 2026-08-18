@@ -52,6 +52,8 @@ def _score_one_ticker(
     weights: Dict[str, float],
     mc_settings: MonteCarloSettings,
     regime_label: Optional[str] = None,
+    normalize: bool = False,
+    normalize_window: int = 252,
 ) -> Optional[StrategySignal]:
     """Score a single ticker: run Monte Carlo + build features + call strategy.score().
 
@@ -66,7 +68,10 @@ def _score_one_ticker(
         mc_result = mc_settings.run(
             symbol=ticker, daily_returns=daily_returns, ohlcv=hist_data
         )
-        features = build_features(hist_data, required_features)
+        features = build_features(
+            hist_data, required_features,
+            normalize=normalize, normalize_window=normalize_window,
+        )
         context = StrategyContext(
             risk=risk_params, weights=weights, mc_result=mc_result,
             regime_label=regime_label,
@@ -85,6 +90,11 @@ _WORKER_STRATEGY: Optional[BaseStrategy] = None
 _WORKER_FEATURES: List[str] = []
 _WORKER_RISK: Optional[RiskParams] = None
 _WORKER_MC_SETTINGS: MonteCarloSettings = MonteCarloSettings()
+#: Run-constant too, and pinned here for the same reason: a worker that
+#: normalized differently from the parent would produce a different signal for
+#: the same ticker depending only on whether `--parallel` was passed.
+_WORKER_NORMALIZE: bool = False
+_WORKER_NORMALIZE_WINDOW: int = 252
 
 
 def _init_scoring_worker(
@@ -92,13 +102,18 @@ def _init_scoring_worker(
     required_features: List[str],
     risk_params: RiskParams,
     mc_settings: MonteCarloSettings,
+    normalize: bool = False,
+    normalize_window: int = 252,
 ) -> None:
     """ProcessPoolExecutor initializer: pin the run-constant scoring inputs."""
     global _WORKER_STRATEGY, _WORKER_FEATURES, _WORKER_RISK, _WORKER_MC_SETTINGS
+    global _WORKER_NORMALIZE, _WORKER_NORMALIZE_WINDOW
     _WORKER_STRATEGY = strategy
     _WORKER_FEATURES = required_features
     _WORKER_RISK = risk_params
     _WORKER_MC_SETTINGS = mc_settings
+    _WORKER_NORMALIZE = normalize
+    _WORKER_NORMALIZE_WINDOW = normalize_window
 
 
 def _score_one_ticker_in_worker(
@@ -117,6 +132,7 @@ def _score_one_ticker_in_worker(
     return _score_one_ticker(
         _WORKER_STRATEGY, ticker, hist_data, _WORKER_FEATURES,
         _WORKER_RISK, weights, mc_settings, regime_label,
+        _WORKER_NORMALIZE, _WORKER_NORMALIZE_WINDOW,
     )
 
 
@@ -168,6 +184,17 @@ class BacktestEngine:
         covariance_min_observations: int = 60,
         covariance_max_candidates: int = 40,
         show_progress: bool = False,
+        # Defaults match what this engine did before it had the setting at all:
+        # it called `build_features` with no `normalize`, taking the pipeline's
+        # own default of False. The evaluation harness and both trainers read
+        # `features.normalize`, whose *schema* default is True — so the day
+        # anyone relies on that default, those paths z-score their features and
+        # this one does not. Worse, `_normalize_features` applies an additional
+        # `.shift(1)`, so the divergence is not a scale difference but a second
+        # session of lag: exactly the disagreement T19 removed, re-created by a
+        # config value. `agents/backtester.py` maps both from AppConfig.
+        feature_normalize: bool = False,
+        feature_normalize_window: int = 252,
     ):
         """
         Initialize the BacktestEngine.
@@ -355,6 +382,27 @@ class BacktestEngine:
 
         # Track untradeable tickers (delisted or NaN issues) - initialize BEFORE loading data
         self.untradeable_tickers: set = set()
+
+        # Filled on first use by `_required_history_rows`; depends only on the
+        # strategy's declared features, which do not change across a run.
+        self._required_rows: Optional[int] = None
+        self.feature_normalize = bool(feature_normalize)
+        self.feature_normalize_window = int(feature_normalize_window)
+
+        # Load *before* the backtest window, so the first scored session has
+        # warm features instead of NaNs. This used to load from `start_date`,
+        # so a run beginning 2023-01-02 had no bar before it — `sma_200` was
+        # undefined for the first 200 sessions no matter how much history the
+        # cache held, and `mom_9m_skip1m` for the first 211. The old 20-row
+        # eligibility bar let those tickers through, which is how the opening
+        # months of every backtest came to rank the universe on NaN.
+        #
+        # 1.6x converts sessions to calendar days with room for weekends
+        # (7/5 = 1.4) and Indian exchange holidays; over-reading costs one
+        # slice of a parquet file, under-reading costs the warm-up itself.
+        self._load_from = self.start_date - pd.Timedelta(
+            days=int(self._required_history_rows() * 1.6) + 7
+        )
         
         # Load all ticker data into memory
         self.ticker_data: Dict[str, pd.DataFrame] = {}
@@ -446,7 +494,7 @@ class BacktestEngine:
         )
         for ticker in ticker_iter:
             df = load_ticker_data(ticker,
-                                  start_date=self.start_date.strftime('%Y-%m-%d'),
+                                  start_date=self._load_from.strftime('%Y-%m-%d'),
                                   end_date=self.end_date.strftime('%Y-%m-%d'))
             if df is not None and len(df) > 0:
                 # Ensure proper column names
@@ -536,6 +584,26 @@ class BacktestEngine:
         
         return None
     
+    def _required_history_rows(self) -> int:
+        """Rows a ticker needs before this strategy's features are all defined.
+
+        Cached on the instance: it depends only on `required_features()`, which
+        does not change across a run, and the underlying probe is itself
+        cached. Recomputing per date would be a feature evaluation per session
+        for no new information.
+        """
+        if self._required_rows is None:
+            from portfolio_agent.features.pipeline import warmup_rows
+
+            # `strategy` is optional on this constructor, and a run without one
+            # scores nothing — so it needs no warm-up rather than a guessed
+            # default that would quietly widen every load.
+            features = (
+                self.strategy.required_features() if self.strategy is not None else []
+            )
+            self._required_rows = max(warmup_rows(features), 1)
+        return self._required_rows
+
     def _history_through(self, ticker: str, decision_date: pd.Timestamp) -> Optional[pd.DataFrame]:
         """Bars up to and **including** `decision_date`.
 
@@ -898,12 +966,18 @@ class BacktestEngine:
         Returns:
             Dictionary of ticker -> StrategySignal.
         """
+        # Derived from what this strategy asked for, not a constant. The bar
+        # here was 20 rows, against which six of the ten features `momentum`
+        # requires are still NaN — `mom_9m_skip1m` among them, which is the
+        # value it ranks on. Neither 20 nor the harness's 252 was wrong so much
+        # as unrelated to the question; `warmup_rows` answers the question.
+        required_rows = self._required_history_rows()
         eligible: Dict[str, pd.DataFrame] = {}
         for ticker in self.universe_tickers:
             if ticker in self.untradeable_tickers:
                 continue
             hist_data = self._history_through(ticker, current_date)
-            if hist_data is None or len(hist_data) < 20:
+            if hist_data is None or len(hist_data) < required_rows:
                 continue
             eligible[ticker] = hist_data
 
@@ -925,7 +999,12 @@ class BacktestEngine:
 
         if self.strategy.supports_gpu_batch or self.strategy.requires_full_batch:
             features_by_symbol = {
-                ticker: build_features(hist_data, self.strategy.required_features())
+                ticker: build_features(
+                    hist_data,
+                    self.strategy.required_features(),
+                    normalize=self.feature_normalize,
+                    normalize_window=self.feature_normalize_window,
+                )
                 for ticker, hist_data in eligible.items()
             }
             benchmark_close = self._benchmark_up_to(current_date)
@@ -1069,6 +1148,8 @@ class BacktestEngine:
                     self.strategy.required_features(),
                     self.risk_params,
                     self.mc_settings,
+                    self.feature_normalize,
+                    self.feature_normalize_window,
                 ),
             )
         return self._scoring_executor

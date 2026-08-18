@@ -212,3 +212,71 @@ def test_the_label_keeps_the_first_rows_of_the_sample(ohlcv, horizon):
     assert label.head(horizon).notna().all()
     assert label.tail(horizon).isna().all()
     assert label.notna().sum() == len(ohlcv) - horizon
+
+
+class TestTheEngineLoadsItsOwnWarmup:
+    """Raising the eligibility bar exposed why it had been low.
+
+    `_load_all_data` requested data from `start_date`, so a run beginning
+    2023-01-02 had no bar before it. `sma_200` was undefined for the first 200
+    sessions regardless of what the cache held, and `mom_9m_skip1m` for the
+    first 211 — and the 20-row bar let those tickers through, which is how the
+    opening months of every backtest came to rank the universe on NaN.
+    """
+
+    def _engine(self, monkeypatch, ohlcv, strategy=None, **kwargs):
+        from portfolio_agent.src import backtest_engine as module
+
+        requested = {}
+
+        def fake_load(ticker, start_date=None, end_date=None):
+            requested["start"] = start_date
+            return ohlcv.copy()
+
+        monkeypatch.setattr(module, "load_ticker_data", fake_load)
+        engine = module.BacktestEngine(
+            start_date="2022-06-01", end_date="2022-12-30",
+            initial_capital=1_000_000.0, universe_tickers=["A.NS"],
+            strategy=strategy, **kwargs,
+        )
+        return engine, requested
+
+    def test_it_reaches_back_before_the_window(self, monkeypatch, ohlcv):
+        from portfolio_agent.config.schema import StrategyConfig
+        from portfolio_agent.strategies.cross_sectional import MomentumStrategy
+
+        strategy = MomentumStrategy(StrategyConfig(type="momentum", params={}))
+        engine, requested = self._engine(monkeypatch, ohlcv, strategy=strategy)
+
+        assert pd.Timestamp(requested["start"]) < engine.start_date
+
+    def test_the_reach_covers_the_warm_up_in_sessions(self, monkeypatch, ohlcv):
+        """211 sessions of warm-up cannot be 211 calendar days."""
+        from portfolio_agent.config.schema import StrategyConfig
+        from portfolio_agent.strategies.cross_sectional import MomentumStrategy
+
+        strategy = MomentumStrategy(StrategyConfig(type="momentum", params={}))
+        engine, requested = self._engine(monkeypatch, ohlcv, strategy=strategy)
+
+        needed = engine._required_history_rows()
+        sessions_available = len(
+            pd.bdate_range(pd.Timestamp(requested["start"]), engine.start_date)
+        )
+        assert needed > 200
+        assert sessions_available >= needed
+
+    def test_the_scored_window_is_unchanged(self, monkeypatch, ohlcv):
+        """Extra bars are warm-up; the run must not start scoring earlier."""
+        from portfolio_agent.config.schema import StrategyConfig
+        from portfolio_agent.strategies.cross_sectional import MomentumStrategy
+
+        strategy = MomentumStrategy(StrategyConfig(type="momentum", params={}))
+        engine, _ = self._engine(monkeypatch, ohlcv, strategy=strategy)
+
+        assert engine.master_date_index.min() >= engine.start_date
+        assert engine.master_date_index.max() <= engine.end_date
+
+    def test_a_run_without_a_strategy_asks_for_no_warm_up(self, monkeypatch, ohlcv):
+        """It scores nothing, so a guessed default would widen every load."""
+        engine, _ = self._engine(monkeypatch, ohlcv)
+        assert engine._required_history_rows() == 1

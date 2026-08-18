@@ -157,3 +157,48 @@ def apply_cross_sectional_target(
         transformed[ticker] = updated
 
     return transformed or panel_by_ticker
+
+
+#: Above this, a forward return is arithmetic rather than a price move. Five
+#: consecutive 20% upper circuits compound to +149%, so the default admits any
+#: genuinely reachable Indian move and rejects only impossible ones.
+DEFAULT_MAX_ABS_LABEL = 5.0
+
+
+def drop_absurd_labels(
+    frame: pd.DataFrame,
+    target_column: str,
+    max_abs: float = DEFAULT_MAX_ABS_LABEL,
+    verbose: bool = False,
+) -> pd.DataFrame:
+    """Remove rows whose label is too large to be a price move.
+
+    The supervised pipeline has done this since a run was poisoned by one: a
+    split that escaped adjustment produces an eleven-million-percent "return",
+    and a single such row dominates a squared-error objective completely. The
+    boosting trainers never did, because they assemble their label in
+    `build_gbm_panel` rather than in `prepare_features`, so the filter sat on
+    one side of a fork nobody had noticed was a fork.
+
+    **Dropped, not clipped.** A clip piles a spike of samples at the bound and
+    teaches the model that the bound is a common outcome — trading one
+    distortion for a subtler one.
+
+    Returns:
+        The frame, unchanged when nothing was absurd.
+    """
+    if target_column not in frame.columns or frame.empty:
+        return frame
+
+    values = frame[target_column].abs()
+    absurd = values > max_abs
+    if not absurd.any():
+        return frame
+
+    if verbose:
+        print(
+            f"Dropped {int(absurd.sum())} row(s) whose |{target_column}| exceeded "
+            f"{max_abs:g} (max was {values.max():.4g}) — almost certainly bad "
+            "cached bars"
+        )
+    return frame[~absurd]

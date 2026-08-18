@@ -34,6 +34,7 @@ from portfolio_agent.features.labels import (  # noqa: F401
     MIN_CROSS_SECTION_NAMES,
     apply_cross_sectional_target,
     build_forward_return,
+    drop_absurd_labels,
     target_column_name,
 )
 from portfolio_agent.features.scaling import FeatureScaler, apply_cross_sectional_scaling
@@ -432,16 +433,9 @@ def prepare_features(df: pd.DataFrame, config: AppConfig, verbose: bool = True) 
     # outcome. The default admits any genuinely reachable move — five
     # consecutive 20% upper circuits compound to +149% — and rejects only
     # arithmetic that cannot be a price.
-    target_values = feature_df[target_name]
-    absurd = target_values.abs() > config.training.max_abs_target
-    if absurd.any():
-        if verbose:
-            print(
-                f"Dropped {int(absurd.sum())} row(s) whose |{target_name}| exceeded "
-                f"{config.training.max_abs_target:g} "
-                f"(max was {target_values.abs().max():.4g}) — almost certainly bad cached bars"
-            )
-        feature_df = feature_df[~absurd]
+    feature_df = drop_absurd_labels(
+        feature_df, target_name, config.training.max_abs_target, verbose=verbose
+    )
 
     if verbose:
         print(f"Built feature matrix with {len(feature_df)} samples and {len(feature_df.columns)} columns")
