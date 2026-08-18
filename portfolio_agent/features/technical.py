@@ -250,6 +250,31 @@ def return_5d(df: pd.DataFrame) -> pd.Series:
     return close_shifted.pct_change(periods=5)
 
 
+@register_feature('return_21d')
+def return_21d(df: pd.DataFrame) -> pd.Series:
+    """Trailing one-month return — the short-term reversal formation window.
+
+    This is deliberately *the exact window `mom_9m_skip1m` skips*. Momentum's
+    skip-month exists because the most recent month reverses rather than
+    continues (Jegadeesh 1990, Lehmann 1990), and the platform has been
+    applying that correction on the strength of the literature without ever
+    measuring the effect it corrects for on this data.
+
+    21 sessions rather than a calendar month, matching the skip in
+    `mom_9m_skip1m` so the two describe the same window.
+
+    Uses close shifted by 1, like every other feature here: the return at t
+    reflects what was known at t-1.
+
+    Args:
+        df: DataFrame with 'close' column.
+
+    Returns:
+        Series with 21-day returns (lagged by 1 period).
+    """
+    return df['close'].shift(1).pct_change(periods=21)
+
+
 @register_feature('mom_9m_skip1m')
 def mom_9m_skip1m(df: pd.DataFrame) -> pd.Series:
     """Cross-sectional momentum formation return (Jegadeesh-Titman convention).
