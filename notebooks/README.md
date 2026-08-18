@@ -8,6 +8,14 @@ you do here has a CLI equivalent and is reproducible outside a kernel.
 | --- | --- |
 | `01_strategy_lab.ipynb` | How does *this* strategy train and backtest? |
 | `02_compare_and_sweep.ipynb` | Which strategy, or which settings, is better? |
+| `03_forecast_lab.ipynb` | Does the strategy's **ranking** carry information at all? |
+
+`03` is usually the one to open first, and the reason is worth stating: a
+backtest reports the *product* of two things — does the signal order the
+cross-section, and does that ordering survive becoming a book — and never their
+difference. Round one found a strategy that ranks the cross-section well and has
+a **negative** decile spread. One equity curve cannot say that; it just looks
+bad.
 
 ## Running them
 

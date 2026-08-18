@@ -198,6 +198,127 @@ class Lab:
             self.config, jobs, universe=self.tickers, models_dir=self.models_dir
         )
 
+    def evaluate(
+        self,
+        strategy: str,
+        *,
+        horizon: int = 5,
+        **overrides: Any,
+    ) -> Any:
+        """Measure a strategy's forecast skill on the pinned universe.
+
+        The counterpart to `backtest`, and usually the one to reach for first.
+        A backtest reports the *product* of two things — whether the signal
+        orders the cross-section, and whether that ordering survives becoming a
+        book — and never their difference. Round one found a strategy that
+        ranks the cross-section well and has a negative decile spread; one
+        equity curve cannot say that.
+
+        Nothing here trains. Evaluation is about the signal a strategy already
+        emits, so this runs on any registered strategy including the rule-based
+        ones that have no checkpoint at all.
+
+        Args:
+            strategy: A registered strategy name.
+            horizon: Forward-return horizon in sessions.
+            **overrides: Passed through to `evaluate_forecast` — `stride`,
+                `start_date`, `membership`, `fundamentals`, `slippage_per_side`,
+                and the rest.
+
+        See also:
+            `neutralized`, for how much of the IC survives removing beta and
+            size, and `compare_forecasts`, for several strategies on one table.
+
+        Returns:
+            A `ForecastEvaluation`. `.to_frame()` is one row; `.notes` carries
+            what the run did *not* have — no membership file, no sector map, no
+            fundamentals — which is a property of the number rather than a
+            chore.
+        """
+        from portfolio_agent.evaluation import evaluate_forecast
+
+        return evaluate_forecast(
+            self.config, strategy,
+            universe=self.tickers,
+            horizon=horizon,
+            **overrides,
+        )
+
+    def neutralized(
+        self,
+        strategy: str,
+        *,
+        horizon: int = 5,
+        sector_map: Optional[Mapping[str, str]] = None,
+        **overrides: Any,
+    ) -> Any:
+        """Raw and residual IC side by side, against beta and size.
+
+        The question `evaluate` alone cannot answer: how much of the ranking is
+        the strategy, and how much is a factor exposure it happens to carry?
+        Round one measured momentum at 58% factor loading and low volatility at
+        71% — for a low-volatility screen that is close to tautological, and the
+        number now says so instead of appearing as selection skill.
+
+        Args:
+            strategy: A registered strategy name.
+            horizon: Forward-return horizon in sessions.
+            sector_map: Symbol to sector. **None means the result is not
+                sector-neutral**, and it says so in its own notes — no sector
+                map ships with the repository. See `docs/OBTAINING_DATA.md`.
+            **overrides: Passed through to `evaluate_neutralized`.
+
+        Returns:
+            A `NeutralizationResult`. `.raw` and `.neutralized` are the two IC
+            summaries; `.notes` says what could not be neutralized against and
+            why.
+        """
+        from portfolio_agent.evaluation import evaluate_neutralized
+
+        return evaluate_neutralized(
+            self.config, strategy,
+            universe=self.tickers,
+            horizon=horizon,
+            sector_map=sector_map,
+            **overrides,
+        )
+
+    def compare_forecasts(
+        self,
+        strategies: Sequence[str],
+        *,
+        horizon: int = 5,
+        **overrides: Any,
+    ) -> Any:
+        """Score several strategies on the pinned universe and tabulate them.
+
+        The forecasting counterpart to `compare`, which trains. One universe,
+        one set of dates, one table — comparing runs that each drew their own
+        sample differs by the draw at least as much as by the strategy.
+
+        Returns:
+            A DataFrame, one row per strategy. A strategy that fails to
+            evaluate is omitted with its reason rather than discarding the rest.
+        """
+        from portfolio_agent.evaluation import compare_forecasts, evaluate_forecast
+
+        results = []
+        failures: Dict[str, str] = {}
+        for name in strategies:
+            try:
+                results.append(evaluate_forecast(
+                    self.config, name, universe=self.tickers,
+                    horizon=horizon, **overrides,
+                ))
+            except (ValueError, KeyError, RuntimeError) as error:
+                failures[name] = str(error)
+
+        if not results:
+            raise ValueError(f"no strategy could be evaluated: {failures}")
+        if failures:
+            print(f"Omitted (failed to evaluate): {failures}")
+        return compare_forecasts(results)
+
     def sweep(
         self,
         strategy: Optional[str],

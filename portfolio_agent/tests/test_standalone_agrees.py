@@ -230,3 +230,128 @@ class TestTheGeneratedFileIsCurrent:
         sources = "\n".join(p.read_text() for p in blocks.glob("*.py"))
         assert "def idiosyncratic_volatility(" in sources
         assert "MIN_CROSS_SECTION_NAMES = 5" in sources
+
+
+# --------------------------------------------------------------------------
+# The notebooks
+# --------------------------------------------------------------------------
+
+NOTEBOOKS = Path(__file__).resolve().parents[2] / "notebooks"
+
+
+def _code_cells(path: Path):
+    import json
+
+    return [
+        "".join(cell["source"])
+        for cell in json.loads(path.read_text())["cells"]
+        if cell["cell_type"] == "code"
+    ]
+
+
+class TestTheNotebooksStillRun:
+    """Notebooks rot silently — nothing imports them and no test opens them.
+
+    These do not execute a kernel (that needs cached price data and the
+    optional extras). They check the two things that break first when the
+    package moves underneath: the code no longer parses, and a name it imports
+    no longer exists.
+    """
+
+    @pytest.mark.parametrize(
+        "name",
+        ["01_strategy_lab.ipynb", "02_compare_and_sweep.ipynb",
+         "03_forecast_lab.ipynb"],
+    )
+    def test_every_code_cell_parses(self, name):
+        import ast
+
+        for source in _code_cells(NOTEBOOKS / name):
+            # IPython magics are not Python; strip them the way the kernel does.
+            body = "\n".join(
+                line for line in source.splitlines()
+                if not line.lstrip().startswith(("%", "!"))
+            )
+            ast.parse(body)
+
+    @pytest.mark.parametrize(
+        "name",
+        ["01_strategy_lab.ipynb", "02_compare_and_sweep.ipynb",
+         "03_forecast_lab.ipynb"],
+    )
+    def test_every_imported_name_exists(self, name):
+        """The failure mode a doc pass cannot catch by reading.
+
+        A notebook importing `evaluate_decay` from a module that exports
+        `decay_curve` looks perfectly reasonable on the page and dies on the
+        first cell.
+        """
+        import ast
+        import importlib
+
+        for source in _code_cells(NOTEBOOKS / name):
+            body = "\n".join(
+                line for line in source.splitlines()
+                if not line.lstrip().startswith(("%", "!"))
+            )
+            for node in ast.walk(ast.parse(body)):
+                if not isinstance(node, ast.ImportFrom):
+                    continue
+                if not node.module or "portfolio_agent" not in node.module:
+                    continue
+                module = importlib.import_module(node.module)
+                for alias in node.names:
+                    assert hasattr(module, alias.name), (
+                        f"{name} imports {alias.name} from {node.module}, "
+                        f"which does not export it"
+                    )
+
+
+class TestTheLabCanEvaluate:
+    """`Lab` had `train`, `backtest`, `compare` and `sweep` — and no way to
+    reach the evaluation layer at all, which is the layer round one was built
+    for."""
+
+    def test_it_has_the_forecasting_methods(self):
+        from portfolio_agent.lab import Lab
+
+        for name in ("evaluate", "neutralized", "compare_forecasts"):
+            assert callable(getattr(Lab, name)), name
+
+    def test_evaluate_does_not_train(self):
+        """Evaluation is about the signal a strategy already emits, so it must
+        work on the rule-based strategies that have no checkpoint at all.
+
+        Matched against the *code*, with the docstring stripped — the docstring
+        says "nothing here trains", and a naive text search finds that sentence
+        and calls it a training call.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        from portfolio_agent.lab import Lab
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(Lab.evaluate)))
+        called = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        imported = {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+        }
+
+        assert "evaluate_forecast" in called
+        assert not {"run_training_job", "run_bulk", "train"} & (called | imported)
+
+    def test_neutralized_says_when_it_is_not_sector_neutral(self):
+        import inspect
+
+        from portfolio_agent.lab import Lab
+
+        doc = inspect.getdoc(Lab.neutralized)
+        assert "not\n                sector-neutral" in doc or "sector-neutral" in doc
