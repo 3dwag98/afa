@@ -71,6 +71,12 @@ and why the data work is about provenance rather than latency.
 | [T29](T29-short-term-reversal.md) | Measure the effect momentum's skip-month exists to avoid | 18 |
 | [T30](T30-pairs-cointegration.md) | Cointegrated pairs as a per-name score; closes Phase 3 | 37 |
 
+## Phase four: data adapters
+
+| Task | What it did | Tests added |
+| --- | --- | --- |
+| [T31](T31-fundamentals-adapter.md) | Point-in-time fundamentals keyed on the report date; six characteristics | 42 |
+
 ## What round two found
 
 **The platform reported the information coefficient four different ways, and

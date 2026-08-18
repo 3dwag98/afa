@@ -157,3 +157,99 @@ that were not index constituents on their own date, across 137 symbol(s).
 Dates outside the file's coverage are left **unfiltered** rather than dropped,
 and counted separately — a shorter window that looks clean is worse than a
 longer one that says which part of it is uncorrected.
+
+---
+
+## Point-in-time fundamentals (the bias that looks like alpha)
+
+`docs/QUANT_RESEARCH.md` §8 and §9 both stop at the same sentence — the data
+isn't ingested — and between them they cover size, value, profitability,
+investment and quality. None of it is expressible from OHLCV.
+
+### Why the *report* date is the whole problem
+
+A company's results for the quarter ending **31 March** are published in late
+May. A backtest that uses them from 31 March has read six to eight weeks into
+the future, on every stock, every quarter, forever.
+
+This is the single most common way a fundamentals backtest lies, and it is
+invisible in the output: the numbers are real, the dates are real, and the
+strategy simply knew them early. **It does not look like a bug. It looks like
+alpha.**
+
+So every row carries two dates, and the store is keyed on the second:
+
+- `fiscal_date` — the period the number describes.
+- `report_date` — when it was published.
+
+`report_date` is a **required** column. A file without it is rejected rather
+than defaulted, because the only available default is the fiscal date and that
+is precisely the look-ahead.
+
+### The file format
+
+```csv
+symbol,fiscal_date,report_date,total_assets,total_equity,revenue,cost_of_goods_sold,net_income,cash_flow_operating,total_debt,shares_outstanding
+RELIANCE.NS,2023-03-31,2023-05-12,1650000,720000,220000,150000,19300,28000,310000,6765
+RELIANCE.NS,2023-06-30,2023-08-08,1680000,738000,214000,146000,16000,25000,315000,6765
+```
+
+Amounts in whatever unit you like, as long as it is **consistent within a
+column** — every characteristic is a ratio, so the units cancel. Only `symbol`,
+`fiscal_date` and `report_date` are required; a file with three fact columns
+yields the characteristics those three support and says which. Restatements are
+fine as extra rows: the store keeps the **earliest** report date for a period,
+because a restatement published later was not knowable at the original
+announcement.
+
+```bash
+portfolio-agent evaluate --strategy momentum \
+    --fundamentals universe/nifty500_fundamentals.csv
+```
+
+### What validation checks, and why those numbers
+
+SEBI **LODR Regulation 33** requires quarterly results within **45 days** of the
+period end and annual results within **60 days**. That fixes what a plausible
+lag looks like:
+
+| Check | Severity | Why |
+| --- | --- | --- |
+| `report_date` column missing | **error** | The only fallback is the fiscal date, which is the look-ahead |
+| `report_date` < `fiscal_date` | **error** | Not a late filing — a column swap, so every value is suspect |
+| lag < 15 days | warning | Faster than an audited filing plausibly is |
+| lag > 120 days | warning | A late filer, or a fiscal date in the report-date column |
+| **every lag identical** | warning | See below |
+
+That last one is the sharpest check in the module. A file whose report dates
+were produced by adding a constant to the fiscal date is **worse than having no
+file at all**: it has the shape of point-in-time data and none of the content,
+so a backtest on it looks rigorous and is not. If a vendor gives you fiscal
+dates only, do not synthesize report dates — run without fundamentals and let
+the result say so.
+
+### Where to get it
+
+| Source | Cost | Notes |
+| --- | --- | --- |
+| BSE / NSE corporate-filings archives | free | Authoritative and carries the true announcement timestamp, which is the field everything else gets wrong. Machine-readable coverage thins going back before ~2015. |
+| Screener.in, Tijori, Trendlyne | low | Convenient and broadly accurate on *values*. Check what they give for announcement dates — several expose only fiscal periods, which is the one field that cannot be reconstructed. |
+| Refinitiv, Bloomberg, CMIE Prowess | paid | Prowess is the standard for Indian academic work and carries genuine point-in-time snapshots. |
+| `yfinance` quarterly statements | free | Already a dependency. Convenient for a smoke test, **not** point-in-time — it serves the current view of history, restatements and all. |
+
+The last row is worth its own sentence: `yfinance` is the easiest thing to
+reach for and will give you a file that validates cleanly and is silently
+wrong, because a restated figure is served for the date the original was
+published. Use it to check the pipeline runs, not to produce a result.
+
+### Running without it
+
+Every evaluation without a fundamentals file prints:
+
+> No fundamentals data was supplied, so this result controls for no accounting
+> characteristic. Size, value, profitability, investment and quality exposures
+> are uncontrolled, and any of them could be producing the ranking measured
+> here.
+
+That is the same contract the survivorship note has. It is a statement about
+the number sitting next to it, not a chore someone is meant to remember.
