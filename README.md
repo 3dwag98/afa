@@ -48,8 +48,11 @@ uv sync --extra hf
 # Download 5 years of Indian-market OHLCV from the HuggingFace dataset
 uv run portfolio-agent download-data
 
-# Run the live paper-trading agent (writes an Excel recommendation report)
-uv run portfolio-agent run-agent
+# Measure a strategy's forecast skill — rank IC, decile spread, decay
+uv run portfolio-agent evaluate --strategy momentum --neutralize beta,size
+
+# Compare several strategies on one universe, one table
+uv run portfolio-agent compare --strategies momentum,residual_momentum,bab
 
 # Backtest the rule-based strategy over 1 year
 uv run portfolio-agent backtest --strategy rule_based --years 1
@@ -122,9 +125,34 @@ portfolio-agent backtest
     [--device auto|cuda|mps|cpu]   Device for ML-strategy inference
     [--output PATH]                Excel report path
 
-portfolio-agent run-agent [--force-refresh] [--simulate-outcome] [--update-outcomes]
-    Run the live daily paper-trading loop: fetch data, score every ticker with
-    the configured strategy, save recommendations, export an Excel report.
+portfolio-agent evaluate --strategy NAME
+    [--horizons 1,2,3,5,10,21]     Decay curve in one pass, ~the cost of one horizon
+    [--neutralize beta,size,sector] Report raw and residual IC together
+    [--baseline gbm]               Score a second strategy on the identical panel
+    [--horizon N] [--stride N] [--buckets N]
+    [--cv] [--splits N] [--embargo N]   Purged walk-forward, per-fold IC
+    [--tickers | --universe-snapshot | --universe-size N | --limit N]
+    [--start-date/--end-date] [--min-history N] [--max-dates N]
+    [--gross | --slippage-bps N]   Net of the Indian cost schedule by default
+    [--membership PATH]            Point-in-time index membership
+    Measure forecast skill directly — rank IC, decile spread, decay, and the
+    spread net of costs — without simulating a book.
+
+portfolio-agent compare --strategies a,b,c [same evaluation flags]
+    Score several strategies on ONE universe and print one table. The
+    comparison is the point: identical names, identical dates, identical splits.
+
+portfolio-agent list-features [--json]
+    List registered features and what each computes.
+
+portfolio-agent data status | validate | build [--years N]
+    Inspect, check and populate the parquet cache. `validate` runs the ingest
+    invariants; `build` downloads then reports what actually arrived.
+
+portfolio-agent report [--run ID] [--runs-dir DIR] [--output PATH]
+    [--no-html] [--limit N] [--allow-dirty] [--json]
+    Render a recorded evaluation run into a research note. Every `evaluate`
+    writes a manifest under `runs/`; this turns one into a readable document.
 
 portfolio-agent list-strategies [--name NAME] [--strategy-config PATH]
     List registered strategies. With --name, show that strategy's entry/exit
@@ -247,7 +275,7 @@ rejected at load time rather than silently ranking each name against itself.
 2. Register it: `register_strategy("my_strategy", MyStrategy)` in `strategies/registry.py` (or call `register_strategy` yourself before running the CLI, e.g. from a small bootstrap script).
 3. Use it: `portfolio-agent backtest --strategy my_strategy`.
 
-No other code needs to change — `run-agent`, `backtest`, and any UMA that references your strategy by name all pick it up automatically through the registry.
+No other code needs to change — `evaluate`, `compare`, `backtest`, and any UMA that references your strategy by name all pick it up automatically through the registry.
 
 > **Full guide: [docs/STRATEGIES.md](docs/STRATEGIES.md)** — complete worked examples for all four kinds of strategy, how to update one safely, how to remove one cleanly, plus adding indicators and model architectures. For how the layer works internally, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -501,7 +529,7 @@ The day bar carries the simulated date, current equity, open positions and cumul
 Edit `config.yaml` at the repo root. Every field can also be overridden via environment variables using the `AFA_` prefix with double-underscore nesting (see `.env.example`):
 
 ```bash
-AFA_RISK__PORTFOLIO_VALUE_INR=500000 uv run portfolio-agent run-agent
+AFA_RISK__PORTFOLIO_VALUE_INR=500000 uv run portfolio-agent backtest --years 1
 ```
 
 Key sections: `data` (universe/tickers), `strategy`, `training`, `backtest`, `risk`, `learning`, `simulation` (Monte Carlo), `compliance`, `paths`.
@@ -515,7 +543,7 @@ data:
   benchmark_symbol: "^NSEI"    # index driving the momentum crash filter
   default_history_years: 5     # history kept, both sources
   download_workers: 4          # concurrent chunk downloads (yfinance); 1 if rate-limited
-  parallel_ticker_prep: true   # prepare tickers across a CPU pool during run-agent
+  parallel_ticker_prep: true   # prepare tickers across a CPU pool
 risk:
   portfolio_value_inr: 308733
   risk_per_trade_pct: 0.01
@@ -575,16 +603,21 @@ paths:
 
 There's no scheduler baked into the app — run the CLI on your own schedule.
 
+The live daily loop (`run-agent`) was removed in T11 — the execution namespace
+is frozen, and nothing here places an order. What is worth scheduling is data
+refresh and re-measurement.
+
 **Linux/macOS (cron):**
 ```
-# Daily run at 15:45 IST on weekdays
-45 15 * * 1-5 cd /path/to/afa && uv run portfolio-agent run-agent
+# Refresh the cache after the close, weekdays
+45 15 * * 1-5 cd /path/to/afa && uv run portfolio-agent data build
 
-# Update outcomes at 16:00 IST on weekdays
-0 16 * * 1-5 cd /path/to/afa && uv run portfolio-agent run-agent --update-outcomes
+# Re-measure the strategy weekly and write a manifest under runs/
+0 18 * * 6   cd /path/to/afa && uv run portfolio-agent evaluate \
+                 --strategy momentum --neutralize beta,size
 ```
 
-**Windows (Task Scheduler):** create a task that runs `uv run portfolio-agent run-agent` from the project directory on your desired schedule.
+**Windows (Task Scheduler):** create a task running `uv run portfolio-agent data build` from the project directory on your desired schedule.
 
 ## Backtest findings and known limitations
 

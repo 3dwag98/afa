@@ -2,8 +2,8 @@
 
 A complete, plug-and-play guide to the strategy layer. Everything here is
 additive: you drop in a file, register a name, and every command
-(`backtest`, `run-agent`, `list-strategies`, UMAs) picks it up. No engine,
-orchestrator or reporting code has to change.
+(`evaluate`, `compare`, `backtest`, `list-strategies`, UMAs) picks it up. No
+engine, evaluation or reporting code has to change.
 
 For how the layer fits into the rest of the platform, see
 **[ARCHITECTURE.md](ARCHITECTURE.md)**.
@@ -42,7 +42,7 @@ flowchart LR
     end
     subgraph free["What you get for free"]
         BT["backtest --strategy yours"]
-        LIVE["run-agent"]
+        EV["evaluate / compare --strategy yours"]
         LS["list-strategies --name yours"]
         UMA["usable as a UMA member"]
         PAR["CPU parallelism (--parallel)"]
@@ -379,7 +379,7 @@ portfolio-agent backtest --strategy mean_reversion --years 2
 portfolio-agent backtest --strategy mean_reversion --years 2 --parallel --workers 8
 ```
 
-To make it the default for `run-agent`, set it in `config.yaml`:
+To make it the default everywhere, set it in `config.yaml`:
 
 ```yaml
 strategy:
@@ -732,7 +732,7 @@ What happens if you miss a reference:
 
 | Leftover | Symptom |
 |---|---|
-| `config.yaml` still names it | Every `run-agent` fails: `Unknown strategy type: 'mean_reversion'. Available: [...]` |
+| `config.yaml` still names it | Every command fails: `Unknown strategy type: 'mean_reversion'. Available: [...]` |
 | A UMA still lists it as a member | That UMA fails to load; other strategies keep working |
 | Only the YAML is left behind | Harmless, but delete it anyway |
 
@@ -848,7 +848,8 @@ portfolio-agent list-strategies --name NAME [--strategy-config PATH]
 portfolio-agent backtest --strategy NAME [--strategy-config PATH] [--years N]
                          [--parallel --workers N] [--device auto|cuda|mps|cpu]
                          [--output PATH]
-portfolio-agent run-agent
+portfolio-agent evaluate --strategy NAME [--neutralize beta,size] [--baseline gbm]
+portfolio-agent compare  --strategies a,b,c
 portfolio-agent gpu-check
 ```
 
@@ -867,7 +868,7 @@ Anything in `config.yaml` can be overridden by environment variable using the
 `AFA_` prefix and double-underscore nesting:
 
 ```bash
-AFA_STRATEGY__TYPE=mean_reversion portfolio-agent run-agent
+AFA_STRATEGY__TYPE=mean_reversion portfolio-agent evaluate --strategy mean_reversion
 ```
 
 ### The built-in `rule_based` scoring modes
