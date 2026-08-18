@@ -16,6 +16,12 @@ dependencies = [
     "pydantic>=2.0.0",
     "arch>=6.0.0",
     "scipy>=1.10.0",
+    # Engle-Granger cointegration for the pairs strategy. Already present
+    # transitively via `arch`, and declared here because relying on another
+    # package's dependency for something load-bearing is how a working install
+    # breaks on an unrelated upgrade. The MacKinnon critical values in
+    # `statsmodels.tsa.stattools.coint` are the reason not to hand-roll it.
+    "statsmodels>=0.14.0",
 ]
 
 [project.optional-dependencies]

@@ -15,6 +15,7 @@ from .cross_section import (
 # import time, and this module not being imported here is why the platform's
 # only cross-sectional feature lived outside every registry and was reached by
 # importing it directly inside a strategy method.
+from . import cointegration  # noqa: F401
 from . import market_relative  # noqa: F401
 from .technical import (
     sma_20,

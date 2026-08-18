@@ -75,6 +75,10 @@ from .types import (
     StrategySignal,
 )
 from portfolio_agent.config.schema import StrategyConfig
+from portfolio_agent.features.cointegration import (
+    PAIRS_NOT_NEUTRAL_NOTE,
+    pair_cheapness_feature,
+)
 from portfolio_agent.features.cross_section import build_cross_section, latest_values
 from portfolio_agent.features.market_relative import (
     # Aliased because `src.regime` exports a `DEFAULT_VOL_WINDOW` too, and its
@@ -122,6 +126,16 @@ DEFAULT_BAB_BETA_WINDOW = 252
 #: The formation window `ShortTermReversalStrategy` ranks on — exactly the
 #: window `mom_9m_skip1m` skips.
 REVERSAL_FEATURE = "return_21d"
+
+#: Formation window `CointegrationPairsStrategy` screens over by default.
+DEFAULT_PAIR_FORMATION = 252
+
+#: Minimum universe for the pair screen. Lower than the decile strategies'
+#: 30 because the constraint is different: a decile of 20 names is 2 stocks
+#: and not a ranking, whereas a pair screen over 20 names is 190 tests and
+#: a real screen. Still not small — cointegration on a handful of names is
+#: a few tests looking for structure that needs many to be visible.
+DEFAULT_PAIR_MIN_UNIVERSE = 15
 
 
 # Decile ranking is a statistical statement about a cross-section. Below ~30
@@ -942,6 +956,104 @@ class ShortTermReversalStrategy(MomentumStrategy):
             if value is not None:
                 values[symbol] = value
         return values
+
+
+@register_strategy("pairs")
+class CointegrationPairsStrategy(MomentumStrategy):
+    """Long the cheap leg of a cointegrated pair.
+
+    `docs/QUANT_RESEARCH.md` section 7 recorded this as scoped out, and named
+    the two blockers precisely. Both are resolved here, and one of them is
+    resolved by *conceding* rather than solving.
+
+    **The interface was the feature layer, not `BaseStrategy`.** Section 7 read
+    the gap as "every strategy scores one ticker at a time, and a pair is a
+    relationship between two". True, and it turned out not to be where the
+    obstruction was: T24's cross-sectional registry receives the whole
+    `(date x symbol)` panel, so a feature can screen pairs internally and emit
+    a per-symbol number — how cheap each name is against its own partner. The
+    scoring interface never had to change.
+
+    **The short leg is foregone, not solved.** Textbook pairs trading is
+    market-neutral because it shorts the expensive leg against the cheap one.
+    This platform does not short, so this buys the cheap leg and stops there.
+    That is a real cost: the signal keeps full market exposure, and its results
+    are **not** comparable with published market-neutral pairs returns. The
+    strategy says so in its own notes rather than letting the words "pairs
+    trading" imply otherwise.
+
+    Two failure modes are handled in `features/cointegration.py` rather than
+    here, because they are properties of the screen:
+
+    - **Look-ahead through selection.** Pairs are screened on a trailing
+      formation window and applied only to dates after it closes. Screening on
+      the full sample and then trading what it found is the severe version of
+      this mistake, and it is easy to make without noticing.
+    - **Multiple testing.** A 50-name universe is 1,225 tests, of which about
+      61 pass at p<0.05 by chance. Bonferroni is on by default and the expected
+      false-positive count is reported.
+
+    Ranked highest-cheapness-first, so this is `higher_metric_is_better=True`
+    like momentum, even though it is a mean-reversion signal: the metric is
+    already stated as "undervaluation", not as a return.
+    """
+
+    trigger_name = "Pairs"
+
+    def __init__(self, config: StrategyConfig):
+        super().__init__(config)
+        params = config.params or {}
+        self._name = params.get("name", "pairs")
+        self._formation = int(params.get("formation_window", DEFAULT_PAIR_FORMATION))
+        # Resolved at construction so an unregistered window fails when the
+        # strategy is built rather than on the first scored date.
+        self._pair_feature = pair_cheapness_feature(self._formation)
+        # A pair screen needs far fewer names than a decile sort: the book is
+        # whichever legs are currently stretched, not a tenth of the universe.
+        self._min_universe = int(params.get("min_universe", DEFAULT_PAIR_MIN_UNIVERSE))
+
+    def required_features(self) -> List[str]:
+        return [
+            "close", "atr_14", "realized_vol_60"
+        ] + self._tradability.required_features()
+
+    def required_cross_sectional_features(self) -> List[str]:
+        return [self._pair_feature]
+
+    def entry_rules(self) -> Dict[str, Any]:
+        rules = super().entry_rules()
+        rules["rule"] = (
+            f"Long top decile by relative cheapness against a cointegrated "
+            f"partner, screened on a rolling {self._formation}-session "
+            f"formation window"
+        )
+        rules["formation_metric"] = self._pair_feature
+        rules["formation_window"] = self._formation
+        rules["market_neutral"] = False
+        rules["notes"] = [PAIRS_NOT_NEUTRAL_NOTE]
+        return rules
+
+    def _formation_metric(
+        self, features_by_symbol: Dict[str, pd.DataFrame], context: StrategyContext
+    ) -> Dict[str, float]:
+        """Relative cheapness for the batch, via the cross-sectional registry.
+
+        A pair needs two names, and a *screen* needs enough of them for the
+        cointegration test to be about anything, so this refuses below the
+        minimum rather than ranking on whatever one lucky pair produced.
+        """
+        usable = {
+            symbol: features
+            for symbol, features in features_by_symbol.items()
+            if not features.empty and "close" in features.columns
+        }
+        if len(usable) < 2:
+            return {}
+
+        built = build_cross_section(
+            usable, [self._pair_feature], benchmark=context.benchmark_close,
+        )
+        return latest_values(built.get(self._pair_feature, pd.DataFrame()))
 
 
 #: How `LowVolatilityStrategy` measures risk. `total` is trailing realized
