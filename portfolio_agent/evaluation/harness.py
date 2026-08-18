@@ -52,6 +52,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
+from portfolio_agent.data_quality.fundamentals import FUNDAMENTALS_NOTE
 from portfolio_agent.data_quality.membership import (
     SURVIVORSHIP_NOTE,
     apply_membership,
@@ -299,6 +300,46 @@ def _bar(value: float, values: Sequence[float], width: int = 24) -> str:
 # --------------------------------------------------------------------------
 # Scoring a panel
 # --------------------------------------------------------------------------
+
+
+def fundamentals_notes(path: Optional[str]) -> List[str]:
+    """What a run should say about the fundamentals it did or did not have.
+
+    Same contract as T15's survivorship note: absence is a property of the
+    number sitting next to it, not an outstanding chore, so it is stated in the
+    result rather than tracked somewhere else.
+
+    A file that *was* supplied gets its validation warnings surfaced too — a
+    fundamentals set whose report lags are all identical is worse than none,
+    and a run on it should say that where the result can be seen.
+    """
+    from portfolio_agent.data_quality.fundamentals import (
+        FUNDAMENTALS_NOTE,
+        load_fundamentals,
+    )
+
+    if path is None:
+        return [FUNDAMENTALS_NOTE]
+
+    try:
+        store = load_fundamentals(path)
+    except (FileNotFoundError, ValueError) as exc:
+        # Not fatal: the evaluation itself is price-based and still means
+        # something. But it must not read as though fundamentals were applied.
+        return [
+            f"Fundamentals file {path!r} could not be used ({exc}). This "
+            f"result controls for no accounting characteristic."
+        ]
+
+    lines = [
+        f"Fundamentals: {len(store.symbols)} symbol(s), fields "
+        f"{store.available_facts}, median report lag "
+        f"{store.validation.median_lag_days:.0f} days."
+        if store.validation else f"Fundamentals: {len(store.symbols)} symbol(s)."
+    ]
+    if store.validation:
+        lines.extend(store.validation.warnings)
+    return lines
 
 
 def evaluate_panel(
@@ -750,6 +791,7 @@ def evaluate_forecast(
     slippage_per_side: Optional[float] = None,
     membership: Optional[str] = None,
     index_name: Optional[str] = None,
+    fundamentals: Optional[str] = None,
 ) -> ForecastEvaluation:
     """Measure one strategy's forecast skill, end to end.
 
@@ -784,6 +826,9 @@ def evaluate_forecast(
             every date is ranked against the names that survived to be
             downloaded, and the result says so in its notes.
         index_name: Narrow a multi-index membership file to one index.
+        fundamentals: Path to a point-in-time fundamentals CSV. Without one the
+            result controls for no accounting characteristic, and says so in
+            its notes — the same contract `membership` has.
 
     Returns:
         A `ForecastEvaluation`, carrying `run_id` when a manifest was written.
@@ -832,6 +877,11 @@ def evaluate_forecast(
                 f"membership file {resolved_membership.source} and the "
                 "evaluation universe may not overlap"
             )
+
+    # Same contract as the membership note above, for the same reason: a run
+    # without fundamentals has controlled for no accounting characteristic, and
+    # that is a property of the number rather than an outstanding chore.
+    notes.extend(fundamentals_notes(fundamentals))
 
     if buys_only:
         before = len(panel)
