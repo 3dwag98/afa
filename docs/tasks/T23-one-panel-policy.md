@@ -137,7 +137,12 @@ arithmetic that cannot be a price.
   per-feature probe behind it; `effective_min_history`, which raises a caller's
   threshold to the warm-up.
 - `evaluation/harness.py`, `training/data.py` — route `min_history` through it
-  and log when it is raised.
+  and log when it is raised. `prepare_panel` also validates feature names
+  against the registry before any I/O: the warm-up lookup needs them to resolve
+  anyway, and the old path discovered a typo by loading the entire universe,
+  finding nothing survived, and raising "No ticker produced usable history"
+  with a hint that *if* `missing_features` dominated the skip counts, *maybe* a
+  feature was unregistered.
 - `features/labels.py` — `drop_absurd_labels`, `DEFAULT_MAX_ABS_LABEL`.
 - `src/backtest_engine.py` — `_required_history_rows`; loads from
   `start_date` minus the warm-up; eligibility uses the derived threshold rather
