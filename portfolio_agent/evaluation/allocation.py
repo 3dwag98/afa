@@ -602,8 +602,13 @@ def weight_turnover(weights: pd.DataFrame) -> pd.Series:
     absolute-difference sum by 0.60 and is 30% turnover, which is the convention
     `costs.one_way_turnover` already uses so the two numbers are comparable.
 
-    The first rebalance is the cost of establishing the book from cash, so its
-    turnover is the full invested fraction rather than zero.
+    **The first date is establishment, and the halving happens to be right for
+    it too.** Going from cash to a fully invested book moves the sum by 1.0 and
+    so reports 0.5, which looks like an understatement: 100% of the book was
+    bought. But the caller charges `turnover x round_trip`, and establishing
+    pays only the buy leg — so 0.5 round trips is one leg, which is exactly the
+    cost incurred. Recorded because it is a coincidence of two conventions
+    rather than a derivation, and the day either changes it stops holding.
     """
     if weights.empty:
         return pd.Series(dtype=float)
