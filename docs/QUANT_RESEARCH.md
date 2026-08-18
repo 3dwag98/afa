@@ -287,11 +287,19 @@ QMJ's third leg — earnings **growth** — is not implemented. It needs a multi
 
 ---
 
-## 10. FII/DII institutional flows (not yet implemented)
+## 10. FII/DII institutional flows
 
 **Evidence.** FII (foreign) and DII (domestic) daily net flows are widely documented as a major driver of Indian index-level returns and volatility — FIIs tend to dominate price momentum and are correlated with global risk appetite and rate cycles, while DII flows (mutual funds, insurers) provide offsetting structural support during FII selloffs; large-cap, high-foreign-ownership sectors (banks, IT) are most sensitive.
 
-**Why it isn't implemented.** FII/DII net-flow data isn't in OHLCV and isn't currently ingested; NSE/SEBI publish daily provisional figures that would need a new scraper/ingestion path (similar scoping decision to §8/§9). A flow-based regime filter (e.g., dampen position sizing during sustained FII selling) is a reasonable future addition once that data source exists.
+**The adapter is implemented; the data is supplied by the user (T32).** Same shape as §8 and §9: `data_quality/reference.py` carries the schema, validation and tests, and `docs/OBTAINING_DATA.md` carries the acquisition. NSE and SEBI publish daily provisional figures; NSDL publishes the settled monthly series.
+
+Unlike every other input here, this describes the **market** rather than the names in it — so it conditions a result rather than entering a cross-sectional ranking.
+
+**`FlowSeries.net` is FII minus DII, and the subtraction is the point.** Domestic institutions systematically buy into foreign selling, so the two series are strongly negatively correlated and neither leg alone says whether the market was under pressure. Their difference does. A flow file read one leg at a time would report "heavy FII selling" on days when domestic buying fully absorbed it.
+
+`FlowSeries.states()` labels each date `inflow`/`outflow` on a trailing 63-session window, shaped to drop into the conditional split §2 describes (T28). The window ends at the date it labels, so a flow-conditioned result is **tradable** rather than only attribution — the distinction that separates a regime filter from a post-hoc explanation.
+
+The flow-based regime filter this section anticipated — dampening position sizing during sustained FII selling — is now one step away rather than blocked: the states exist and `CrashProtection` already accepts an exposure scalar. It is not wired, because whether to hand a live sizing decision to a provisional, later-revised figure is a risk judgement rather than an implementation detail.
 
 **Sources:**
 - [Why Do FII and DII Investment Flows Significantly Impact Indian Stock Market Movements?](https://www.gwcindia.in/blog/why-do-fii-and-dii-investment-flows-significantly-impact-indian-stock-market-movements/)

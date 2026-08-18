@@ -253,3 +253,104 @@ Every evaluation without a fundamentals file prints:
 
 That is the same contract the survivorship note has. It is a statement about
 the number sitting next to it, not a chore someone is meant to remember.
+
+---
+
+## Reference data: free float, sector, and institutional flows
+
+Three inputs that are neither prices nor accounts. Each closes a caveat the
+platform is already printing.
+
+### Free float (replaces the size proxy)
+
+Every neutralized result currently prints:
+
+> size is a proxy: log rolling-median traded value, not log market cap. Market
+> cap needs shares outstanding, which this platform does not have, and for
+> Indian equities the correct figure is free float — promoter holdings run
+> 50–75%, so total capitalisation is not what trades.
+
+**Free float, not total shares**, and that is not a refinement. Two firms with
+identical issued shares and identical prices are the same size on paper and
+2.7× apart to anyone who has to trade them, if one is 30% floated and the other
+80%. A total-capitalisation size sort on Indian equities ranks by promoter stake
+as much as by size. NSE's own indices are free-float weighted for this reason.
+
+```csv
+symbol,effective_date,free_float_shares,total_shares
+RELIANCE.NS,2020-01-01,3380000000,6765000000
+RELIANCE.NS,2023-08-15,3420000000,6765000000
+```
+
+`total_shares` is optional but earns its keep: it is what makes the free-float
+*fraction* checkable, and the fraction is where the errors are. A file that has
+quietly put total shares in the free-float column is **undetectable from the
+float alone** and produces a size sort wrong by exactly the promoter stake —
+largest where promoter holdings are largest, which is the opposite of a size
+correction. The validator flags a median float above 95% of issued shares for
+that reason.
+
+Rows are keyed on `effective_date` and read with `<= date`. Share counts move
+on splits, bonuses, buybacks and QIPs; promoter stakes move on pledges and
+secondary sales. Applying today's float to a 2015 date restates a decade of
+market caps in one direction.
+
+**Where to get it:** NSE publishes free-float factors alongside its index
+methodology, and BSE's shareholding-pattern filings give promoter holdings
+quarterly. Both are free and both need assembling into a time series.
+
+### Sector map
+
+`src/sectors.py` has loaded these files since the concentration limits were
+written. Nothing ships a CSV, so `--neutralize sector` has never had anything
+to neutralize with — and Indian momentum concentrates hard by sector, which
+makes this the single most likely place for an apparent alpha to be a sector
+bet.
+
+```csv
+symbol,sector
+HDFCBANK.NS,Financials
+INFY.NS,Information Technology
+```
+
+Column names are flexible (`ticker`/`symbol`, `sector`/`industry`/`gics_sector`).
+
+**Coverage is the thing to check, not existence.** A map resolving 60% of a
+universe produces a "sector-neutral" result in which the other 40% were
+neutralized against a pool called `UNKNOWN` — that is, against each other
+rather than against their real peers. `sector_coverage()` reports the fraction
+and the largest sector's share so the claim can be read at its real strength.
+
+**Where to get it:** NSE's index constituent files carry a sector column;
+so does BSE's list of listed companies. Both are free downloads.
+
+### FII / DII flows (§10)
+
+Unlike the two above, this describes the **market** rather than the names in
+it, so it conditions a result rather than entering a cross-sectional ranking.
+
+```csv
+date,fii_net,dii_net
+2023-01-02,-1245.30,982.11
+2023-01-03,-88.42,301.55
+```
+
+Units are free as long as they are consistent — every use is a sign, a ratio or
+a z-score.
+
+The adapter exposes `fii_net − dii_net` directly, because **neither leg alone
+says whether the market was under pressure.** Domestic institutions
+systematically buy into foreign selling, so the two series are strongly
+negatively correlated; their difference is what carries the information.
+
+`FlowSeries.states()` labels each date `inflow`/`outflow` on a trailing
+63-session window, shaped to drop into `evaluation/conditional.py` as an
+alternative conditioner. The window ends at the date it labels, so a
+flow-conditioned split is **tradable** rather than only attribution — the
+distinction T28 turns on.
+
+**Where to get it:** NSE and SEBI both publish daily provisional FII/DII
+figures. NSDL publishes the settled monthly series. The provisional daily
+numbers are revised, so a file assembled from them is approximately right
+rather than exactly right — which is fine for a regime read and not for
+anything that needs the level.
