@@ -311,3 +311,115 @@ def _family_name(stem: str, window: int) -> str:
             f"window is part of what the feature measures."
         )
     return f"{stem}_{window}"
+
+
+# --------------------------------------------------------------------------
+# Residual momentum
+# --------------------------------------------------------------------------
+
+#: Formation window in sessions (~9 months), and the skip (~1 month). Both
+#: match `technical.mom_9m_skip1m` exactly, because the whole point of this
+#: feature is to be the *same* momentum measured on the residual — a different
+#: formation window would make the comparison between them a comparison of two
+#: things at once.
+RESIDUAL_FORMATION_DAYS = 189
+RESIDUAL_SKIP_DAYS = 21
+
+#: Sessions used to estimate the beta the residual is taken against. Longer
+#: than the formation window on purpose, and the reason is a trap worth
+#: recording: **if beta is fitted with an intercept over exactly the window the
+#: residuals are then cumulated over, the cumulative residual is identically
+#: zero** — OLS residuals sum to zero by construction. Blitz, Huij & Martens
+#: avoid it by estimating over 36 months and forming over 12. Here the beta is
+#: estimated on a rolling one-year window ending at each date and applied
+#: without an intercept, so the residual carries the alpha rather than having
+#: it differenced away.
+RESIDUAL_BETA_WINDOW = 252
+
+
+def residual_returns(
+    returns: pd.DataFrame,
+    market: Optional[pd.Series] = None,
+    beta_window: int = RESIDUAL_BETA_WINDOW,
+) -> pd.DataFrame:
+    """Daily CAPM residual per symbol, against a rolling beta.
+
+    `resid_t = r_t - beta_t * r_m,t`, where `beta_t` is estimated on the
+    trailing `beta_window` ending at `t`. No intercept: the intercept is the
+    alpha this feature exists to measure, and subtracting it would remove the
+    signal along with the exposure.
+
+    Args:
+        returns: Wide (date x symbol) daily returns, already lagged if owed.
+        market: Market returns. Defaults to the cross-section's own composite.
+        beta_window: Sessions in the rolling beta estimate.
+
+    Returns:
+        Wide (date x symbol) residual returns, NaN until the beta window fills.
+    """
+    if returns.empty:
+        return returns
+
+    market_returns = market_composite(returns) if market is None else market
+    market_returns = pd.Series(market_returns).reindex(returns.index)
+
+    beta = rolling_beta(returns, market_returns, window=beta_window)
+    return returns - beta.mul(market_returns, axis=0)
+
+
+def residual_momentum(
+    returns: pd.DataFrame,
+    market: Optional[pd.Series] = None,
+    formation: int = RESIDUAL_FORMATION_DAYS,
+    skip: int = RESIDUAL_SKIP_DAYS,
+    beta_window: int = RESIDUAL_BETA_WINDOW,
+) -> pd.DataFrame:
+    """Blitz-Huij-Martens residual momentum: the residual's information ratio.
+
+    The ranking statistic is **standardized**, not the raw cumulative residual:
+
+        RESMOM = mean(residual over formation) / std(residual over formation)
+
+    That standardization is the substance of the effect rather than a tidying
+    step. Raw cumulated residuals still rank high-residual-volatility names
+    highest, which reintroduces exactly the risk exposure residualizing was
+    meant to remove; dividing by the residual's own dispersion is what leaves a
+    per-unit-of-risk statement. Blitz, Huij & Martens (2011) report roughly
+    double the risk-adjusted profit of price momentum with materially shallower
+    drawdowns, and attribute the difference to that.
+
+    Round two measured this platform's own momentum at 58% factor loading,
+    which is the exposure this removes.
+
+    Args:
+        returns: Wide (date x symbol) daily returns, already lagged if owed.
+        market: Market returns. Defaults to the cross-section's own composite.
+        formation: Sessions in the formation window.
+        skip: Sessions skipped before the formation window ends, the
+            Jegadeesh-Titman convention that keeps short-term reversal out of a
+            momentum signal.
+        beta_window: Sessions in the rolling beta estimate.
+
+    Returns:
+        Wide (date x symbol) standardized residual momentum.
+    """
+    residual = residual_returns(returns, market, beta_window=beta_window)
+    if residual.empty:
+        return residual
+
+    floor = max(2, formation // 2)
+    mean = residual.rolling(formation, min_periods=floor).mean()
+    dispersion = residual.rolling(formation, min_periods=floor).std()
+
+    # A name whose residual never moved has no risk-adjusted momentum to
+    # report, and dividing by zero would rank it first or last depending only
+    # on a floating-point sign.
+    standardized = mean / dispersion.replace(0.0, np.nan)
+    return standardized.shift(skip) if skip else standardized
+
+
+@register_cross_sectional_feature("residual_momentum_9m_skip1m", inputs=("close",))
+def _residual_momentum_9m_skip1m(panel: CrossSectionPanel) -> pd.DataFrame:
+    """Standardized CAPM-residual momentum, 9-month formation skipping 1 month."""
+    returns, market = _panel_returns(panel)
+    return residual_momentum(returns, market)

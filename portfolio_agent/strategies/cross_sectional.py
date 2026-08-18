@@ -62,6 +62,9 @@ from portfolio_agent.features.market_relative import (
     idiosyncratic_vol_feature,
 )
 
+#: Registry name of the formation measure `ResidualMomentumStrategy` ranks on.
+RESIDUAL_MOMENTUM_FEATURE = "residual_momentum_9m_skip1m"
+
 from portfolio_agent.src.risk import calculate_stop_target, net_reward_risk
 from portfolio_agent.src.liquidity import (
     DEFAULT_MAX_CIRCUIT_LOCK_FRACTION,
@@ -571,6 +574,31 @@ class MomentumStrategy(BaseStrategy):
             },
         }
 
+    #: Trigger and component-score label. A subclass ranking on a different
+    #: formation measure sets this so the emitted signal says which one, rather
+    #: than every momentum variant reporting "Momentum".
+    trigger_name = "Momentum"
+
+    def _formation_metric(
+        self, features_by_symbol: Dict[str, pd.DataFrame], context: StrategyContext
+    ) -> Dict[str, float]:
+        """The formation return this strategy ranks on, per symbol.
+
+        The one thing a momentum variant changes. Everything around it — the
+        tradability screen, the regime assessment, the decile selection, the
+        volatility-targeted scale — is identical, which is what makes a
+        comparison between two variants a comparison of the formation measure
+        and nothing else.
+        """
+        values: Dict[str, float] = {}
+        for symbol, features in features_by_symbol.items():
+            if features.empty:
+                continue
+            value = _clean(features.iloc[-1].get("mom_9m_skip1m"))
+            if value is not None:
+                values[symbol] = value
+        return values
+
     def score(self, symbol: str, features: pd.DataFrame, context: StrategyContext) -> StrategySignal:
         return self.score_batch({symbol: features}, context)[symbol]
 
@@ -581,6 +609,8 @@ class MomentumStrategy(BaseStrategy):
         latest_by_symbol: Dict[str, pd.Series] = {}
 
         rejected: Dict[str, str] = {}
+
+        metric = self._formation_metric(features_by_symbol, context)
 
         for symbol, features in features_by_symbol.items():
             if features.empty:
@@ -593,9 +623,9 @@ class MomentumStrategy(BaseStrategy):
                 rejected[symbol] = reason
                 continue
 
-            mom = _clean(latest.get("mom_9m_skip1m"))
-            if mom is not None:
-                metric_by_symbol[symbol] = mom
+            value = _clean(metric.get(symbol))
+            if value is not None:
+                metric_by_symbol[symbol] = value
 
         regime = _assess_regime(
             features_by_symbol, self._protection,
@@ -608,13 +638,96 @@ class MomentumStrategy(BaseStrategy):
             context=context,
             top_fraction=self._top_fraction,
             higher_is_better=True,
-            trigger="Momentum",
-            component_name="Momentum",
+            trigger=self.trigger_name,
+            component_name=self.trigger_name,
             min_universe=self._min_universe,
             protection=self._protection,
             regime=regime,
             rejected=rejected,
         )
+
+
+@register_strategy("residual_momentum")
+class ResidualMomentumStrategy(MomentumStrategy):
+    """Momentum measured on the CAPM residual rather than the raw return.
+
+    Price momentum's returns are substantially a bet on whatever the market
+    has been rewarding, which is why it crashes the way it does: the exposure
+    that pays during a trend is the same exposure that reverses violently at a
+    turn. Round two measured this platform's own momentum at **58% factor
+    loading**, so the correction is not hypothetical here.
+
+    Blitz, Huij & Martens (2011) rank on the residual's *information ratio* —
+    the mean residual over the formation window divided by its own dispersion —
+    and report roughly double the risk-adjusted profit of price momentum with
+    materially shallower drawdowns. The standardization is the substance:
+    ranking on raw cumulated residuals still puts high-residual-volatility
+    names on top, reintroducing exactly the risk exposure residualizing was
+    meant to remove.
+
+    Everything except the formation measure is inherited from
+    `MomentumStrategy` — the same tradability screen, regime filter,
+    volatility targeting and decile selection — so a comparison between the two
+    is a comparison of the formation measure and nothing else:
+
+        portfolio-agent compare --strategies momentum,residual_momentum
+
+    This also corrects `docs/QUANT_RESEARCH.md` section 12(c), which recorded
+    idiosyncratic momentum as needing section 8's un-ingested factor data. It
+    needs a market return and a rolling beta, both of which T14 built.
+    """
+
+    trigger_name = "ResidualMomentum"
+
+    def __init__(self, config: StrategyConfig):
+        super().__init__(config)
+        params = config.params or {}
+        self._name = params.get("name", "residual_momentum")
+
+    def required_features(self) -> List[str]:
+        # `mom_9m_skip1m` is deliberately absent: this strategy does not rank on
+        # it, and requesting it would widen every warm-up by 211 rows for a
+        # column nothing reads.
+        return [
+            "close", "atr_14", "realized_vol_60"
+        ] + self._tradability.required_features()
+
+    def required_cross_sectional_features(self) -> List[str]:
+        return [RESIDUAL_MOMENTUM_FEATURE]
+
+    def entry_rules(self) -> Dict[str, Any]:
+        rules = super().entry_rules()
+        rules["rule"] = (
+            "Long top decile of the eligible universe by the information ratio "
+            "of the CAPM residual over a 9-month formation window, skipping "
+            "the most recent month"
+        )
+        rules["formation_metric"] = RESIDUAL_MOMENTUM_FEATURE
+        return rules
+
+    def _formation_metric(
+        self, features_by_symbol: Dict[str, pd.DataFrame], context: StrategyContext
+    ) -> Dict[str, float]:
+        """Residual momentum for the batch, via the cross-sectional registry.
+
+        A residual is defined against a cross-section, so below two names there
+        is nothing to residualize against and this returns nothing rather than
+        a number that would rank identically to raw momentum while being
+        labelled otherwise — the same refusal `LowVolatilityStrategy` makes.
+        """
+        usable = {
+            symbol: features
+            for symbol, features in features_by_symbol.items()
+            if not features.empty and "close" in features.columns
+        }
+        if len(usable) < 2:
+            return {}
+
+        built = build_cross_section(
+            usable, [RESIDUAL_MOMENTUM_FEATURE],
+            benchmark=context.benchmark_close,
+        )
+        return latest_values(built.get(RESIDUAL_MOMENTUM_FEATURE, pd.DataFrame()))
 
 
 #: How `LowVolatilityStrategy` measures risk. `total` is trailing realized
