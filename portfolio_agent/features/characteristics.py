@@ -88,8 +88,21 @@ def _book_to_price(panel: CrossSectionPanel) -> pd.DataFrame:
     book value shrinks toward zero, where P/B explodes. Fama and French rank on
     B/P for exactly that reason, and a cross-sectional rank on P/B is dominated
     by whichever handful of firms are closest to zero book.
+
+    **Firms with non-positive book equity are dropped, not ranked.** This is
+    Fama and French's own screen and it is not a tidying step. A firm whose
+    accumulated losses exceed its paid-in capital has a *negative* B/P, which
+    sorts it to the extreme "growth" end of the cross-section — the opposite
+    end from where a distressed balance sheet belongs. Keeping them would let
+    the value decile at one end be populated by exactly the firms the
+    characteristic cannot describe.
+
+    Contrast `earnings_to_price`, which **keeps** negative values: a loss-making
+    firm has a real and interpretable earnings yield, and it sorts to the end a
+    reader would expect.
     """
-    return _safe_ratio(panel.get("total_equity"), market_cap(panel))
+    equity = panel.get("total_equity")
+    return _safe_ratio(equity.where(equity > 0), market_cap(panel))
 
 
 @register_cross_sectional_feature(
