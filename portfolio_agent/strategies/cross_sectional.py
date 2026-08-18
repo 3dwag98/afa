@@ -44,6 +44,7 @@ import pandas as pd
 from .base import BaseStrategy
 from .types import StrategyContext, StrategySignal
 from portfolio_agent.config.schema import StrategyConfig
+from portfolio_agent.features.cross_section import build_cross_section, latest_values
 from portfolio_agent.features.market_relative import (
     # Aliased because `src.regime` exports a `DEFAULT_VOL_WINDOW` too, and its
     # import below would otherwise shadow this one. Both are 60 today, which is
@@ -52,7 +53,7 @@ from portfolio_agent.features.market_relative import (
     # market's own volatility lookback — so the day either moves, the
     # idiosyncratic sort would silently start using the regime filter's number.
     DEFAULT_VOL_WINDOW as DEFAULT_IDIOSYNCRATIC_WINDOW,
-    idiosyncratic_vol_from_closes,
+    idiosyncratic_vol_feature,
 )
 
 from portfolio_agent.src.risk import calculate_stop_target, net_reward_risk
@@ -757,6 +758,19 @@ class LowVolatilityStrategy(BaseStrategy):
             rejected=rejected,
         )
 
+    def required_cross_sectional_features(self) -> List[str]:
+        """The residual sort ranks on a feature of the whole cross-section.
+
+        The configured window selects the registry name rather than being
+        passed as an argument, matching how every other window in the feature
+        layer works (`sma_20`, `realized_vol_60`). An unregistered window
+        raises at construction instead of silently ranking on 60 sessions
+        under a name that says otherwise.
+        """
+        if self._sort_on != "idiosyncratic":
+            return []
+        return [idiosyncratic_vol_feature(self._vol_window)]
+
     def _idiosyncratic_vol(
         self, features_by_symbol: Dict[str, pd.DataFrame], context: StrategyContext
     ) -> Dict[str, float]:
@@ -771,33 +785,33 @@ class LowVolatilityStrategy(BaseStrategy):
         below two symbols this returns nothing rather than a number that would
         rank identically to the total-volatility sort while being labelled
         differently.
+
+        Routed through the cross-sectional registry since T24. It used to
+        import `idiosyncratic_vol_from_closes` directly and pass `lag=1` by
+        hand — the platform's only cross-sectional feature, reached from inside
+        a strategy method because no registry could express its shape. The
+        decorator owns the lag now, so this cannot drift from the convention
+        the per-ticker features follow.
         """
-        closes = {
-            symbol: features["close"]
+        usable = {
+            symbol: features
             for symbol, features in features_by_symbol.items()
             if not features.empty and "close" in features.columns
         }
-        if len(closes) < 2:
+        if len(usable) < 2:
             return {}
 
-        frame = pd.DataFrame(closes).sort_index()
-        if len(frame) < self._vol_window + 2:
+        # `+2` because the window needs its rows *after* the lag and the
+        # differencing each consume one.
+        if max(len(frame) for frame in usable.values()) < self._vol_window + 2:
             return {}
 
-        residual = idiosyncratic_vol_from_closes(
-            frame, market_close=context.benchmark_close, window=self._vol_window
+        built = build_cross_section(
+            usable, self.required_cross_sectional_features(),
+            benchmark=context.benchmark_close,
         )
-        if residual.empty:
-            return {}
-
-        latest = residual.iloc[-1]
-        return {
-            symbol: value
-            for symbol, value in (
-                (symbol, _clean(latest.get(symbol))) for symbol in frame.columns
-            )
-            if value is not None
-        }
+        name = self.required_cross_sectional_features()[0]
+        return latest_values(built.get(name, pd.DataFrame()))
 
 
 class IdiosyncraticLowVolatilityStrategy(LowVolatilityStrategy):

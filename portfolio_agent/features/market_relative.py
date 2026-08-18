@@ -32,6 +32,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from .cross_section import CrossSectionPanel, register_cross_sectional_feature
+
 #: Sessions in a year, for annualizing a daily standard deviation. Matches
 #: `features/technical.py::realized_vol_60`, which the idiosyncratic version is
 #: meant to be directly comparable with.
@@ -41,6 +43,11 @@ TRADING_DAYS_PER_YEAR = 252
 #: comparison between total and idiosyncratic volatility is only about the
 #: *decomposition* if the window is held fixed.
 DEFAULT_VOL_WINDOW = 60
+
+#: Default beta estimation window, in sessions. Matches the vol window so a
+#: beta sort and an idiosyncratic-volatility sort are decompositions of the
+#: same 60 sessions rather than two different samples.
+DEFAULT_BETA_WINDOW = 60
 
 
 def market_composite(returns: pd.DataFrame) -> pd.Series:
@@ -155,3 +162,152 @@ def idiosyncratic_vol_from_closes(
         market = market_shifted.pct_change()
 
     return rolling_idiosyncratic_vol(returns, market, window=window)
+
+
+def rolling_beta(
+    returns: pd.DataFrame,
+    market: Optional[pd.Series] = None,
+    window: int = DEFAULT_BETA_WINDOW,
+) -> pd.DataFrame:
+    """Rolling market beta per symbol.
+
+    Moved here from `evaluation/neutralize.py`, which is where it was written
+    and where it did not belong: it is a characteristic of a stock, the
+    evaluation layer was importing `market_composite` *from this module* to
+    compute it, and `betting-against-beta` needs to rank on it rather than
+    neutralize by it. `neutralize.rolling_beta` now delegates, so its callers
+    and its tests are unchanged.
+
+    Causal by construction: `rolling` windows end at the row they label, so the
+    beta on date `t` was estimable on date `t`.
+
+    Args:
+        returns: Wide (date x symbol) daily returns. Already lagged if the
+            caller owes a lag — same contract as `rolling_idiosyncratic_vol`.
+        market: Market returns. Defaults to the cross-section's own composite.
+        window: Sessions in the estimation window.
+
+    Returns:
+        Wide (date x symbol) betas, NaN until the window fills.
+    """
+    if returns.empty:
+        return pd.DataFrame(index=returns.index, columns=returns.columns, dtype=float)
+
+    market_returns = market_composite(returns) if market is None else market
+    market_returns = pd.Series(market_returns).reindex(returns.index)
+
+    floor = max(2, window // 2)
+    market_variance = market_returns.rolling(window, min_periods=floor).var()
+    safe_variance = market_variance.replace(0.0, np.nan)
+
+    betas = {
+        symbol: returns[symbol].rolling(window, min_periods=floor).cov(market_returns)
+        / safe_variance
+        for symbol in returns.columns
+    }
+    return pd.DataFrame(betas, index=returns.index)
+
+
+# --------------------------------------------------------------------------
+# Registered cross-sectional features
+#
+# The decorator applies the one-bar lag, so the bodies below take the panel's
+# frames as already shifted and must not shift again. That is the difference
+# between this module before and after T24: the lag used to be re-implemented
+# by hand here (`idiosyncratic_vol_from_closes(..., lag=1)`) because there was
+# no registry able to express a feature of the whole cross-section, and the
+# only caller reached in and imported the function directly.
+# --------------------------------------------------------------------------
+
+
+#: Windows each market-relative feature is registered at. The window lives in
+#: the *name*, which is the convention the per-ticker registry already
+#: follows — `sma_20`, `sma_50`, `sma_200`, `realized_vol_60` all do exactly
+#: this. It matters more here than there: a caller asking for
+#: "idiosyncratic volatility" with an out-of-family window would otherwise get
+#: the 60-session answer under a name claiming otherwise, and a sort measured
+#: over the wrong window is not visibly wrong.
+REGISTERED_WINDOWS = (20, 60, 120, 252)
+
+
+def _panel_returns(panel: CrossSectionPanel) -> tuple:
+    """Cross-section and market returns from an already-lagged panel."""
+    returns = panel.get("close").pct_change()
+    market = panel.benchmark.pct_change() if panel.benchmark is not None else None
+    return returns, market
+
+
+def _register_window_family() -> None:
+    """Register both market-relative features at every window in the family.
+
+    A loop rather than eight decorated functions, because the eight would be
+    identical but for an integer and the platform has already been bitten once
+    by an expression restated in a second place.
+    """
+    for window in REGISTERED_WINDOWS:
+
+        def make_vol(w: int):
+            def feature(panel: CrossSectionPanel) -> pd.DataFrame:
+                returns, market = _panel_returns(panel)
+                return rolling_idiosyncratic_vol(returns, market, window=w)
+
+            feature.__name__ = f"idiosyncratic_vol_{w}"
+            feature.__doc__ = (
+                f"Annualized volatility of the CAPM residual over {w} sessions."
+            )
+            return feature
+
+        def make_beta(w: int):
+            def feature(panel: CrossSectionPanel) -> pd.DataFrame:
+                returns, market = _panel_returns(panel)
+                return rolling_beta(returns, market, window=w)
+
+            feature.__name__ = f"market_beta_{w}"
+            feature.__doc__ = (
+                f"Rolling CAPM beta over {w} sessions, for sorting rather than "
+                f"neutralizing."
+            )
+            return feature
+
+        register_cross_sectional_feature(
+            f"idiosyncratic_vol_{window}", inputs=("close",)
+        )(make_vol(window))
+        register_cross_sectional_feature(
+            f"market_beta_{window}", inputs=("close",)
+        )(make_beta(window))
+
+
+_register_window_family()
+
+
+def idiosyncratic_vol_feature(window: int) -> str:
+    """Registry name for the residual-volatility feature at `window` sessions.
+
+    Raises:
+        ValueError: If no feature is registered at that window. Loud, because
+            the alternative is ranking on a 60-session residual while the
+            config says 120 — a sort measured over the wrong window looks
+            exactly like a sort measured over the right one.
+    """
+    return _family_name("idiosyncratic_vol", window)
+
+
+def market_beta_feature(window: int) -> str:
+    """Registry name for the beta feature at `window` sessions.
+
+    Raises:
+        ValueError: If no feature is registered at that window.
+    """
+    return _family_name("market_beta", window)
+
+
+def _family_name(stem: str, window: int) -> str:
+    window = int(window)
+    if window not in REGISTERED_WINDOWS:
+        raise ValueError(
+            f"No '{stem}' feature registered at a {window}-session window. "
+            f"Available: {sorted(REGISTERED_WINDOWS)}. Add the window to "
+            f"`REGISTERED_WINDOWS` rather than rounding to a neighbour — the "
+            f"window is part of what the feature measures."
+        )
+    return f"{stem}_{window}"
